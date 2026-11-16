@@ -62,6 +62,7 @@ namespace Styx.Logic.Relogin
         private volatile bool _wasInGame;
         private DateTime? _outOfGameSinceUtc;
         private DateTime _nextAttemptUtc = DateTime.MinValue;
+        private int _pinnedProcessId;
 
         /// <summary>Cool-down after MaxAttemptsPerDisconnect failures.</summary>
         private const int FailureCoolDownSeconds = 300;
@@ -75,6 +76,18 @@ namespace Styx.Logic.Relogin
         public string Status
         {
             get { lock (_stateLock) return _status; }
+        }
+
+        /// <summary>
+        /// Client the monitor must stay on while it is alive - the explicit /pid= target
+        /// the bot was started with. 0 = follow any client (the configured executable,
+        /// then any live one). Cleared automatically once that process exits, so a crashed
+        /// pinned client can still be relaunched and adopted.
+        /// </summary>
+        public int PinnedProcessId
+        {
+            get => Volatile.Read(ref _pinnedProcessId);
+            set => Volatile.Write(ref _pinnedProcessId, value);
         }
 
         /// <summary>True while a launch/login sequence is in flight.</summary>
@@ -181,7 +194,7 @@ namespace Styx.Logic.Relogin
                 if (cancellationToken.IsCancellationRequested || _stopRequested)
                     return false;
 
-                Process? client = ReloginNative.FindClient(ReloginSettings.Instance.WowExePath);
+                Process? client = ReloginNative.FindClient(ReloginSettings.Instance.WowExePath, PinnedProcessId);
                 if (client != null && ReloginNative.TryReadInGame(client, out bool inGame) && inGame)
                     return true;
 
@@ -206,7 +219,7 @@ namespace Styx.Logic.Relogin
         /// <summary>True when a client process is currently in the world.</summary>
         public bool IsAnyClientInGame()
         {
-            Process? client = ReloginNative.FindClient(ReloginSettings.Instance.WowExePath);
+            Process? client = ReloginNative.FindClient(ReloginSettings.Instance.WowExePath, PinnedProcessId);
             return client != null && ReloginNative.TryReadInGame(client, out bool inGame) && inGame;
         }
 
@@ -259,7 +272,17 @@ namespace Styx.Logic.Relogin
             if (!settings.Enabled || _suspended)
                 return;
 
-            Process? client = ReloginNative.FindClient(settings.WowExePath);
+            // Drop the pin as soon as the target exits: from then on any live client may
+            // be relaunched / adopted again.
+            int pinned = PinnedProcessId;
+            if (pinned != 0 && !ReloginNative.IsProcessAlive(pinned))
+            {
+                Logging.Write("[AutoRelogin] The pinned client (pid {0}) is gone; following any live client again.", pinned);
+                PinnedProcessId = 0;
+                pinned = 0;
+            }
+
+            Process? client = ReloginNative.FindClient(settings.WowExePath, pinned);
 
             // ---------------------------------------------------------------- no client
             if (client == null)

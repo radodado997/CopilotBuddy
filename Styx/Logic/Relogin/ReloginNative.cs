@@ -126,8 +126,25 @@ namespace Styx.Logic.Relogin
         /// Finds a 3.3.5a client. The configured executable wins; otherwise any
         /// process with a known client name is accepted.
         /// </summary>
-        public static Process? FindClient(string? preferredExePath)
+        public static Process? FindClient(string? preferredExePath, int pinnedPid = 0)
         {
+            // An explicitly pinned client (the /pid= target the bot was started with)
+            // wins over everything else while it is alive, so the monitor never switches
+            // to a second client that happens to be running.
+            if (pinnedPid != 0)
+            {
+                try
+                {
+                    Process pinned = Process.GetProcessById(pinnedPid);
+                    if (!pinned.HasExited)
+                        return pinned;
+                }
+                catch
+                {
+                    // Gone: fall through to the normal scan.
+                }
+            }
+
             Process[] all;
             try
             {
@@ -179,6 +196,23 @@ namespace Styx.Logic.Relogin
             // OrderBy(StartTime) reads a property that throws for processes we cannot
             // query, so use a value that never throws instead.
             return alive.OrderBy(SafeProcessId).FirstOrDefault() ?? alive[0];
+        }
+
+        /// <summary>True when the process exists and has not exited.</summary>
+        public static bool IsProcessAlive(int processId)
+        {
+            if (processId == 0)
+                return false;
+
+            try
+            {
+                using Process p = Process.GetProcessById(processId);
+                return !p.HasExited;
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         private static int SafeProcessId(Process p)

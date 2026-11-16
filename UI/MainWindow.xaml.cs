@@ -397,12 +397,31 @@ namespace CopilotBuddy.UI
             string? pidArg = Environment.GetCommandLineArgs()
                 .FirstOrDefault(s => s.StartsWith("/pid=", StringComparison.OrdinalIgnoreCase));
 
-            // Auto Relogin: a /pid= from the command line points at the client the bot was
-            // started with, which is stale once that client was relaunched. The pid handed
-            // over by the relogin manager is authoritative, so it replaces the argument
-            // and goes through the same discovery/validation path below.
-            if (preferPid != 0)
+            // An explicit /pid= target stays authoritative while that process is alive, so
+            // the relogin pid only takes over once it exited (or when there was no /pid=).
+            int commandLinePid = 0;
+            if (pidArg != null && int.TryParse(pidArg.Substring("/pid=".Length).Trim(), out int parsedPid))
+                commandLinePid = parsedPid;
+
+            if (preferPid != 0 && (commandLinePid == 0 || !ReloginNative.IsProcessAlive(commandLinePid)))
                 pidArg = "/pid=" + preferPid;
+            else if (commandLinePid != 0)
+                pidArg = "/pid=" + commandLinePid;
+
+            // Keep the Auto Relogin monitor on the same client: without this it would
+            // follow the configured executable / the first live client and could log a
+            // *different* WoW in while the pinned one is still running. The pin is only
+            // held while that process lives - 0 means "follow any live client", which is
+            // also what a crashed /pid= target has to fall back to.
+            try
+            {
+                ReloginManager.Instance.PinnedProcessId =
+                    ReloginNative.IsProcessAlive(commandLinePid) ? commandLinePid : 0;
+            }
+            catch (Exception ex)
+            {
+                Logging.WriteDebug("Auto Relogin: could not pin the client: {0}", ex.Message);
+            }
 
             _selectedWoWProc = null;
             var candidates = new List<Process>();
@@ -797,6 +816,16 @@ namespace CopilotBuddy.UI
 
             if (_isClosing || !_startupCompleted)
                 return;
+
+            // An explicit /pid= target is authoritative while it is alive: never attach to
+            // a different client on its behalf (the monitor falls back to any live client
+            // on its own once the pinned process is gone).
+            int pinnedPid = ReloginManager.Instance.PinnedProcessId;
+            if (pinnedPid != 0 && pid != pinnedPid && ReloginNative.IsProcessAlive(pinnedPid))
+            {
+                Logging.WriteDebug("Auto Relogin: ignoring client {0} - the pinned client {1} is still running.", pid, pinnedPid);
+                return;
+            }
 
             // Already attached to a live client. Either the event is just the monitor
             // noticing a healthy session, or the detachment triggered by ClientLost /
