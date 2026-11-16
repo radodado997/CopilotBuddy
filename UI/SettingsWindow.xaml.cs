@@ -12,6 +12,12 @@ namespace CopilotBuddy.UI
     /// </summary>
     public partial class SettingsWindow : MetroWindow
     {
+        /// <summary>
+        /// True while the ctor fills the password box, so the PasswordChanged handler
+        /// does not write the value straight back into the settings.
+        /// </summary>
+        private bool _loadingReloginPassword;
+
         public SettingsWindow()
         {
             InitializeComponent();
@@ -20,8 +26,19 @@ namespace CopilotBuddy.UI
             DataContext = new SettingsDataContext
             {
                 CharSettings = CharacterSettings.Instance,
-                StyxSettings = StyxSettings.Instance
+                StyxSettings = StyxSettings.Instance,
+                Relogin = ReloginSettings.Instance
             };
+
+            // PasswordBox has no bindable Password property, so it is filled here and
+            // written back from the PasswordChanged handler.
+            _loadingReloginPassword = true;
+            try
+            {
+                pwdReloginPassword.Password = ReloginSettings.Instance.Password ?? "";
+            }
+            catch { /* ignore */ }
+            _loadingReloginPassword = false;
 
             // Initialize log level ComboBox
             InitializeLogLevelComboBox();
@@ -116,12 +133,76 @@ namespace CopilotBuddy.UI
 
         private void btnSaveAndClose_Click(object sender, RoutedEventArgs e)
         {
-            // Save both settings
-            CharacterSettings.Instance.Save();
+            // Save both settings. CharacterSettings only exists once a character has
+            // been attached, and the window is reachable before that (Auto Relogin).
+            CharacterSettings.Instance?.Save();
             StyxSettings.Instance.Save();
-            
+
+            // Auto Relogin settings are global (not per character) and include the
+            // encrypted password, which never goes through a binding.
+            ReloginSettings.Instance.Save();
+
+            // The monitor may have been idle because the feature was off at startup;
+            // enable it now instead of asking for a restart. (Start() is a no-op when
+            // it is already running, and the monitor itself does nothing while the
+            // feature is disabled.)
+            if (ReloginSettings.Instance.Enabled)
+            {
+                try
+                {
+                    Styx.Logic.Relogin.ReloginManager.Instance.Start();
+
+                    // Saving with the feature enabled is also how a pause caused by an
+                    // intentional logout (inactivity detector) is cleared.
+                    Styx.Logic.Relogin.ReloginManager.Instance.Resume();
+                }
+                catch (Exception ex)
+                {
+                    Styx.Helpers.Logging.WriteDebug("Auto Relogin: could not start the monitor: {0}", ex.Message);
+                }
+            }
+
             // Close the window
             Close();
+        }
+
+        private void pwdReloginPassword_PasswordChanged(object sender, RoutedEventArgs e)
+        {
+            if (_loadingReloginPassword)
+                return;
+
+            ReloginSettings.Instance.Password = pwdReloginPassword.Password ?? "";
+        }
+
+        private void btnBrowseWowExe_Click(object sender, RoutedEventArgs e)
+        {
+            var dialog = new Microsoft.Win32.OpenFileDialog
+            {
+                Title = "Select Wow.exe (3.3.5a client)",
+                Filter = "Executable (*.exe)|*.exe|All files (*.*)|*.*",
+                CheckFileExists = true
+            };
+
+            try
+            {
+                string current = ReloginSettings.Instance.WowExePath;
+                if (!string.IsNullOrWhiteSpace(current))
+                {
+                    string? directory = System.IO.Path.GetDirectoryName(current);
+                    if (!string.IsNullOrEmpty(directory) && System.IO.Directory.Exists(directory))
+                        dialog.InitialDirectory = directory;
+                }
+            }
+            catch { /* ignore, the dialog just opens in the last folder */ }
+
+            if (dialog.ShowDialog(this) == true)
+            {
+                ReloginSettings.Instance.WowExePath = dialog.FileName;
+
+                // ReloginSettings has no change notification, so push the value into the
+                // text box as well instead of waiting for a reload of the window.
+                try { txtWowExePath.Text = dialog.FileName; } catch { /* ignore */ }
+            }
         }
 
         private void btnClassConfig_Click(object sender, RoutedEventArgs e)
@@ -169,5 +250,6 @@ namespace CopilotBuddy.UI
     {
         public CharacterSettings? CharSettings { get; set; }
         public StyxSettings? StyxSettings { get; set; }
+        public ReloginSettings? Relogin { get; set; }
     }
 }
