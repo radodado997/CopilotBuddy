@@ -58,7 +58,8 @@ namespace Styx.Logic.Relogin
         private volatile bool _busy;
         private int _attempts;
         private int _lastPid;
-        private bool _wasInGame;
+        // Written by RequestLoggedInSignal from the UI thread as well as by the monitor.
+        private volatile bool _wasInGame;
         private DateTime? _outOfGameSinceUtc;
         private DateTime _nextAttemptUtc = DateTime.MinValue;
 
@@ -188,6 +189,18 @@ namespace Styx.Logic.Relogin
             }
 
             return false;
+        }
+
+        /// <summary>
+        /// Re-arms the "client is in the world" transition so the next monitor tick raises
+        /// <see cref="ClientLoggedIn"/> again. Used when the bot could not attach to a
+        /// client that is already in game (busy mutex, transient failure), where waiting
+        /// for the character to leave and re-enter the world is not an option.
+        /// </summary>
+        public void RequestLoggedInSignal()
+        {
+            _wasInGame = false;
+            try { _wake.Set(); } catch { /* disposed */ }
         }
 
         /// <summary>True when a client process is currently in the world.</summary>
@@ -457,6 +470,17 @@ namespace Styx.Logic.Relogin
 
             if (!SleepInterruptible(300) || ShouldAbortSequence())
                 return;
+
+            // Re-checked immediately before the keys: the focus can be lost during the
+            // delay above (screen saver, another window stealing it), and Ctrl+A/Delete
+            // must never land in whatever window is in front.
+            if (!ReloginNative.IsForeground(window))
+            {
+                Logging.Write(System.Windows.Media.Colors.Red,
+                    "[AutoRelogin] The game window lost the foreground before the account field could be cleared; not sending any keystrokes.");
+                ApplyBackoff(settings);
+                return;
+            }
 
             // The account field is focused by default; clear whatever the client has
             // pre-filled (after a disconnect it holds the last account name) and retype.

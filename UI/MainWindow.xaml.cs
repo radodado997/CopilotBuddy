@@ -83,6 +83,15 @@ namespace CopilotBuddy.UI
         /// <summary>The running re-attach sequence, awaited by Window_Closing.</summary>
         private Task? _reattachTask;
 
+        /// <summary>The running detach sequence, awaited by Window_Closing.</summary>
+        private Task? _detachTask;
+
+        /// <summary>Consecutive failed re-attach sequences (reset by a successful one).</summary>
+        private int _reattachFailures;
+
+        /// <summary>How often a failed re-attach asks the monitor for another attempt.</summary>
+        private const int MaxReattachRetries = 10;
+
         /// <summary>
         /// Set when a ClientLoggedIn event arrives while the detachment is still in
         /// flight: the attach would fail (ObjectManager is still initialized), so the
@@ -648,6 +657,11 @@ namespace CopilotBuddy.UI
             if (!settings.Enabled || !settings.HasClientPath || !settings.HasCredentials)
                 return false;
 
+            // The application is already shutting down: do not start (or keep running) the
+            // monitor just to have it restarted by the next process.
+            if (cancellationToken.IsCancellationRequested || _isClosing)
+                return false;
+
             Logging.Write("Auto Relogin: no client to attach to - starting it and logging in.");
             Dispatcher.Invoke(() => SetStatus("Auto Relogin: starting WoW..."));
 
@@ -700,6 +714,7 @@ namespace CopilotBuddy.UI
                 return;
 
             _reloginInProgress = true;
+            _reattachFailures = 0;
             _wasRunningBeforeRelogin = _isRunning || TreeRoot.State != TreeRootState.Stopped;
 
             Logging.Write(Colors.Orange, "Auto Relogin: {0}. Detaching from the client.", reason);
@@ -711,12 +726,17 @@ namespace CopilotBuddy.UI
             ToggleButtons(false);
             _infoTimer?.Stop();
 
-            Task.Run(() =>
+            _detachTask = Task.Run(() =>
             {
                 // The worker must be gone before the EndScene hook and the process
                 // handles are released, or it keeps ticking against a dead client.
                 if (!WaitForTreeRootStop(15000))
                     Logging.Write("Auto Relogin: the bot thread did not stop in time; detaching anyway.");
+
+                // Window_Closing tears the attachment down itself; detaching a second
+                // time here would race with ObjectManager.Shutdown().
+                if (_isClosing || _startupCts.IsCancellationRequested)
+                    return;
 
                 DetachFromGame();
 
@@ -775,13 +795,21 @@ namespace CopilotBuddy.UI
             // pid and let the detach task retry once the attachment is gone.
             if (ObjectManager.IsInitialized)
             {
-                if (_reloginInProgress)
-                {
-                    Interlocked.Exchange(ref _pendingLoggedInPid, pid);
-                    Logging.WriteDebug("Auto Relogin: client {0} is in the world while detaching; will attach when the detach finishes.", pid);
-                }
+                if (!_reloginInProgress)
+                    return;
 
-                return;
+                Interlocked.Exchange(ref _pendingLoggedInPid, pid);
+                Logging.WriteDebug("Auto Relogin: client {0} is in the world while detaching; will attach when the detach finishes.", pid);
+
+                if (ObjectManager.IsInitialized)
+                    return;
+
+                // The detach finished between the check above and the store, so the detach
+                // task has already drained the pending pid and nobody would pick it up.
+                // Take it back and continue through the normal attach path below.
+                pid = Interlocked.Exchange(ref _pendingLoggedInPid, 0);
+                if (pid == 0)
+                    return;
             }
 
             // One re-attach at a time. This also covers the case where the recovery
@@ -823,16 +851,35 @@ namespace CopilotBuddy.UI
                 if (!attached)
                 {
                     Logging.Write(Colors.Red, "Auto Relogin: could not re-attach to the client.");
+
+                    // Ask the monitor for another ClientLoggedIn on a later tick: the
+                    // client is in the world, so waiting for the character to leave and
+                    // re-enter would never retry. Bounded, so an unattachable client
+                    // (e.g. another CopilotBuddy owns it) does not retry forever.
+                    bool requestAnother =
+                        ++_reattachFailures <= MaxReattachRetries && !_isClosing && !_startupCts.IsCancellationRequested;
+                    if (requestAnother)
+                        ReloginManager.Instance.RequestLoggedInSignal();
+                    else
+                        Logging.Write(Colors.Red,
+                            "Auto Relogin: giving up on re-attaching. Attach again manually (restart CopilotBuddy) once the problem is solved.");
+
                     Dispatcher.BeginInvoke(new Action(() =>
                     {
                         if (_isClosing) return;
                         _reloginInProgress = false;
-                        ToggleButtons(true);
-                        _infoTimer?.Start();
-                        SetStatus("Auto Relogin: re-attach failed");
+
+                        // No attachment exists, so Start/Stop stay disabled - the bot
+                        // cannot be started without a client. Settings stay reachable.
+                        btnSettings.IsEnabled = true;
+                        SetStatus(requestAnother
+                            ? "Auto Relogin: waiting for the client"
+                            : "Auto Relogin: re-attach failed");
                     }));
                     return;
                 }
+
+                _reattachFailures = 0;
 
                 Logging.Write("Attached to WoW with ID {0}", _selectedWoWProc!.Value);
 
@@ -1086,8 +1133,11 @@ namespace CopilotBuddy.UI
             // Shutdown has to run afterwards to restore EndScene deterministically.
             WaitForStartupToStop(5000);
 
-            // An Auto Relogin re-attach may be in flight (it also attaches and calls
-            // Dispatcher.Invoke); it must finish before ObjectManager.Shutdown() below.
+            // An Auto Relogin detach or re-attach may be in flight (both attach/detach and
+            // call Dispatcher.Invoke); they must finish before ObjectManager.Shutdown()
+            // below. The detach task also checks _isClosing and returns without touching
+            // the attachment once this handler has started.
+            WaitForDetachToStop(5000);
             WaitForReattachToStop(5000);
 
             // The startup callback above was retired by the wait.  Re-check the worker:
@@ -1200,6 +1250,12 @@ namespace CopilotBuddy.UI
         private void WaitForReattachToStop(int timeoutMs)
         {
             WaitForWorkerTask(_reattachTask, timeoutMs, "Auto Relogin re-attach");
+        }
+
+        /// <summary>Same wait for the Auto Relogin detach task.</summary>
+        private void WaitForDetachToStop(int timeoutMs)
+        {
+            WaitForWorkerTask(_detachTask, timeoutMs, "Auto Relogin detach");
         }
 
         private void WaitForWorkerTask(Task? task, int timeoutMs, string what)
