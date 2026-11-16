@@ -89,6 +89,13 @@ namespace CopilotBuddy.UI
         /// <summary>Consecutive failed re-attach sequences (reset by a successful one).</summary>
         private int _reattachFailures;
 
+        /// <summary>
+        /// A ClientLost / ClientDisconnected that arrived while a recovery was already in
+        /// flight. Stored (not dropped) and replayed once the re-attach worker released the
+        /// attachment: -1 = pending with pid 0, 0 = nothing pending.
+        /// </summary>
+        private int _pendingRecoveryPid;
+
         /// <summary>How often a failed re-attach asks the monitor for another attempt.</summary>
         private const int MaxReattachRetries = 10;
 
@@ -399,9 +406,7 @@ namespace CopilotBuddy.UI
 
             // An explicit /pid= target stays authoritative while that process is alive, so
             // the relogin pid only takes over once it exited (or when there was no /pid=).
-            int commandLinePid = 0;
-            if (pidArg != null && int.TryParse(pidArg.Substring("/pid=".Length).Trim(), out int parsedPid))
-                commandLinePid = parsedPid;
+            int commandLinePid = GetCommandLinePid();
 
             if (preferPid != 0 && (commandLinePid == 0 || !ReloginNative.IsProcessAlive(commandLinePid)))
                 pidArg = "/pid=" + preferPid;
@@ -649,6 +654,28 @@ namespace CopilotBuddy.UI
         private volatile bool _startupCompleted;
 
         /// <summary>
+        /// The pid from an explicit <c>/pid=</c> command line argument, 0 when there is
+        /// none (or it is not a number).
+        /// </summary>
+        private static int GetCommandLinePid()
+        {
+            try
+            {
+                string? pidArg = Environment.GetCommandLineArgs()
+                    .FirstOrDefault(s => s.StartsWith("/pid=", StringComparison.OrdinalIgnoreCase));
+
+                if (pidArg == null)
+                    return 0;
+
+                return int.TryParse(pidArg.Substring("/pid=".Length).Trim(), out int pid) ? pid : 0;
+            }
+            catch
+            {
+                return 0;
+            }
+        }
+
+        /// <summary>
         /// Hooks the manager events (once) and starts the monitor when the feature is
         /// enabled. Called from the startup task, i.e. off the UI thread.
         /// </summary>
@@ -681,6 +708,14 @@ namespace CopilotBuddy.UI
                     Logging.Write(Colors.Red,
                         "Auto Relogin is enabled but no account name / password is configured.");
                 }
+
+                // Pin the monitor to the explicit /pid= target *before* it starts, using
+                // the same rule as FindAndAttachToWoW: while that process is alive no other
+                // client may be logged in or adopted, and once it exits the pin falls back
+                // to any live client.
+                int commandLinePid = GetCommandLinePid();
+                ReloginManager.Instance.PinnedProcessId =
+                    ReloginNative.IsProcessAlive(commandLinePid) ? commandLinePid : 0;
 
                 ReloginManager.Instance.Start();
                 Logging.Write("Auto Relogin: monitoring the game client ({0}).", settings.WowExePath);
@@ -762,8 +797,21 @@ namespace CopilotBuddy.UI
                 return;
             }
 
-            if (_isClosing || _reloginInProgress)
+            if (_isClosing)
                 return;
+
+            // Ownership handoff: _reloginInProgress covers a whole recovery (detach,
+            // relogin, re-attach) and _reattachRunning is the token of the worker that
+            // currently owns the attachment - FindAndAttachToWoW, LoadSettings and
+            // RoutineManager.Init all run under it. Detaching underneath that worker would
+            // corrupt what it publishes, so the event is retained instead of dropped and
+            // replayed by the worker when it is done.
+            if (_reloginInProgress || Volatile.Read(ref _reattachRunning) != 0)
+            {
+                Interlocked.Exchange(ref _pendingRecoveryPid, pid == 0 ? -1 : pid);
+                Logging.WriteDebug("Auto Relogin: {0} while a relogin/re-attach is in flight; replaying it afterwards.", reason);
+                return;
+            }
 
             // Only recover the client this window is (or was) attached to.
             if (_selectedWoWProc.HasValue && pid != 0 && pid != _selectedWoWProc.Value)
@@ -771,6 +819,7 @@ namespace CopilotBuddy.UI
 
             _reloginInProgress = true;
             _reattachFailures = 0;
+            Interlocked.Exchange(ref _pendingRecoveryPid, 0);
             _wasRunningBeforeRelogin = _isRunning || TreeRoot.State != TreeRootState.Stopped;
 
             Logging.Write(Colors.Orange, "Auto Relogin: {0}. Detaching from the client.", reason);
@@ -1044,12 +1093,29 @@ namespace CopilotBuddy.UI
                 // Allow the next relogin to start a fresh attach sequence.
                 Interlocked.Exchange(ref _reattachRunning, 0);
 
+                // A login parked while this sequence ran is stale now: on success the
+                // attachment already exists, on failure the re-signal below produces a
+                // fresh ClientLoggedIn. Draining it keeps a later detach from dispatching
+                // an attach for a pid that nobody is waiting for any more.
+                Interlocked.Exchange(ref _pendingLoggedInPid, 0);
+
                 // Only now ask for another ClientLoggedIn: the monitor answers on its
                 // next tick, and that event has to find _reattachRunning released.
                 if (requestAnother)
                 {
                     try { ReloginManager.Instance.RequestLoggedInSignal(); }
                     catch (Exception ex) { Logging.WriteDebug("Auto Relogin: could not request another attempt: {0}", ex.Message); }
+                }
+
+                // Replay a loss that arrived while this worker owned the attachment. The
+                // UI callbacks above were queued earlier, so _reloginInProgress is cleared
+                // by the time this dispatch runs.
+                int pendingRecovery = Interlocked.Exchange(ref _pendingRecoveryPid, 0);
+                if (pendingRecovery != 0 && !_isClosing)
+                {
+                    Dispatcher.BeginInvoke(new Action<int, string>(DispatchClientRecovery),
+                        pendingRecovery == -1 ? 0 : pendingRecovery,
+                        "the client went away again");
                 }
             }
         }
