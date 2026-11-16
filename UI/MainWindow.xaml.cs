@@ -259,6 +259,13 @@ namespace CopilotBuddy.UI
 
                         Dispatcher.Invoke(() =>
                         {
+                            // The window may already be closing: Window_Closing pumps this
+                            // dispatcher queue while it waits for the startup task, so this
+                            // callback can run during teardown.  Do not touch the UI, restart
+                            // the info timer or auto-start (StartBot is also guarded) then.
+                            if (_isClosing)
+                                return;
+
                             // Populate bot selector with all loaded bots (built-in + external)
                             cmbBotSelector.Items.Clear();
                             foreach (var bot in BotManager.Instance.Bots)
@@ -567,6 +574,17 @@ namespace CopilotBuddy.UI
             // Shutdown has to run afterwards to restore EndScene deterministically.
             WaitForStartupToStop(5000);
 
+            // The startup callback above was retired by the wait.  Re-check the worker:
+            // a callback that slipped past the _isClosing guard just before it was set
+            // could have started TreeRoot while the stop above was already running.
+            if (TreeRoot.State != TreeRootState.Stopped)
+            {
+                Logging.Write("A worker was still running after startup shutdown; stopping it again.");
+                TreeRoot.Stop("Main window is closing");
+                if (!WaitForTreeRootStop(5000))
+                    Logging.Write("Bot thread hung during the second stop attempt");
+            }
+
             // Persist window geometry FIRST so that SaveSettings() below
             // already writes the correct coordinates to UISettings.xml.
             // Use RestoreBounds so we always capture the Normal-state rect
@@ -862,6 +880,15 @@ namespace CopilotBuddy.UI
 
         private void StartBot()
         {
+            // Never create a worker while the window is closing: teardown has already
+            // stopped TreeRoot and is about to dispose the executor/hook, so anything
+            // started here would be left running against a half-torn-down process.
+            if (_isClosing)
+            {
+                Logging.WriteDebug("StartBot ignored: the application is closing.");
+                return;
+            }
+
             if (_isRunning) return;
 
             if (BotManager.Current == null)

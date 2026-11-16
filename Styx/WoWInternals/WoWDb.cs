@@ -11,8 +11,16 @@ namespace Styx.WoWInternals
         #region Fields
 
         private static readonly Dictionary<ClientDb, DbTable> _tables = new Dictionary<ClientDb, DbTable>();
+        // Guards _tables and _initialized.  The walk can now also be retried from a lookup
+        // (see EnsureInitialized), so a reader must not observe the dictionary while the
+        // writer adds to it or clears it after a failed attempt.
+        private static readonly object _sync = new object();
         // Static flag: true once init succeeded. False allows retry if WoW wasn't attached on first call.
         private static bool _initialized = false;
+        // Environment.TickCount64 of the last walk attempt; throttles the retry path so a
+        // layout mismatch cannot turn every lookup into a 4096-iteration remote walk.
+        private static long _lastInitAttemptTick = long.MinValue;
+        private const int InitRetryIntervalMs = 1000;
 
         #endregion
 
@@ -20,15 +28,38 @@ namespace Styx.WoWInternals
 
         internal WoWDb()
         {
-            Initialize();
+            EnsureInitialized();
         }
 
-        private void Initialize()
+        /// <summary>
+        /// Runs the registration-table walk if it has not succeeded yet.  Called from the
+        /// constructor and, if that first attempt failed, from every lookup: StyxWoW.Db
+        /// caches this instance, so an instance built before the client was readable (or
+        /// during a walk failure) would otherwise return empty results for the rest of the
+        /// session even after the DBC tables became available.
+        /// </summary>
+        private static void EnsureInitialized()
         {
             if (_initialized) return;
 
             var wow = ObjectManager.Wow;
-            if (wow == null) return;
+            if (wow == null) return;   // not attached yet - nothing to walk
+
+            lock (_sync)
+            {
+                if (_initialized) return;
+
+                long now = Environment.TickCount64;
+                if (now - _lastInitAttemptTick < InitRetryIntervalMs)
+                    return;             // retried recently; do not hammer the client
+                _lastInitAttemptTick = now;
+
+                InitializeCore(wow);
+            }
+        }
+
+        private static void InitializeCore(Memory wow)
+        {
 
             // _initialized is only set once the registration walk actually reached the
             // RET terminator.  Otherwise a layout mismatch would latch a half-populated
@@ -90,7 +121,11 @@ namespace Styx.WoWInternals
                     }
 
                     // Check if Lock DBC is accessible
-                    var lockDb = this[ClientDb.Lock];
+                    DbTable? lockDb;
+                    lock (_sync)
+                    {
+                        _tables.TryGetValue(ClientDb.Lock, out lockDb);
+                    }
                     Helpers.Logging.WriteDebug($"[WoWDb] Lock DBC lookup: {(lockDb != null ? $"FOUND (rows={lockDb.NumRows})" : "NOT FOUND")}");
                     Helpers.Logging.WriteDebug($"[WoWDb] ClientDb.Lock enum value = {(int)ClientDb.Lock} (0x{(int)ClientDb.Lock:X8})");
                 }
@@ -115,8 +150,16 @@ namespace Styx.WoWInternals
         {
             get
             {
-                DbTable? table;
-                return _tables.TryGetValue(db, out table) ? table : null;
+                // Retry a failed/early initialisation before answering, so the cached
+                // StyxWoW.Db instance starts returning real tables once the client is
+                // readable.  A no-op once the walk has succeeded.
+                EnsureInitialized();
+
+                lock (_sync)
+                {
+                    DbTable? table;
+                    return _tables.TryGetValue(db, out table) ? table : null;
+                }
             }
         }
 
