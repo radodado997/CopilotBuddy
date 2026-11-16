@@ -351,6 +351,16 @@ namespace CopilotBuddy.UI
                     // the manager is the component that brings the client up and it
                     // raises ClientLoggedIn once the character is in the world.
                     _startupCompleted = true;
+
+                    // Nothing attached and we are not shutting down: the client may already
+                    // be in the world (the monitor saw it while the startup path was giving
+                    // up, or it came up just after the wait expired), in which case no
+                    // further ClientLoggedIn would ever be raised. Ask for one more.
+                    if (!_isClosing && !ObjectManager.IsInitialized)
+                    {
+                        try { ReloginManager.Instance.RequestLoggedInSignal(); }
+                        catch (Exception ex) { Logging.WriteDebug("Auto Relogin: could not request a login signal: {0}", ex.Message); }
+                    }
                 }
             });
         }
@@ -828,6 +838,8 @@ namespace CopilotBuddy.UI
         /// </summary>
         private void ReattachAfterRelogin(int pid)
         {
+            bool requestAnother = false;
+
             try
             {
                 CancellationToken token = _startupCts.Token;
@@ -856,11 +868,15 @@ namespace CopilotBuddy.UI
                     // client is in the world, so waiting for the character to leave and
                     // re-enter would never retry. Bounded, so an unattachable client
                     // (e.g. another CopilotBuddy owns it) does not retry forever.
-                    bool requestAnother =
-                        ++_reattachFailures <= MaxReattachRetries && !_isClosing && !_startupCts.IsCancellationRequested;
-                    if (requestAnother)
-                        ReloginManager.Instance.RequestLoggedInSignal();
-                    else
+                    // The request itself is raised in the finally below, once this
+                    // sequence has released _reattachRunning - otherwise the event it
+                    // triggers would be swallowed by the guard of the sequence that is
+                    // still winding down.
+                    requestAnother = ++_reattachFailures <= MaxReattachRetries
+                                     && !_isClosing
+                                     && !_startupCts.IsCancellationRequested;
+
+                    if (!requestAnother)
                         Logging.Write(Colors.Red,
                             "Auto Relogin: giving up on re-attaching. Attach again manually (restart CopilotBuddy) once the problem is solved.");
 
@@ -946,6 +962,14 @@ namespace CopilotBuddy.UI
             {
                 // Allow the next relogin to start a fresh attach sequence.
                 Interlocked.Exchange(ref _reattachRunning, 0);
+
+                // Only now ask for another ClientLoggedIn: the monitor answers on its
+                // next tick, and that event has to find _reattachRunning released.
+                if (requestAnother)
+                {
+                    try { ReloginManager.Instance.RequestLoggedInSignal(); }
+                    catch (Exception ex) { Logging.WriteDebug("Auto Relogin: could not request another attempt: {0}", ex.Message); }
+                }
             }
         }
 
