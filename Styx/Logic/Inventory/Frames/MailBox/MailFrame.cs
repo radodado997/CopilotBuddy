@@ -163,7 +163,16 @@ namespace Styx.Logic.Inventory.Frames.MailBox
 			// A failed attempt must not consume one of the "count" iterations, so retries
 			// are bounded separately and a failure is reported instead of silently
 			// leaving mail uncollected.
-			int remaining = MailCount;
+			// Batch sizing must come from a *successful* count read: the public MailCount
+			// 0 fallback would look like "inbox empty" and exit the batch without
+			// collecting (or reporting) anything.
+			int remaining;
+			if (!TryGetMailCount(out remaining))
+			{
+				Logging.WriteDebug("OpenAllMail: inbox count unavailable; skipping this batch.");
+				return;
+			}
+
 			int consecutiveFailures = 0;
 
 			while (remaining > 0 && consecutiveFailures < MaxLootAttemptsPerMail)
@@ -191,7 +200,16 @@ namespace Styx.Logic.Inventory.Frames.MailBox
 			if (IsVisible)
 			{
 				Lua.DoString("CheckInbox()");
-				int count = MailCount;
+
+				// Same reasoning as OpenAllMail: a failed read must not silently select no
+				// mail at all.  MailCount's 0 fallback is kept for API compatibility only.
+				int count;
+				if (!TryGetMailCount(out count))
+				{
+					Logging.WriteDebug("OpenAllMailFrom: inbox count unavailable; skipping this batch.");
+					return;
+				}
+
 				var mailIndicesToCollect = new List<int>(count);
 
 				for (int i = 1; i <= count; i++)
