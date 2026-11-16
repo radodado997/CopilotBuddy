@@ -561,6 +561,10 @@ namespace CopilotBuddy.UI
             // Step 4: Attach to selected process
             int wowPid = _selectedWoWProc.Value;
             Logging.Write(Colors.Green, "Please wait a few seconds while CopilotBuddy initializes.");
+            // Everything below can fail. The claim acquired in Step 2/3 must not survive a
+            // failed attach, otherwise the next attempt (and any other instance) sees the
+            // client as owned and the attach can never succeed again.
+
             Logging.WriteDebug("Using WoW with process ID {0}", wowPid);
             Logging.WriteDebug("Platform: {0}", Environment.Is64BitProcess ? "x64" : "x86");
             Logging.WriteDebug("Executable Path: {0}", AppDomain.CurrentDomain.BaseDirectory);
@@ -575,6 +579,7 @@ namespace CopilotBuddy.UI
                     memory.Dispose();
                     Logging.Write(Colors.Red, "Process ID {0} is not logged in game!", wowPid);
                     Dispatcher.Invoke(() => SetStatus("Not logged in"));
+                    ReleaseProcessMutex();
                     return false;
                 }
 
@@ -585,6 +590,7 @@ namespace CopilotBuddy.UI
                 {
                     memory.Dispose();
                     Logging.WriteDebug("Attach aborted: the application is closing.");
+                    ReleaseProcessMutex();
                     return false;
                 }
 
@@ -605,11 +611,32 @@ namespace CopilotBuddy.UI
             }
             catch (Exception ex)
             {
+                // Whatever got published before the failure is rolled back here; the claim
+                // must not outlive a failed attach.
+                try { ObjectManager.Shutdown(); } catch { /* best effort */ }
+                ReleaseProcessMutex();
+                _memory = null;
+                _executor = null;
+
                 Logging.Write(Colors.Red, "Error attaching to WoW! - {0}", ex.Message);
                 Logging.WriteException(ex);
                 Dispatcher.Invoke(() => SetStatus("Attach failed"));
                 return false;
             }
+        }
+
+        /// <summary>
+        /// Drops the process claim taken by the last attach attempt. Safe to call when no
+        /// mutex is held. Must NOT be used after a successful attach - the claim protects
+        /// the attached session for its whole lifetime.
+        /// </summary>
+        private void ReleaseProcessMutex()
+        {
+            Mutex? mutex = Interlocked.Exchange(ref _processMutex, null);
+            if (mutex == null)
+                return;
+
+            try { mutex.Dispose(); } catch { /* already released */ }
         }
 
         #region Auto Relogin
@@ -790,14 +817,18 @@ namespace CopilotBuddy.UI
         /// </summary>
         private void DetachFromGame()
         {
-            // Release our own side of the attachment FIRST; ObjectManager.Shutdown() below
-            // is the detach-completion boundary. ObjectManager.IsInitialized (=> Wow != null)
-            // only becomes false inside that call, and a new attach is only allowed once it
+            // Take our own state out of the fields FIRST; ObjectManager.Shutdown() below is
+            // the detach-completion boundary. ObjectManager.IsInitialized (=> Wow != null)
+            // only becomes false inside that call and a new attach is only allowed once it
             // is false, so no re-attach can publish _processMutex/_memory/_selectedWoWProc
             // while this method is still clearing them - clearing them afterwards could
             // wipe (and dispose) the freshly published attachment.
-            try { _processMutex?.Dispose(); } catch { /* already released */ }
-            _processMutex = null;
+            //
+            // The process claim itself stays alive until the shutdown returned: another
+            // CopilotBuddy must not be able to claim the client while the EndScene hook is
+            // still being restored. Only the field is cleared here, the mutex is disposed
+            // in the finally below.
+            Mutex? mutex = Interlocked.Exchange(ref _processMutex, null);
             _memory = null;
             _executor = null;
             _selectedWoWProc = null;
@@ -809,6 +840,10 @@ namespace CopilotBuddy.UI
             catch (Exception ex)
             {
                 Logging.WriteDebug("Auto Relogin: ObjectManager.Shutdown failed: {0}", ex.Message);
+            }
+            finally
+            {
+                try { mutex?.Dispose(); } catch { /* already released */ }
             }
 
             // Make sure the monitor keeps running: it is the component that brings the

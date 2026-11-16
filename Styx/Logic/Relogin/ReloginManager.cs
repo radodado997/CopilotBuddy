@@ -58,17 +58,22 @@ namespace Styx.Logic.Relogin
         private volatile bool _busy;
         private int _attempts;
         private int _lastPid;
-        // Written by RequestLoggedInSignal from the UI thread as well as by the monitor.
-        private volatile bool _wasInGame;
+
+        // Session state. Only ever written by the monitor thread (Tick and the relogin
+        // sequence it runs); RequestLoggedInSignal does not touch it but asks Tick to
+        // re-arm the transition through _loggedInSignalRequested.
+        private bool _wasInGame;
 
         /// <summary>
         /// Pid that produced the current in-game state. The loss transition has to be
         /// reported for *this* pid - the monitor may have moved to a different client
         /// (pinned target exited, another client found) and must not lose the transition
-        /// or attribute it to the wrong process. Volatile: RequestLoggedInSignal resets it
-        /// from the UI thread.
+        /// or attribute it to the wrong process.
         /// </summary>
-        private volatile int _inGamePid;
+        private int _inGamePid;
+
+        /// <summary>Set by RequestLoggedInSignal (any thread), consumed by Tick.</summary>
+        private volatile bool _loggedInSignalRequested;
         private DateTime? _outOfGameSinceUtc;
         private DateTime _nextAttemptUtc = DateTime.MinValue;
         private int _pinnedProcessId;
@@ -218,11 +223,13 @@ namespace Styx.Logic.Relogin
         /// <see cref="ClientLoggedIn"/> again. Used when the bot could not attach to a
         /// client that is already in game (busy mutex, transient failure), where waiting
         /// for the character to leave and re-enter the world is not an option.
+        ///
+        /// Only a flag is set here: the session state itself stays owned by the monitor
+        /// thread, which consumes the request before it looks at the client.
         /// </summary>
         public void RequestLoggedInSignal()
         {
-            _wasInGame = false;
-            _inGamePid = 0;
+            _loggedInSignalRequested = true;
             try { _wake.Set(); } catch { /* disposed */ }
         }
 
@@ -281,6 +288,15 @@ namespace Styx.Logic.Relogin
 
             if (!settings.Enabled || _suspended)
                 return;
+
+            // Honor a pending re-arm request before looking at the client, so this tick
+            // can already produce the requested ClientLoggedIn transition.
+            if (_loggedInSignalRequested)
+            {
+                _loggedInSignalRequested = false;
+                _wasInGame = false;
+                _inGamePid = 0;
+            }
 
             // Drop the pin as soon as the target exits: from then on any live client may
             // be relaunched / adopted again.
