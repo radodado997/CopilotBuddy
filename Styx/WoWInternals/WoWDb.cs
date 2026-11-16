@@ -50,8 +50,14 @@ namespace Styx.WoWInternals
                 if (_initialized) return;
 
                 long now = Environment.TickCount64;
-                if (now - _lastInitAttemptTick < InitRetryIntervalMs)
+                // Check the sentinel first: `now - long.MinValue` overflows (the result wraps
+                // negative in unchecked arithmetic), which would make the very first attempt
+                // look like a recent one and skip the walk forever.
+                if (_lastInitAttemptTick != long.MinValue &&
+                    now - _lastInitAttemptTick < InitRetryIntervalMs)
+                {
                     return;             // retried recently; do not hammer the client
+                }
                 _lastInitAttemptTick = now;
 
                 InitializeCore(wow);

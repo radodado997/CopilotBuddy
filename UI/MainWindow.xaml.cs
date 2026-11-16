@@ -585,6 +585,26 @@ namespace CopilotBuddy.UI
                     Logging.Write("Bot thread hung during the second stop attempt");
             }
 
+            // Second plugin pass.  The startup task calls PluginManager.Initialize(...) after
+            // attaching, so a startup that completed inside the wait above can have published
+            // plugin containers after the first pass disabled them; those would keep running
+            // their overlay/hotkeys through ObjectManager.Shutdown().  Best effort only: if
+            // startup is still running past the timeout, the cancellation token and the
+            // _isClosing guards are what stop it, not this loop.  Wrapped because the startup
+            // thread may be replacing the collection while we enumerate it.
+            try
+            {
+                Styx.Plugins.PluginManager.IsTearingDown = true;
+                foreach (var pluginContainer in Styx.Plugins.PluginManager.Plugins)
+                {
+                    pluginContainer.Enabled = false;
+                }
+            }
+            catch (Exception ex)
+            {
+                Logging.WriteDebug("Second plugin disable pass failed: {0}", ex.Message);
+            }
+
             // Persist window geometry FIRST so that SaveSettings() below
             // already writes the correct coordinates to UISettings.xml.
             // Use RestoreBounds so we always capture the Normal-state rect
