@@ -410,13 +410,30 @@ namespace Styx.WoWInternals
                     if (curMgr == 0U) return;
                     
                     uint currentObject = Wow.Read<uint>(curMgr + FirstObjectOffset);
-                    
+                    var visited = new HashSet<uint>(64);
+
                     // Traverse the linked list
                     while (currentObject != 0U && (currentObject & 1U) == 0U)
                     {
-                        // Batch reading for performance
-                        Wow.ReadBytes(currentObject + (uint)minOffset, buffer);
-                        
+                        // Batch reading for performance.  The old void ReadBytes overload
+                        // silently left the buffer untouched when RPM failed, so the
+                        // previous object's GUID/type/next-pointer were re-used — the walk
+                        // then jumped to a bogus object, or looped forever inside
+                        // _updateLock if the stale "next" pointed back at itself.
+                        if (!Wow.TryReadBytes(currentObject + (uint)minOffset, buffer, buffer.Length))
+                        {
+                            Logging.WriteDebug("ObjectManager: batch read failed at 0x{0:X8}; aborting this update", currentObject);
+                            break;
+                        }
+
+                        // Guard against a corrupted/cyclic next-pointer.  Without this the
+                        // whole update loop spins while holding _updateLock (UI freeze).
+                        if (!visited.Add(currentObject))
+                        {
+                            Logging.WriteDebug("ObjectManager: cyclic object list at 0x{0:X8}; aborting this update", currentObject);
+                            break;
+                        }
+
                         // Extract GUID
                         ulong objGuid = BitConverter.ToUInt64(buffer, guidOffset);
                         
@@ -479,6 +496,61 @@ namespace Styx.WoWInternals
                 }
             }
         }
+
+        /// <summary>
+        /// Deterministic teardown for application exit: restores the EndScene hook, removes
+        /// the Lua event frame and closes the process/thread handles on the calling thread.
+        /// Without this the cleanup only happened in ~ExecutorRand / ~LuaEvents, i.e. on the
+        /// GC finalizer thread, which injected into WoW while the bot might still be running
+        /// (freezes / InjectionDesyncException at shutdown).
+        /// </summary>
+        public static void Shutdown()
+        {
+            lock (_updateLock)
+            {
+                // Lua cleanup runs FIRST: removing the event frame goes through
+                // Lua.DoString, which needs the (still initialized) executor.
+                try
+                {
+                    Lua.ShutdownEvents();
+                }
+                catch (Exception ex)
+                {
+                    Logging.WriteDebug("ObjectManager.Shutdown: failed to remove Lua events: {0}", ex.Message);
+                }
+
+                try
+                {
+                    Executor?.Dispose();
+                }
+                catch (Exception ex)
+                {
+                    Logging.WriteDebug("ObjectManager.Shutdown: failed to dispose the EndScene executor: {0}", ex.Message);
+                }
+                Executor = null;
+
+                lock (_cacheLock)
+                {
+                    _distanceCache.Clear();
+                    _losCache.Clear();
+                    _threatCache.Clear();
+                }
+                _objectList.Clear();
+                _objectsToRemove.Clear();
+                Me = null;
+
+                try
+                {
+                    Wow?.Dispose();
+                }
+                catch (Exception ex)
+                {
+                    Logging.WriteDebug("ObjectManager.Shutdown: failed to close the process handle: {0}", ex.Message);
+                }
+                Wow = null;
+            }
+        }
+
         private static WoWObject CreateWoWObject(uint baseAddress, WoWObjectType? objType, ulong objGuid, ulong myGuid)
         {
             // If type not provided, read it from memory

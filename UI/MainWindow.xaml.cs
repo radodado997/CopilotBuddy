@@ -154,6 +154,14 @@ namespace CopilotBuddy.UI
             }
         }
 
+        // Startup (attach + EndScene hook publication) runs on a worker thread.  These
+        // let Window_Closing cancel it and wait for it, so an attach can never publish a
+        // hook after teardown has already started.
+        private readonly CancellationTokenSource _startupCts = new CancellationTokenSource();
+        private Task? _startupTask;
+        private volatile bool _isClosing;
+        private bool _closingHandled;
+
         private void Window_Loaded(object sender, RoutedEventArgs e)
         {
             // Window geometry is already restored in OnSourceInitialized above.
@@ -169,11 +177,12 @@ namespace CopilotBuddy.UI
             SetStatus("Searching for WoW...");
             ToggleButtons(false);
 
-            Task.Run(() =>
+            CancellationToken startupToken = _startupCts.Token;
+            _startupTask = Task.Run(() =>
             {
                 try
                 {
-                    if (!FindAndAttachToWoW())
+                    if (!FindAndAttachToWoW(startupToken))
                         return;
 
                     if (ObjectManager.IsInitialized)
@@ -250,6 +259,13 @@ namespace CopilotBuddy.UI
 
                         Dispatcher.Invoke(() =>
                         {
+                            // The window may already be closing: Window_Closing pumps this
+                            // dispatcher queue while it waits for the startup task, so this
+                            // callback can run during teardown.  Do not touch the UI, restart
+                            // the info timer or auto-start (StartBot is also guarded) then.
+                            if (_isClosing)
+                                return;
+
                             // Populate bot selector with all loaded bots (built-in + external)
                             cmbBotSelector.Items.Clear();
                             foreach (var bot in BotManager.Instance.Bots)
@@ -316,8 +332,15 @@ namespace CopilotBuddy.UI
         ///   6. If 2+: show ProcessSelectorWindow
         ///   7. Attach to selected process
         /// </summary>
-        private bool FindAndAttachToWoW()
+        private bool FindAndAttachToWoW(CancellationToken cancellationToken = default)
         {
+            // Cancelled while the user was closing the window: never start an attach.
+            if (cancellationToken.IsCancellationRequested || _isClosing)
+            {
+                Logging.WriteDebug("Attach skipped: the application is closing.");
+                return false;
+            }
+
             Logging.Write("Searching for WoW process...");
 
             // Step 1: Check for /pid= command line argument
@@ -359,7 +382,11 @@ namespace CopilotBuddy.UI
                         if (!proc.HasExited)
                         {
                             int build = proc.MainModule?.FileVersionInfo.FilePrivatePart ?? 0;
-                            if (build == ObjectManager.SupportedBuild)
+                            // Same rule as the enumeration path above: build == 0 means the
+                            // client has no version resource (private-server Wow.exe), which
+                            // is still a valid 3.3.5a client.  Requiring the exact build here
+                            // made HBRelog-style "/pid=<id>" attach fail on those clients.
+                            if (build == ObjectManager.SupportedBuild || build == 0)
                                 candidates.Add(proc);
                         }
                     }
@@ -475,6 +502,16 @@ namespace CopilotBuddy.UI
                     return false;
                 }
 
+                // Last checkpoint before publishing the attachment (and installing the
+                // EndScene hook): Window_Closing sets _isClosing and then waits for this
+                // task to finish before it runs ObjectManager.Shutdown().
+                if (cancellationToken.IsCancellationRequested || _isClosing)
+                {
+                    memory.Dispose();
+                    Logging.WriteDebug("Attach aborted: the application is closing.");
+                    return false;
+                }
+
                 ObjectManager.Initialize(memory);
 
                 // HB 6.2.3: Initialize hotkeys against the WoW window handle so that
@@ -497,6 +534,18 @@ namespace CopilotBuddy.UI
 
         private void Window_Closing(object sender, System.ComponentModel.CancelEventArgs e)
         {
+            // Re-entrancy guard: WaitForStartupToStop() pumps the dispatcher queue below, so
+            // a queued Close()/SetStatus from the startup thread can re-enter this handler.
+            if (_closingHandled)
+                return;
+            _closingHandled = true;
+
+            // Cancel the Window_Loaded startup work first. An attach that has not reached
+            // its last checkpoint aborts (and disposes its Memory) instead of publishing an
+            // EndScene hook after teardown has begun.
+            _isClosing = true;
+            try { _startupCts.Cancel(); } catch { /* already disposed */ }
+
             // HB 6.2.3/Legion pattern: close all auxiliary windows first.
             foreach (Window window in System.Windows.Application.Current.Windows.Cast<Window>().ToList())
             {
@@ -518,6 +567,42 @@ namespace CopilotBuddy.UI
             foreach (var pluginContainer in Styx.Plugins.PluginManager.Plugins)
             {
                 pluginContainer.Enabled = false;
+            }
+
+            // Bounded wait for the startup task. It must complete BEFORE ObjectManager.Shutdown():
+            // if the attach already got past its last checkpoint it publishes the executor, and
+            // Shutdown has to run afterwards to restore EndScene deterministically.
+            WaitForStartupToStop(5000);
+
+            // The startup callback above was retired by the wait.  Re-check the worker:
+            // a callback that slipped past the _isClosing guard just before it was set
+            // could have started TreeRoot while the stop above was already running.
+            if (TreeRoot.State != TreeRootState.Stopped)
+            {
+                Logging.Write("A worker was still running after startup shutdown; stopping it again.");
+                TreeRoot.Stop("Main window is closing");
+                if (!WaitForTreeRootStop(5000))
+                    Logging.Write("Bot thread hung during the second stop attempt");
+            }
+
+            // Second plugin pass.  The startup task calls PluginManager.Initialize(...) after
+            // attaching, so a startup that completed inside the wait above can have published
+            // plugin containers after the first pass disabled them; those would keep running
+            // their overlay/hotkeys through ObjectManager.Shutdown().  Best effort only: if
+            // startup is still running past the timeout, the cancellation token and the
+            // _isClosing guards are what stop it, not this loop.  Wrapped because the startup
+            // thread may be replacing the collection while we enumerate it.
+            try
+            {
+                Styx.Plugins.PluginManager.IsTearingDown = true;
+                foreach (var pluginContainer in Styx.Plugins.PluginManager.Plugins)
+                {
+                    pluginContainer.Enabled = false;
+                }
+            }
+            catch (Exception ex)
+            {
+                Logging.WriteDebug("Second plugin disable pass failed: {0}", ex.Message);
             }
 
             // Persist window geometry FIRST so that SaveSettings() below
@@ -547,9 +632,24 @@ namespace CopilotBuddy.UI
                 System.Diagnostics.Debug.WriteLine("[UISettings] Failed to save window geometry: " + ex.Message);
             }
 
-            // Save all other per-character settings (HB 4.3.4 pattern).
+            // Save all other per-character settings (HB 4.3.4 pattern) BEFORE the teardown
+            // below: SaveSettings() returns early once ObjectManager.Wow is null, so saving
+            // afterwards would silently drop CharacterSettings/StyxSettings/LevelbotSettings.
             // UISettings is already flushed above with the correct geometry.
             SaveSettings();
+
+            // Deterministic teardown: restore the EndScene hook and close the game's
+            // process/thread handles here, on this thread.  Previously the only cleanup
+            // lived in finalizers, i.e. it ran on the GC thread (often after the UI had
+            // already gone away) and could freeze or desync the injected detour.
+            try
+            {
+                ObjectManager.Shutdown();
+            }
+            catch (Exception ex)
+            {
+                Logging.Write("Shutdown cleanup failed: {0}", ex.Message);
+            }
 
             // Release process mutex so another CopilotBuddy can claim this WoW
             try
@@ -564,6 +664,30 @@ namespace CopilotBuddy.UI
             BotEvents.OnBotStarted -= BotEvents_OnBotStarted;
             BotEvents.OnBotStopped -= BotEvents_OnBotStopped;
             _infoTimer?.Stop();
+        }
+
+        /// <summary>
+        /// Waits (bounded) for the Window_Loaded startup task to finish, while continuing to
+        /// pump the dispatcher queue: the startup thread calls Dispatcher.Invoke, so blocking
+        /// this thread with Wait()/Join() would deadlock until the timeout expired.
+        /// </summary>
+        private void WaitForStartupToStop(int timeoutMs)
+        {
+            Task? startup = _startupTask;
+            if (startup == null || startup.IsCompleted)
+                return;
+
+            var sw = Stopwatch.StartNew();
+            while (!startup.IsCompleted && sw.ElapsedMilliseconds < timeoutMs)
+            {
+                // DispatcherPriority.Background processes everything queued at Background and
+                // above, which includes the startup thread's pending Dispatcher.Invoke calls.
+                Dispatcher.Invoke(() => { }, DispatcherPriority.Background);
+                Thread.Sleep(10);
+            }
+
+            if (!startup.IsCompleted)
+                Logging.Write("Startup thread did not finish within {0} ms; continuing shutdown.", timeoutMs);
         }
 
         private static bool WaitForTreeRootStop(int timeoutMs)
@@ -776,6 +900,15 @@ namespace CopilotBuddy.UI
 
         private void StartBot()
         {
+            // Never create a worker while the window is closing: teardown has already
+            // stopped TreeRoot and is about to dispose the executor/hook, so anything
+            // started here would be left running against a half-torn-down process.
+            if (_isClosing)
+            {
+                Logging.WriteDebug("StartBot ignored: the application is closing.");
+                return;
+            }
+
             if (_isRunning) return;
 
             if (BotManager.Current == null)

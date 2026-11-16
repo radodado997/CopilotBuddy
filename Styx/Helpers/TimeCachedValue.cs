@@ -12,7 +12,11 @@ namespace Styx.Helpers
         private readonly TimeSpan _duration;
         private readonly Stopwatch _stopwatch;
         private readonly Func<T> _producer;
+        private readonly object _sync = new object();
         private T _cachedValue;
+        // Incremented by Reset().  A producer that started before a Reset must not
+        // publish its (pre-reset) result afterwards.
+        private long _generation;
 
         public TimeCachedValue(TimeSpan duration, Func<T> producer)
         {
@@ -30,12 +34,30 @@ namespace Styx.Helpers
         {
             get
             {
-                if (!_stopwatch.IsRunning || _stopwatch.Elapsed > _duration)
+                long generation;
+                lock (_sync)
                 {
-                    _cachedValue = _producer();
-                    _stopwatch.Restart();
+                    if (_stopwatch.IsRunning && _stopwatch.Elapsed <= _duration)
+                        return _cachedValue;
+
+                    generation = _generation;
                 }
-                return _cachedValue;
+
+                // The producer runs outside the lock.  It usually walks ObjectManager,
+                // which flushes these caches from inside its own lock (Update() ->
+                // ResetCaches()), so calling it while holding _sync could deadlock.
+                T produced = _producer();
+
+                lock (_sync)
+                {
+                    // Publish only if no Reset() happened while we were producing.
+                    if (generation == _generation)
+                    {
+                        _cachedValue = produced;
+                        _stopwatch.Restart();
+                    }
+                    return produced;
+                }
             }
         }
 
@@ -50,8 +72,12 @@ namespace Styx.Helpers
         /// </summary>
         public void Reset()
         {
-            _stopwatch.Reset();
-            _cachedValue = default!;
+            lock (_sync)
+            {
+                _stopwatch.Reset();
+                _cachedValue = default!;
+                _generation++;
+            }
         }
     }
 }

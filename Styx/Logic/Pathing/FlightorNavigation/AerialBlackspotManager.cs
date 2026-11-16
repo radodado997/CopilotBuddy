@@ -54,7 +54,13 @@ namespace Styx.Logic.Pathing.FlightorNavigation
             {
                 EnsureInitialized();
 
-                uint mapId = StyxWoW.Me.MapId;
+                // Me is null before login / after logout; the getter used to throw an NRE
+                // that escaped into Flightor's path generation.
+                var me = StyxWoW.Me;
+                if (me == null)
+                    return Array.Empty<Vector2[]>();
+
+                uint mapId = me.MapId;
                 WoWFactionGroup faction = PlayerFaction;
 
                 var result = new List<Vector2[]>();

@@ -23,6 +23,8 @@ namespace Styx
 
         private static WoWCache? _cache;
         private static WoWDb? _db;
+        // Serializes lazy construction/publication of the shared WoWDb instance.
+        private static readonly object _dbLock = new object();
         private static AreaManager? _areaManager;
         private static WoWClient? _woWClient;
         private static OverlayManager? _overlayManager;
@@ -35,9 +37,17 @@ namespace Styx
         {
             get
             {
-                if (_db == null)
-                    _db = new WoWDb();
-                return _db;
+                // Dedicated lock around the null check, the construction and the return:
+                // the WoWDb constructor walks the client's registration table and fills
+                // static tables, so two concurrent callers must not both construct one.
+                // (A WoWDb whose first walk failed is not replaced; its own lookups retry
+                // the walk once the client becomes readable, see WoWDb.EnsureInitialized.)
+                lock (_dbLock)
+                {
+                    if (_db == null)
+                        _db = new WoWDb();
+                    return _db;
+                }
             }
         }
 

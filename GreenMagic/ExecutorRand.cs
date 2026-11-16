@@ -174,9 +174,19 @@ namespace GreenMagic
                 throw new Exception("You should never see this message, but the event was opened instead of created!  That's bad!");
             }
 
-            InitializeDetour();
-            Clear();
-            IsInitialized = true;
+            try
+            {
+                InitializeDetour();
+                Clear();
+                IsInitialized = true;
+            }
+            catch
+            {
+                // There is no finalizer to fall back on, so undo any partially installed
+                // detour / allocated remote memory before letting the construction fail.
+                try { Dispose(); } catch { }
+                throw;
+            }
         }
 
         public ExecutorRand(int processId, uint endSceneAddress)
@@ -786,7 +796,7 @@ namespace GreenMagic
             AddRandomLine("call @TearDownGate");
 
             AddRandomLine("popad");
-            
+
             // Restore original EndScene prologue based on captured bytes
             var prolog = m_OriginalEndSceneBytes;
             if (prolog != null && prolog.Length >= 6)
@@ -1002,11 +1012,10 @@ namespace GreenMagic
 
         #region Cleanup
 
-        ~ExecutorRand()
-        {
-            Dispose();
-        }
-
+        // No finalizer on purpose: restoring EndScene, waiting on the injected gate and
+        // freeing remote memory must not run on the GC finalizer thread (no AssemblyLock,
+        // arbitrary timing relative to a running frame).  Dispose is called from
+        // ObjectManager.Shutdown() at application exit.
         public void Dispose()
         {
             if (m_Disposed)
@@ -1014,6 +1023,7 @@ namespace GreenMagic
 
             m_Disposed = true;
             IsInitialized = false;
+            GC.SuppressFinalize(this);
 
             try
             {
@@ -1022,6 +1032,7 @@ namespace GreenMagic
                     // Signal one more frame to trigger TearDownGate in the target
                     // Write a bare RET to injected code so it does nothing
                     Memory.Write<byte>(m_InjectedCode, 195); // 0xC3 = retn
+
                     try
                     {
                         m_InjectionWaitingEvent.Set();
@@ -1071,10 +1082,16 @@ namespace GreenMagic
                     // Clear injected code
                     Memory.WriteBytes(m_InjectedCode, m_ClearBytes);
 
-                    // Free allocated memory
-                    Memory.FreeMemory(m_EndSceneDetour);
-                    Memory.FreeMemory(m_InjectedCode);
-                    Memory.FreeMemory(m_DataPtr);
+                    // Deliberately NOT freed.  The injected allocations cannot be released
+                    // safely from here: the detour's tail (prologue replay + jump back into
+                    // d3d9) is executed *after* the injection handshake completes, and a
+                    // frame can already be at any point of that tail — including on another
+                    // core — when this method runs.  Neither the finished event nor any
+                    // fixed delay proves the render thread has left the detour page, so
+                    // VirtualFreeEx here would risk decommitting code that is about to run.
+                    // The pages are left allocated; the game process reclaims them when it
+                    // exits.  (Three small VirtualAllocEx regions per attach.)
+                    Debug.WriteLine("[ExecutorRand] Leaving injected regions allocated (the render thread may still be inside the detour tail); the game process reclaims them on exit.");
                 }
             }
             catch

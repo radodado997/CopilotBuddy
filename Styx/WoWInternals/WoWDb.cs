@@ -11,8 +11,16 @@ namespace Styx.WoWInternals
         #region Fields
 
         private static readonly Dictionary<ClientDb, DbTable> _tables = new Dictionary<ClientDb, DbTable>();
+        // Guards _tables and _initialized.  The walk can now also be retried from a lookup
+        // (see EnsureInitialized), so a reader must not observe the dictionary while the
+        // writer adds to it or clears it after a failed attempt.
+        private static readonly object _sync = new object();
         // Static flag: true once init succeeded. False allows retry if WoW wasn't attached on first call.
         private static bool _initialized = false;
+        // Environment.TickCount64 of the last walk attempt; throttles the retry path so a
+        // layout mismatch cannot turn every lookup into a 4096-iteration remote walk.
+        private static long _lastInitAttemptTick = long.MinValue;
+        private const int InitRetryIntervalMs = 1000;
 
         #endregion
 
@@ -20,29 +28,67 @@ namespace Styx.WoWInternals
 
         internal WoWDb()
         {
-            Initialize();
+            EnsureInitialized();
         }
 
-        private void Initialize()
+        /// <summary>
+        /// Runs the registration-table walk if it has not succeeded yet.  Called from the
+        /// constructor and, if that first attempt failed, from every lookup: StyxWoW.Db
+        /// caches this instance, so an instance built before the client was readable (or
+        /// during a walk failure) would otherwise return empty results for the rest of the
+        /// session even after the DBC tables became available.
+        /// </summary>
+        private static void EnsureInitialized()
         {
             if (_initialized) return;
 
             var wow = ObjectManager.Wow;
-            if (wow == null) return;
+            if (wow == null) return;   // not attached yet - nothing to walk
 
-            _initialized = true;
+            lock (_sync)
+            {
+                if (_initialized) return;
 
+                long now = Environment.TickCount64;
+                // Check the sentinel first: `now - long.MinValue` overflows (the result wraps
+                // negative in unchecked arithmetic), which would make the very first attempt
+                // look like a recent one and skip the walk forever.
+                if (_lastInitAttemptTick != long.MinValue &&
+                    now - _lastInitAttemptTick < InitRetryIntervalMs)
+                {
+                    return;             // retried recently; do not hammer the client
+                }
+                _lastInitAttemptTick = now;
+
+                InitializeCore(wow);
+            }
+        }
+
+        private static void InitializeCore(Memory wow)
+        {
+
+            // _initialized is only set once the registration walk actually reached the
+            // RET terminator.  Otherwise a layout mismatch would latch a half-populated
+            // table set forever (the old code published _initialized *before* the walk).
             try
             {
                 // Base address for ClientDb_RegisterBase
                 uint addr = (uint)GlobalOffsets.ClientDb_RegisterBase; // 0x6337D0
                 
-                // Walk through the registration table
-                while (true)
+                // Walk through the registration table.
+                // Bounded: a failed read returns 0 (never 0xC3), so if the client layout
+                // does not match the hardcoded offsets this walk used to loop forever
+                // reading unmapped memory. Each real entry is 17 bytes; 4096 entries is
+                // far beyond any 3.3.5a build and acts as a hard stop.
+                bool reachedTerminator = false;
+                for (int guard = 0; guard < 4096; guard++)
                 {
                     byte opcode = wow.Read<byte>(addr);
                     if (opcode == 0xC3) // RET instruction = end of list
+                    {
+                        reachedTerminator = true;
                         break;
+                    }
 
                     uint tableId = wow.Read<uint>(addr + 1);
                     int tablePtr = wow.Read<int>(addr + 11);
@@ -55,24 +101,51 @@ namespace Styx.WoWInternals
                     
                     addr += 17; // Each entry is 17 bytes
                 }
-                
-                // Diagnostic: log what was loaded
-                Helpers.Logging.WriteDebug($"[WoWDb] Loaded {_tables.Count} DBC tables");
-                int logged = 0;
-                foreach (var kvp in _tables)
+
+                if (!reachedTerminator)
                 {
-                    if (logged++ < 5)
-                        Helpers.Logging.WriteDebug($"[WoWDb]   Key={(int)kvp.Key} (0x{(int)kvp.Key:X8}) Rows={kvp.Value.NumRows}");
+                    // No terminator within the bound: treat the whole walk as failed,
+                    // discard the partial results and leave _initialized false so a later
+                    // WoWDb instance can retry against a valid layout.
+                    int partial = _tables.Count;
+                    _tables.Clear();
+                    Helpers.Logging.WriteDebug("[WoWDb] ClientDb table walk never reached the RET terminator; discarded {0} partial tables, will retry", partial);
+                    return;
                 }
-                
-                // Check if Lock DBC is accessible
-                var lockDb = this[ClientDb.Lock];
-                Helpers.Logging.WriteDebug($"[WoWDb] Lock DBC lookup: {(lockDb != null ? $"FOUND (rows={lockDb.NumRows})" : "NOT FOUND")}");
-                Helpers.Logging.WriteDebug($"[WoWDb] ClientDb.Lock enum value = {(int)ClientDb.Lock} (0x{(int)ClientDb.Lock:X8})");
+
+                _initialized = true;
+
+                // Diagnostics must not invalidate a good initialisation.
+                try
+                {
+                    Helpers.Logging.WriteDebug($"[WoWDb] Loaded {_tables.Count} DBC tables");
+                    int logged = 0;
+                    foreach (var kvp in _tables)
+                    {
+                        if (logged++ < 5)
+                            Helpers.Logging.WriteDebug($"[WoWDb]   Key={(int)kvp.Key} (0x{(int)kvp.Key:X8}) Rows={kvp.Value.NumRows}");
+                    }
+
+                    // Check if Lock DBC is accessible
+                    DbTable? lockDb;
+                    lock (_sync)
+                    {
+                        _tables.TryGetValue(ClientDb.Lock, out lockDb);
+                    }
+                    Helpers.Logging.WriteDebug($"[WoWDb] Lock DBC lookup: {(lockDb != null ? $"FOUND (rows={lockDb.NumRows})" : "NOT FOUND")}");
+                    Helpers.Logging.WriteDebug($"[WoWDb] ClientDb.Lock enum value = {(int)ClientDb.Lock} (0x{(int)ClientDb.Lock:X8})");
+                }
+                catch (Exception ex)
+                {
+                    Helpers.Logging.WriteDebug("[WoWDb] Diagnostics failed: {0}", ex.Message);
+                }
             }
             catch (Exception)
             {
-                // Table initialization failed - tables will be unavailable
+                // Table initialization failed - discard partial results so the next
+                // WoWDb instance retries instead of using a half-built table set.
+                _tables.Clear();
+                _initialized = false;
             }
         }
 
@@ -83,8 +156,16 @@ namespace Styx.WoWInternals
         {
             get
             {
-                DbTable? table;
-                return _tables.TryGetValue(db, out table) ? table : null;
+                // Retry a failed/early initialisation before answering, so the cached
+                // StyxWoW.Db instance starts returning real tables once the client is
+                // readable.  A no-op once the walk has succeeded.
+                EnsureInitialized();
+
+                lock (_sync)
+                {
+                    DbTable? table;
+                    return _tables.TryGetValue(db, out table) ? table : null;
+                }
             }
         }
 

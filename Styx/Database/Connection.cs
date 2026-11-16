@@ -3,6 +3,7 @@ using System;
 using System.Data;
 using System.Data.SQLite;
 using System.Text.RegularExpressions;
+using System.Threading;
 using Styx.Helpers;
 using Styx.Logic.Pathing;
 
@@ -17,27 +18,37 @@ namespace Styx.Database
         private static SQLiteConnection _connection;
         private static readonly Regex ParamRegex = new Regex(@"@[\w_]*", RegexOptions.Compiled | RegexOptions.CultureInvariant);
         private static bool _isAvailable = true;
-        private static bool _initialized = false;
+
+        // Serializes every "set parameters -> execute -> read all rows" sequence.
+        // The commands created by CreateCommand are static/shared, so two threads
+        // calling NpcQueries at the same time used to overwrite each other's
+        // parameters (and step a shared reader) concurrently.
+        internal static readonly object SyncRoot = new object();
+
+        // Lazy also makes the one-time initialisation thread-safe: the old
+        // "if (!_initialized) { _initialized = true; TryInitialize(); }" let a second
+        // thread see _initialized == true while _connection was still null.
+        private static readonly Lazy<SQLiteConnection> _lazyConnection =
+            new Lazy<SQLiteConnection>(InitializeCore, LazyThreadSafetyMode.ExecutionAndPublication);
 
         /// <summary>
         /// Indicates if the database is available.
         /// </summary>
-        public static bool IsAvailable => _isAvailable && _connection != null;
+        public static bool IsAvailable => Instance != null && _isAvailable;
 
         /// <summary>
         /// Gets the SQLite connection instance.
         /// </summary>
-        public static SQLiteConnection Instance
+        public static SQLiteConnection Instance => _lazyConnection.Value;
+
+        private static SQLiteConnection InitializeCore()
         {
-            get
-            {
-                if (!_initialized)
-                {
-                    _initialized = true;
-                    TryInitialize();
-                }
-                return _connection;
-            }
+            // Lazy guarantees this runs exactly once, so no extra lock is needed here.
+            // (Taking SyncRoot here would invert the lock order against callers that
+            // already hold SyncRoot and then touch IsAvailable/Instance.)
+            if (_connection == null)
+                TryInitialize();
+            return _connection;
         }
 
         private static void TryInitialize()

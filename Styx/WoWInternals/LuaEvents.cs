@@ -36,23 +36,47 @@ namespace Styx.WoWInternals
             LuaEvents._validChars = "ABCDEFGHIJKLMNOPQRSTUVXYZabcdefghijklmnopqrstuvxyz".ToCharArray();
         }
 
-        ~LuaEvents()
+        /// <summary>
+        /// Unregisters everything this instance installed in the Lua state.
+        /// Explicitly called from Lua.ShutdownEvents()/ObjectManager.Shutdown().
+        ///
+        /// This used to run from a finalizer. Finalizers run on the GC thread, with no
+        /// AssemblyLock and no guarantee that the injected EndScene detour is alive, so
+        /// cleanup could race a running frame (InjectionDesyncException) or deadlock
+        /// shutdown waiting for an event that would never be signalled.
+        /// </summary>
+        public void Dispose()
         {
+            string frameName;
+            string eventTableName;
+            string filterTableName;
+
+            lock (_eventLock)
+            {
+                frameName = this._frameName;
+                eventTableName = this._eventTableName;
+                filterTableName = this._filterTableName;
+            }
+
             try
             {
-                if (ObjectManager.WoWProcess != null && !ObjectManager.WoWProcess.HasExited && ObjectManager.IsInGame && this._frameName != null)
+                if (frameName != null &&
+                    ObjectManager.WoWProcess != null && !ObjectManager.WoWProcess.HasExited &&
+                    ObjectManager.IsInGame)
                 {
-                    Lua.DoString(string.Format("if {0} then {0}:UnregisterAllEvents(); {0}:SetScript('OnEvent', nil); {0} = nil; end if {1} then {1} = nil; end", 
-                        this._frameName, this._eventTableName));
-                    if (!string.IsNullOrEmpty(this._filterTableName))
+                    Lua.DoString(string.Format("if {0} then {0}:UnregisterAllEvents(); {0}:SetScript('OnEvent', nil); {0} = nil; end if {1} then {1} = nil; end",
+                        frameName, eventTableName));
+                    if (!string.IsNullOrEmpty(filterTableName))
                     {
-                        Lua.DoString(string.Format("if {0} then {0} = nil; end", this._filterTableName));
+                        Lua.DoString(string.Format("if {0} then {0} = nil; end", filterTableName));
                     }
                 }
             }
             catch
             {
             }
+
+            GC.SuppressFinalize(this);
         }
 
         /// <summary>
