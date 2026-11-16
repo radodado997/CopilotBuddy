@@ -813,7 +813,12 @@ namespace CopilotBuddy.UI
 
             // Make sure the monitor keeps running: it is the component that brings the
             // client back, and it also re-raises ClientLoggedIn when the world is up.
-            try { ReloginManager.Instance.Start(); } catch { /* ignore */ }
+            // Not while closing: Window_Closing has already stopped it and must not have
+            // it restarted (and relaunching clients) underneath the teardown.
+            if (!_isClosing)
+            {
+                try { ReloginManager.Instance.Start(); } catch { /* ignore */ }
+            }
 
             Logging.WriteDebug("Auto Relogin: detached; waiting for the client to come back.");
         }
