@@ -117,15 +117,17 @@ namespace Styx.Helpers
         public static WoWPoint CalculatePointBehind(WoWPoint target, float targetFacingRadians, float distanceToTarget)
         {
             targetFacingRadians = NormalizeRadian(targetFacingRadians);
-            
-            var direction = new WoWPoint
-            {
-                X = -(float)Math.Cos(targetFacingRadians),
-                Y = (float)Math.Sin(targetFacingRadians + HalfPI),
-                Z = 0f
-            };
-            
-            return target - direction * distanceToTarget;
+
+            // The facing vector is (cos f, sin f); "behind" is exactly opposite it, so the
+            // point is target - facing * distance.
+            // The previous implementation used X = -cos(f) together with
+            // Y = sin(f + PI/2) (= cos f), which returned a point in FRONT of the target
+            // (or, when facing +/-Y, the target's own position — an unreachable spot that
+            // left behind-only abilities permanently "out of range").
+            return new WoWPoint(
+                target.X - (float)Math.Cos(targetFacingRadians) * distanceToTarget,
+                target.Y - (float)Math.Sin(targetFacingRadians) * distanceToTarget,
+                target.Z);
         }
         
         public static WoWPoint CalculatePointAtSide(WoWPoint target, float targetFacingInRadians, float distanceToTarget, bool rightSide)

@@ -359,7 +359,11 @@ namespace CopilotBuddy.UI
                         if (!proc.HasExited)
                         {
                             int build = proc.MainModule?.FileVersionInfo.FilePrivatePart ?? 0;
-                            if (build == ObjectManager.SupportedBuild)
+                            // Same rule as the enumeration path above: build == 0 means the
+                            // client has no version resource (private-server Wow.exe), which
+                            // is still a valid 3.3.5a client.  Requiring the exact build here
+                            // made HBRelog-style "/pid=<id>" attach fail on those clients.
+                            if (build == ObjectManager.SupportedBuild || build == 0)
                                 candidates.Add(proc);
                         }
                     }
@@ -518,6 +522,19 @@ namespace CopilotBuddy.UI
             foreach (var pluginContainer in Styx.Plugins.PluginManager.Plugins)
             {
                 pluginContainer.Enabled = false;
+            }
+
+            // Deterministic teardown: restore the EndScene hook and close the game's
+            // process/thread handles here, on this thread.  Previously the only cleanup
+            // lived in finalizers, i.e. it ran on the GC thread (often after the UI had
+            // already gone away) and could freeze or desync the injected detour.
+            try
+            {
+                ObjectManager.Shutdown();
+            }
+            catch (Exception ex)
+            {
+                Logging.Write("Shutdown cleanup failed: {0}", ex.Message);
             }
 
             // Persist window geometry FIRST so that SaveSettings() below

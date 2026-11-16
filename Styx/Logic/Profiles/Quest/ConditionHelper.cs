@@ -383,7 +383,11 @@ namespace Styx.Logic.Profiles.Quest
         /// </summary>
         private class ExpressionBinder
         {
-            private static readonly Dictionary<string, Func<bool>> _cachedMethods = new Dictionary<string, Func<bool>>();
+            // Concurrent: the fast-path TryGetValue below ran outside _parserLock while other
+            // threads (plugin/profile loaders) inserted into the same Dictionary, which can
+            // corrupt it or throw.  ConcurrentDictionary keeps the lock-free read safe.
+            private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, Func<bool>> _cachedMethods =
+                new System.Collections.Concurrent.ConcurrentDictionary<string, Func<bool>>();
             private static readonly object _parserLock = new object();
             private readonly string _expression;
             private Func<bool> _method;
@@ -415,7 +419,7 @@ namespace Styx.Logic.Profiles.Quest
 
             private static Func<bool> Compile(string expression, int? line)
             {
-                // Check cache first (outside lock for performance)
+                // Check cache first (safe: ConcurrentDictionary)
                 if (_cachedMethods.TryGetValue(expression, out Func<bool> func))
                     return func;
 

@@ -37,12 +37,22 @@ namespace Styx.WoWInternals
                 // Base address for ClientDb_RegisterBase
                 uint addr = (uint)GlobalOffsets.ClientDb_RegisterBase; // 0x6337D0
                 
-                // Walk through the registration table
-                while (true)
+                // Walk through the registration table.
+                // Bounded: a failed read returns 0 (never 0xC3), so if the client layout
+                // does not match the hardcoded offsets this walk used to loop forever
+                // reading unmapped memory. Each real entry is 17 bytes; 4096 entries is
+                // far beyond any 3.3.5a build and acts as a hard stop.
+                for (int guard = 0; guard < 4096; guard++)
                 {
                     byte opcode = wow.Read<byte>(addr);
                     if (opcode == 0xC3) // RET instruction = end of list
                         break;
+
+                    if (guard == 4095)
+                    {
+                        Helpers.Logging.WriteDebug("[WoWDb] ClientDb table walk hit the iteration guard; layout mismatch?");
+                        break;
+                    }
 
                     uint tableId = wow.Read<uint>(addr + 1);
                     int tablePtr = wow.Read<int>(addr + 11);

@@ -333,8 +333,11 @@ namespace Styx.Logic.BehaviorTree
 			if (State != TreeRootState.Running && State != TreeRootState.Paused)
 				return;
 
-			// sync ticks-per-second slider value (per-character)
-			TicksPerSecond = CharacterSettings.Instance.TicksPerSecond;
+			// sync ticks-per-second slider value (per-character).
+			// Clamped: TicksPerSecond = 0 made "1000.0 / TicksPerSecond" evaluate to
+			// +Infinity, which cast to int.MinValue, so the tick loop never slept and
+			// pegged a core at 100% CPU.
+			TicksPerSecond = Math.Clamp(CharacterSettings.Instance.TicksPerSecond, (byte)1, (byte)60);
 			var sw = Stopwatch.StartNew();
 			if (StyxSettings.Instance.UseFrameLock)
 			{

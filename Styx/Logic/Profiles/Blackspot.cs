@@ -78,11 +78,23 @@ namespace Styx.Logic.Profiles
             return $"[Blackspot Location: {Location}, Radius: {Radius}, Height: {Height}]";
         }
 
+        /// <summary>
+        /// Rounds a float onto the 1e-3 grid that Equals/GetHashCode both use.
+        /// Equals compares with a 0.001 tolerance while GetHashCode hashed the exact
+        /// floats, so two "equal" blackspots could hash differently and every
+        /// HashSet/Dictionary lookup in BlackspotManager missed — re-marking the same
+        /// polygons on every pathfind and leaking blackspot polys.
+        /// </summary>
+        private static int Quantize(float value)
+        {
+            return (int)Math.Round(value * 1000f, MidpointRounding.AwayFromZero);
+        }
+
         public bool Equals(Blackspot other)
         {
-            return Location.Equals(other.Location) && 
-                   Math.Abs(Radius - other.Radius) < 0.001f && 
-                   Math.Abs(Height - other.Height) < 0.001f;
+            return Location.Equals(other.Location) &&
+                   Quantize(Radius) == Quantize(other.Radius) &&
+                   Quantize(Height) == Quantize(other.Height);
         }
 
         public override bool Equals(object obj)
@@ -92,7 +104,7 @@ namespace Styx.Logic.Profiles
 
         public override int GetHashCode()
         {
-            return HashCode.Combine(Location, Radius, Height);
+            return HashCode.Combine(Location, Quantize(Radius), Quantize(Height));
         }
 
         public static bool operator ==(Blackspot left, Blackspot right)
@@ -102,7 +114,7 @@ namespace Styx.Logic.Profiles
 
         public static bool operator !=(Blackspot left, Blackspot right)
         {
-            return !left.Equals(right);
+            return !(left == right);
         }
     }
 }

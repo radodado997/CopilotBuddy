@@ -21,6 +21,8 @@ namespace Styx.Database
         private static SQLiteCommand _unitDropsItemCmd;
         private static SQLiteCommand _getGameObjectsByItemCmd;
         private static SQLiteCommand _gameObjectDropsItemCmd;
+        // Shared commands + shared connection: parameter writes and row stepping must not interleave.
+        private static readonly object _sync = new object();
 
         public static bool IsAvailable
         {
@@ -31,11 +33,25 @@ namespace Styx.Database
             }
         }
 
+        private static readonly object _initLock = new object();
+
         private static void EnsureInitialized()
         {
             if (_initialized) return;
-            _initialized = true;
 
+            // Double-checked: the old code published _initialized = true *before*
+            // opening the database, so a second thread could observe "initialized"
+            // while _isAvailable was still false and silently get empty results.
+            lock (_initLock)
+            {
+                if (_initialized) return;
+                InitializeCore();
+                _initialized = true;
+            }
+        }
+
+        private static void InitializeCore()
+        {
             try
             {
                 var dbPath = Path.Combine(Logging.ApplicationPath, "item_loot.db");
@@ -97,10 +113,13 @@ namespace Styx.Database
 
             try
             {
-                _getCreaturesByItemCmd.Parameters["@item_id"].Value = (int)itemId;
-                using var reader = _getCreaturesByItemCmd.ExecuteReader();
-                while (reader.Read())
-                    result.Add((uint)reader.GetInt32(0));
+                lock (_sync)
+                {
+                    _getCreaturesByItemCmd.Parameters["@item_id"].Value = (int)itemId;
+                    using var reader = _getCreaturesByItemCmd.ExecuteReader();
+                    while (reader.Read())
+                        result.Add((uint)reader.GetInt32(0));
+                }
             }
             catch (Exception ex)
             {
@@ -120,10 +139,13 @@ namespace Styx.Database
 
             try
             {
-                _unitDropsItemCmd.Parameters["@item_id"].Value = (int)itemId;
-                _unitDropsItemCmd.Parameters["@creature_entry"].Value = (int)creatureEntry;
-                using var reader = _unitDropsItemCmd.ExecuteReader();
-                return reader.Read();
+                lock (_sync)
+                {
+                    _unitDropsItemCmd.Parameters["@item_id"].Value = (int)itemId;
+                    _unitDropsItemCmd.Parameters["@creature_entry"].Value = (int)creatureEntry;
+                    using var reader = _unitDropsItemCmd.ExecuteReader();
+                    return reader.Read();
+                }
             }
             catch (Exception ex)
             {
@@ -143,10 +165,13 @@ namespace Styx.Database
 
             try
             {
-                _getGameObjectsByItemCmd.Parameters["@item_id"].Value = (int)itemId;
-                using var reader = _getGameObjectsByItemCmd.ExecuteReader();
-                while (reader.Read())
-                    result.Add((uint)reader.GetInt32(0));
+                lock (_sync)
+                {
+                    _getGameObjectsByItemCmd.Parameters["@item_id"].Value = (int)itemId;
+                    using var reader = _getGameObjectsByItemCmd.ExecuteReader();
+                    while (reader.Read())
+                        result.Add((uint)reader.GetInt32(0));
+                }
             }
             catch (Exception ex)
             {
@@ -166,10 +191,13 @@ namespace Styx.Database
 
             try
             {
-                _gameObjectDropsItemCmd.Parameters["@item_id"].Value = (int)itemId;
-                _gameObjectDropsItemCmd.Parameters["@gameobject_entry"].Value = (int)gameObjectEntry;
-                using var reader = _gameObjectDropsItemCmd.ExecuteReader();
-                return reader.Read();
+                lock (_sync)
+                {
+                    _gameObjectDropsItemCmd.Parameters["@item_id"].Value = (int)itemId;
+                    _gameObjectDropsItemCmd.Parameters["@gameobject_entry"].Value = (int)gameObjectEntry;
+                    using var reader = _gameObjectDropsItemCmd.ExecuteReader();
+                    return reader.Read();
+                }
             }
             catch (Exception ex)
             {

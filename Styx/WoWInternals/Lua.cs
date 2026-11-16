@@ -19,8 +19,9 @@ namespace Styx.WoWInternals
             { "\\", "\\\\" },
             { "\"", "\\\"" },
             { "'", "\\'" },
-            { "[", "\\[" },
-            { "]", "\\]" },
+            // NOTE: '[' and ']' must NOT be escaped.  Lua 5.1 has no \[ / \] escape
+            // sequence, so "\[" made the whole chunk fail to compile ("invalid escape
+            // sequence") — brackets are literal characters inside a quoted string.
             { "\n", "\\n" },
             { "\r", "\\r" },
             { "\t", "\\t" }
@@ -105,7 +106,10 @@ namespace Styx.WoWInternals
 
                             // 2. luaL_loadbuffer
                             executor.AddLine("push {0}", fileNameOffset);
-                            executor.AddLine("push {0}", lua.Length);
+                            // luaL_loadbuffer takes the buffer length in *bytes*.
+                            // lua.Length is the UTF-16 char count, which truncated every
+                            // non-ASCII chunk and made the loader fail (=> empty results).
+                            executor.AddLine("push {0}", bytes.Length);
                             executor.AddLine("push {0}", address);
                             executor.AddLine("push {0}", fullState);
                             executor.AddLine("call {0}", (uint)GlobalOffsets.FrameScript_Load);
@@ -594,6 +598,17 @@ namespace Styx.WoWInternals
         public static LuaEvents Events
         {
             get { return _events ??= new LuaEvents(); }
+        }
+
+        /// <summary>
+        /// Deterministic teardown of the Lua event frame, called from
+        /// ObjectManager.Shutdown() while WoW is still attached.
+        /// </summary>
+        internal static void ShutdownEvents()
+        {
+            var events = _events;
+            _events = null;
+            events?.Dispose();
         }
 
         internal static void ProcessEvents()

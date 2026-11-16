@@ -22,6 +22,8 @@ namespace Styx.Database
         private static SQLiteCommand _getSpawnsByEntryCmd;
         private static SQLiteCommand _getSpawnsByEntryAndMapCmd;
         private static SQLiteCommand _getSpawnsNearPointCmd;
+        // Shared commands + shared connection: parameter writes and row stepping must not interleave.
+        private static readonly object _sync = new object();
 
         /// <summary>
         /// Indicates if the creature spawns database is available.
@@ -35,11 +37,25 @@ namespace Styx.Database
             }
         }
 
+        private static readonly object _initLock = new object();
+
         private static void EnsureInitialized()
         {
             if (_initialized) return;
-            _initialized = true;
 
+            // Double-checked: the old code published _initialized = true *before*
+            // opening the database, so a second thread could observe "initialized"
+            // while _isAvailable was still false and silently get empty results.
+            lock (_initLock)
+            {
+                if (_initialized) return;
+                InitializeCore();
+                _initialized = true;
+            }
+        }
+
+        private static void InitializeCore()
+        {
             try
             {
                 var dbPath = Path.Combine(Logging.ApplicationPath, "CreatureSpawns.db");
@@ -109,15 +125,18 @@ namespace Styx.Database
 
             try
             {
-                _getSpawnsByEntryCmd.Parameters["@entry"].Value = (int)entry;
-                using var reader = _getSpawnsByEntryCmd.ExecuteReader();
-                while (reader.Read())
+                lock (_sync)
                 {
-                    var point = new WoWPoint(
-                        reader.GetFloat(0),
-                        reader.GetFloat(1),
-                        reader.GetFloat(2));
-                    result.Add(point);
+                    _getSpawnsByEntryCmd.Parameters["@entry"].Value = (int)entry;
+                    using var reader = _getSpawnsByEntryCmd.ExecuteReader();
+                    while (reader.Read())
+                    {
+                        var point = new WoWPoint(
+                            reader.GetFloat(0),
+                            reader.GetFloat(1),
+                            reader.GetFloat(2));
+                        result.Add(point);
+                    }
                 }
             }
             catch (Exception ex)
@@ -144,16 +163,19 @@ namespace Styx.Database
 
             try
             {
-                _getSpawnsByEntryAndMapCmd.Parameters["@entry"].Value = (int)entry;
-                _getSpawnsByEntryAndMapCmd.Parameters["@map_id"].Value = (int)mapId;
-                using var reader = _getSpawnsByEntryAndMapCmd.ExecuteReader();
-                while (reader.Read())
+                lock (_sync)
                 {
-                    var point = new WoWPoint(
-                        reader.GetFloat(0),
-                        reader.GetFloat(1),
-                        reader.GetFloat(2));
-                    result.Add(point);
+                    _getSpawnsByEntryAndMapCmd.Parameters["@entry"].Value = (int)entry;
+                    _getSpawnsByEntryAndMapCmd.Parameters["@map_id"].Value = (int)mapId;
+                    using var reader = _getSpawnsByEntryAndMapCmd.ExecuteReader();
+                    while (reader.Read())
+                    {
+                        var point = new WoWPoint(
+                            reader.GetFloat(0),
+                            reader.GetFloat(1),
+                            reader.GetFloat(2));
+                        result.Add(point);
+                    }
                 }
             }
             catch (Exception ex)
@@ -183,21 +205,24 @@ namespace Styx.Database
 
             try
             {
-                _getSpawnsNearPointCmd.Parameters["@entry"].Value = (int)entry;
-                _getSpawnsNearPointCmd.Parameters["@map_id"].Value = (int)mapId;
-                _getSpawnsNearPointCmd.Parameters["@minX"].Value = center.X - searchRadius;
-                _getSpawnsNearPointCmd.Parameters["@maxX"].Value = center.X + searchRadius;
-                _getSpawnsNearPointCmd.Parameters["@minY"].Value = center.Y - searchRadius;
-                _getSpawnsNearPointCmd.Parameters["@maxY"].Value = center.Y + searchRadius;
-
-                using var reader = _getSpawnsNearPointCmd.ExecuteReader();
-                while (reader.Read())
+                lock (_sync)
                 {
-                    var point = new WoWPoint(
-                        reader.GetFloat(0),
-                        reader.GetFloat(1),
-                        reader.GetFloat(2));
-                    result.Add(point);
+                    _getSpawnsNearPointCmd.Parameters["@entry"].Value = (int)entry;
+                    _getSpawnsNearPointCmd.Parameters["@map_id"].Value = (int)mapId;
+                    _getSpawnsNearPointCmd.Parameters["@minX"].Value = center.X - searchRadius;
+                    _getSpawnsNearPointCmd.Parameters["@maxX"].Value = center.X + searchRadius;
+                    _getSpawnsNearPointCmd.Parameters["@minY"].Value = center.Y - searchRadius;
+                    _getSpawnsNearPointCmd.Parameters["@maxY"].Value = center.Y + searchRadius;
+
+                    using var reader = _getSpawnsNearPointCmd.ExecuteReader();
+                    while (reader.Read())
+                    {
+                        var point = new WoWPoint(
+                            reader.GetFloat(0),
+                            reader.GetFloat(1),
+                            reader.GetFloat(2));
+                        result.Add(point);
+                    }
                 }
             }
             catch (Exception ex)

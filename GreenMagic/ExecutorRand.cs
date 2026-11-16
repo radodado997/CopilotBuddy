@@ -174,9 +174,19 @@ namespace GreenMagic
                 throw new Exception("You should never see this message, but the event was opened instead of created!  That's bad!");
             }
 
-            InitializeDetour();
-            Clear();
-            IsInitialized = true;
+            try
+            {
+                InitializeDetour();
+                Clear();
+                IsInitialized = true;
+            }
+            catch
+            {
+                // There is no finalizer to fall back on, so undo any partially installed
+                // detour / allocated remote memory before letting the construction fail.
+                try { Dispose(); } catch { }
+                throw;
+            }
         }
 
         public ExecutorRand(int processId, uint endSceneAddress)
@@ -1002,11 +1012,10 @@ namespace GreenMagic
 
         #region Cleanup
 
-        ~ExecutorRand()
-        {
-            Dispose();
-        }
-
+        // No finalizer on purpose: restoring EndScene, waiting on the injected gate and
+        // freeing remote memory must not run on the GC finalizer thread (no AssemblyLock,
+        // arbitrary timing relative to a running frame).  Dispose is called from
+        // ObjectManager.Shutdown() at application exit.
         public void Dispose()
         {
             if (m_Disposed)
@@ -1014,6 +1023,7 @@ namespace GreenMagic
 
             m_Disposed = true;
             IsInitialized = false;
+            GC.SuppressFinalize(this);
 
             try
             {

@@ -44,7 +44,18 @@ namespace Styx.Helpers
 			}
 			else
 			{
-				LoadFromXML(XElement.Load(SettingsPath));
+				// A truncated/hand-edited XML file, or one written by another version,
+				// used to throw straight out of the constructor and abort startup.
+				// Keep the defaults and report the problem instead.
+				try
+				{
+					LoadFromXML(XElement.Load(SettingsPath));
+				}
+				catch (Exception ex)
+				{
+					Logging.Write("Could not load settings from {0}: {1} (using defaults)", SettingsPath, ex.Message);
+					Logging.WriteDebug("Settings load exception: {0}", ex);
+				}
 			}
 		}
 
@@ -227,7 +238,23 @@ namespace Styx.Helpers
 							convertedValue = ConvertValue(textValue, propertyInfo.PropertyType, element.Name.ToString());
 						}
 
-						propertyInfo.SetValue(this, convertedValue, null);
+						if (convertedValue == null && propertyInfo.PropertyType.IsValueType &&
+						    Nullable.GetUnderlyingType(propertyInfo.PropertyType) == null)
+						{
+							// Conversion failed for a non-nullable value type: keep the
+							// default instead of throwing and aborting the whole load.
+							Logging.WriteDebug("Setting {0} could not be parsed; keeping the default value.", elementName);
+							continue;
+						}
+
+						try
+						{
+							propertyInfo.SetValue(this, convertedValue, null);
+						}
+						catch (Exception ex)
+						{
+							Logging.WriteDebug("Setting {0} could not be assigned: {1}", elementName, ex.Message);
+						}
 					}
 				}
 			}
@@ -286,6 +313,21 @@ namespace Styx.Helpers
 			catch (FormatException)
 			{
 				Logging.Write("Setting {0} has invalid format \"{1}\"!", elementName, val);
+			}
+			catch (ArgumentException)
+			{
+				// Enum.Parse throws ArgumentException for an unknown member name.
+				Logging.Write("Setting {0} has an unknown value \"{1}\"!", elementName, val);
+			}
+			catch (OverflowException)
+			{
+				// Convert.ChangeType throws OverflowException when the number does not
+				// fit the target type (e.g. 300 stored for a byte setting).
+				Logging.Write("Setting {0} value \"{1}\" is out of range!", elementName, val);
+			}
+			catch (Exception ex)
+			{
+				Logging.Write("Setting {0} could not be converted from \"{1}\": {2}", elementName, val, ex.Message);
 			}
 			return null;
 		}

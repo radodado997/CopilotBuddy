@@ -12,6 +12,7 @@ namespace Styx.Helpers
         private readonly TimeSpan _duration;
         private readonly Stopwatch _stopwatch;
         private readonly Func<T> _producer;
+        private readonly object _sync = new object();
         private T _cachedValue;
 
         public TimeCachedValue(TimeSpan duration, Func<T> producer)
@@ -30,12 +31,18 @@ namespace Styx.Helpers
         {
             get
             {
-                if (!_stopwatch.IsRunning || _stopwatch.Elapsed > _duration)
+                // ObjectManager's caches are read from the bot thread, the UI thread and
+                // plugin threads; the unsynchronised Stopwatch + field pair could hand a
+                // reader a value produced for a different frame.
+                lock (_sync)
                 {
-                    _cachedValue = _producer();
-                    _stopwatch.Restart();
+                    if (!_stopwatch.IsRunning || _stopwatch.Elapsed > _duration)
+                    {
+                        _cachedValue = _producer();
+                        _stopwatch.Restart();
+                    }
+                    return _cachedValue;
                 }
-                return _cachedValue;
             }
         }
 
@@ -50,8 +57,11 @@ namespace Styx.Helpers
         /// </summary>
         public void Reset()
         {
-            _stopwatch.Reset();
-            _cachedValue = default!;
+            lock (_sync)
+            {
+                _stopwatch.Reset();
+                _cachedValue = default!;
+            }
         }
     }
 }

@@ -186,6 +186,11 @@ namespace GreenMagic
             int size = FastSize<T>.Size;
             byte[] buffer = ReadBytes(address, size);
 
+            // ReadBytes returns null when ReadProcessMemory fails (e.g. the object was
+            // despawned between the caller's validity check and this read).
+            if (buffer == null)
+                throw new InvalidOperationException($"ReadProcessMemory failed reading {size} bytes at 0x{address:X8}");
+
             if (buffer.Length < size)
                 throw new ArgumentException("Buffer too small", "address");
 
@@ -300,6 +305,40 @@ namespace GreenMagic
             return null;
         }
 
+        /// <summary>
+        /// Reads <paramref name="count"/> bytes into <paramref name="buffer"/> and reports
+        /// whether the whole range could be read. Unlike the void ReadBytes overload this
+        /// never leaves the caller with a partially filled (or stale) buffer masquerading
+        /// as valid data — callers can break out of a walk instead of trusting garbage.
+        /// </summary>
+        public bool TryReadBytes(uint address, byte[] buffer, int count)
+        {
+            if (buffer == null)
+                throw new ArgumentNullException(nameof(buffer));
+            if (count < 0 || count > buffer.Length)
+                throw new ArgumentOutOfRangeException(nameof(count), "Count must fit inside the buffer");
+
+            if (_hProcess == IntPtr.Zero)
+                throw new InvalidOperationException("Process handle is not open");
+
+            if (count == 0)
+                return true;
+
+            int bytesRead;
+            if (!Imports.ReadProcessMemory(_hProcess, address, buffer, count, out bytesRead))
+                return false;
+
+            return bytesRead == count;
+        }
+
+        /// <summary>
+        /// Reads the whole buffer; returns false if any of it could not be read.
+        /// </summary>
+        public bool TryReadBytes(uint address, byte[] buffer)
+        {
+            return TryReadBytes(address, buffer, buffer?.Length ?? 0);
+        }
+
         public unsafe void ReadBytes(uint address, byte[] bytes)
         {
             if (bytes == null)
@@ -349,9 +388,18 @@ namespace GreenMagic
 
         public string ReadString(Encoding encoding, uint address, int length)
         {
-            byte[] buffer = new byte[512];
+            if (length <= 0)
+                return string.Empty;
+
+            byte[] buffer = new byte[length];
             int bytesRead;
-            Imports.ReadProcessMemory(ProcessHandle, address, buffer, buffer.Length, out bytesRead);
+            if (!Imports.ReadProcessMemory(ProcessHandle, address, buffer, buffer.Length, out bytesRead) || bytesRead <= 0)
+                return string.Empty;
+
+            // Only decode what was actually read — decoding the whole buffer would
+            // append leftover zero bytes / stale data past a short read.
+            if (bytesRead < buffer.Length)
+                Array.Resize(ref buffer, bytesRead);
 
             string result = encoding.GetString(buffer);
             int nullIndex = result.IndexOf('\0');
@@ -459,17 +507,36 @@ namespace GreenMagic
 
         public bool WriteStruct<T>(uint address, T value) where T : struct
         {
+            IntPtr ptr = IntPtr.Zero;
+            int size = 0;
             try
             {
-                IntPtr ptr = Marshal.AllocHGlobal(Marshal.SizeOf(value));
-                byte[] buffer = new byte[Marshal.SizeOf(value)];
-                Marshal.Copy(ptr, buffer, 0, Marshal.SizeOf(value));
-                Marshal.FreeHGlobal(ptr);
-                return WriteBytes(address, buffer) > 0;
+                size = Marshal.SizeOf<T>();
+                ptr = Marshal.AllocHGlobal(size);
+                Marshal.StructureToPtr(value, ptr, false);
+
+                int written = WriteRawMemory(_hProcess, address, ptr, size);
+                if (written != size)
+                {
+                    Debug.WriteLine($"[Memory] WriteStruct short write at 0x{address:X8}: {written}/{size}");
+                    return false;
+                }
+
+                return true;
             }
-            catch
+            catch (Exception ex)
             {
+                Debug.WriteLine($"[Memory] WriteStruct failed at 0x{address:X8}: {ex.Message}");
                 return false;
+            }
+            finally
+            {
+                if (ptr != IntPtr.Zero)
+                {
+                    try { Marshal.DestroyStructure(ptr, typeof(T)); }
+                    catch { }
+                    Marshal.FreeHGlobal(ptr);
+                }
             }
         }
 
@@ -812,15 +879,38 @@ namespace GreenMagic
 
         #region Dispose
 
+        private bool _disposed;
+
         internal void CloseProcessHandle()
         {
-            Imports.CloseHandle(ProcessHandle);
-            Process.LeaveDebugMode();
+            if (_disposed)
+                return;
+            _disposed = true;
+
+            // _hProcess/_hThread are zero for a Memory instance created with pid 0 or for a
+            // PID that vanished; CloseHandle(IntPtr.Zero) is harmless but LeaveDebugMode()
+            // on a null Process is not.
+            if (_hProcess != IntPtr.Zero)
+                Imports.CloseHandle(_hProcess);
+
+            // One thread handle is opened per Memory instance; without this every attach
+            // attempt (ProcessSelectorWindow, FindAndAttachToWoW, ...) leaked a handle.
+            if (_hThread != IntPtr.Zero)
+                Imports.CloseHandle(_hThread);
+
+            // LeaveDebugMode is a static member; only call it when we actually entered
+            // debug mode (i.e. a real process was attached).
+            if (_process != null)
+            {
+                try { System.Diagnostics.Process.LeaveDebugMode(); }
+                catch { /* process already gone */ }
+            }
         }
 
         public void Dispose()
         {
             CloseProcessHandle();
+            GC.SuppressFinalize(this);
         }
 
         #endregion

@@ -27,7 +27,9 @@ namespace Styx.Logic.Inventory.Frames.MailBox
 			get
 			{
 				var result = Lua.GetReturnValues("return GetInboxNumItems()", "Economist.lua");
-				return result != null && result.Count > 0 ? Convert.ToInt32(result[0]) : 0;
+				if (result == null || result.Count <= 0 || string.IsNullOrEmpty(result[0]))
+					return 0;
+				return int.TryParse(result[0], out int count) ? count : 0;
 			}
 		}
 
@@ -40,8 +42,9 @@ namespace Styx.Logic.Inventory.Frames.MailBox
 			{
 				Lua.DoString("CheckInbox()");
 				var result = Lua.GetReturnValues("return HasNewMail()", "Economist.lua");
-				return result != null && result.Count > 0 && !string.IsNullOrEmpty(result[0])
-					&& Convert.ToBoolean(Convert.ToInt32(result[0]));
+				if (result == null || result.Count <= 0 || string.IsNullOrEmpty(result[0]))
+					return false;
+				return int.TryParse(result[0], out int hasNewMail) && hasNewMail != 0;
 			}
 		}
 
@@ -67,24 +70,58 @@ namespace Styx.Logic.Inventory.Frames.MailBox
 		public void GetMailAttachments(int mailIndex)
 		{
 			int mailCount = MailCount;
-			var moneyResult = Lua.GetReturnValues("return GetMoney()", "Economist.lua");
-			int currentMoney = (moneyResult == null || moneyResult.Count <= 0) ? 0 : int.Parse(moneyResult[0]);
+			int currentMoney = GetMoney();
 
 			var headerResult = Lua.GetReturnValues($"return GetInboxHeaderInfo({mailIndex})", "Economist.lua");
 			if (headerResult != null && headerResult.Count >= 8)
 			{
+				// headerResult[4] is nil for text-only mail, and GetMoney()/GetInboxNumItems()
+				// can return nil while the mailbox is closing — both used to throw
+				// FormatException/IndexOutOfRangeException from inside the wait loops.
 				int mailMoney = 0;
 				if (!string.IsNullOrEmpty(headerResult[4]))
-					mailMoney = int.Parse(headerResult[4]);
+					int.TryParse(headerResult[4], out mailMoney);
 
 				Lua.DoString($"AutoLootMailItem({mailIndex})", "Economist.lua");
 
-				while (int.Parse(Lua.GetReturnValues("return GetMoney()", "Economist.lua")[0]) < currentMoney + mailMoney)
-					StyxWoW.Sleep(250);
+				// Bounded waits: a mail carrying no money (or a full gold cap that blocks
+				// the delta) never satisfies these conditions, so the old unbounded loops
+				// hung the bot forever.
+				int startTick = Environment.TickCount;
+				if (mailMoney > 0)
+				{
+					while (Environment.TickCount - startTick < 5000 && GetMoney() < currentMoney + mailMoney)
+						StyxWoW.Sleep(250);
+				}
 
-				while (MailCount >= mailCount)
+				startTick = Environment.TickCount;
+				bool looted = false;
+				while (Environment.TickCount - startTick < 5000)
+				{
+					if (MailCount < mailCount)
+					{
+						looted = true;
+						break;
+					}
 					StyxWoW.Sleep(250);
+				}
+
+				if (!looted)
+					Logging.WriteDebug("GetMailAttachments: timed out waiting for mail {0} to be looted.", mailIndex);
 			}
+		}
+
+		/// <summary>
+		/// Reads the player's copper amount, returning 0 when the Lua call yields no
+		/// usable number (mailbox closed, player not in world, ...).
+		/// </summary>
+		private static int GetMoney()
+		{
+			var moneyResult = Lua.GetReturnValues("return GetMoney()", "Economist.lua");
+			if (moneyResult == null || moneyResult.Count <= 0 || string.IsNullOrEmpty(moneyResult[0]))
+				return 0;
+
+			return int.TryParse(moneyResult[0], out int money) ? money : 0;
 		}
 
 		/// <summary>
@@ -117,7 +154,8 @@ namespace Styx.Logic.Inventory.Frames.MailBox
 					if (headerResult != null && headerResult.Count >= 8)
 					{
 						string sender = headerResult[2];
-						if (sender.ToLower().Contains(senderName.ToLower()))
+						if (!string.IsNullOrEmpty(sender) && !string.IsNullOrEmpty(senderName) &&
+						    sender.ToLower().Contains(senderName.ToLower()))
 							mailIndicesToCollect.Add(i);
 					}
 				}
@@ -150,7 +188,13 @@ namespace Styx.Logic.Inventory.Frames.MailBox
 
 			Lua.DoString("ClearSendMail()");
 			SwitchToSendMailTab();
-			Lua.DoString($"SendMailNameEditBox:SetText(\"{recipient}\")", "_main.lua");
+			// Escape before interpolating: a recipient/subject/body containing a quote
+			// (or a newline from a profile) otherwise produced a syntactically invalid
+			// Lua chunk, so the mail was never sent — or worse, executed as code.
+			string escapedRecipient = Lua.Escape(recipient ?? string.Empty);
+			string escapedSubject = Lua.Escape(subject ?? string.Empty);
+			string escapedBody = Lua.Escape(body ?? string.Empty);
+			Lua.DoString($"SendMailNameEditBox:SetText(\"{escapedRecipient}\")", "_main.lua");
 			Lua.DoString($"SetSendMailMoney({copper})", "_main.lua");
 
 			if (attachmentItems.Length > 0)
@@ -165,7 +209,7 @@ namespace Styx.Logic.Inventory.Frames.MailBox
 					Logging.Write("Something is messed up, we didn't attach all of our items.");
 			}
 
-			Lua.DoString($"SendMail(\"{recipient}\", \"{subject}\", \"{body}\")", "_main.lua");
+			Lua.DoString($"SendMail(\"{escapedRecipient}\", \"{escapedSubject}\", \"{escapedBody}\")", "_main.lua");
 		}
 
 		/// <summary>
