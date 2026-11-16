@@ -508,6 +508,17 @@ namespace Styx.WoWInternals
         {
             lock (_updateLock)
             {
+                // Lua cleanup runs FIRST: removing the event frame goes through
+                // Lua.DoString, which needs the (still initialized) executor.
+                try
+                {
+                    Lua.ShutdownEvents();
+                }
+                catch (Exception ex)
+                {
+                    Logging.WriteDebug("ObjectManager.Shutdown: failed to remove Lua events: {0}", ex.Message);
+                }
+
                 try
                 {
                     Executor?.Dispose();
@@ -517,15 +528,6 @@ namespace Styx.WoWInternals
                     Logging.WriteDebug("ObjectManager.Shutdown: failed to dispose the EndScene executor: {0}", ex.Message);
                 }
                 Executor = null;
-
-                try
-                {
-                    Lua.ShutdownEvents();
-                }
-                catch (Exception ex)
-                {
-                    Logging.WriteDebug("ObjectManager.Shutdown: failed to remove Lua events: {0}", ex.Message);
-                }
 
                 lock (_cacheLock)
                 {

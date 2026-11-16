@@ -170,16 +170,10 @@ namespace Styx.Database
                     if (!IsFriendly(myFaction, result.Faction))
                         continue;
 
-                    if (_trainerNavCache.TryGetValue(result, out bool cached))
-                    {
-                        if (!cached) continue;
-                    }
-                    else
-                    {
-                        bool canNav = CanNavigateSafely(location, result.Location);
-                        _trainerNavCache[result] = canNav;
-                        if (!canNav) continue;
-                    }
+                    if (!TryGetCachedNav(_trainerNavCache, result, location, out bool cached))
+                        continue; // navigation not ready yet - do not cache, retry next call
+
+                    if (!cached) continue;
                     return result;
                 }
             }
@@ -205,19 +199,40 @@ namespace Styx.Database
 
         /// <summary>
         /// Navigator.CanNavigateFully throws InvalidOperationException until a navigation
-        /// provider has been set (OnBotStart).  Called from NpcQueries during startup that
-        /// exception escaped from inside an open SQLiteDataReader; fail closed instead.
+        /// provider has been set (OnBotStart).  A thrown check must not be treated as a
+        /// completed "unreachable" answer: the caller only caches the result when this
+        /// returns true, so a failed check is retried on the next call instead of
+        /// permanently blacklisting a vendor/trainer.
         /// </summary>
-        private static bool CanNavigateSafely(WoWPoint from, WoWPoint to)
+        private static bool TryGetNavResult(WoWPoint from, WoWPoint to, out bool canNavigate)
         {
             try
             {
-                return Navigator.CanNavigateFully(from, to);
+                canNavigate = Navigator.CanNavigateFully(from, to);
+                return true;
             }
             catch (Exception)
             {
+                canNavigate = false;
                 return false;
             }
+        }
+
+        /// <summary>
+        /// Cache lookup/update for a nav result.  Returns false when the check could not be
+        /// completed (navigation not initialised yet) — such results are neither used nor
+        /// stored, so the caller skips this candidate and retries later.
+        /// </summary>
+        private static bool TryGetCachedNav(ConcurrentDictionary<NpcResult, bool> cache, NpcResult npc, WoWPoint from, out bool canNavigate)
+        {
+            if (cache.TryGetValue(npc, out canNavigate))
+                return true;
+
+            if (!TryGetNavResult(from, npc.Location, out canNavigate))
+                return false;
+
+            cache[npc] = canNavigate;
+            return true;
         }
 
         /// <summary>
@@ -272,16 +287,10 @@ namespace Styx.Database
                     if (((npcFlags & UnitNPCFlags.ClassTrainer) == UnitNPCFlags.None || result.TrainerClass == (int)myClass) &&
                         IsFriendly(myFaction, result.Faction))
                     {
-                        if (_npcNavCache.TryGetValue(result, out bool cached))
-                        {
-                            if (!cached) continue;
-                        }
-                        else
-                        {
-                            bool canNav = CanNavigateSafely(location, result.Location);
-                            _npcNavCache[result] = canNav;
-                            if (!canNav) continue;
-                        }
+                        if (!TryGetCachedNav(_npcNavCache, result, location, out bool cached))
+                            continue; // navigation not ready yet - do not cache, retry next call
+
+                        if (!cached) continue;
                         return result;
                     }
                 }

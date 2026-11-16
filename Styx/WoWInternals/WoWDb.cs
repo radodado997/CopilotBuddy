@@ -30,8 +30,9 @@ namespace Styx.WoWInternals
             var wow = ObjectManager.Wow;
             if (wow == null) return;
 
-            _initialized = true;
-
+            // _initialized is only set once the registration walk actually reached the
+            // RET terminator.  Otherwise a layout mismatch would latch a half-populated
+            // table set forever (the old code published _initialized *before* the walk).
             try
             {
                 // Base address for ClientDb_RegisterBase
@@ -42,15 +43,13 @@ namespace Styx.WoWInternals
                 // does not match the hardcoded offsets this walk used to loop forever
                 // reading unmapped memory. Each real entry is 17 bytes; 4096 entries is
                 // far beyond any 3.3.5a build and acts as a hard stop.
+                bool reachedTerminator = false;
                 for (int guard = 0; guard < 4096; guard++)
                 {
                     byte opcode = wow.Read<byte>(addr);
                     if (opcode == 0xC3) // RET instruction = end of list
-                        break;
-
-                    if (guard == 4095)
                     {
-                        Helpers.Logging.WriteDebug("[WoWDb] ClientDb table walk hit the iteration guard; layout mismatch?");
+                        reachedTerminator = true;
                         break;
                     }
 
@@ -65,24 +64,47 @@ namespace Styx.WoWInternals
                     
                     addr += 17; // Each entry is 17 bytes
                 }
-                
-                // Diagnostic: log what was loaded
-                Helpers.Logging.WriteDebug($"[WoWDb] Loaded {_tables.Count} DBC tables");
-                int logged = 0;
-                foreach (var kvp in _tables)
+
+                if (!reachedTerminator)
                 {
-                    if (logged++ < 5)
-                        Helpers.Logging.WriteDebug($"[WoWDb]   Key={(int)kvp.Key} (0x{(int)kvp.Key:X8}) Rows={kvp.Value.NumRows}");
+                    // No terminator within the bound: treat the whole walk as failed,
+                    // discard the partial results and leave _initialized false so a later
+                    // WoWDb instance can retry against a valid layout.
+                    int partial = _tables.Count;
+                    _tables.Clear();
+                    Helpers.Logging.WriteDebug("[WoWDb] ClientDb table walk never reached the RET terminator; discarded {0} partial tables, will retry", partial);
+                    return;
                 }
-                
-                // Check if Lock DBC is accessible
-                var lockDb = this[ClientDb.Lock];
-                Helpers.Logging.WriteDebug($"[WoWDb] Lock DBC lookup: {(lockDb != null ? $"FOUND (rows={lockDb.NumRows})" : "NOT FOUND")}");
-                Helpers.Logging.WriteDebug($"[WoWDb] ClientDb.Lock enum value = {(int)ClientDb.Lock} (0x{(int)ClientDb.Lock:X8})");
+
+                _initialized = true;
+
+                // Diagnostics must not invalidate a good initialisation.
+                try
+                {
+                    Helpers.Logging.WriteDebug($"[WoWDb] Loaded {_tables.Count} DBC tables");
+                    int logged = 0;
+                    foreach (var kvp in _tables)
+                    {
+                        if (logged++ < 5)
+                            Helpers.Logging.WriteDebug($"[WoWDb]   Key={(int)kvp.Key} (0x{(int)kvp.Key:X8}) Rows={kvp.Value.NumRows}");
+                    }
+
+                    // Check if Lock DBC is accessible
+                    var lockDb = this[ClientDb.Lock];
+                    Helpers.Logging.WriteDebug($"[WoWDb] Lock DBC lookup: {(lockDb != null ? $"FOUND (rows={lockDb.NumRows})" : "NOT FOUND")}");
+                    Helpers.Logging.WriteDebug($"[WoWDb] ClientDb.Lock enum value = {(int)ClientDb.Lock} (0x{(int)ClientDb.Lock:X8})");
+                }
+                catch (Exception ex)
+                {
+                    Helpers.Logging.WriteDebug("[WoWDb] Diagnostics failed: {0}", ex.Message);
+                }
             }
             catch (Exception)
             {
-                // Table initialization failed - tables will be unavailable
+                // Table initialization failed - discard partial results so the next
+                // WoWDb instance retries instead of using a half-built table set.
+                _tables.Clear();
+                _initialized = false;
             }
         }
 

@@ -15,6 +15,10 @@ namespace Styx.Logic.Inventory.Frames.MailBox
 	{
 		public static readonly MailFrame Instance = new MailFrame();
 
+		// How many consecutive failed loot attempts are tolerated for the same mail
+		// before OpenAllMail gives up and reports the batch as incomplete.
+		private const int MaxLootAttemptsPerMail = 3;
+
 		public MailFrame() : base("MailFrame")
 		{
 		}
@@ -26,11 +30,25 @@ namespace Styx.Logic.Inventory.Frames.MailBox
 		{
 			get
 			{
-				var result = Lua.GetReturnValues("return GetInboxNumItems()", "Economist.lua");
-				if (result == null || result.Count <= 0 || string.IsNullOrEmpty(result[0]))
-					return 0;
-				return int.TryParse(result[0], out int count) ? count : 0;
+				// Public API keeps its "0 when unavailable" fallback.
+				return TryGetMailCount(out int count) ? count : 0;
 			}
+		}
+
+		/// <summary>
+		/// Reads the inbox item count and reports whether the read produced a usable
+		/// number.  Callers that compare counts (loot confirmation, batch sizing) must
+		/// use this instead of <see cref="MailCount"/>, otherwise the public 0 fallback
+		/// looks like "all mail gone".
+		/// </summary>
+		private static bool TryGetMailCount(out int count)
+		{
+			count = 0;
+			var result = Lua.GetReturnValues("return GetInboxNumItems()", "Economist.lua");
+			if (result == null || result.Count <= 0 || string.IsNullOrEmpty(result[0]))
+				return false;
+
+			return int.TryParse(result[0], out count);
 		}
 
 		/// <summary>
@@ -67,48 +85,57 @@ namespace Styx.Logic.Inventory.Frames.MailBox
 		/// <summary>
 		/// Gets all attachments from a mail item.
 		/// </summary>
-		public void GetMailAttachments(int mailIndex)
+		public bool GetMailAttachments(int mailIndex)
 		{
-			int mailCount = MailCount;
+			// Baseline must come from a *successful* count read: the public MailCount
+			// fallback of 0 would make the confirmation compare meaningless.
+			bool haveBaseline = TryGetMailCount(out int mailCount);
 			int currentMoney = GetMoney();
 
 			var headerResult = Lua.GetReturnValues($"return GetInboxHeaderInfo({mailIndex})", "Economist.lua");
-			if (headerResult != null && headerResult.Count >= 8)
+			if (headerResult == null || headerResult.Count < 8)
 			{
-				// headerResult[4] is nil for text-only mail, and GetMoney()/GetInboxNumItems()
-				// can return nil while the mailbox is closing — both used to throw
-				// FormatException/IndexOutOfRangeException from inside the wait loops.
-				int mailMoney = 0;
-				if (!string.IsNullOrEmpty(headerResult[4]))
-					int.TryParse(headerResult[4], out mailMoney);
-
-				Lua.DoString($"AutoLootMailItem({mailIndex})", "Economist.lua");
-
-				// Bounded waits: a mail carrying no money (or a full gold cap that blocks
-				// the delta) never satisfies these conditions, so the old unbounded loops
-				// hung the bot forever.
-				int startTick = Environment.TickCount;
-				if (mailMoney > 0)
-				{
-					while (Environment.TickCount - startTick < 5000 && GetMoney() < currentMoney + mailMoney)
-						StyxWoW.Sleep(250);
-				}
-
-				startTick = Environment.TickCount;
-				bool looted = false;
-				while (Environment.TickCount - startTick < 5000)
-				{
-					if (MailCount < mailCount)
-					{
-						looted = true;
-						break;
-					}
-					StyxWoW.Sleep(250);
-				}
-
-				if (!looted)
-					Logging.WriteDebug("GetMailAttachments: timed out waiting for mail {0} to be looted.", mailIndex);
+				Logging.WriteDebug("GetMailAttachments: no header for mail {0}; nothing collected.", mailIndex);
+				return false;
 			}
+
+			// headerResult[4] is nil for text-only mail, and GetMoney() can return nil
+			// while the mailbox is closing — both used to throw from the wait loops.
+			int mailMoney = 0;
+			if (!string.IsNullOrEmpty(headerResult[4]))
+				int.TryParse(headerResult[4], out mailMoney);
+
+			Lua.DoString($"AutoLootMailItem({mailIndex})", "Economist.lua");
+
+			// Bounded waits: a mail carrying no money (or a full gold cap that blocks the
+			// delta) never satisfies these conditions, so unbounded loops hung the bot.
+			int startTick = Environment.TickCount;
+			if (mailMoney > 0)
+			{
+				while (Environment.TickCount - startTick < 5000 && GetMoney() < currentMoney + mailMoney)
+					StyxWoW.Sleep(250);
+			}
+
+			if (!haveBaseline)
+			{
+				// Cannot verify the loot without a trustworthy baseline. Report failure so
+				// the caller retries rather than advancing its batch on a bogus 0.
+				Logging.WriteDebug("GetMailAttachments: could not read the mail count; collection of mail {0} unverified.", mailIndex);
+				return false;
+			}
+
+			startTick = Environment.TickCount;
+			while (Environment.TickCount - startTick < 5000)
+			{
+				// Only a successful read may confirm the loot.
+				if (TryGetMailCount(out int remaining) && remaining < mailCount)
+					return true;
+
+				StyxWoW.Sleep(250);
+			}
+
+			Logging.WriteDebug("GetMailAttachments: timed out waiting for mail {0} to be looted.", mailIndex);
+			return false;
 		}
 
 		/// <summary>
@@ -129,12 +156,31 @@ namespace Styx.Logic.Inventory.Frames.MailBox
 		/// </summary>
 		public void OpenAllMail()
 		{
-			if (IsVisible)
+			if (!IsVisible)
+				return;
+
+			// Looting always targets index 1: every collected mail shifts the rest down.
+			// A failed attempt must not consume one of the "count" iterations, so retries
+			// are bounded separately and a failure is reported instead of silently
+			// leaving mail uncollected.
+			int remaining = MailCount;
+			int consecutiveFailures = 0;
+
+			while (remaining > 0 && consecutiveFailures < MaxLootAttemptsPerMail)
 			{
-				int count = MailCount;
-				for (int i = 0; i < count; i++)
-					GetMailAttachments(1);
+				if (GetMailAttachments(1))
+				{
+					remaining--;
+					consecutiveFailures = 0;
+					continue;
+				}
+
+				consecutiveFailures++;
+				StyxWoW.Sleep(250);
 			}
+
+			if (remaining > 0)
+				Logging.WriteDebug("OpenAllMail: incomplete — {0} mail(s) could not be collected.", remaining);
 		}
 
 		/// <summary>

@@ -14,6 +14,9 @@ namespace Styx.Helpers
         private readonly Func<T> _producer;
         private readonly object _sync = new object();
         private T _cachedValue;
+        // Incremented by Reset().  A producer that started before a Reset must not
+        // publish its (pre-reset) result afterwards.
+        private long _generation;
 
         public TimeCachedValue(TimeSpan duration, Func<T> producer)
         {
@@ -31,17 +34,29 @@ namespace Styx.Helpers
         {
             get
             {
-                // ObjectManager's caches are read from the bot thread, the UI thread and
-                // plugin threads; the unsynchronised Stopwatch + field pair could hand a
-                // reader a value produced for a different frame.
+                long generation;
                 lock (_sync)
                 {
-                    if (!_stopwatch.IsRunning || _stopwatch.Elapsed > _duration)
+                    if (_stopwatch.IsRunning && _stopwatch.Elapsed <= _duration)
+                        return _cachedValue;
+
+                    generation = _generation;
+                }
+
+                // The producer runs outside the lock.  It usually walks ObjectManager,
+                // which flushes these caches from inside its own lock (Update() ->
+                // ResetCaches()), so calling it while holding _sync could deadlock.
+                T produced = _producer();
+
+                lock (_sync)
+                {
+                    // Publish only if no Reset() happened while we were producing.
+                    if (generation == _generation)
                     {
-                        _cachedValue = _producer();
+                        _cachedValue = produced;
                         _stopwatch.Restart();
                     }
-                    return _cachedValue;
+                    return produced;
                 }
             }
         }
@@ -61,6 +76,7 @@ namespace Styx.Helpers
             {
                 _stopwatch.Reset();
                 _cachedValue = default!;
+                _generation++;
             }
         }
     }

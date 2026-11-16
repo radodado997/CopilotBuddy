@@ -26,9 +26,13 @@ namespace GreenMagic
         private EventWaitHandle m_InjectionWaitingEvent;
         private EventWaitHandle m_InjectionContinueEvent;
         public EventWaitHandle m_InjectionFinishedEvent;
+        // Signalled by the detour as its LAST action in the frame (after it is done with the
+        // injected code/data).  Dispose waits on it before freeing remote memory.
+        private EventWaitHandle m_ExitEvent;
         private string m_InjectionWaitingEventName;
         private string m_InjectionContinueEventName;
         private string m_InjectionFinishedEventName;
+        private string m_ExitEventName;
 
         // Memory addresses in WoW process
         private uint m_OrigEndScene;
@@ -43,6 +47,7 @@ namespace GreenMagic
         // VEH data region fields (data + 16..36)
         private uint m_FrameCountPtr;               // data + 16
         private uint m_InHookPtr;                   // data + 20
+        private uint m_ExitHandlePtr;               // data + 40
         private uint m_StatusPtr;                   // data + 24
         private uint m_TlsPtr;                      // data + 28 (init: 0xFFFFFFFF)
         private uint m_VehPtr;                      // data + 32 (init: 0)
@@ -169,6 +174,13 @@ namespace GreenMagic
             m_InjectionFinishedEventName = "Global\\" + GetRandomString(16);
             System.Diagnostics.Debug.WriteLine($"[ExecutorRand] Creating FinishedEvent: {m_InjectionFinishedEventName}");
             m_InjectionFinishedEvent = EventWaitHandleAcl.Create(false, EventResetMode.AutoReset, m_InjectionFinishedEventName, out flag, eventWaitHandleSecurity);
+            if (!flag)
+            {
+                throw new Exception("You should never see this message, but the event was opened instead of created!  That's bad!");
+            }
+            m_ExitEventName = "Global\\" + GetRandomString(16);
+            System.Diagnostics.Debug.WriteLine($"[ExecutorRand] Creating ExitEvent: {m_ExitEventName}");
+            m_ExitEvent = EventWaitHandleAcl.Create(false, EventResetMode.AutoReset, m_ExitEventName, out flag, eventWaitHandleSecurity);
             if (!flag)
             {
                 throw new Exception("You should never see this message, but the event was opened instead of created!  That's bad!");
@@ -480,9 +492,11 @@ namespace GreenMagic
 
             uint name2 = namesMem + (uint)m_InjectionWaitingEventName.Length + 4;
             uint name3 = name2 + (uint)m_InjectionContinueEventName.Length + 4;
+            uint name4 = name3 + (uint)m_InjectionFinishedEventName.Length + 4;
             if (!Memory.Write(namesMem, m_InjectionWaitingEventName) ||
                 !Memory.Write(name2, m_InjectionContinueEventName) ||
-                !Memory.Write(name3, m_InjectionFinishedEventName))
+                !Memory.Write(name3, m_InjectionFinishedEventName) ||
+                !Memory.Write(name4, m_ExitEventName))
             {
                 throw new Exception("Could not write event names to memory.");
             }
@@ -547,6 +561,7 @@ namespace GreenMagic
             m_TlsPtr                     = m_DataPtr + 28;
             m_VehPtr                     = m_DataPtr + 32;
             m_FrameDropWaitTimePtr       = m_DataPtr + 36;
+            m_ExitHandlePtr              = m_DataPtr + 40;
 
             // Initialize VEH-related memory to safe defaults
             Memory.Write<uint>(m_TlsPtr, 0xFFFFFFFF);  // TLS_OUT_OF_INDEXES sentinel
@@ -554,10 +569,11 @@ namespace GreenMagic
             Memory.Write<uint>(m_StatusPtr, 0);         // Status OK
             Memory.Write<uint>(m_FrameCountPtr, 0);     // Frame counter
             Memory.Write<uint>(m_InHookPtr, 0);         // Not in hook
+            Memory.Write<uint>(m_ExitHandlePtr, 0);     // No exit-event handle yet
             // Initialize FrameDropWaitTime to 1000ms (XOR-obfuscated, like HB Legion)
             Memory.Write<uint>(m_FrameDropWaitTimePtr, 1000 ^ m_FrameDropWaitTimeXorKey);
 
-            if (!InjectEventStub(eventStub, namesMem, name2, name3))
+            if (!InjectEventStub(eventStub, namesMem, name2, name3, name4))
                 throw new Exception("InjectEventStub failed");
 
             InjectDetour();
@@ -796,7 +812,18 @@ namespace GreenMagic
             AddRandomLine("call @TearDownGate");
 
             AddRandomLine("popad");
-            
+
+            // ── Exit handshake ──
+            // Last use of the injected data block (m_ExitHandlePtr) and of the injected
+            // code (the call @CallGate already returned).  Dispose() waits on this event
+            // before it frees the remote allocations, so a frame that is still inside the
+            // detour is never left executing freed memory.  pushad/popad keep the register
+            // state intact for the prologue replay and the jump back into d3d9.
+            AddRandomLine("pushad");
+            AddRandomLine("push dword [{0}]", m_ExitHandlePtr);
+            AddRandomLine("call {0}", SetEvent);
+            AddRandomLine("popad");
+
             // Restore original EndScene prologue based on captured bytes
             var prolog = m_OriginalEndSceneBytes;
             if (prolog != null && prolog.Length >= 6)
@@ -940,7 +967,7 @@ namespace GreenMagic
             Debug.WriteLine("[InjectDetour] VEH-protected detour installed successfully");
         }
 
-        private bool InjectEventStub(uint eventStub, uint waitNamePtr, uint contNamePtr, uint finNamePtr)
+        private bool InjectEventStub(uint eventStub, uint waitNamePtr, uint contNamePtr, uint finNamePtr, uint exitNamePtr)
         {
             try
             {
@@ -972,6 +999,14 @@ namespace GreenMagic
                 AddRandomLine("test eax, eax");
                 AddRandomLine("jz @ReturnFalse");
                 AddRandomLine("mov [{0}], eax", m_InjectionFinishedHandlePtr);
+                AddRandomLine("push {0}", exitNamePtr);
+                AddRandomLine("push 0");
+                AddRandomLine("push 0");
+                AddRandomLine("push 0");
+                AddRandomLine("call {0}", CreateEventA);
+                AddRandomLine("test eax, eax");
+                AddRandomLine("jz @ReturnFalse");
+                AddRandomLine("mov [{0}], eax", m_ExitHandlePtr);
                 AddLine("mov eax, 1");
                 AddLine("retn");
                 AddLine("@ReturnFalse:");
@@ -1032,12 +1067,24 @@ namespace GreenMagic
                     // Signal one more frame to trigger TearDownGate in the target
                     // Write a bare RET to injected code so it does nothing
                     Memory.Write<byte>(m_InjectedCode, 195); // 0xC3 = retn
+
+                    // Exit handshake: the detour sets m_ExitEvent as its last action in a
+                    // frame (after the call gate returned and the VEH gate was torn down).
+                    // Only when that is confirmed may the remote allocations be freed —
+                    // otherwise a frame could still be executing the detour while
+                    // VirtualFreeEx decommits it.
+                    bool frameExited = false;
                     try
                     {
+                        m_ExitEvent.Reset(); // drop any signal from a previous frame
+
                         m_InjectionWaitingEvent.Set();
-                        m_InjectionFinishedEvent.WaitOne(5000, false);
+                        bool injectionRan = m_InjectionFinishedEvent.WaitOne(5000, false);
                         m_InjectionWaitingEvent.Reset();
                         m_InjectionContinueEvent.Set();
+
+                        if (injectionRan)
+                            frameExited = m_ExitEvent.WaitOne(5000, false);
                     }
                     catch { }
 
@@ -1081,10 +1128,25 @@ namespace GreenMagic
                     // Clear injected code
                     Memory.WriteBytes(m_InjectedCode, m_ClearBytes);
 
-                    // Free allocated memory
-                    Memory.FreeMemory(m_EndSceneDetour);
-                    Memory.FreeMemory(m_InjectedCode);
-                    Memory.FreeMemory(m_DataPtr);
+                    if (frameExited)
+                    {
+                        // The detour confirmed it is past its last use of the injected
+                        // code/data.  Its own tail (prologue replay + jump back to d3d9)
+                        // still executes a few bytes of m_EndSceneDetour, so give a
+                        // preempted render thread one scheduler quantum to leave the page.
+                        Thread.Sleep(100);
+
+                        Memory.FreeMemory(m_EndSceneDetour);
+                        Memory.FreeMemory(m_InjectedCode);
+                        Memory.FreeMemory(m_DataPtr);
+                    }
+                    else
+                    {
+                        // Not confirmed: leave the allocations in place rather than free
+                        // memory that a frame may still be executing.  The game process
+                        // reclaims them when it exits.
+                        Debug.WriteLine("[ExecutorRand] WARNING: detour did not confirm its exit handshake; skipping remote frees.");
+                    }
                 }
             }
             catch
@@ -1094,6 +1156,7 @@ namespace GreenMagic
             try { m_InjectionWaitingEvent?.Close(); } catch { }
             try { m_InjectionContinueEvent?.Close(); } catch { }
             try { m_InjectionFinishedEvent?.Close(); } catch { }
+            try { m_ExitEvent?.Close(); } catch { }
         }
 
         #endregion

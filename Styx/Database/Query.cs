@@ -1,5 +1,6 @@
 #nullable disable
 using System;
+using System.Collections.Generic;
 using System.Data.SQLite;
 using Styx.Logic.Pathing;
 
@@ -48,6 +49,11 @@ namespace Styx.Database
             var command = _getNpcsWithFlagsCmd;
             if (command == null) return null;
 
+            // Read the matching rows while holding the connection lock, then release it
+            // before calling back into user code: extraConditions is caller-supplied and
+            // may itself query the database (or block), which would deadlock/starve every
+            // other database user while a reader is open.
+            var candidates = new List<NpcResult>();
             lock (Connection.SyncRoot)
             {
                 using var reader = Connection.ExecuteReader(command,
@@ -60,13 +66,19 @@ namespace Styx.Database
                 if (reader == null) return null;
 
                 while (reader.Read())
-                {
-                    var npcResult = new NpcResult(reader);
-                    if (extraConditions == null)
-                        return npcResult;
-                    if (extraConditions(npcResult))
-                        return npcResult;
-                }
+                    candidates.Add(new NpcResult(reader));
+            }
+
+            if (candidates.Count == 0)
+                return null;
+
+            if (extraConditions == null)
+                return candidates[0];
+
+            foreach (var npcResult in candidates)
+            {
+                if (extraConditions(npcResult))
+                    return npcResult;
             }
 
             return null;
