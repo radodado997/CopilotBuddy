@@ -365,15 +365,32 @@ namespace Styx.Logic.Relogin
             Logging.Write("[AutoRelogin] Relogin attempt {0}/{1} ({2}).",
                 _attempts, settings.MaxAttemptsPerDisconnect, reason);
 
+            if (ShouldAbortSequence())
+                return;
+
             // ------------------------------------------------- restart a stuck client
             bool restartClient = _attempts > 1 && settings.RestartClientOnRepeatedFailure;
             if (restartClient && client != null)
             {
                 SetStatus("Restarting the game client.");
                 Logging.Write("[AutoRelogin] Restarting the client after a failed attempt.");
-                ReloginNative.KillClient(client);
+
+                if (!ReloginNative.KillClient(client))
+                {
+                    // Termination failed: do not launch a second client next to the one
+                    // that is still running. Keep the reference, back off and let the
+                    // next attempt deal with it (it may have exited by then).
+                    Logging.Write(System.Windows.Media.Colors.Red,
+                        "[AutoRelogin] Could not terminate the game client (pid {0}).", client.Id);
+                    ApplyBackoff(settings);
+                    return;
+                }
+
                 client = null;
-                Thread.Sleep(4000);
+                SleepInterruptible(4000);
+
+                if (ShouldAbortSequence())
+                    return;
             }
 
             // ------------------------------------------------------------- start client
@@ -383,7 +400,8 @@ namespace Styx.Logic.Relogin
                 if (delay > 0)
                 {
                     SetStatus($"Starting the client in {delay}s.");
-                    SleepInterruptible(delay * 1000);
+                    if (!SleepInterruptible(delay * 1000))
+                        return;
                 }
 
                 SetStatus("Starting the game client.");
@@ -409,12 +427,19 @@ namespace Styx.Logic.Relogin
             }
 
             // The window exists; give the client a moment to draw the login screen.
-            SleepInterruptible(3000);
+            if (!SleepInterruptible(3000))
+                return;
 
             // ------------------------------------------------------- credentials + enter
+            // Every keystroke below is aimed at the game window: if it cannot be brought
+            // to the foreground we stop instead of typing the password into whatever
+            // window happens to have the focus.
             SetStatus("Sending credentials.");
-            ReloginNative.FocusWindow(window);
-            SleepInterruptible(800);
+            if (!EnsureClientFocus(window, settings))
+                return;
+
+            if (!SleepInterruptible(800) || ShouldAbortSequence())
+                return;
 
             // After a disconnect the client shows a modal "You have been disconnected
             // from the server" box whose OK button is the default, so Enter dismisses
@@ -423,27 +448,59 @@ namespace Styx.Logic.Relogin
             // If the box is not there the Enter simply submits the current, empty
             // login; the next attempt (a restarted client) starts from a clean screen.
             ReloginNative.SendKey(ReloginNative.VkReturn);
-            SleepInterruptible(1200);
 
-            ReloginNative.FocusWindow(window);
-            SleepInterruptible(300);
+            if (!SleepInterruptible(1200) || ShouldAbortSequence())
+                return;
+
+            if (!EnsureClientFocus(window, settings))
+                return;
+
+            if (!SleepInterruptible(300) || ShouldAbortSequence())
+                return;
 
             // The account field is focused by default; clear whatever the client has
             // pre-filled (after a disconnect it holds the last account name) and retype.
             ReloginNative.SendSelectAll();
             ReloginNative.SendKey(ReloginNative.VkDelete);
-            SleepInterruptible(200);
 
-            ReloginNative.SendText(settings.AccountName);
-            SleepInterruptible(400);
+            if (!SleepInterruptible(200) || ShouldAbortSequence())
+                return;
+
+            // SendText stops by itself as soon as the client loses the foreground, so a
+            // stray Alt+Tab in the middle of the account name cannot leak the password
+            // into another window.
+            if (!ReloginNative.SendText(settings.AccountName, window))
+            {
+                Logging.Write(System.Windows.Media.Colors.Red,
+                    "[AutoRelogin] Lost the foreground while typing the account name.");
+                ApplyBackoff(settings);
+                return;
+            }
+
+            if (!SleepInterruptible(400) || ShouldAbortSequence())
+                return;
+
             ReloginNative.SendKey(ReloginNative.VkTab);
-            SleepInterruptible(300);
-            ReloginNative.SendText(settings.Password);
-            SleepInterruptible(300);
+
+            if (!SleepInterruptible(300) || ShouldAbortSequence())
+                return;
+
+            if (!ReloginNative.SendText(settings.Password, window))
+            {
+                Logging.Write(System.Windows.Media.Colors.Red,
+                    "[AutoRelogin] Lost the foreground while typing the password.");
+                ApplyBackoff(settings);
+                return;
+            }
+
+            if (!SleepInterruptible(300) || ShouldAbortSequence())
+                return;
+
             ReloginNative.SendKey(ReloginNative.VkReturn);
 
             SetStatus("Waiting for the character list.");
-            SleepInterruptible(Math.Max(5, settings.CharSelectDelaySeconds) * 1000);
+            if (!SleepInterruptible(Math.Max(5, settings.CharSelectDelaySeconds) * 1000))
+                return;
 
             // Character select: the first character is preselected and the "Enter World"
             // button has the focus once the list is loaded, so Enter enters the world.
@@ -453,9 +510,15 @@ namespace Styx.Logic.Relogin
             SetStatus("Entering the world.");
             DateTime enterDeadline = DateTime.UtcNow.AddSeconds(Math.Max(30, settings.EnterWorldTimeoutSeconds));
             int press = 0;
-            while (!_stopRequested && DateTime.UtcNow < enterDeadline)
+            while (DateTime.UtcNow < enterDeadline && !ShouldAbortSequence())
             {
-                ReloginNative.FocusWindow(window);
+                // Never aim Enter/Tab at a window that is not the client; just wait for
+                // the next round instead of fighting the foreground lock.
+                if (!ReloginNative.FocusWindow(window))
+                {
+                    SleepInterruptible(1000);
+                    continue;
+                }
 
                 if (press++ % 2 == 0)
                 {
@@ -549,7 +612,7 @@ namespace Styx.Logic.Relogin
 
             while (stopwatch.ElapsedMilliseconds < timeoutMs)
             {
-                if (_stopRequested)
+                if (ShouldAbortSequence())
                     return false;
 
                 if (ReloginNative.TryReadInGame(client, out bool inGame) && inGame)
@@ -561,16 +624,60 @@ namespace Styx.Logic.Relogin
             return false;
         }
 
-        /// <summary>Sleep that aborts early when the monitor is stopped.</summary>
-        private void SleepInterruptible(int milliseconds)
+        /// <summary>
+        /// True when the sequence must not continue: the monitor was stopped, the bot
+        /// logged out on purpose, or the user disabled the feature while we were waiting.
+        /// Checked before every key / process operation so a Stop() or a settings change
+        /// during a SleepInterruptible cannot be missed.
+        /// </summary>
+        private bool ShouldAbortSequence()
+        {
+            if (_stopRequested || _suspended)
+                return true;
+
+            try
+            {
+                return !ReloginSettings.Instance.Enabled;
+            }
+            catch
+            {
+                return true;
+            }
+        }
+
+        /// <summary>
+        /// Brings the client to the foreground or backs off. Returns false when the client
+        /// cannot be focused, so the caller never sends keystrokes to an unknown window.
+        /// </summary>
+        private bool EnsureClientFocus(IntPtr window, ReloginSettings settings)
+        {
+            if (ReloginNative.FocusWindow(window))
+                return true;
+
+            Logging.Write(System.Windows.Media.Colors.Red,
+                "[AutoRelogin] Could not bring the game window to the foreground; not sending any keystrokes.");
+            ApplyBackoff(settings);
+            return false;
+        }
+
+        /// <summary>
+        /// Sleep that aborts early when the sequence has to stop. Returns true when the
+        /// whole delay elapsed, false when it was interrupted.
+        /// </summary>
+        private bool SleepInterruptible(int milliseconds)
         {
             int remaining = milliseconds;
-            while (remaining > 0 && !_stopRequested)
+            while (remaining > 0)
             {
+                if (ShouldAbortSequence())
+                    return false;
+
                 int slice = Math.Min(250, remaining);
                 Thread.Sleep(slice);
                 remaining -= slice;
             }
+
+            return !ShouldAbortSequence();
         }
 
         #endregion

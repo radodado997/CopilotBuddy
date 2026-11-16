@@ -349,17 +349,32 @@ namespace Styx.Logic.Relogin
             }
         }
 
-        /// <summary>Types a plain ASCII string with KEYEVENTF_UNICODE events.</summary>
-        public static void SendText(string text)
+        /// <summary>
+        /// Types a string with KEYEVENTF_UNICODE events. Stops and returns false as soon as
+        /// <paramref name="targetWindow"/> is no longer the foreground window, so a stray
+        /// focus change can never type the credentials into another application.
+        /// </summary>
+        public static bool SendText(string text, IntPtr targetWindow)
         {
             if (string.IsNullOrEmpty(text))
-                return;
+                return true;
 
             foreach (char c in text)
             {
+                if (targetWindow != IntPtr.Zero && !IsForeground(targetWindow))
+                    return false;
+
                 SendUnicodeChar(c);
                 Thread.Sleep(35);
             }
+
+            return true;
+        }
+
+        /// <summary>True when the given window is the foreground window.</summary>
+        public static bool IsForeground(IntPtr windowHandle)
+        {
+            return windowHandle != IntPtr.Zero && GetForegroundWindow() == windowHandle;
         }
 
         private static void SendUnicodeChar(char c)

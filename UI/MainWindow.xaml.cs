@@ -80,6 +80,23 @@ namespace CopilotBuddy.UI
         /// </summary>
         private int _reattachRunning;
 
+        /// <summary>The running re-attach sequence, awaited by Window_Closing.</summary>
+        private Task? _reattachTask;
+
+        /// <summary>
+        /// Set when a ClientLoggedIn event arrives while the detachment is still in
+        /// flight: the attach would fail (ObjectManager is still initialized), so the
+        /// pid is parked here and retried once DetachFromGame() has finished.
+        /// </summary>
+        private int _pendingLoggedInPid;
+
+        /// <summary>
+        /// 0 = the one-time, attachment independent initialization has not run yet.
+        /// It must happen exactly once per process, no matter whether the first client
+        /// was attached by the startup path or by Auto Relogin much later.
+        /// </summary>
+        private int _globalInitDone;
+
         #endregion
 
         #region Constructor
@@ -226,11 +243,6 @@ namespace CopilotBuddy.UI
                     {
                         Logging.Write("Attached to WoW with ID {0}", _selectedWoWProc!.Value);
 
-                        // HB 6.2.3 smethod_3: Start minimize guard thread + event handlers
-                        TreeRoot.Initialize();
-                        BotEvents.OnBotStarted += BotEvents_OnBotStarted;
-                        BotEvents.OnBotStopped += BotEvents_OnBotStopped;
-
                         // Log character info (HB 4.3.4 pattern after attach)
                         if (ObjectManager.Me != null)
                         {
@@ -242,11 +254,18 @@ namespace CopilotBuddy.UI
                             Logging.Write("Current zone is {0}", ObjectManager.Me.RealZoneText);
                         }
 
-                        // Reinitialize and load settings for this character (HB 4.3.4 pattern)
+                        // Reinitialize and load settings for this character (HB 4.3.4 pattern).
+                        // Must run before the plugin initialization below: that one reads
+                        // CharacterSettings.EnabledPlugins for the freshly attached character.
                         LoadSettings();
 
-                        // Initialize Combat Routines (compile and load from Routines folder)
-                        // This must be done AFTER attachment when ObjectManager.Me is available
+                        // One-time, attachment independent initialization: tree hooks, bot
+                        // events, external bots, plugins. Shared with the Auto Relogin
+                        // late-attach path so a reconnect never doubles the subscriptions.
+                        EnsureGlobalBotInitialization();
+
+                        // Initialize Combat Routines (compile and load from the Routines folder).
+                        // This must be done AFTER attachment when ObjectManager.Me is available.
                         try
                         {
                             Styx.Logic.Combat.RoutineManager.Init();
@@ -254,43 +273,6 @@ namespace CopilotBuddy.UI
                         catch (Exception ex)
                         {
                             Logging.Write(Colors.Red, "Failed to initialize combat routines: {0}", ex.Message);
-                            Logging.WriteException(ex);
-                        }
-
-                        // Load additional bots from Bots folder (external/custom bots)
-                        try
-                        {
-                            string botsPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Bots");
-                            if (Directory.Exists(botsPath))
-                            {
-                                BotManager.Instance.LoadBots(botsPath);
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            Logging.WriteException(ex);
-                        }
-
-                        // Initialize plugins (compile and load from Plugins folder)
-                        try
-                        {
-                            Logging.Write("Initializing Plugins...");
-                            
-                            // Pre-load System.Drawing.Common for plugin compilation
-                            try
-                            {
-                                // Force load System.Drawing.Common into AppDomain
-                                var _ = System.Drawing.Font.FromHdc(IntPtr.Zero);
-                            }
-                            catch { /* Ignore, just ensure assembly is loaded */ }
-                            
-                            // Load previously enabled plugins from CharacterSettings
-                            var enabledPlugins = CharacterSettings.Instance.EnabledPlugins ?? new string[0];
-                            Styx.Plugins.PluginManager.Initialize(enabledPlugins);
-                        }
-                        catch (Exception ex)
-                        {
-                            Logging.Write(Colors.Red, "Failed to initialize plugins: {0}", ex.Message);
                             Logging.WriteException(ex);
                         }
 
@@ -396,6 +378,13 @@ namespace CopilotBuddy.UI
             string? pidArg = Environment.GetCommandLineArgs()
                 .FirstOrDefault(s => s.StartsWith("/pid=", StringComparison.OrdinalIgnoreCase));
 
+            // Auto Relogin: a /pid= from the command line points at the client the bot was
+            // started with, which is stale once that client was relaunched. The pid handed
+            // over by the relogin manager is authoritative, so it replaces the argument
+            // and goes through the same discovery/validation path below.
+            if (preferPid != 0)
+                pidArg = "/pid=" + preferPid;
+
             _selectedWoWProc = null;
             var candidates = new List<Process>();
 
@@ -444,22 +433,6 @@ namespace CopilotBuddy.UI
                         Logging.Write(Colors.Red, "Process with PID {0} not found or inaccessible.", pid);
                     }
                 }
-            }
-
-            // Auto Relogin: attach to the client it just logged in, never to a random one
-            // (and never through the selector dialog, which nobody is there to answer).
-            if (preferPid != 0 && candidates.Count > 1)
-            {
-                try
-                {
-                    var preferred = candidates.Where(p => p.Id == preferPid).ToList();
-                    if (preferred.Count == 1)
-                    {
-                        candidates.Clear();
-                        candidates.Add(preferred[0]);
-                    }
-                }
-                catch { /* a client exited between the scan and the filter: keep them all */ }
             }
 
             if (candidates.Count == 0)
@@ -746,6 +719,13 @@ namespace CopilotBuddy.UI
                     Logging.Write("Auto Relogin: the bot thread did not stop in time; detaching anyway.");
 
                 DetachFromGame();
+
+                // A ClientLoggedIn that arrived while we were detaching was parked above;
+                // handle it now that the old attachment is gone, otherwise the client
+                // would have to be logged in twice before the bot comes back.
+                int pendingPid = Interlocked.Exchange(ref _pendingLoggedInPid, 0);
+                if (pendingPid != 0 && !_isClosing)
+                    Dispatcher.BeginInvoke(new Action<int>(OnReloginClientLoggedIn), pendingPid);
             });
         }
 
@@ -788,10 +768,21 @@ namespace CopilotBuddy.UI
             if (_isClosing || !_startupCompleted)
                 return;
 
-            // Already attached to a live client: the event was just the monitor noticing
-            // a healthy session.
+            // Already attached to a live client. Either the event is just the monitor
+            // noticing a healthy session, or the detachment triggered by ClientLost /
+            // ClientDisconnected has not finished yet (ObjectManager is still initialized
+            // for a moment). In the second case the login must not be dropped: park the
+            // pid and let the detach task retry once the attachment is gone.
             if (ObjectManager.IsInitialized)
+            {
+                if (_reloginInProgress)
+                {
+                    Interlocked.Exchange(ref _pendingLoggedInPid, pid);
+                    Logging.WriteDebug("Auto Relogin: client {0} is in the world while detaching; will attach when the detach finishes.", pid);
+                }
+
                 return;
+            }
 
             // One re-attach at a time. This also covers the case where the recovery
             // handshake is still in flight: the client is in the world, so attaching
@@ -800,7 +791,7 @@ namespace CopilotBuddy.UI
                 return;
 
             Logging.Write(Colors.Green, "Auto Relogin: client {0} is in the world - re-attaching.", pid);
-            Task.Run(() => ReattachAfterRelogin(pid));
+            _reattachTask = Task.Run(() => ReattachAfterRelogin(pid));
         }
 
         /// <summary>
@@ -845,6 +836,13 @@ namespace CopilotBuddy.UI
 
                 Logging.Write("Attached to WoW with ID {0}", _selectedWoWProc!.Value);
 
+                // Same complete initialization the startup path performs, in the same order:
+                // settings first (the plugin initialization reads CharacterSettings), then
+                // the global block - which only runs once per process, so a plain reconnect
+                // does not duplicate event subscriptions - then the combat routines.
+                LoadSettings();
+                bool globalInitRanNow = EnsureGlobalBotInitialization();
+
                 // The combat routines were compiled against the previous attachment.
                 try
                 {
@@ -855,8 +853,6 @@ namespace CopilotBuddy.UI
                     Logging.Write(Colors.Red, "Failed to initialize combat routines: {0}", ex.Message);
                     Logging.WriteException(ex);
                 }
-
-                LoadSettings();
 
                 Dispatcher.BeginInvoke(new Action(() =>
                 {
@@ -884,6 +880,13 @@ namespace CopilotBuddy.UI
                         Logging.Write(Colors.Red,
                             "Auto Relogin: the character is back but no botbase is selected - pick one and press Start.");
                     }
+                    else if (globalInitRanNow)
+                    {
+                        // The startup path never completed an attach, so its tail -
+                        // command-line auto-load/auto-start - still has to run. A normal
+                        // reconnect never gets here (restartBot covers that case).
+                        ApplyAutoStartConfig();
+                    }
                 }));
             }
             catch (Exception ex)
@@ -897,6 +900,72 @@ namespace CopilotBuddy.UI
                 // Allow the next relogin to start a fresh attach sequence.
                 Interlocked.Exchange(ref _reattachRunning, 0);
             }
+        }
+
+        /// <summary>
+        /// One-time initialization that does not depend on a particular character: the
+        /// TreeRoot hooks, the bot event subscriptions, the external botbases and the
+        /// plugin containers. Runs exactly once per process - either right after the first
+        /// successful attach at startup, or (when the client only came up later) from the
+        /// Auto Relogin re-attach. Returns true when it ran on this call.
+        /// </summary>
+        private bool EnsureGlobalBotInitialization()
+        {
+            if (Interlocked.CompareExchange(ref _globalInitDone, 1, 0) != 0)
+                return false;
+
+            // HB 6.2.3 smethod_3: start the minimize guard thread + event handlers
+            try
+            {
+                TreeRoot.Initialize();
+                BotEvents.OnBotStarted += BotEvents_OnBotStarted;
+                BotEvents.OnBotStopped += BotEvents_OnBotStopped;
+            }
+            catch (Exception ex)
+            {
+                Logging.Write(Colors.Red, "Failed to initialize the behavior tree: {0}", ex.Message);
+                Logging.WriteException(ex);
+            }
+
+            // Load additional bots from the Bots folder (external/custom bots)
+            try
+            {
+                string botsPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Bots");
+                if (Directory.Exists(botsPath))
+                {
+                    BotManager.Instance.LoadBots(botsPath);
+                }
+            }
+            catch (Exception ex)
+            {
+                Logging.WriteException(ex);
+            }
+
+            // Initialize plugins (compile and load from the Plugins folder)
+            try
+            {
+                Logging.Write("Initializing Plugins...");
+
+                // Pre-load System.Drawing.Common for plugin compilation
+                try
+                {
+                    // Force load System.Drawing.Common into AppDomain
+                    var _ = System.Drawing.Font.FromHdc(IntPtr.Zero);
+                }
+                catch { /* Ignore, just ensure assembly is loaded */ }
+
+                // Load previously enabled plugins from CharacterSettings (null when the
+                // settings for this character have not been initialized yet)
+                var enabledPlugins = CharacterSettings.Instance?.EnabledPlugins ?? new string[0];
+                Styx.Plugins.PluginManager.Initialize(enabledPlugins);
+            }
+            catch (Exception ex)
+            {
+                Logging.Write(Colors.Red, "Failed to initialize plugins: {0}", ex.Message);
+                Logging.WriteException(ex);
+            }
+
+            return true;
         }
 
         /// <summary>
@@ -1017,6 +1086,10 @@ namespace CopilotBuddy.UI
             // Shutdown has to run afterwards to restore EndScene deterministically.
             WaitForStartupToStop(5000);
 
+            // An Auto Relogin re-attach may be in flight (it also attaches and calls
+            // Dispatcher.Invoke); it must finish before ObjectManager.Shutdown() below.
+            WaitForReattachToStop(5000);
+
             // The startup callback above was retired by the wait.  Re-check the worker:
             // a callback that slipped past the _isClosing guard just before it was set
             // could have started TreeRoot while the stop above was already running.
@@ -1116,21 +1189,35 @@ namespace CopilotBuddy.UI
         /// </summary>
         private void WaitForStartupToStop(int timeoutMs)
         {
-            Task? startup = _startupTask;
-            if (startup == null || startup.IsCompleted)
+            WaitForWorkerTask(_startupTask, timeoutMs, "Startup");
+        }
+
+        /// <summary>
+        /// Same bounded, queue pumping wait for the Auto Relogin re-attach sequence: it also
+        /// calls Dispatcher.Invoke (FindAndAttachToWoW) and must not publish an attachment
+        /// after ObjectManager.Shutdown() has run.
+        /// </summary>
+        private void WaitForReattachToStop(int timeoutMs)
+        {
+            WaitForWorkerTask(_reattachTask, timeoutMs, "Auto Relogin re-attach");
+        }
+
+        private void WaitForWorkerTask(Task? task, int timeoutMs, string what)
+        {
+            if (task == null || task.IsCompleted)
                 return;
 
             var sw = Stopwatch.StartNew();
-            while (!startup.IsCompleted && sw.ElapsedMilliseconds < timeoutMs)
+            while (!task.IsCompleted && sw.ElapsedMilliseconds < timeoutMs)
             {
                 // DispatcherPriority.Background processes everything queued at Background and
-                // above, which includes the startup thread's pending Dispatcher.Invoke calls.
+                // above, which includes the worker thread's pending Dispatcher.Invoke calls.
                 Dispatcher.Invoke(() => { }, DispatcherPriority.Background);
                 Thread.Sleep(10);
             }
 
-            if (!startup.IsCompleted)
-                Logging.Write("Startup thread did not finish within {0} ms; continuing shutdown.", timeoutMs);
+            if (!task.IsCompleted)
+                Logging.Write("{0} thread did not finish within {1} ms; continuing shutdown.", what, timeoutMs);
         }
 
         private static bool WaitForTreeRootStop(int timeoutMs)
