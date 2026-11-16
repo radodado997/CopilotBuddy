@@ -60,6 +60,15 @@ namespace Styx.Logic.Relogin
         private int _lastPid;
         // Written by RequestLoggedInSignal from the UI thread as well as by the monitor.
         private volatile bool _wasInGame;
+
+        /// <summary>
+        /// Pid that produced the current in-game state. The loss transition has to be
+        /// reported for *this* pid - the monitor may have moved to a different client
+        /// (pinned target exited, another client found) and must not lose the transition
+        /// or attribute it to the wrong process. Volatile: RequestLoggedInSignal resets it
+        /// from the UI thread.
+        /// </summary>
+        private volatile int _inGamePid;
         private DateTime? _outOfGameSinceUtc;
         private DateTime _nextAttemptUtc = DateTime.MinValue;
         private int _pinnedProcessId;
@@ -213,6 +222,7 @@ namespace Styx.Logic.Relogin
         public void RequestLoggedInSignal()
         {
             _wasInGame = false;
+            _inGamePid = 0;
             try { _wake.Set(); } catch { /* disposed */ }
         }
 
@@ -290,8 +300,10 @@ namespace Styx.Logic.Relogin
                 if (_wasInGame)
                 {
                     _wasInGame = false;
-                    SetStatus("Game client is gone (crash or closed).");
-                    SafeRaise(ClientLost, _lastPid);
+                    int lostPid = _inGamePid != 0 ? _inGamePid : _lastPid;
+                    _inGamePid = 0;
+                    SetStatus($"Game client {lostPid} is gone (crash or closed).");
+                    SafeRaise(ClientLost, lostPid);
                 }
 
                 _outOfGameSinceUtc ??= DateTime.UtcNow;
@@ -300,6 +312,19 @@ namespace Styx.Logic.Relogin
                 // delay); there is nothing to wait for, so no grace period here.
                 TryRelogin("client is not running", null);
                 return;
+            }
+
+            // The client that was in the world is gone while another one is running (the
+            // pinned target exited, or the monitor fell back to a different client). Report
+            // the loss for the pid that actually entered the world *before* adopting the
+            // new one, so the app detaches from it and the new pid can raise its own
+            // ClientLoggedIn later.
+            if (_wasInGame && _inGamePid != 0 && _inGamePid != client.Id && !ReloginNative.IsProcessAlive(_inGamePid))
+            {
+                _wasInGame = false;
+                SetStatus($"Game client {_inGamePid} is gone (crash or closed).");
+                SafeRaise(ClientLost, _inGamePid);
+                _inGamePid = 0;
             }
 
             _lastPid = client.Id;
@@ -323,6 +348,7 @@ namespace Styx.Logic.Relogin
                 if (!_wasInGame)
                 {
                     _wasInGame = true;
+                    _inGamePid = client.Id;
                     SetStatus("Character is in the world.");
                     SafeRaise(ClientLoggedIn, client.Id);
                 }
@@ -344,6 +370,7 @@ namespace Styx.Logic.Relogin
             if (_wasInGame)
             {
                 _wasInGame = false;
+                _inGamePid = 0;
                 SetStatus($"Character left the world (pid {client.Id}).");
                 SafeRaise(ClientDisconnected, client.Id);
             }
@@ -588,6 +615,7 @@ namespace Styx.Logic.Relogin
                 _outOfGameSinceUtc = null;
                 _nextAttemptUtc = DateTime.MinValue;
                 _wasInGame = true;
+                _inGamePid = client.Id;
                 SetStatus("Relogin successful - character is in the world.");
                 Logging.Write(System.Windows.Media.Colors.Green, "[AutoRelogin] Client is back in the world (pid {0}).", client.Id);
                 SafeRaise(ClientLoggedIn, client.Id);

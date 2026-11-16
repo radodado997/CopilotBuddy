@@ -753,6 +753,12 @@ namespace CopilotBuddy.UI
 
             SetStatus("Reconnecting...");
             ToggleButtons(false);
+
+            // ToggleButtons(false) also disables Settings; keep it reachable, because a
+            // login that keeps failing (wrong password, realm down) is fixed there and
+            // the recovery can run for minutes.
+            btnSettings.IsEnabled = true;
+
             _infoTimer?.Stop();
 
             _detachTask = Task.Run(() =>
@@ -784,6 +790,18 @@ namespace CopilotBuddy.UI
         /// </summary>
         private void DetachFromGame()
         {
+            // Release our own side of the attachment FIRST; ObjectManager.Shutdown() below
+            // is the detach-completion boundary. ObjectManager.IsInitialized (=> Wow != null)
+            // only becomes false inside that call, and a new attach is only allowed once it
+            // is false, so no re-attach can publish _processMutex/_memory/_selectedWoWProc
+            // while this method is still clearing them - clearing them afterwards could
+            // wipe (and dispose) the freshly published attachment.
+            try { _processMutex?.Dispose(); } catch { /* already released */ }
+            _processMutex = null;
+            _memory = null;
+            _executor = null;
+            _selectedWoWProc = null;
+
             try
             {
                 ObjectManager.Shutdown();
@@ -792,12 +810,6 @@ namespace CopilotBuddy.UI
             {
                 Logging.WriteDebug("Auto Relogin: ObjectManager.Shutdown failed: {0}", ex.Message);
             }
-
-            try { _processMutex?.Dispose(); } catch { /* already released */ }
-            _processMutex = null;
-            _memory = null;
-            _executor = null;
-            _selectedWoWProc = null;
 
             // Make sure the monitor keeps running: it is the component that brings the
             // client back, and it also re-raises ClientLoggedIn when the world is up.
