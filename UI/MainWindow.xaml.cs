@@ -103,6 +103,16 @@ namespace CopilotBuddy.UI
         /// </summary>
         private int _pendingRecoveryPid;
 
+        /// <summary>
+        /// Serializes the recovery-ownership handoff: the ownership read and the park in
+        /// <see cref="DispatchClientRecovery"/> must not interleave with the flag clear and
+        /// the drain of the pending slot that every owner performs when it finishes (the
+        /// startup finally, the re-attach finally and the recovery callbacks). Without it a
+        /// loss stored between a drain and the next read would keep the slot occupied with
+        /// nobody left to replay it.
+        /// </summary>
+        private readonly object _recoveryGate = new object();
+
         /// <summary>How often a failed re-attach asks the monitor for another attempt.</summary>
         private const int MaxReattachRetries = 10;
 
@@ -666,13 +676,41 @@ namespace CopilotBuddy.UI
         private volatile bool _startupCompleted;
 
         /// <summary>
+        /// In-game state of the live client, for the post-detach re-arm: 1 = in the world,
+        /// 0 = readable and not in the world (including "no client at all"), -1 = the state
+        /// could not be determined because the process could not be read right now.
+        /// </summary>
+        private static int ProbeClientInGame()
+        {
+            try
+            {
+                Process? client = ReloginNative.FindClient(ReloginSettings.Instance.WowExePath,
+                    ReloginManager.Instance.PinnedProcessId);
+                if (client == null)
+                    return 0;
+
+                if (!ReloginNative.TryReadInGame(client, out bool inGame))
+                    return -1;
+
+                return inGame ? 1 : 0;
+            }
+            catch
+            {
+                return -1;
+            }
+        }
+
+        /// <summary>
         /// Dispatches a client loss that was parked in <see cref="_pendingRecoveryPid"/>,
         /// if any, so it is handled instead of lingering. Must be called on the UI thread
         /// after recovery ownership was released.
         /// </summary>
         private bool ReplayParkedRecovery(string reason)
         {
-            int pendingRecovery = Interlocked.Exchange(ref _pendingRecoveryPid, 0);
+            int pendingRecovery;
+            lock (_recoveryGate)
+                pendingRecovery = Interlocked.Exchange(ref _pendingRecoveryPid, 0);
+
             if (pendingRecovery == 0 || _isClosing)
                 return false;
 
@@ -876,9 +914,18 @@ namespace CopilotBuddy.UI
             // RoutineManager.Init all run under one of them. Detaching underneath those
             // would corrupt what they publish, so the event is retained instead of dropped
             // and replayed when the owner is done.
-            if (_reloginInProgress || !_startupCompleted || Volatile.Read(ref _reattachRunning) != 0)
+            bool parked = false;
+            lock (_recoveryGate)
             {
-                Interlocked.Exchange(ref _pendingRecoveryPid, pid == 0 ? -1 : pid);
+                if (_reloginInProgress || !_startupCompleted || Volatile.Read(ref _reattachRunning) != 0)
+                {
+                    Interlocked.Exchange(ref _pendingRecoveryPid, pid == 0 ? -1 : pid);
+                    parked = true;
+                }
+            }
+
+            if (parked)
+            {
                 Logging.WriteDebug("Auto Relogin: {0} while a relogin/re-attach is in flight; replaying it afterwards.", reason);
                 return;
             }
@@ -945,18 +992,28 @@ namespace CopilotBuddy.UI
                     // already (it reconnected while we were still attached or during the
                     // drain above). The monitor's in-game state is latched in that case, so
                     // it will not announce the login again on its own and this detached
-                    // application would never attach. Ask for a fresh transition.
-                    try
+                    // application would never attach. Ask for a fresh transition - without
+                    // trusting a single read: a process that cannot be read right now must
+                    // not be mistaken for "not in the world". The monitor keeps its latched
+                    // state in that case, so the session would stay detached even after the
+                    // reads recover.
+                    int inGame = ProbeClientInGame();
+                    for (int attempt = 1; attempt <= 3 && inGame < 0 && !_isClosing; attempt++)
                     {
-                        if (ReloginManager.Instance.IsAnyClientInGame())
-                        {
-                            Logging.WriteDebug("Auto Relogin: the client is already back in the world after the detach; requesting a login signal.");
-                            ReloginManager.Instance.RequestLoggedInSignal();
-                        }
+                        Logging.WriteDebug("Auto Relogin: could not read the in-game state after the detach (attempt {0}); retrying.", attempt);
+                        Thread.Sleep(1000);
+                        inGame = ProbeClientInGame();
                     }
-                    catch (Exception ex)
+
+                    // 1 = in the world and -1 = unreadable both need the signal. 0 = the
+                    // client is definitely out of the world, which the monitor detects (and
+                    // relogins) on its own. Requesting it unconditionally would be harmless
+                    // too, but this keeps the log meaningful.
+                    if (inGame != 0 && !_isClosing)
                     {
-                        Logging.WriteDebug("Auto Relogin: could not request a login signal after the detach: {0}", ex.Message);
+                        Logging.WriteDebug("Auto Relogin: requesting a login signal after the detach (in-game probe: {0}).", inGame);
+                        try { ReloginManager.Instance.RequestLoggedInSignal(); }
+                        catch (Exception ex) { Logging.WriteDebug("Auto Relogin: could not request a login signal after the detach: {0}", ex.Message); }
                     }
                 }
             });
