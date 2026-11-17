@@ -321,6 +321,7 @@ namespace Styx.Logic.Relogin
                         FireTrigger(ReloginTrigger.ProcessExited, "client process is gone", generation);
                         client = null;
                         unresponsiveFor.Reset();
+                        SleepPollSlices(generation);
                         continue;
                     }
 
