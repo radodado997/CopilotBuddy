@@ -1,4 +1,4 @@
-﻿<mah:MetroWindow x:Class="CopilotBuddy.UI.SettingsWindow"
+<mah:MetroWindow x:Class="CopilotBuddy.UI.SettingsWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:mah="http://metro.mahapps.com/winfx/xaml/controls"
@@ -278,55 +278,6 @@
             <TextBlock Foreground="LightGray" Margin="8,64,8,8" TextWrapping="Wrap" VerticalAlignment="Top"
                        Text="{loc:Resx LblLanguageRestart}"/>
           </Grid>
-        </GroupBox>
-        <!-- Auto Relogin GroupBox -->
-        <GroupBox x:Name="gbAutoRelogin" Header="Auto Relogin"
-                  Foreground="White" Height="266" Width="224" Margin="4">
-          <StackPanel Margin="8,4,8,4">
-            <CheckBox x:Name="chkAutoRelogin" Content="Enable auto relogin" Foreground="White"
-                      Margin="0,0,0,6"
-                      ToolTip="Log back in after a disconnect, and relaunch + log in when the client crashes or is closed."
-                      IsChecked="{Binding Path=Relogin.Enabled, Mode=TwoWay}"/>
-
-            <Label x:Name="lblWowExePath" Content="Wow.exe" Foreground="White" Padding="0"/>
-            <Grid>
-              <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="*"/>
-                <ColumnDefinition Width="Auto"/>
-              </Grid.ColumnDefinitions>
-              <TextBox x:Name="txtWowExePath" Grid.Column="0" TextWrapping="NoWrap" Margin="0,0,4,0"
-                       Text="{Binding Path=Relogin.WowExePath, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
-              <Button x:Name="btnBrowseWowExe" Grid.Column="1" Content="..." Width="24" Height="22"
-                      Click="btnBrowseWowExe_Click"/>
-            </Grid>
-
-            <Label x:Name="lblReloginAccount" Content="Account" Foreground="White" Padding="0" Margin="0,6,0,0"/>
-            <TextBox x:Name="txtReloginAccount" TextWrapping="NoWrap"
-                     Text="{Binding Path=Relogin.AccountName, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
-
-            <Label x:Name="lblReloginPassword" Content="Password" Foreground="White" Padding="0" Margin="0,6,0,0"/>
-            <PasswordBox x:Name="pwdReloginPassword" PasswordChanged="pwdReloginPassword_PasswordChanged"/>
-
-            <Grid Margin="0,6,0,0">
-              <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="Auto"/>
-                <ColumnDefinition Width="Auto"/>
-                <ColumnDefinition Width="Auto"/>
-                <ColumnDefinition Width="Auto"/>
-              </Grid.ColumnDefinitions>
-              <Label x:Name="lblReloginGrace" Grid.Column="0" Content="Grace (s)" Foreground="White"
-                     Padding="0" VerticalAlignment="Center"/>
-              <TextBox x:Name="txtReloginGrace" Grid.Column="1" Width="36" Margin="4,0,10,0"
-                       Text="{Binding Path=Relogin.DisconnectGraceSeconds, Mode=TwoWay}"/>
-              <Label x:Name="lblReloginAttempts" Grid.Column="2" Content="Tries" Foreground="White"
-                     Padding="0" VerticalAlignment="Center"/>
-              <TextBox x:Name="txtReloginAttempts" Grid.Column="3" Width="36" Margin="4,0,0,0"
-                       Text="{Binding Path=Relogin.MaxAttemptsPerDisconnect, Mode=TwoWay}"/>
-            </Grid>
-
-            <TextBlock Foreground="LightGray" FontSize="10" TextWrapping="Wrap" Margin="0,8,0,0"
-                       Text="Starts Wow.exe, types the account and password and enters the world. Needs an elevated bot and a windowed client."/>
-          </StackPanel>
         </GroupBox>
       </WrapPanel>
     </ScrollViewer>

@@ -49,17 +49,9 @@ namespace Styx.Common
 
         public static void Initialize(IntPtr windowHandle)
         {
-            // The handle has to follow the client: Auto Relogin attaches to a relaunched
-            // process (and therefore a new window) without restarting the bot, and the
-            // processing thread compares the foreground window against this value. The
-            // rest of the initialization still only runs once. A zero handle would disable
-            // every hotkey, so it is never stored.
-            if (windowHandle != IntPtr.Zero)
-                _windowHandle = windowHandle;
-
             if (_initialized)
                 return;
-
+            _windowHandle = windowHandle;
             _initialized = true;
         }
 

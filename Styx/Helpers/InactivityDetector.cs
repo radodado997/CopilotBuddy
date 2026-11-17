@@ -43,10 +43,6 @@ namespace Styx.Helpers
         /// <param name="useForceQuit">If true, uses ForceQuit() instead of Logout().</param>
         public static void ForceLogout(bool useForceQuit)
         {
-            // This logout is deliberate: tell Auto Relogin to stay out of the way,
-            // otherwise it would log the character straight back in after the grace.
-            Styx.Logic.Relogin.ReloginManager.Instance.NotifyIntentionalLogout();
-
             if (!useForceQuit)
             {
                 Lua.DoString("Logout()");
