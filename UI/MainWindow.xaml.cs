@@ -557,6 +557,29 @@ namespace CopilotBuddy.UI
             _isClosing = true;
             try { _startupCts.Cancel(); } catch { /* already disposed */ }
 
+            // Auto-relogin first: retiring the monitor bumps the generation, so any attach or
+            // relaunch it still has in flight aborts before it can publish a hook or a pid.
+            // Stop() is bounded, and the generation check inside TryAttachAndHook is what
+            // covers work that outlives the join. Doing it here — not after
+            // ObjectManager.Shutdown() — keeps it from touching the client during teardown.
+            try
+            {
+                ReloginManager.Stop();
+                ReloginManager.ResumeBot -= ReloginManager_ResumeBot;
+            }
+            catch (Exception ex)
+            {
+                Logging.WriteDebug("[Relogin] Monitor shutdown failed: {0}", ex.Message);
+            }
+
+            // Release any process claim made for a relaunched client that was never resumed.
+            try
+            {
+                Mutex? claimed = ReloginManager.TakeClaimedMutex();
+                claimed?.Dispose();
+            }
+            catch { /* already released */ }
+
             // HB 6.2.3/Legion pattern: close all auxiliary windows first.
             foreach (Window window in System.Windows.Application.Current.Windows.Cast<Window>().ToList())
             {
@@ -670,19 +693,6 @@ namespace CopilotBuddy.UI
             }
             catch { /* Mutex may already be released */ }
 
-            // Auto-relogin: stop the monitor last. It is stopped before the process mutex is
-            // released so it can never race a new attach, but only after ObjectManager.Shutdown()
-            // so it cannot try to attach while the teardown above is still running.
-            try
-            {
-                ReloginManager.Stop();
-                ReloginManager.ResumeBot -= ReloginManager_ResumeBot;
-            }
-            catch (Exception ex)
-            {
-                Logging.WriteDebug("[Relogin] Monitor shutdown failed: {0}", ex.Message);
-            }
-
             // Cleanup
             Logging.OnLogMessage -= OnLogMessage;
             BotEvents.OnBotStarted -= BotEvents_OnBotStarted;
@@ -712,6 +722,34 @@ namespace CopilotBuddy.UI
 
             if (!startup.IsCompleted)
                 Logging.Write("Startup thread did not finish within {0} ms; continuing shutdown.", timeoutMs);
+        }
+
+        /// <summary>How long a relaunched client may take to become usable after the world loads.</summary>
+        private const int ReadyTimeoutSeconds = 30;
+
+        /// <summary>
+        /// Waits until the attached client can actually host the bot: the object manager has a
+        /// valid local player and the world is entered. Yields to the dispatcher between
+        /// polls (this is called on the UI thread) instead of blocking it, and abandons the
+        /// wait as soon as the window closes or the recovery run is retired.
+        /// </summary>
+        private async Task<bool> WaitForClientReadyAsync(int generation)
+        {
+            var deadline = Stopwatch.StartNew();
+            while (deadline.Elapsed < TimeSpan.FromSeconds(ReadyTimeoutSeconds))
+            {
+                if (_isClosing || !ReloginManager.IsCurrentGeneration(generation))
+                    return false;
+
+                try { ObjectManager.Update(); } catch { /* still loading */ }
+
+                if (ObjectManager.Me != null && ObjectManager.Me.BaseAddress != 0U && StyxWoW.IsInWorld)
+                    return true;
+
+                await Task.Delay(500);
+            }
+
+            return false;
         }
 
         private static bool WaitForTreeRootStop(int timeoutMs)
@@ -1260,11 +1298,13 @@ namespace CopilotBuddy.UI
         ///
         /// Runs on a ThreadPool thread (the monitor thread must not block on the dispatcher).
         /// </summary>
-        private void ReloginManager_ResumeBot()
+        private async void ReloginManager_ResumeBot(int generation)
         {
+            // The generation has to survive both hops: the ThreadPool -> dispatcher hop below
+            // and the wait that follows. Retired work must not start the bot.
             if (Dispatcher.Thread != Thread.CurrentThread)
             {
-                Dispatcher.BeginInvoke(new Action(ReloginManager_ResumeBot));
+                Dispatcher.BeginInvoke(new Action<int>(ReloginManager_ResumeBot), generation);
                 return;
             }
 
@@ -1276,6 +1316,12 @@ namespace CopilotBuddy.UI
                     return;
                 }
 
+                if (!ReloginManager.IsCurrentGeneration(generation))
+                {
+                    Logging.WriteDebug("[Relogin] Resume skipped: that recovery run was cancelled.");
+                    return;
+                }
+
                 // Adopt the (possibly relaunched) client and make sure the bot knows it. The
                 // monitor already attached + hooked it; this re-syncs the pid and the UI.
                 int pid = ReloginManager.AttachedProcessId;
@@ -1283,6 +1329,15 @@ namespace CopilotBuddy.UI
                 {
                     _selectedWoWProc = pid;
                     ReloginManager.SetAttachedProcess(pid);
+
+                    // The mutex this window holds names the client that crashed. Take over the
+                    // claim the manager made for the replacement so no other instance attaches.
+                    Mutex? claimed = ReloginManager.TakeClaimedMutex();
+                    if (claimed != null)
+                    {
+                        try { _processMutex?.Dispose(); } catch { /* already released */ }
+                        _processMutex = claimed;
+                    }
                 }
 
                 // A relaunched client has a new window: point the hotkeys at it.
@@ -1291,14 +1346,13 @@ namespace CopilotBuddy.UI
 
                 // The client can still be finishing its loading screen when the in-world flag
                 // flips. The bot cannot start from that state ("cannot be started while not
-                // ingame"), so wait for the object manager to be usable first.
-                var readyWait = Stopwatch.StartNew();
-                while (readyWait.Elapsed < TimeSpan.FromSeconds(30) && !_isClosing)
+                // ingame"), so wait for the object manager to be usable first. The wait yields
+                // to the dispatcher (this runs on the UI thread) instead of blocking it.
+                if (!await WaitForClientReadyAsync(generation))
                 {
-                    try { ObjectManager.Update(); } catch { /* still loading */ }
-                    if (ObjectManager.Me != null && ObjectManager.Me.BaseAddress != 0U && StyxWoW.IsInWorld)
-                        break;
-                    Thread.Sleep(500);
+                    Logging.Write(Colors.Red, "[Relogin] Resume failed: the client did not become ready within {0}s; leaving the bot stopped.",
+                        ReadyTimeoutSeconds);
+                    return;
                 }
 
                 LoadSettings();
@@ -1332,6 +1386,20 @@ namespace CopilotBuddy.UI
                     // Wait for that shutdown to finish so a new worker is not started over it.
                     if (!WaitForTreeRootStop(5000))
                         Logging.Write("[Relogin] Previous bot thread did not stop in time; resuming anyway.");
+                }
+
+                // Last gate: the profile load above is file I/O, so cancellation and the
+                // client state are rechecked immediately before the bot is started.
+                if (_isClosing || !ReloginManager.IsCurrentGeneration(generation))
+                {
+                    Logging.WriteDebug("[Relogin] Resume cancelled before the bot was started.");
+                    return;
+                }
+
+                if (!StyxWoW.IsInWorld || ObjectManager.Me == null || ObjectManager.Me.BaseAddress == 0U)
+                {
+                    Logging.Write(Colors.Red, "[Relogin] Resume failed: the client is no longer in the world; leaving the bot stopped.");
+                    return;
                 }
 
                 Logging.Write("[Relogin] Resuming botbase: {0}", BotManager.Current.Name);

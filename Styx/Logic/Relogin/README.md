@@ -68,7 +68,7 @@ character, and the file must exist before the bot has ever attached).
 | `LoginScreenTimeoutSeconds` | (file only) | `120` | wait for a readable glue screen / for login to complete |
 | `InWorldTimeoutSeconds` | (file only) | `180` | wait for `g_ClientConnectionState` + `LocalPlayer` after `EnterWorld` |
 | `HangGraceSeconds` | (file only) | `45` | sustained non-responsiveness before a hang counts as a crash; `0` disables hang detection |
-| `LoginRejectSeconds` | (file only) | `20` | a login that fails faster than this is a credential rejection, not an unreachable server |
+| `LoginRejectSeconds` | (file only) | `20` | a login that fails faster than this *and* never reached the connecting state is a credential rejection, not an unreachable server |
 
 ### Storage format — plain text
 
@@ -121,15 +121,23 @@ Three triggers, each logged with its reason:
 3. **`ClientLoggedOut`** — the client dropped out of the world to `login`/`charselect` **and stayed
    there for 5 s**, **and** the bot was running at that moment (`TreeRoot.IsRunning`).
 
+The logout transition is tracked with an explicit `pendingLogout` state rather than by comparing
+against the previous poll. `lastInWorld` is still updated every poll, but the confirmation timer
+is owned by the pending state, which is what lets it accumulate across the polls that follow the
+transition. It is cleared when the client is back in the world, when the bot is stopped, when the
+loading screen is up, and when recovery starts.
+
 ### Why lag / a normal logout never triggers it
 
 * **Memory-read failures are not a trigger.** `ReadProcessMemory` returning false (lag, a page not
   resident, a GC pause in the client) only produces `GlueKind.Unknown` for that one poll. The
   logout trigger needs five *consecutive* seconds of a *named* glue screen; the hang trigger uses
   the window's `Responding` state, not memory reads, and needs a sustained stall.
-* **Zoning/loading** keeps `g_ClientConnectionState` at 0 only briefly, and while loading the glue
-  string is `""` or `charselect` — the 5 s confirmation covers the transition. (EnterWorld →
-  loading → in-world never shows a stable `login` screen, so it cannot fire.)
+* **Loading screens are read explicitly.** `g_ClientConnectionState` drops to 0 while a loading
+  screen is up, so the probe also reads `IsLoadingOrConnecting` (`0x00B6AA38`). Those polls reset
+  the logout timer instead of counting toward it, which is what keeps zoning and the initial
+  loading screen out of the detector entirely. (EnterWorld → loading → in-world never shows a
+  stable `login` screen, so it cannot fire even without this.)
 * **A user logout** (`Logout`/`Exit Game` to character select or the login form) is ignored because
   the bot is stopped at that point: the logout trigger requires `TreeRoot.IsRunning`. The
   `ProcessExited` trigger still applies if the user closes the client while the bot is attached —
@@ -160,15 +168,19 @@ Three triggers, each logged with its reason:
 
 ### Wrong password vs. unreachable server
 
-Both end up back on the `login` screen, so they are separated by timing:
+Both end up back on the `login` screen and the client exposes **no explicit rejection flag**
+(there is no glue-error offset in this codebase), so two independent observations are required
+before calling it a credential problem:
 
-* rejection arrives quickly (auth handshake answered, credentials refused) → if it happens within
-  `LoginRejectSeconds`, it is reported as **"credentials rejected by the server (wrong account name
-  or password)"** and is **fatal** — no retry loop of the same wrong password;
-* a server that is down usually never answers, so the login form comes back only after the
-  client's own timeout (long after `LoginRejectSeconds`) → reported as
-  **"the server did not answer the login attempt (unreachable or realm offline)"** and retried up
-  to the budget.
+1. the client **never** entered the loading/connecting state (`IsLoadingOrConnecting`) after the
+   credentials were submitted — authentication never got far enough to reach the world server, and
+2. it came back within `LoginRejectSeconds`.
+
+Only then is it reported as **"the server refused the login …"** and treated as **fatal**, so the
+same wrong password is not retried in a loop. If the client *did* connect (the flag went up) the
+attempt is reported as a connection failure and stays retryable, and a slow bounce past
+`LoginRejectSeconds` is likewise retried. This means an incorrect password on a reachable server
+is classified correctly in both the fast-reject and the connected-then-dropped cases.
 
 ---
 
@@ -192,7 +204,9 @@ Both end up back on the `login` screen, so they are separated by timing:
    * `realmwizard`/`movie`/`credits`/`trialconvert` → realm list chunk / dismiss,
    * `charcreate` → `CharacterCreate_Back()`,
    * `charselect` → `CharacterSelect_SelectCharacter(i)` + `EnterWorld()`, or `RequestRealmList(1)`
-     if the configured realm is not the current one,
+     if the configured realm is not the current one. Consecutive realm-switch requests are
+     counted; after `MaxRealmSwitches` (5) the attempt fails with "the client could not switch to
+     realm …" instead of spinning until the screen timeout,
    * `patchdownload` → fatal.
 4. **In-world confirmation** (`ConfirmInWorld`): `g_ClientConnectionState != 0` **and**
    `ObjectManager.Me != null`. `EnterWorld` is re-issued at 15 s / 30 s / 45 s in case the first
@@ -201,7 +215,9 @@ Both end up back on the `login` screen, so they are separated by timing:
    `MainWindow.ReloginManager_ResumeBot` (on the UI thread):
    * adopts the new pid, re-points the hotkeys at the new window
      (`HotkeysManager.UpdateWindowHandle` — `Initialize` is one-shot),
-   * waits (bounded 30 s) until `StyxWoW.IsInWorld` and the object manager are usable,
+   * waits (bounded 30 s) until `StyxWoW.IsInWorld` and the object manager are usable, yielding to
+     the dispatcher between polls; if it expires the bot is left **stopped** and the failure is
+     reported rather than starting anyway,
    * `LoadSettings()` (re-creates per-character settings for the character),
    * reloads `LevelbotSettings.LastUsedPath` / `CharacterSettings.LastUsedPath` via
      `ProfileManager.LoadNew`,

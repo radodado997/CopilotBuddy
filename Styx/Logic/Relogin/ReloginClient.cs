@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Text;
+using System.Threading;
 using GreenMagic;
 using Styx.Helpers;
 using Styx.Offsets;
@@ -51,6 +52,13 @@ namespace Styx.Logic.Relogin
     {
         /// <summary>g_ClientConnectionState — 1 once CGGameUI__EnterWorld ran, 0 on LeaveWorld.</summary>
         private const uint InGameOffset = GlobalOffsets.InGame;
+
+        /// <summary>
+        /// Non-zero while the client is on a loading screen / connecting. During that window
+        /// g_ClientConnectionState is already 0 but the player has not logged out, so the
+        /// logout detector must not count these polls.
+        /// </summary>
+        private const uint LoadingOffset = GlobalOffsets.IsLoadingOrConnecting;
 
         /// <summary>Length of the glue screen-name buffer at GlueScreenString.</summary>
         private const int GlueStringLength = 32;
@@ -229,21 +237,26 @@ namespace Styx.Logic.Relogin
             public readonly string GlueRaw;
             /// <summary>Mapped glue screen name.</summary>
             public readonly GlueKind Glue;
-            /// <summary>True when at least one of the two reads succeeded.</summary>
+            /// <summary>True when at least one of the reads succeeded.</summary>
             public readonly bool Readable;
+            /// <summary>Loading screen / connecting — not in world, but not logged out either.</summary>
+            public readonly bool Loading;
 
-            public ClientProbe(bool inGame, string glueRaw, GlueKind glue, bool readable)
+            public ClientProbe(bool inGame, string glueRaw, GlueKind glue, bool readable, bool loading = false)
             {
                 InGame = inGame;
                 GlueRaw = glueRaw ?? "";
                 Glue = glue;
                 Readable = readable;
+                Loading = loading;
             }
 
             public override string ToString()
             {
                 if (!Readable) return "unreadable";
-                return InGame ? "in world" : ("glue: " + (GlueRaw.Length > 0 ? GlueRaw : "?"));
+                if (InGame) return "in world";
+                if (Loading) return "loading";
+                return "glue: " + (GlueRaw.Length > 0 ? GlueRaw : "?");
             }
         }
 
@@ -267,9 +280,12 @@ namespace Styx.Logic.Relogin
                 bool inGame = false;
                 try { inGame = memory.Read<byte>(InGameOffset) != 0; } catch { }
 
+                bool loading = false;
+                try { loading = memory.Read<byte>(LoadingOffset) != 0; } catch { }
+
                 GlueKind glue = ReadGlueScreen(memory, out string raw, out bool glueReadable);
 
-                return new ClientProbe(inGame, raw, glue, inGame || glueReadable);
+                return new ClientProbe(inGame, raw, glue, inGame || glueReadable, loading);
             }
             catch
             {
@@ -289,7 +305,15 @@ namespace Styx.Logic.Relogin
         /// The hook is installed while the client is still on the glue screen: the login Lua
         /// needs the executor, and the executor is what the whole bot uses afterwards.
         /// </summary>
-        internal static Memory? TryAttachAndHook(int pid, out string error)
+        /// <summary>
+        /// Called with the new pid right before a replacement client is attached, so the
+        /// process can be claimed through <see cref="ProcessMutex"/>. Returns the claimed
+        /// mutex, or null plus a reason when the client must not be attached to (already
+        /// owned by another instance, or the claim failed).
+        /// </summary>
+        internal static Func<int, (Mutex? Mutex, string Error)>? ClaimProcess;
+
+        internal static Memory? TryAttachAndHook(int pid, out string error, bool isReplacement = false)
         {
             error = "";
             Memory? memory = null;
@@ -306,11 +330,33 @@ namespace Styx.Logic.Relogin
                     _attachedPid = 0;
                 }
 
+                // A client this feature launched is a new pid: the mutex MainWindow holds still
+                // names the dead client, so claim the replacement before attaching to it. If the
+                // claim fails, another instance owns that client and attaching would fight it.
+                Mutex? claim = null;
+                if (isReplacement && ClaimProcess != null)
+                {
+                    (Mutex? Mutex, string Error) claimed;
+                    try { claimed = ClaimProcess(pid); }
+                    catch (Exception ex) { claimed = (null, ex.Message); }
+
+                    if (claimed.Mutex == null)
+                    {
+                        error = string.IsNullOrEmpty(claimed.Error)
+                            ? "the relaunched client could not be claimed"
+                            : claimed.Error;
+                        return null;
+                    }
+
+                    claim = claimed.Mutex;
+                }
+
                 memory = new Memory(pid);
                 if (!memory.IsProcessOpen)
                 {
                     error = "OpenProcess failed (access denied or process exiting)";
                     memory.Dispose();
+                    try { claim?.Dispose(); } catch { }
                     return null;
                 }
 
@@ -320,6 +366,7 @@ namespace Styx.Logic.Relogin
                     error = "EndScene hook could not be installed";
                     ObjectManager.Shutdown();
                     memory.Dispose();
+                    try { claim?.Dispose(); } catch { }
                     return null;
                 }
 

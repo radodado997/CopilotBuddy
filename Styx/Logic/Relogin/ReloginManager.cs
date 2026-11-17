@@ -134,6 +134,14 @@ namespace Styx.Logic.Relogin
         private static volatile bool _sequenceActive;
         private static volatile bool _gaveUp;
 
+        /// <summary>
+        /// ProcessMutex claim for a client this feature launched. The mutex MainWindow holds
+        /// belongs to the client it attached to, which after a crash is the dead one, so the
+        /// replacement has to be claimed here or a second CopilotBuddy could attach to it.
+        /// Handed over to MainWindow when the bot resumes.
+        /// </summary>
+        private static Mutex? _claimedMutex;
+
         private static Config _config = new Config();
         private static int _processId;
 
@@ -154,7 +162,13 @@ namespace Styx.Logic.Relogin
         /// Raised once, after a relogin attempt reached the in-world state. The handler must
         /// restart the bot (the caller maps this to the normal Start path).
         /// </summary>
-        public static event Action? ResumeBot;
+        /// <summary>
+        /// Raised (on a ThreadPool thread) once a client is confirmed in world. The argument is
+        /// the recovery generation that produced it: subscribers that hop to another thread
+        /// must carry it and check <see cref="IsCurrentGeneration"/> before starting the bot,
+        /// so retired or cancelled recovery work can never start it.
+        /// </summary>
+        public static event Action<int>? ResumeBot;
 
         #endregion
 
@@ -188,6 +202,38 @@ namespace Styx.Logic.Relogin
 
                 if (processId > 0)
                     _processId = processId;
+
+                // Claiming is delegated so ReloginClient stays free of manager state. The
+                // returned mutex is stored here and handed to MainWindow on resume.
+                ReloginClient.ClaimProcess = pid =>
+                {
+                    try
+                    {
+                        Mutex mutex = ProcessMutex.Create(pid, out bool createdNew);
+                        if (!createdNew)
+                        {
+                            // Another CopilotBuddy already owns this client: don't attach.
+                            mutex.Close();
+                            string message = string.Format(
+                                "the relaunched client (pid {0}) is already claimed by another CopilotBuddy instance", pid);
+                            Logging.Write(Colors.Red, "[Relogin] Cannot attach: {0}.", message);
+                            return (null, message);
+                        }
+
+                        // _sync is not taken here: Start()/Stop() already hold it when the
+                        // delegate is installed, and the sequence runs on the monitor thread
+                        // where a re-entrant lock would deadlock. Assignment is atomic.
+                        Mutex? previous = Interlocked.Exchange(ref _claimedMutex, mutex);
+                        try { previous?.Dispose(); } catch { }
+
+                        return (mutex, "");
+                    }
+                    catch (Exception ex)
+                    {
+                        Logging.WriteDebug("[Relogin] Could not claim pid {0}: {1}", pid, ex.Message);
+                        return (null, "the relaunched client could not be claimed: " + ex.Message);
+                    }
+                };
 
                 _gaveUp = false;
                 _attempt = 0;
@@ -249,6 +295,21 @@ namespace Styx.Logic.Relogin
         /// <summary>The client pid the monitor is currently watching.</summary>
         public static int AttachedProcessId => _processId;
 
+        /// <summary>
+        /// Takes ownership of the process claim created for a relaunched client, if any. The
+        /// caller (the main window) then becomes responsible for disposing it. Returns null
+        /// when no replacement client was launched, i.e. the existing claim still applies.
+        /// </summary>
+        internal static Mutex? TakeClaimedMutex()
+        {
+            lock (_sync)
+            {
+                Mutex? claimed = _claimedMutex;
+                _claimedMutex = null;
+                return claimed;
+            }
+        }
+
         #endregion
 
         #region Monitor
@@ -282,12 +343,22 @@ namespace Styx.Logic.Relogin
             return generation == Volatile.Read(ref _generation);
         }
 
+        /// <summary>
+        /// Public form of the generation check, for code that resumes on another thread (the
+        /// UI) and must not act on recovery work that was retired while it was queued.
+        /// </summary>
+        public static bool IsCurrentGeneration(int generation) => IsCurrent(generation);
+
+        /// <summary>The live monitor generation, for a subscriber that has not been given one.</summary>
+        public static int CurrentGeneration => Volatile.Read(ref _generation);
+
         private static void MonitorLoop(int generation)
         {
             Process? client = null;
             var unresponsiveFor = new Stopwatch();
             var notInWorldFor = new Stopwatch();
             bool? lastInWorld = null;
+            bool pendingLogout = false;
 
             try
             {
@@ -311,7 +382,12 @@ namespace Styx.Logic.Relogin
 
                     // Re-resolve every poll: after a relaunch the old Process object refers to
                     // the dead client, and re-using it would immediately look like another exit.
-                    client = ReloginClient.FindProcessById(_processId) ?? ReloginClient.FindClientProcessByName();
+                    // Name discovery is only a bootstrap: once this session tracks a pid, a
+                    // vanished pid means the client we were watching died. Adopting some other
+                    // running client instead would silently hijack a process the user started.
+                    client = _processId > 0
+                        ? ReloginClient.FindProcessById(_processId)
+                        : ReloginClient.FindClientProcessByName();
                     if (client != null)
                         _processId = client.Id;
 
@@ -321,6 +397,9 @@ namespace Styx.Logic.Relogin
                         FireTrigger(ReloginTrigger.ProcessExited, "client process is gone", generation);
                         client = null;
                         unresponsiveFor.Reset();
+                        notInWorldFor.Reset();
+                        pendingLogout = false;
+                        lastInWorld = null;
                         SleepPollSlices(generation);
                         continue;
                     }
@@ -347,6 +426,7 @@ namespace Styx.Logic.Relogin
                                 generation);
                             unresponsiveFor.Reset();
                             notInWorldFor.Reset();
+                            pendingLogout = false;
                             lastInWorld = null;
                             continue;
                         }
@@ -359,9 +439,26 @@ namespace Styx.Logic.Relogin
                     }
 
                     // ---- Logout detection: dropped from the world to the login screen -----
+                    // The transition has to be remembered across polls: after the first poll
+                    // without the in-world flag, lastInWorld is false, so the confirmation
+                    // window must be carried by an explicit pending state instead.
                     if (probe.Readable)
                     {
-                        if (lastInWorld == true && !probe.InGame)
+                        if (probe.InGame)
+                        {
+                            if (pendingLogout)
+                                Logging.WriteDebug("[Relogin] Client is back in the world; pending logout cancelled.");
+                            pendingLogout = false;
+                            notInWorldFor.Reset();
+                        }
+                        else if (probe.Loading)
+                        {
+                            // Loading screen / connecting: the in-world flag drops to 0 here,
+                            // but this is not a logout, so these polls never count toward it.
+                            pendingLogout = false;
+                            notInWorldFor.Reset();
+                        }
+                        else if (pendingLogout || lastInWorld == true)
                         {
                             // Only while the bot is actually running: if the bot is stopped the
                             // user is in control of the client, and a logout to the login or
@@ -371,36 +468,38 @@ namespace Styx.Logic.Relogin
 
                             if (!botWasRunning)
                             {
+                                pendingLogout = false;
                                 notInWorldFor.Reset();
                                 Logging.WriteDebug("[Relogin] Client left the world while the bot is stopped; not a crash, so no relogin.");
                             }
                             else if (probe.Glue == GlueKind.Login || probe.Glue == GlueKind.CharSelect)
                             {
                                 // The glue screen must be stable for a few seconds first: a
-                                // zoning/loading transition briefly races the flag.
-                                if (!notInWorldFor.IsRunning)
+                                // zoning transition briefly races the flag.
+                                if (!pendingLogout)
                                 {
-                                    notInWorldFor.Start();
+                                    pendingLogout = true;
+                                    notInWorldFor.Restart();
                                 }
                                 else if (notInWorldFor.Elapsed.TotalSeconds >= LogoutConfirmSeconds)
                                 {
+                                    // Recovery starts: the pending state is cleared so a
+                                    // second logout cannot fire while this one is handled.
+                                    pendingLogout = false;
+                                    notInWorldFor.Reset();
+                                    lastInWorld = null;
                                     FireTrigger(ReloginTrigger.ClientLoggedOut,
                                         string.Format("client returned to {0} and stayed there for {1}s",
                                             probe.Glue, LogoutConfirmSeconds),
                                         generation);
-                                    notInWorldFor.Reset();
-                                    lastInWorld = null;
                                     continue;
                                 }
                             }
                             else
                             {
+                                pendingLogout = false;
                                 notInWorldFor.Reset();
                             }
-                        }
-                        else
-                        {
-                            notInWorldFor.Reset();
                         }
 
                         lastInWorld = probe.InGame;
@@ -425,6 +524,13 @@ namespace Styx.Logic.Relogin
 
         /// <summary>How long the login/character-selection screen has to be stable to count as a logout.</summary>
         private const int LogoutConfirmSeconds = 5;
+
+        /// <summary>
+        /// How many consecutive "switch to the configured realm" answers are tolerated before
+        /// the attempt is failed. Enough for a normal realm-list round trip, short enough that
+        /// a character that lives on another realm is reported instead of timing out.
+        /// </summary>
+        private const int MaxRealmSwitches = 5;
 
         private static bool IsWindowNotResponding(Process client)
         {
@@ -523,11 +629,20 @@ namespace Styx.Logic.Relogin
                 _sequenceActive = false;
                 CurrentStep = ReloginStep.Idle;
 
+                // A claim is only meaningful for a client that was successfully brought back;
+                // anything else must not keep a stale pid claimed.
+                if (!resumed)
+                {
+                    Mutex? abandoned = TakeClaimedMutex();
+                    try { abandoned?.Dispose(); } catch { }
+                }
+
                 if (resumed && IsCurrent(generation))
                 {
                     // Only now, with the in-world state confirmed, does the routine/profile
                     // resume — through the caller's normal Start path.
-                    ThreadPool.QueueUserWorkItem(_ => ResumeBot?.Invoke());
+                    int resumeGeneration = generation;
+                    ThreadPool.QueueUserWorkItem(_ => ResumeBot?.Invoke(resumeGeneration));
                 }
             }
         }
@@ -537,7 +652,7 @@ namespace Styx.Logic.Relogin
         {
             return reason != null &&
                    (reason.Contains("executable path", StringComparison.OrdinalIgnoreCase)
-                    || reason.Contains("credentials rejected", StringComparison.OrdinalIgnoreCase)
+                    || reason.Contains("server refused the login", StringComparison.OrdinalIgnoreCase)
                     || reason.Contains("not configured", StringComparison.OrdinalIgnoreCase)
                     || reason.Contains("updater", StringComparison.OrdinalIgnoreCase));
         }
@@ -571,6 +686,7 @@ namespace Styx.Logic.Relogin
             // ---- 1. Client process ---------------------------------------------------
             CurrentStep = ReloginStep.StartingClient;
             Process? client = _processId > 0 ? ReloginClient.FindProcessById(_processId) : null;
+            bool launchedReplacement = false;
 
             // A hung client is still running, so it has to be closed before it can be
             // relaunched — otherwise the relaunch would just attach to the frozen process.
@@ -584,6 +700,15 @@ namespace Styx.Logic.Relogin
 
                 Logging.Write("[Relogin] Unresponsive client closed.");
                 client = null;
+
+                // TerminateClient blocks for as long as the close takes. If the monitor was
+                // retired meanwhile (settings saved, bot stopped, app closing), no replacement
+                // may be launched: a retired generation must not publish a new pid or attach.
+                if (!IsCurrent(generation))
+                {
+                    failure = "stopped";
+                    return false;
+                }
             }
 
             if (client == null)
@@ -599,6 +724,12 @@ namespace Styx.Logic.Relogin
                     return false;
                 }
 
+                if (!IsCurrent(generation))
+                {
+                    failure = "stopped";
+                    return false;
+                }
+
                 Logging.Write("[Relogin] Starting client: {0}", _config.WowExecutablePath);
                 client = ReloginClient.StartClient(_config.WowExecutablePath, out string startError);
                 if (client == null)
@@ -608,6 +739,7 @@ namespace Styx.Logic.Relogin
                 }
 
                 _processId = client.Id;
+                launchedReplacement = true;
                 Logging.Write("[Relogin] Client started, pid {0}.", _processId);
             }
             else
@@ -634,7 +766,7 @@ namespace Styx.Logic.Relogin
 
                 if (!ReloginClient.IsAttached(pid))
                 {
-                    Memory? attached = ReloginClient.TryAttachAndHook(pid, out string hookError);
+                    Memory? attached = ReloginClient.TryAttachAndHook(pid, out string hookError, launchedReplacement);
                     if (attached == null)
                     {
                         Logging.WriteDebug("[Relogin] Hook not ready yet ({0}); retrying.", hookError);
@@ -676,7 +808,9 @@ namespace Styx.Logic.Relogin
             CurrentStep = ReloginStep.WaitingForCharacterSelect;
             var selectWait = Stopwatch.StartNew();
             int submissions = 0;
+            int realmSwitches = 0;
             bool entered = false;
+            bool sawLoadingSinceSubmit = false;
 
             while (selectWait.Elapsed.TotalSeconds < _config.LoginScreenTimeoutSeconds)
             {
@@ -691,6 +825,12 @@ namespace Styx.Logic.Relogin
                     break;
                 }
 
+                // Remember whether authentication ever got past the login form: it is what
+                // separates "the server refused these credentials" from "the server was not
+                // reachable", and the client exposes no explicit rejection flag.
+                if (probe.Loading)
+                    sawLoadingSinceSubmit = true;
+
                 switch (probe.Glue)
                 {
                     case GlueKind.CharSelect:
@@ -701,6 +841,7 @@ namespace Styx.Logic.Relogin
                         {
                             case 1:
                                 CurrentStep = ReloginStep.WaitingForInWorld;
+                                realmSwitches = 0;
                                 Logging.Write("[Relogin] Character '{0}' selected; EnterWorld issued.", _config.CharacterName);
                                 entered = true;
                                 break;
@@ -713,12 +854,33 @@ namespace Styx.Logic.Relogin
 
                             case 2:
                                 // Not really on the character screen (realm list / loading).
+                                realmSwitches = 0;
                                 ReloginClient.SendLogin(_config.AccountName, _config.Password, _config.RealmName);
                                 submissions++;
                                 break;
 
+                            case 3:
+                                // The client is on a different realm and was asked to go back
+                                // to the realm list. A handful of these is normal while the
+                                // switch completes; a client that keeps asking means the realm
+                                // is not reachable for this account, so report that instead of
+                                // spinning until the screen timeout.
+                                if (++realmSwitches > MaxRealmSwitches)
+                                {
+                                    failure = string.Format(
+                                        "the client could not switch to realm '{0}' (character '{1}' is not reachable there)",
+                                        string.IsNullOrEmpty(_config.RealmName) ? "?" : _config.RealmName,
+                                        _config.CharacterName);
+                                    return false;
+                                }
+                                Logging.WriteVerbose("[Relogin] Switching to realm '{0}' ({1}/{2}).",
+                                    _config.RealmName, realmSwitches, MaxRealmSwitches);
+                                ReloginClient.SendLogin(_config.AccountName, _config.Password, _config.RealmName);
+                                break;
+
                             default:
-                                // 0 = list still loading, 3 = realm switch requested, -1 = Lua failed
+                                // 0 = list still loading, -1 = Lua failed. Reading again is enough.
+                                realmSwitches = 0;
                                 break;
                         }
                         break;
@@ -726,20 +888,37 @@ namespace Styx.Logic.Relogin
                     case GlueKind.Login:
                         CurrentStep = ReloginStep.LoggingIn;
 
-                        // Credentials bounce back to this screen when the attempt failed. A
-                        // fast bounce means the server rejected the account/password; a slow
-                        // one means the server could not be reached at all. Reporting them
-                        // separately is what stops us from retrying a wrong password.
-                        if (submissions > 0 && selectWait.Elapsed.TotalSeconds < _config.LoginRejectSeconds)
+                        // Credentials bounce back to this screen when the attempt failed, and
+                        // the client gives no explicit "rejected" flag. Two independent signals
+                        // are therefore required before calling it a credential problem:
+                        //   1. the client never entered the loading/connecting state, i.e.
+                        //      authentication never got far enough to talk to the world server,
+                        //      and
+                        //   2. it came back faster than LoginRejectSeconds.
+                        // If the client did connect (or came back slowly) authentication may
+                        // still have been in progress, so the attempt stays retryable.
+                        if (submissions > 0)
                         {
-                            failure = "credentials rejected by the server (wrong account name or password)";
-                            return false;
+                            double sinceSubmit = selectWait.Elapsed.TotalSeconds;
+                            if (!sawLoadingSinceSubmit && sinceSubmit < _config.LoginRejectSeconds)
+                            {
+                                failure = string.Format(
+                                    "the server refused the login for '{0}' (wrong account name or password, or the account is not allowed to log in)",
+                                    _config.AccountName);
+                                return false;
+                            }
+
+                            if (sawLoadingSinceSubmit)
+                            {
+                                Logging.Write("[Relogin] Client reached the connecting state and came back to the login screen; treating as a connection failure, not bad credentials.");
+                            }
                         }
 
                         Logging.WriteVerbose("[Relogin] Submitting credentials for {0} (attempt {1}).",
                             _config.AccountName, submissions + 1);
                         ReloginClient.SendLogin(_config.AccountName, _config.Password, _config.RealmName);
                         submissions++;
+                        sawLoadingSinceSubmit = false;
                         break;
 
                     case GlueKind.RealmWizard:
