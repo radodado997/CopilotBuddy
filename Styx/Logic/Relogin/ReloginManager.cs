@@ -74,6 +74,14 @@ namespace Styx.Logic.Relogin
 
         /// <summary>Set by RequestLoggedInSignal (any thread), consumed by Tick.</summary>
         private volatile bool _loggedInSignalRequested;
+
+        /// <summary>
+        /// Set by the UI (BeginUiDetach) while it tears its attachment down after a loss
+        /// event and cleared by it once DetachFromGame returned (EndUiDetach). The relogin
+        /// sequence waits for it before it restarts or launches a client and before it types
+        /// credentials, so the two state machines do not interleave on the same client.
+        /// </summary>
+        private volatile bool _uiDetachInProgress;
         private DateTime? _outOfGameSinceUtc;
         private DateTime _nextAttemptUtc = DateTime.MinValue;
         private int _pinnedProcessId;
@@ -231,6 +239,59 @@ namespace Styx.Logic.Relogin
         {
             _loggedInSignalRequested = true;
             try { _wake.Set(); } catch { /* disposed */ }
+        }
+
+        /// <summary>
+        /// Announces that the UI is about to detach from the lost client. Called before its
+        /// detach worker starts, so the monitor defers the relogin instead of launching a
+        /// client and typing into it while the old attachment is still being shut down.
+        /// </summary>
+        public void BeginUiDetach()
+        {
+            _uiDetachInProgress = true;
+        }
+
+        /// <summary>
+        /// Announces that the UI finished detaching (called once <c>DetachFromGame</c>
+        /// returned, or when the detach was abandoned because the application is closing).
+        /// </summary>
+        public void EndUiDetach()
+        {
+            _uiDetachInProgress = false;
+        }
+
+        /// <summary>
+        /// Waits (bounded) while the UI is still detaching. Returns false when the sequence
+        /// has to be abandoned (shutdown / feature disabled); the caller then leaves the
+        /// attempt to the next tick, which keeps the existing grace period, the _busy check
+        /// and the stop-request checks untouched.
+        /// </summary>
+        private bool WaitForUiDetach()
+        {
+            if (!_uiDetachInProgress)
+                return true;
+
+            SetStatus("Waiting for CopilotBuddy to detach from the client.");
+
+            // The detach also waits for a bot tick that may be stuck in native code; after a
+            // bounded wait the sequence continues anyway, because the attachment belongs to
+            // the client that is already gone and blocking the monitor would only delay the
+            // session further.
+            const int maxWaitMs = 15000;
+
+            for (int waited = 0; waited < maxWaitMs && _uiDetachInProgress; waited += 250)
+            {
+                if (!SleepInterruptible(250))
+                    return false;
+            }
+
+            if (_uiDetachInProgress)
+            {
+                Logging.Write(System.Windows.Media.Colors.Orange,
+                    "[AutoRelogin] CopilotBuddy is still detaching after {0}s; continuing with the relogin.", maxWaitMs / 1000);
+            }
+
+            return true;
         }
 
         /// <summary>True when a client process is currently in the world.</summary>
@@ -420,6 +481,11 @@ namespace Styx.Logic.Relogin
             if (DateTime.UtcNow < _nextAttemptUtc)
                 return;
 
+            // The loss event that brought us here also starts the UI's detach worker; it
+            // must be done before this sequence restarts or launches a client.
+            if (!WaitForUiDetach())
+                return;
+
             _busy = true;
             try
             {
@@ -483,6 +549,12 @@ namespace Styx.Logic.Relogin
                         return;
                 }
 
+                // The detach may have begun after this sequence claimed the work (the loss
+                // event is dispatched asynchronously); never launch the replacement client
+                // into a half torn down attachment.
+                if (!WaitForUiDetach())
+                    return;
+
                 SetStatus("Starting the game client.");
                 client = ReloginNative.StartClient(settings.WowExePath, settings.WowArguments);
                 if (client == null)
@@ -513,6 +585,12 @@ namespace Styx.Logic.Relogin
             // Every keystroke below is aimed at the game window: if it cannot be brought
             // to the foreground we stop instead of typing the password into whatever
             // window happens to have the focus.
+            // Never type into the client while the previous attachment is still being torn
+            // down (the detach can start late if the loss event was dispatched while a
+            // relaunch was already in progress).
+            if (!WaitForUiDetach())
+                return;
+
             SetStatus("Sending credentials.");
             if (!EnsureClientFocus(window, settings))
                 return;

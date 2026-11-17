@@ -959,24 +959,41 @@ namespace CopilotBuddy.UI
 
             _infoTimer?.Stop();
 
+            // Announce the detach before the worker starts: the monitor waits for this
+            // signal before it restarts or launches a client and before it types
+            // credentials, so the relogin cannot interleave with the teardown below.
+            try { ReloginManager.Instance.BeginUiDetach(); }
+            catch (Exception ex) { Logging.WriteDebug("Auto Relogin: could not announce the detach: {0}", ex.Message); }
+
             _detachTask = Task.Run(() =>
             {
-                // The worker must be gone before the EndScene hook and the process
-                // handles are released, or it keeps ticking against a dead client. A tick
-                // in native or CPU bound work can outlive one 15 s window; TreeRoot.Stop()
-                // only interrupts managed waits, and the worker reaches Stopped in its
-                // finally once the current tick returns. Waiting longer is therefore safe,
-                // while detaching on a timeout would pull the resources from under it -
-                // keep waiting, and only give up when the application is closing.
-                while (!WaitForTreeRootStop(15000) && !_isClosing && !_startupCts.IsCancellationRequested)
-                    Logging.Write("Auto Relogin: the bot thread is still stopping; waiting before detaching.");
+                try
+                {
+                    // The worker must be gone before the EndScene hook and the process
+                    // handles are released, or it keeps ticking against a dead client. A tick
+                    // in native or CPU bound work can outlive one 15 s window; TreeRoot.Stop()
+                    // only interrupts managed waits, and the worker reaches Stopped in its
+                    // finally once the current tick returns. Waiting longer is therefore safe,
+                    // while detaching on a timeout would pull the resources from under it -
+                    // keep waiting, and only give up when the application is closing.
+                    while (!WaitForTreeRootStop(15000) && !_isClosing && !_startupCts.IsCancellationRequested)
+                        Logging.Write("Auto Relogin: the bot thread is still stopping; waiting before detaching.");
 
-                // Window_Closing tears the attachment down itself; detaching a second
-                // time here would race with ObjectManager.Shutdown().
-                if (_isClosing || _startupCts.IsCancellationRequested)
-                    return;
+                    // Window_Closing tears the attachment down itself; detaching a second
+                    // time here would race with ObjectManager.Shutdown().
+                    if (_isClosing || _startupCts.IsCancellationRequested)
+                        return;
 
-                DetachFromGame();
+                    DetachFromGame();
+                }
+                finally
+                {
+                    // Released only after DetachFromGame returned (or when the detach was
+                    // abandoned because the application is closing): the monitor waits for
+                    // this before it touches the client.
+                    try { ReloginManager.Instance.EndUiDetach(); }
+                    catch (Exception ex) { Logging.WriteDebug("Auto Relogin: could not release the detach signal: {0}", ex.Message); }
+                }
 
                 // A ClientLoggedIn that arrived while we were detaching was parked above;
                 // handle it now that the old attachment is gone, otherwise the client
