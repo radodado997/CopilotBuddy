@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Diagnostics;
@@ -22,6 +22,7 @@ using Styx.CommonBot;
 using Styx.Helpers;
 using Styx.Logic.BehaviorTree;
 using Styx.Logic.Profiles;
+using Styx.Logic.Relogin;
 using Styx.WoWInternals;
 
 using WpfFontFamily = System.Windows.Media.FontFamily;
@@ -57,6 +58,77 @@ namespace CopilotBuddy.UI
         /// HB 4.3.4 pattern.
         /// </summary>
         private int? _selectedWoWProc;
+
+        /// <summary>
+        /// Auto Relogin event wiring happens once; the handlers survive every
+        /// detach/attach cycle (the manager outlives a single game client).
+        /// </summary>
+        private bool _reloginWired;
+
+        /// <summary>True when the bot was running at the moment the client went away.</summary>
+        private bool _wasRunningBeforeRelogin;
+
+        /// <summary>
+        /// The command-line auto-load/auto-start tail of the startup path has not run yet
+        /// (the startup path never completed an attach, and a replayed loss kept the late
+        /// attach from applying it). Carried until a successful attach applies it.
+        /// </summary>
+        private bool _pendingAutoStartConfig;
+
+        /// <summary>
+        /// Set while the client is being relaunched and the bot re-attached, so a
+        /// burst of manager events cannot start two recoveries at once.
+        /// </summary>
+        private volatile bool _reloginInProgress;
+
+        /// <summary>
+        /// 0 = no re-attach in flight, 1 = one is running. Guards against two
+        /// simultaneous attach sequences (Interlocked, so it is race free).
+        /// </summary>
+        private int _reattachRunning;
+
+        /// <summary>The running re-attach sequence, awaited by Window_Closing.</summary>
+        private Task? _reattachTask;
+
+        /// <summary>The running detach sequence, awaited by Window_Closing.</summary>
+        private Task? _detachTask;
+
+        /// <summary>Consecutive failed re-attach sequences (reset by a successful one).</summary>
+        private int _reattachFailures;
+
+        /// <summary>
+        /// A ClientLost / ClientDisconnected that arrived while a recovery was already in
+        /// flight. Stored (not dropped) and replayed once the re-attach worker released the
+        /// attachment: -1 = pending with pid 0, 0 = nothing pending.
+        /// </summary>
+        private int _pendingRecoveryPid;
+
+        /// <summary>
+        /// Serializes the recovery-ownership handoff: the ownership read and the park in
+        /// <see cref="DispatchClientRecovery"/> must not interleave with the flag clear and
+        /// the drain of the pending slot that every owner performs when it finishes (the
+        /// startup finally, the re-attach finally and the recovery callbacks). Without it a
+        /// loss stored between a drain and the next read would keep the slot occupied with
+        /// nobody left to replay it.
+        /// </summary>
+        private readonly object _recoveryGate = new object();
+
+        /// <summary>How often a failed re-attach asks the monitor for another attempt.</summary>
+        private const int MaxReattachRetries = 10;
+
+        /// <summary>
+        /// Set when a ClientLoggedIn event arrives while the detachment is still in
+        /// flight: the attach would fail (ObjectManager is still initialized), so the
+        /// pid is parked here and retried once DetachFromGame() has finished.
+        /// </summary>
+        private int _pendingLoggedInPid;
+
+        /// <summary>
+        /// 0 = the one-time, attachment independent initialization has not run yet.
+        /// It must happen exactly once per process, no matter whether the first client
+        /// was attached by the startup path or by Auto Relogin much later.
+        /// </summary>
+        private int _globalInitDone;
 
         #endregion
 
@@ -177,22 +249,32 @@ namespace CopilotBuddy.UI
             SetStatus("Searching for WoW...");
             ToggleButtons(false);
 
+            // Auto Relogin has to be configurable *before* a client exists (that is the
+            // whole point of "start the game for me"), so Settings stays reachable even
+            // while nothing is attached.
+            btnSettings.IsEnabled = true;
+
             CancellationToken startupToken = _startupCts.Token;
             _startupTask = Task.Run(() =>
             {
                 try
                 {
+                    // Auto Relogin: wire the events first (they are needed by both the
+                    // startup wait below and by every later crash/disconnect), then let
+                    // the manager start the client if nothing is running.
+                    InitializeAutoRelogin();
+
                     if (!FindAndAttachToWoW(startupToken))
-                        return;
+                    {
+                        // With Auto Relogin enabled the client may simply not be running
+                        // yet: the monitor starts it and logs in, then we retry the attach.
+                        if (!WaitForAutoReloginAndAttach(startupToken))
+                            return;
+                    }
 
                     if (ObjectManager.IsInitialized)
                     {
                         Logging.Write("Attached to WoW with ID {0}", _selectedWoWProc!.Value);
-
-                        // HB 6.2.3 smethod_3: Start minimize guard thread + event handlers
-                        TreeRoot.Initialize();
-                        BotEvents.OnBotStarted += BotEvents_OnBotStarted;
-                        BotEvents.OnBotStopped += BotEvents_OnBotStopped;
 
                         // Log character info (HB 4.3.4 pattern after attach)
                         if (ObjectManager.Me != null)
@@ -205,11 +287,18 @@ namespace CopilotBuddy.UI
                             Logging.Write("Current zone is {0}", ObjectManager.Me.RealZoneText);
                         }
 
-                        // Reinitialize and load settings for this character (HB 4.3.4 pattern)
+                        // Reinitialize and load settings for this character (HB 4.3.4 pattern).
+                        // Must run before the plugin initialization below: that one reads
+                        // CharacterSettings.EnabledPlugins for the freshly attached character.
                         LoadSettings();
 
-                        // Initialize Combat Routines (compile and load from Routines folder)
-                        // This must be done AFTER attachment when ObjectManager.Me is available
+                        // One-time, attachment independent initialization: tree hooks, bot
+                        // events, external bots, plugins. Shared with the Auto Relogin
+                        // late-attach path so a reconnect never doubles the subscriptions.
+                        EnsureGlobalBotInitialization();
+
+                        // Initialize Combat Routines (compile and load from the Routines folder).
+                        // This must be done AFTER attachment when ObjectManager.Me is available.
                         try
                         {
                             Styx.Logic.Combat.RoutineManager.Init();
@@ -217,43 +306,6 @@ namespace CopilotBuddy.UI
                         catch (Exception ex)
                         {
                             Logging.Write(Colors.Red, "Failed to initialize combat routines: {0}", ex.Message);
-                            Logging.WriteException(ex);
-                        }
-
-                        // Load additional bots from Bots folder (external/custom bots)
-                        try
-                        {
-                            string botsPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Bots");
-                            if (Directory.Exists(botsPath))
-                            {
-                                BotManager.Instance.LoadBots(botsPath);
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            Logging.WriteException(ex);
-                        }
-
-                        // Initialize plugins (compile and load from Plugins folder)
-                        try
-                        {
-                            Logging.Write("Initializing Plugins...");
-                            
-                            // Pre-load System.Drawing.Common for plugin compilation
-                            try
-                            {
-                                // Force load System.Drawing.Common into AppDomain
-                                var _ = System.Drawing.Font.FromHdc(IntPtr.Zero);
-                            }
-                            catch { /* Ignore, just ensure assembly is loaded */ }
-                            
-                            // Load previously enabled plugins from CharacterSettings
-                            var enabledPlugins = CharacterSettings.Instance.EnabledPlugins ?? new string[0];
-                            Styx.Plugins.PluginManager.Initialize(enabledPlugins);
-                        }
-                        catch (Exception ex)
-                        {
-                            Logging.Write(Colors.Red, "Failed to initialize plugins: {0}", ex.Message);
                             Logging.WriteException(ex);
                         }
 
@@ -316,6 +368,29 @@ namespace CopilotBuddy.UI
                             MessageBoxImage.Error);
                     });
                 }
+                finally
+                {
+                    // Startup no longer owns the attach. From here on Auto Relogin may
+                    // re-attach by itself - also when nothing was attached yet, because
+                    // the manager is the component that brings the client up and it
+                    // raises ClientLoggedIn once the character is in the world.
+                    _startupCompleted = true;
+
+                    // Nothing attached and we are not shutting down: the client may already
+                    // be in the world (the monitor saw it while the startup path was giving
+                    // up, or it came up just after the wait expired), in which case no
+                    // further ClientLoggedIn would ever be raised. Ask for one more.
+                    if (!_isClosing && !ObjectManager.IsInitialized)
+                    {
+                        try { ReloginManager.Instance.RequestLoggedInSignal(); }
+                        catch (Exception ex) { Logging.WriteDebug("Auto Relogin: could not request a login signal: {0}", ex.Message); }
+                    }
+
+                    // Replay a client loss that arrived while startup owned the attachment
+                    // (it was parked, not dropped, by DispatchClientRecovery). The pid guard
+                    // there decides whether it still concerns the current attachment.
+                    ReplayParkedRecovery("the client was lost during startup");
+                }
             });
         }
 
@@ -332,7 +407,11 @@ namespace CopilotBuddy.UI
         ///   6. If 2+: show ProcessSelectorWindow
         ///   7. Attach to selected process
         /// </summary>
-        private bool FindAndAttachToWoW(CancellationToken cancellationToken = default)
+        /// <param name="preferPid">
+        /// When set, that client is attached even if several clients are running. Used by the
+        /// unattended Auto Relogin path, which must never open the process selector dialog.
+        /// </param>
+        private bool FindAndAttachToWoW(CancellationToken cancellationToken = default, int preferPid = 0)
         {
             // Cancelled while the user was closing the window: never start an attach.
             if (cancellationToken.IsCancellationRequested || _isClosing)
@@ -346,6 +425,30 @@ namespace CopilotBuddy.UI
             // Step 1: Check for /pid= command line argument
             string? pidArg = Environment.GetCommandLineArgs()
                 .FirstOrDefault(s => s.StartsWith("/pid=", StringComparison.OrdinalIgnoreCase));
+
+            // An explicit /pid= target stays authoritative while that process is alive, so
+            // the relogin pid only takes over once it exited (or when there was no /pid=).
+            int commandLinePid = GetCommandLinePid();
+
+            if (preferPid != 0 && (commandLinePid == 0 || !ReloginNative.IsProcessAlive(commandLinePid)))
+                pidArg = "/pid=" + preferPid;
+            else if (commandLinePid != 0)
+                pidArg = "/pid=" + commandLinePid;
+
+            // Keep the Auto Relogin monitor on the same client: without this it would
+            // follow the configured executable / the first live client and could log a
+            // *different* WoW in while the pinned one is still running. The pin is only
+            // held while that process lives - 0 means "follow any live client", which is
+            // also what a crashed /pid= target has to fall back to.
+            try
+            {
+                ReloginManager.Instance.PinnedProcessId =
+                    ReloginNative.IsProcessAlive(commandLinePid) ? commandLinePid : 0;
+            }
+            catch (Exception ex)
+            {
+                Logging.WriteDebug("Auto Relogin: could not pin the client: {0}", ex.Message);
+            }
 
             _selectedWoWProc = null;
             var candidates = new List<Process>();
@@ -485,6 +588,10 @@ namespace CopilotBuddy.UI
             // Step 4: Attach to selected process
             int wowPid = _selectedWoWProc.Value;
             Logging.Write(Colors.Green, "Please wait a few seconds while CopilotBuddy initializes.");
+            // Everything below can fail. The claim acquired in Step 2/3 must not survive a
+            // failed attach, otherwise the next attempt (and any other instance) sees the
+            // client as owned and the attach can never succeed again.
+
             Logging.WriteDebug("Using WoW with process ID {0}", wowPid);
             Logging.WriteDebug("Platform: {0}", Environment.Is64BitProcess ? "x64" : "x86");
             Logging.WriteDebug("Executable Path: {0}", AppDomain.CurrentDomain.BaseDirectory);
@@ -499,6 +606,7 @@ namespace CopilotBuddy.UI
                     memory.Dispose();
                     Logging.Write(Colors.Red, "Process ID {0} is not logged in game!", wowPid);
                     Dispatcher.Invoke(() => SetStatus("Not logged in"));
+                    ReleaseProcessMutex();
                     return false;
                 }
 
@@ -509,6 +617,7 @@ namespace CopilotBuddy.UI
                 {
                     memory.Dispose();
                     Logging.WriteDebug("Attach aborted: the application is closing.");
+                    ReleaseProcessMutex();
                     return false;
                 }
 
@@ -517,7 +626,11 @@ namespace CopilotBuddy.UI
                 // HB 6.2.3: Initialize hotkeys against the WoW window handle so that
                 // hotkeys activate when WoW is in the foreground, not CopilotBuddy.
                 HotkeysManager.Initialize(ObjectManager.WoWProcess!.MainWindowHandle);
-                HotkeysManager.Register("Core_BringBotToForeground", Keys.F7, Styx.Common.ModifierKeys.Shift, BringBotToForeground);
+
+                // Re-attaching after an Auto Relogin runs this method again. Register()
+                // allocates a new hotkey id on every call, so skip the duplicate.
+                if (!HotkeysManager.Hotkeys.Any(h => h.Name == "Core_BringBotToForeground"))
+                    HotkeysManager.Register("Core_BringBotToForeground", Keys.F7, Styx.Common.ModifierKeys.Shift, BringBotToForeground);
 
                 _memory = memory;
                 _executor = ObjectManager.Executor;
@@ -525,12 +638,802 @@ namespace CopilotBuddy.UI
             }
             catch (Exception ex)
             {
+                // Whatever got published before the failure is rolled back here; the claim
+                // must not outlive a failed attach.
+                try { ObjectManager.Shutdown(); } catch { /* best effort */ }
+                ReleaseProcessMutex();
+                _memory = null;
+                _executor = null;
+
                 Logging.Write(Colors.Red, "Error attaching to WoW! - {0}", ex.Message);
                 Logging.WriteException(ex);
                 Dispatcher.Invoke(() => SetStatus("Attach failed"));
                 return false;
             }
         }
+
+        /// <summary>
+        /// Drops the process claim taken by the last attach attempt. Safe to call when no
+        /// mutex is held. Must NOT be used after a successful attach - the claim protects
+        /// the attached session for its whole lifetime.
+        /// </summary>
+        private void ReleaseProcessMutex()
+        {
+            Mutex? mutex = Interlocked.Exchange(ref _processMutex, null);
+            if (mutex == null)
+                return;
+
+            try { mutex.Dispose(); } catch { /* already released */ }
+        }
+
+        #region Auto Relogin
+
+        /// <summary>
+        /// True once the startup task has finished and the UI is usable. Before that
+        /// the startup flow owns the attach, so the Auto Relogin re-attach handler
+        /// must stay out of its way.
+        /// </summary>
+        private volatile bool _startupCompleted;
+
+        /// <summary>
+        /// In-game state of the live client, for the post-detach re-arm: 1 = in the world,
+        /// 0 = readable and not in the world (including "no client at all"), -1 = the state
+        /// could not be determined because the process could not be read right now.
+        /// </summary>
+        private static int ProbeClientInGame()
+        {
+            try
+            {
+                Process? client = ReloginNative.FindClient(ReloginSettings.Instance.WowExePath,
+                    ReloginManager.Instance.PinnedProcessId);
+                if (client == null)
+                    return 0;
+
+                if (!ReloginNative.TryReadInGame(client, out bool inGame))
+                    return -1;
+
+                return inGame ? 1 : 0;
+            }
+            catch
+            {
+                return -1;
+            }
+        }
+
+        /// <summary>
+        /// Dispatches a client loss that was parked in <see cref="_pendingRecoveryPid"/>,
+        /// if any, so it is handled instead of lingering. Must be called on the UI thread
+        /// after recovery ownership was released.
+        /// </summary>
+        private bool ReplayParkedRecovery(string reason)
+        {
+            int pendingRecovery;
+            lock (_recoveryGate)
+                pendingRecovery = Interlocked.Exchange(ref _pendingRecoveryPid, 0);
+
+            if (pendingRecovery == 0 || _isClosing)
+                return false;
+
+            int pid = pendingRecovery == -1 ? 0 : pendingRecovery;
+
+            // A parked loss only concerns the client this window is attached to. When it
+            // names a different process, that client is already gone and a newer one was
+            // attached in its place: replaying the loss would detach a healthy attachment
+            // and throw away a bot that was just restarted. Report "nothing was replayed"
+            // so the caller keeps the running decision for the current client. Nothing is
+            // dropped while no attachment is published (ObjectManager.WoWProcess is only
+            // null until the attach completes), so a genuine loss is never lost here.
+            int attachedPid = 0;
+            try
+            {
+                if (ObjectManager.IsInitialized)
+                    attachedPid = ObjectManager.WoWProcess?.Id ?? 0;
+            }
+            catch (Exception ex)
+            {
+                Logging.WriteDebug("Auto Relogin: could not determine the attached client: {0}", ex.Message);
+            }
+
+            if (pid != 0 && attachedPid != 0 && pid != attachedPid)
+            {
+                Logging.WriteDebug(
+                    "Auto Relogin: dropping a parked client loss for pid {0}; the attached client is {1}.",
+                    pid, attachedPid);
+                return false;
+            }
+
+            Dispatcher.BeginInvoke(new Action<int, string>(DispatchClientRecovery), pid, reason);
+            return true;
+        }
+
+        /// <summary>
+        /// The pid from an explicit <c>/pid=</c> command line argument, 0 when there is
+        /// none (or it is not a number).
+        /// </summary>
+        private static int GetCommandLinePid()
+        {
+            try
+            {
+                string? pidArg = Environment.GetCommandLineArgs()
+                    .FirstOrDefault(s => s.StartsWith("/pid=", StringComparison.OrdinalIgnoreCase));
+
+                if (pidArg == null)
+                    return 0;
+
+                return int.TryParse(pidArg.Substring("/pid=".Length).Trim(), out int pid) ? pid : 0;
+            }
+            catch
+            {
+                return 0;
+            }
+        }
+
+        /// <summary>
+        /// Hooks the manager events (once) and starts the monitor when the feature is
+        /// enabled. Called from the startup task, i.e. off the UI thread.
+        /// </summary>
+        private void InitializeAutoRelogin()
+        {
+            try
+            {
+                if (!_reloginWired)
+                {
+                    _reloginWired = true;
+                    ReloginManager.Instance.ClientLost += OnReloginClientLost;
+                    ReloginManager.Instance.ClientDisconnected += OnReloginClientDisconnected;
+                    ReloginManager.Instance.ClientLoggedIn += OnReloginClientLoggedIn;
+                    ReloginManager.Instance.StatusChanged += OnReloginStatus;
+                }
+
+                ReloginSettings settings = ReloginSettings.Instance;
+                if (!settings.Enabled)
+                    return;
+
+                if (!settings.HasClientPath)
+                {
+                    Logging.Write(Colors.Red,
+                        "Auto Relogin is enabled but the WoW.exe path is missing or invalid: '{0}'", settings.WowExePath);
+                    return;
+                }
+
+                if (!settings.HasCredentials)
+                {
+                    Logging.Write(Colors.Red,
+                        "Auto Relogin is enabled but no account name / password is configured.");
+                }
+
+                // Pin the monitor to the explicit /pid= target *before* it starts, using
+                // the same rule as FindAndAttachToWoW: while that process is alive no other
+                // client may be logged in or adopted, and once it exits the pin falls back
+                // to any live client.
+                int commandLinePid = GetCommandLinePid();
+                ReloginManager.Instance.PinnedProcessId =
+                    ReloginNative.IsProcessAlive(commandLinePid) ? commandLinePid : 0;
+
+                // The startup task may be finishing while the window is already closing;
+                // Window_Closing stops the monitor before it waits for this task, so it must
+                // not be started again afterwards.
+                if (_isClosing || _startupCts.IsCancellationRequested)
+                    return;
+
+                ReloginManager.Instance.Start();
+                Logging.Write("Auto Relogin: monitoring the game client ({0}).", settings.WowExePath);
+            }
+            catch (Exception ex)
+            {
+                // Never let the optional relogin feature abort the startup sequence.
+                Logging.Write(Colors.Red, "Auto Relogin: initialization failed: {0}", ex.Message);
+                Logging.WriteDebug("[AutoRelogin] {0}", ex);
+            }
+        }
+
+        /// <summary>
+        /// Startup fallback: when no client could be attached and Auto Relogin is
+        /// enabled, wait for the monitor to start the client and log in, then attach.
+        /// </summary>
+        private bool WaitForAutoReloginAndAttach(CancellationToken cancellationToken)
+        {
+            ReloginSettings settings;
+            try
+            {
+                settings = ReloginSettings.Instance;
+            }
+            catch (Exception ex)
+            {
+                Logging.Write(Colors.Red, "Auto Relogin: settings unavailable: {0}", ex.Message);
+                return false;
+            }
+
+            if (!settings.Enabled || !settings.HasClientPath || !settings.HasCredentials)
+                return false;
+
+            // The application is already shutting down: do not start (or keep running) the
+            // monitor just to have it restarted by the next process.
+            if (cancellationToken.IsCancellationRequested || _isClosing)
+                return false;
+
+            Logging.Write("Auto Relogin: no client to attach to - starting it and logging in.");
+            Dispatcher.Invoke(() => SetStatus("Auto Relogin: starting WoW..."));
+
+            ReloginManager.Instance.Start();
+
+            // Closing can win the race between the cancellation check above and this start;
+            // the monitor must not relaunch a client during the teardown.
+            if (cancellationToken.IsCancellationRequested || _isClosing)
+            {
+                try { ReloginManager.Instance.Stop(); } catch { /* ignore */ }
+                return false;
+            }
+
+            // Cold start of the client + login + world load, with some slack.
+            int budgetMs = (settings.ClientStartupTimeoutSeconds
+                            + settings.CharSelectDelaySeconds
+                            + settings.EnterWorldTimeoutSeconds
+                            + 60) * 1000;
+
+            if (!ReloginManager.Instance.WaitForInGame(budgetMs, cancellationToken))
+            {
+                Logging.Write(Colors.Red, "Auto Relogin: the character did not reach the world in time.");
+                Dispatcher.Invoke(() => SetStatus("Auto Relogin failed"));
+                return false;
+            }
+
+            Logging.Write("Auto Relogin: client is in the world - attaching.");
+            return FindAndAttachToWoW(cancellationToken);
+        }
+
+        private void OnReloginClientLost(int pid)
+        {
+            DispatchClientRecovery(pid, "the game client is gone (crash or closed)");
+        }
+
+        private void OnReloginClientDisconnected(int pid)
+        {
+            DispatchClientRecovery(pid, "the character left the world (disconnect or logout)");
+        }
+
+        /// <summary>
+        /// Stops the bot, waits for the worker thread, then tears the attachment down
+        /// so the manager can restart/log in the client and we can attach again.
+        /// </summary>
+        private void DispatchClientRecovery(int pid, string reason)
+        {
+            if (Dispatcher.Thread != Thread.CurrentThread)
+            {
+                Dispatcher.BeginInvoke(new Action<int, string>(DispatchClientRecovery), pid, reason);
+                return;
+            }
+
+            if (_isClosing)
+                return;
+
+            // Ownership handoff: the startup worker owns the attachment until its finally
+            // releases it (_startupCompleted), _reloginInProgress covers a whole recovery
+            // (detach, relogin, re-attach) and _reattachRunning is the token of a re-attach
+            // worker - FindAndAttachToWoW, LoadSettings, EnsureGlobalBotInitialization and
+            // RoutineManager.Init all run under one of them. Detaching underneath those
+            // would corrupt what they publish, so the event is retained instead of dropped
+            // and replayed when the owner is done.
+            bool parked = false;
+            lock (_recoveryGate)
+            {
+                if (_reloginInProgress || !_startupCompleted || Volatile.Read(ref _reattachRunning) != 0)
+                {
+                    Interlocked.Exchange(ref _pendingRecoveryPid, pid == 0 ? -1 : pid);
+                    parked = true;
+                }
+            }
+
+            if (parked)
+            {
+                Logging.WriteDebug("Auto Relogin: {0} while a relogin/re-attach is in flight; replaying it afterwards.", reason);
+                return;
+            }
+
+            // Only recover the client this window is (or was) attached to.
+            if (_selectedWoWProc.HasValue && pid != 0 && pid != _selectedWoWProc.Value)
+                return;
+
+            _reloginInProgress = true;
+            _reattachFailures = 0;
+            Interlocked.Exchange(ref _pendingRecoveryPid, 0);
+            // OR-instead-of-assign: a loss that is replayed while a previous cycle is still
+            // recovering must not lose the original decision ("the bot was running") just
+            // because that cycle already stopped it. Reset after a successful attach.
+            _wasRunningBeforeRelogin = _wasRunningBeforeRelogin
+                                       || _isRunning
+                                       || TreeRoot.State != TreeRootState.Stopped;
+
+            Logging.Write(Colors.Orange, "Auto Relogin: {0}. Detaching from the client.", reason);
+
+            if (_isRunning)
+                StopBot();
+
+            SetStatus("Reconnecting...");
+            ToggleButtons(false);
+
+            // ToggleButtons(false) also disables Settings; keep it reachable, because a
+            // login that keeps failing (wrong password, realm down) is fixed there and
+            // the recovery can run for minutes.
+            btnSettings.IsEnabled = true;
+
+            _infoTimer?.Stop();
+
+            // Announce the detach before the worker starts: the monitor waits for this
+            // signal before it restarts or launches a client and before it types
+            // credentials, so the relogin cannot interleave with the teardown below.
+            try { ReloginManager.Instance.BeginUiDetach(); }
+            catch (Exception ex) { Logging.WriteDebug("Auto Relogin: could not announce the detach: {0}", ex.Message); }
+
+            _detachTask = Task.Run(() =>
+            {
+                try
+                {
+                    // The worker must be gone before the EndScene hook and the process
+                    // handles are released, or it keeps ticking against a dead client. A tick
+                    // in native or CPU bound work can outlive one 15 s window; TreeRoot.Stop()
+                    // only interrupts managed waits, and the worker reaches Stopped in its
+                    // finally once the current tick returns. Waiting longer is therefore safe,
+                    // while detaching on a timeout would pull the resources from under it -
+                    // keep waiting, and only give up when the application is closing.
+                    while (!WaitForTreeRootStop(15000) && !_isClosing && !_startupCts.IsCancellationRequested)
+                        Logging.Write("Auto Relogin: the bot thread is still stopping; waiting before detaching.");
+
+                    // Window_Closing tears the attachment down itself; detaching a second
+                    // time here would race with ObjectManager.Shutdown().
+                    if (_isClosing || _startupCts.IsCancellationRequested)
+                        return;
+
+                    DetachFromGame();
+                }
+                finally
+                {
+                    // Released only after DetachFromGame returned (or when the detach was
+                    // abandoned because the application is closing): the monitor waits for
+                    // this before it touches the client.
+                    try { ReloginManager.Instance.EndUiDetach(); }
+                    catch (Exception ex) { Logging.WriteDebug("Auto Relogin: could not release the detach signal: {0}", ex.Message); }
+                }
+
+                // A ClientLoggedIn that arrived while we were detaching was parked above;
+                // handle it now that the old attachment is gone, otherwise the client
+                // would have to be logged in twice before the bot comes back.
+                int pendingPid = Interlocked.Exchange(ref _pendingLoggedInPid, 0);
+                if (pendingPid != 0 && !_isClosing)
+                {
+                    Dispatcher.BeginInvoke(new Action<int>(OnReloginClientLoggedIn), pendingPid);
+                }
+                else if (!_isClosing && _reattachFailures <= MaxReattachRetries)
+                {
+                    // No login was parked, but the character may be back in the world
+                    // already (it reconnected while we were still attached or during the
+                    // drain above). The monitor's in-game state is latched in that case, so
+                    // it will not announce the login again on its own and this detached
+                    // application would never attach. Ask for a fresh transition - without
+                    // trusting a single read: a process that cannot be read right now must
+                    // not be mistaken for "not in the world". The monitor keeps its latched
+                    // state in that case, so the session would stay detached even after the
+                    // reads recover.
+                    int inGame = ProbeClientInGame();
+                    for (int attempt = 1; attempt <= 3 && inGame < 0 && !_isClosing; attempt++)
+                    {
+                        Logging.WriteDebug("Auto Relogin: could not read the in-game state after the detach (attempt {0}); retrying.", attempt);
+                        Thread.Sleep(1000);
+                        inGame = ProbeClientInGame();
+                    }
+
+                    // 1 = in the world and -1 = unreadable both need the signal. 0 = the
+                    // client is definitely out of the world, which the monitor detects (and
+                    // relogins) on its own. Requesting it unconditionally would be harmless
+                    // too, but this keeps the log meaningful.
+                    if (inGame != 0 && !_isClosing)
+                    {
+                        Logging.WriteDebug("Auto Relogin: requesting a login signal after the detach (in-game probe: {0}).", inGame);
+                        try { ReloginManager.Instance.RequestLoggedInSignal(); }
+                        catch (Exception ex) { Logging.WriteDebug("Auto Relogin: could not request a login signal after the detach: {0}", ex.Message); }
+                    }
+                }
+            });
+        }
+
+        /// <summary>
+        /// Releases the current attachment (hook, handles, mutex) but keeps the
+        /// application alive. Runs on a worker thread - never touch the UI here.
+        /// </summary>
+        private void DetachFromGame()
+        {
+            // Take our own state out of the fields FIRST; ObjectManager.Shutdown() below is
+            // the detach-completion boundary. ObjectManager.IsInitialized (=> Wow != null)
+            // only becomes false inside that call and a new attach is only allowed once it
+            // is false, so no re-attach can publish _processMutex/_memory/_selectedWoWProc
+            // while this method is still clearing them - clearing them afterwards could
+            // wipe (and dispose) the freshly published attachment.
+            //
+            // The process claim itself stays alive until the shutdown returned: another
+            // CopilotBuddy must not be able to claim the client while the EndScene hook is
+            // still being restored. Only the field is cleared here, the mutex is disposed
+            // in the finally below.
+            Mutex? mutex = Interlocked.Exchange(ref _processMutex, null);
+            _memory = null;
+            _executor = null;
+            _selectedWoWProc = null;
+
+            try
+            {
+                ObjectManager.Shutdown();
+            }
+            catch (Exception ex)
+            {
+                Logging.WriteDebug("Auto Relogin: ObjectManager.Shutdown failed: {0}", ex.Message);
+            }
+            finally
+            {
+                try { mutex?.Dispose(); } catch { /* already released */ }
+            }
+
+            // Make sure the monitor keeps running: it is the component that brings the
+            // client back, and it also re-raises ClientLoggedIn when the world is up.
+            // Not while closing: Window_Closing has already stopped it and must not have
+            // it restarted (and relaunching clients) underneath the teardown.
+            if (!_isClosing && !_startupCts.IsCancellationRequested)
+            {
+                try { ReloginManager.Instance.Start(); } catch { /* ignore */ }
+            }
+
+            Logging.WriteDebug("Auto Relogin: detached; waiting for the client to come back.");
+        }
+
+        private void OnReloginClientLoggedIn(int pid)
+        {
+            if (Dispatcher.Thread != Thread.CurrentThread)
+            {
+                Dispatcher.BeginInvoke(new Action<int>(OnReloginClientLoggedIn), pid);
+                return;
+            }
+
+            if (_isClosing || !_startupCompleted)
+                return;
+
+            // An explicit /pid= target is authoritative while it is alive: never attach to
+            // a different client on its behalf (the monitor falls back to any live client
+            // on its own once the pinned process is gone).
+            int pinnedPid = ReloginManager.Instance.PinnedProcessId;
+            if (pinnedPid != 0 && pid != pinnedPid && ReloginNative.IsProcessAlive(pinnedPid))
+            {
+                Logging.WriteDebug("Auto Relogin: ignoring client {0} - the pinned client {1} is still running.", pid, pinnedPid);
+                return;
+            }
+
+            // Already attached to a live client. Either the event is just the monitor
+            // noticing a healthy session, or the detachment triggered by ClientLost /
+            // ClientDisconnected has not finished yet (ObjectManager is still initialized
+            // for a moment). In the second case the login must not be dropped: park the
+            // pid and let the detach task retry once the attachment is gone.
+            if (ObjectManager.IsInitialized)
+            {
+                if (!_reloginInProgress)
+                    return;
+
+                Interlocked.Exchange(ref _pendingLoggedInPid, pid);
+                Logging.WriteDebug("Auto Relogin: client {0} is in the world while detaching; will attach when the detach finishes.", pid);
+
+                if (ObjectManager.IsInitialized)
+                    return;
+
+                // The detach finished between the check above and the store, so the detach
+                // task has already drained the pending pid and nobody would pick it up.
+                // Take it back and continue through the normal attach path below.
+                pid = Interlocked.Exchange(ref _pendingLoggedInPid, 0);
+                if (pid == 0)
+                    return;
+            }
+
+            // One re-attach at a time. This also covers the case where the recovery
+            // handshake is still in flight: the client is in the world, so attaching
+            // now is exactly what we want.
+            if (Interlocked.CompareExchange(ref _reattachRunning, 1, 0) != 0)
+                return;
+
+            Logging.Write(Colors.Green, "Auto Relogin: client {0} is in the world - re-attaching.", pid);
+            _reattachTask = Task.Run(() => ReattachAfterRelogin(pid));
+        }
+
+        /// <summary>
+        /// Re-attaches to the freshly logged in client and restarts the bot if it was
+        /// running when the client went away. Runs on a worker thread.
+        /// </summary>
+        private void ReattachAfterRelogin(int pid)
+        {
+            bool requestAnother = false;
+
+            try
+            {
+                CancellationToken token = _startupCts.Token;
+                bool attached = false;
+
+                for (int attempt = 1; attempt <= 6 && !token.IsCancellationRequested && !_isClosing; attempt++)
+                {
+                    if (attempt > 1)
+                    {
+                        Logging.WriteDebug("Auto Relogin: re-attach attempt {0}.", attempt);
+                        Thread.Sleep(5000);
+                    }
+
+                    if (FindAndAttachToWoW(token, pid) && ObjectManager.IsInitialized)
+                    {
+                        attached = true;
+                        break;
+                    }
+                }
+
+                if (!attached)
+                {
+                    Logging.Write(Colors.Red, "Auto Relogin: could not re-attach to the client.");
+
+                    // Ask the monitor for another ClientLoggedIn on a later tick: the
+                    // client is in the world, so waiting for the character to leave and
+                    // re-enter would never retry. Bounded, so an unattachable client
+                    // (e.g. another CopilotBuddy owns it) does not retry forever.
+                    // The request itself is raised in the finally below, once this
+                    // sequence has released _reattachRunning - otherwise the event it
+                    // triggers would be swallowed by the guard of the sequence that is
+                    // still winding down.
+                    requestAnother = ++_reattachFailures <= MaxReattachRetries
+                                     && !_isClosing
+                                     && !_startupCts.IsCancellationRequested;
+
+                    if (!requestAnother)
+                        Logging.Write(Colors.Red,
+                            "Auto Relogin: giving up on re-attaching. Attach again manually (restart CopilotBuddy) once the problem is solved.");
+
+                    Dispatcher.BeginInvoke(new Action(() =>
+                    {
+                        if (_isClosing) return;
+                        _reloginInProgress = false;
+
+                        // No attachment exists, so Start/Stop stay disabled - the bot
+                        // cannot be started without a client. Settings stay reachable.
+                        btnSettings.IsEnabled = true;
+                        ReplayParkedRecovery("the client went away during a relogin");
+                        SetStatus(requestAnother
+                            ? "Auto Relogin: waiting for the client"
+                            : "Auto Relogin: re-attach failed");
+                    }));
+                    return;
+                }
+
+                _reattachFailures = 0;
+
+                Logging.Write("Attached to WoW with ID {0}", _selectedWoWProc!.Value);
+
+                // Same complete initialization the startup path performs, in the same order:
+                // settings first (the plugin initialization reads CharacterSettings), then
+                // the global block - which only runs once per process, so a plain reconnect
+                // does not duplicate event subscriptions - then the combat routines.
+                LoadSettings();
+                bool globalInitRanNow = EnsureGlobalBotInitialization();
+
+                // The combat routines were compiled against the previous attachment.
+                try
+                {
+                    Styx.Logic.Combat.RoutineManager.Init();
+                }
+                catch (Exception ex)
+                {
+                    Logging.Write(Colors.Red, "Failed to initialize combat routines: {0}", ex.Message);
+                    Logging.WriteException(ex);
+                }
+
+                Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    if (_isClosing) return;
+
+                    // Populate the bot selector when the client only came up now (the
+                    // startup path could not fill it because nothing was attached).
+                    PopulateBotSelectorIfNeeded();
+
+                    ToggleButtons(true);
+                    _infoTimer?.Start();
+                    SetStatus("CopilotBuddy Startup Complete");
+
+                    // Release recovery ownership and consume anything parked while we had
+                    // it, in the same UI operation: a loss queued before this callback can
+                    // execute after it, and would otherwise stay parked with nobody left to
+                    // replay it (the app would keep the stale attachment and ignore the
+                    // replacement client's login).
+                    _reloginInProgress = false;
+                    bool lossReplayed = ReplayParkedRecovery("the client went away during a relogin");
+
+                    // A replayed loss means the client went away again right after this
+                    // attach; starting the bot now would only stop it again a moment later.
+                    // The running decision is kept for the next successful attach.
+                    bool restartBot = !lossReplayed
+                                      && _wasRunningBeforeRelogin
+                                      && ReloginSettings.Instance.RestartBotAfterRelogin;
+
+                    if (!lossReplayed)
+                        _wasRunningBeforeRelogin = false;
+
+                    if (restartBot && BotManager.Current != null)
+                    {
+                        Logging.Write("Auto Relogin: restarting the bot.");
+                        StartBot();
+                    }
+                    else if (restartBot)
+                    {
+                        Logging.Write(Colors.Red,
+                            "Auto Relogin: the character is back but no botbase is selected - pick one and press Start.");
+                    }
+                    else if (globalInitRanNow || _pendingAutoStartConfig)
+                    {
+                        // The startup path never completed an attach, so its tail -
+                        // command-line auto-load/auto-start - still has to run. A normal
+                        // reconnect never gets here (restartBot covers that case).
+                        if (lossReplayed)
+                        {
+                            // The client went away again before this attach could settle;
+                            // applying the tail now would race with the replayed loss and
+                            // would be attributed to a client that is already gone. Keep it
+                            // pending for the next successful attach.
+                            _pendingAutoStartConfig = true;
+                            Logging.WriteDebug("Auto Relogin: the client went away again; the command-line auto-start configuration is deferred to the next attach.");
+                        }
+                        else
+                        {
+                            ApplyAutoStartConfig();
+                            _pendingAutoStartConfig = false;
+                        }
+                    }
+                }));
+            }
+            catch (Exception ex)
+            {
+                Logging.Write(Colors.Red, "Auto Relogin: re-attach failed: {0}", ex.Message);
+                Logging.WriteException(ex);
+                _reloginInProgress = false;
+            }
+            finally
+            {
+                // Allow the next relogin to start a fresh attach sequence.
+                Interlocked.Exchange(ref _reattachRunning, 0);
+
+                // A login parked while this sequence ran is stale now: on success the
+                // attachment already exists, on failure the re-signal below produces a
+                // fresh ClientLoggedIn. Draining it keeps a later detach from dispatching
+                // an attach for a pid that nobody is waiting for any more.
+                Interlocked.Exchange(ref _pendingLoggedInPid, 0);
+
+                // Only now ask for another ClientLoggedIn: the monitor answers on its
+                // next tick, and that event has to find _reattachRunning released.
+                if (requestAnother)
+                {
+                    try { ReloginManager.Instance.RequestLoggedInSignal(); }
+                    catch (Exception ex) { Logging.WriteDebug("Auto Relogin: could not request another attempt: {0}", ex.Message); }
+                }
+
+                // Replay a loss that arrived while this worker owned the attachment. The
+                // UI callbacks above were queued earlier, so _reloginInProgress is cleared
+                // by the time this dispatch runs.
+                ReplayParkedRecovery("the client went away again");
+            }
+        }
+
+        /// <summary>
+        /// One-time initialization that does not depend on a particular character: the
+        /// TreeRoot hooks, the bot event subscriptions, the external botbases and the
+        /// plugin containers. Runs exactly once per process - either right after the first
+        /// successful attach at startup, or (when the client only came up later) from the
+        /// Auto Relogin re-attach. Returns true when it ran on this call.
+        /// </summary>
+        private bool EnsureGlobalBotInitialization()
+        {
+            if (Interlocked.CompareExchange(ref _globalInitDone, 1, 0) != 0)
+                return false;
+
+            // HB 6.2.3 smethod_3: start the minimize guard thread + event handlers
+            try
+            {
+                TreeRoot.Initialize();
+                BotEvents.OnBotStarted += BotEvents_OnBotStarted;
+                BotEvents.OnBotStopped += BotEvents_OnBotStopped;
+            }
+            catch (Exception ex)
+            {
+                Logging.Write(Colors.Red, "Failed to initialize the behavior tree: {0}", ex.Message);
+                Logging.WriteException(ex);
+            }
+
+            // Load additional bots from the Bots folder (external/custom bots)
+            try
+            {
+                string botsPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Bots");
+                if (Directory.Exists(botsPath))
+                {
+                    BotManager.Instance.LoadBots(botsPath);
+                }
+            }
+            catch (Exception ex)
+            {
+                Logging.WriteException(ex);
+            }
+
+            // Initialize plugins (compile and load from the Plugins folder)
+            try
+            {
+                Logging.Write("Initializing Plugins...");
+
+                // Pre-load System.Drawing.Common for plugin compilation
+                try
+                {
+                    // Force load System.Drawing.Common into AppDomain
+                    var _ = System.Drawing.Font.FromHdc(IntPtr.Zero);
+                }
+                catch { /* Ignore, just ensure assembly is loaded */ }
+
+                // Load previously enabled plugins from CharacterSettings (null when the
+                // settings for this character have not been initialized yet)
+                var enabledPlugins = CharacterSettings.Instance?.EnabledPlugins ?? new string[0];
+                Styx.Plugins.PluginManager.Initialize(enabledPlugins);
+            }
+            catch (Exception ex)
+            {
+                Logging.Write(Colors.Red, "Failed to initialize plugins: {0}", ex.Message);
+                Logging.WriteException(ex);
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// Fills the bot selector if the startup path could not do it (no client was
+        /// attached when the window opened and Auto Relogin brought it up later).
+        /// Must run on the UI thread.
+        /// </summary>
+        private void PopulateBotSelectorIfNeeded()
+        {
+            try
+            {
+                if (cmbBotSelector.Items.Count > 0)
+                    return;
+
+                cmbBotSelector.Items.Clear();
+                foreach (var bot in BotManager.Instance.Bots)
+                    cmbBotSelector.Items.Add(bot.Key);
+
+                if (cmbBotSelector.Items.Count == 0)
+                    return;
+
+                int selectedIndex = CharacterSettings.Instance?.SelectedBotIndex ?? 0;
+                if (selectedIndex < 0 || selectedIndex >= cmbBotSelector.Items.Count)
+                {
+                    selectedIndex = 0;
+                    if (CharacterSettings.Instance != null)
+                        CharacterSettings.Instance.SelectedBotIndex = 0;
+                }
+
+                cmbBotSelector.SelectedIndex = selectedIndex;
+            }
+            catch (Exception ex)
+            {
+                Logging.WriteDebug("Auto Relogin: could not populate the bot selector: {0}", ex.Message);
+            }
+        }
+
+        private void OnReloginStatus(string status)
+        {
+            Logging.WriteVerbose("[AutoRelogin] {0}", status);
+
+            if (_isClosing)
+                return;
+
+            Dispatcher.BeginInvoke(new Action(() =>
+            {
+                if (!_isClosing)
+                    SetStatus("Auto Relogin: " + status);
+            }));
+        }
+
+        #endregion
 
         private void Window_Closing(object sender, System.ComponentModel.CancelEventArgs e)
         {
@@ -545,6 +1448,31 @@ namespace CopilotBuddy.UI
             // EndScene hook after teardown has begun.
             _isClosing = true;
             try { _startupCts.Cancel(); } catch { /* already disposed */ }
+
+            // Auto Relogin must stop before the process teardown below: it holds no
+            // handles itself, but it must not launch a new client while we are exiting.
+            try
+            {
+                ReloginManager.Instance.Stop();
+                ReloginSettings.Instance.Save();
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine("[AutoRelogin] teardown failed: " + ex.Message);
+            }
+
+            if (_reloginWired)
+            {
+                try
+                {
+                    ReloginManager.Instance.ClientLost -= OnReloginClientLost;
+                    ReloginManager.Instance.ClientDisconnected -= OnReloginClientDisconnected;
+                    ReloginManager.Instance.ClientLoggedIn -= OnReloginClientLoggedIn;
+                    ReloginManager.Instance.StatusChanged -= OnReloginStatus;
+                }
+                catch { /* ignore */ }
+                _reloginWired = false;
+            }
 
             // HB 6.2.3/Legion pattern: close all auxiliary windows first.
             foreach (Window window in System.Windows.Application.Current.Windows.Cast<Window>().ToList())
@@ -573,6 +1501,13 @@ namespace CopilotBuddy.UI
             // if the attach already got past its last checkpoint it publishes the executor, and
             // Shutdown has to run afterwards to restore EndScene deterministically.
             WaitForStartupToStop(5000);
+
+            // An Auto Relogin detach or re-attach may be in flight (both attach/detach and
+            // call Dispatcher.Invoke); they must finish before ObjectManager.Shutdown()
+            // below. The detach task also checks _isClosing and returns without touching
+            // the attachment once this handler has started.
+            WaitForDetachToStop(5000);
+            WaitForReattachToStop(5000);
 
             // The startup callback above was retired by the wait.  Re-check the worker:
             // a callback that slipped past the _isClosing guard just before it was set
@@ -673,21 +1608,41 @@ namespace CopilotBuddy.UI
         /// </summary>
         private void WaitForStartupToStop(int timeoutMs)
         {
-            Task? startup = _startupTask;
-            if (startup == null || startup.IsCompleted)
+            WaitForWorkerTask(_startupTask, timeoutMs, "Startup");
+        }
+
+        /// <summary>
+        /// Same bounded, queue pumping wait for the Auto Relogin re-attach sequence: it also
+        /// calls Dispatcher.Invoke (FindAndAttachToWoW) and must not publish an attachment
+        /// after ObjectManager.Shutdown() has run.
+        /// </summary>
+        private void WaitForReattachToStop(int timeoutMs)
+        {
+            WaitForWorkerTask(_reattachTask, timeoutMs, "Auto Relogin re-attach");
+        }
+
+        /// <summary>Same wait for the Auto Relogin detach task.</summary>
+        private void WaitForDetachToStop(int timeoutMs)
+        {
+            WaitForWorkerTask(_detachTask, timeoutMs, "Auto Relogin detach");
+        }
+
+        private void WaitForWorkerTask(Task? task, int timeoutMs, string what)
+        {
+            if (task == null || task.IsCompleted)
                 return;
 
             var sw = Stopwatch.StartNew();
-            while (!startup.IsCompleted && sw.ElapsedMilliseconds < timeoutMs)
+            while (!task.IsCompleted && sw.ElapsedMilliseconds < timeoutMs)
             {
                 // DispatcherPriority.Background processes everything queued at Background and
-                // above, which includes the startup thread's pending Dispatcher.Invoke calls.
+                // above, which includes the worker thread's pending Dispatcher.Invoke calls.
                 Dispatcher.Invoke(() => { }, DispatcherPriority.Background);
                 Thread.Sleep(10);
             }
 
-            if (!startup.IsCompleted)
-                Logging.Write("Startup thread did not finish within {0} ms; continuing shutdown.", timeoutMs);
+            if (!task.IsCompleted)
+                Logging.Write("{0} thread did not finish within {1} ms; continuing shutdown.", what, timeoutMs);
         }
 
         private static bool WaitForTreeRootStop(int timeoutMs)
