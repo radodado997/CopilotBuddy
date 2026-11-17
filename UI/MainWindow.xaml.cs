@@ -1384,8 +1384,14 @@ namespace CopilotBuddy.UI
                 {
                     // The worker was stopped when the client died ("WoW process has exited").
                     // Wait for that shutdown to finish so a new worker is not started over it.
+                    // Starting a second worker over a live one is exactly the situation
+                    // TreeRoot.Start() guards against, so a timeout means the resume is skipped
+                    // rather than attempted anyway.
                     if (!WaitForTreeRootStop(5000))
-                        Logging.Write("[Relogin] Previous bot thread did not stop in time; resuming anyway.");
+                    {
+                        Logging.Write(Colors.Red, "[Relogin] Resume skipped: the previous bot thread did not stop within 5s.");
+                        return;
+                    }
                 }
 
                 // Last gate: the profile load above is file I/O, so cancellation and the

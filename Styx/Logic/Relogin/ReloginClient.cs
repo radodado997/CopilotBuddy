@@ -298,14 +298,6 @@ namespace Styx.Logic.Relogin
         }
 
         /// <summary>
-        /// Opens the client for read/write and installs the EndScene hook, exactly like the
-        /// startup attach path does. Returns the Memory on success; on failure the partially
-        /// initialised state is torn down and <paramref name="error"/> explains why.
-        ///
-        /// The hook is installed while the client is still on the glue screen: the login Lua
-        /// needs the executor, and the executor is what the whole bot uses afterwards.
-        /// </summary>
-        /// <summary>
         /// Called with the new pid right before a replacement client is attached, so the
         /// process can be claimed through <see cref="ProcessMutex"/>. Returns the claimed
         /// mutex, or null plus a reason when the client must not be attached to (already
@@ -313,10 +305,28 @@ namespace Styx.Logic.Relogin
         /// </summary>
         internal static Func<int, (Mutex? Mutex, string Error)>? ClaimProcess;
 
+        /// <summary>
+        /// Called after a claim is released locally, so the manager does not keep handing out
+        /// a mutex that has been disposed.
+        /// </summary>
+        internal static Action? ReleaseClaimFromManager;
+
+        /// <summary>
+        /// Opens the client for read/write and installs the EndScene hook, exactly like the
+        /// startup attach path does. Returns the Memory on success; on failure the partially
+        /// initialised state is torn down and <paramref name="error"/> explains why.
+        ///
+        /// The hook is installed while the client is still on the glue screen: the login Lua
+        /// needs the executor, and the executor is what the whole bot uses afterwards.
+        /// </summary>
         internal static Memory? TryAttachAndHook(int pid, out string error, bool isReplacement = false)
         {
             error = "";
             Memory? memory = null;
+
+            // Declared outside the try so every path below — including the catch — can release
+            // a claim that was made for a client we then failed to attach to.
+            Mutex? claim = null;
 
             try
             {
@@ -333,7 +343,6 @@ namespace Styx.Logic.Relogin
                 // A client this feature launched is a new pid: the mutex MainWindow holds still
                 // names the dead client, so claim the replacement before attaching to it. If the
                 // claim fails, another instance owns that client and attaching would fight it.
-                Mutex? claim = null;
                 if (isReplacement && ClaimProcess != null)
                 {
                     (Mutex? Mutex, string Error) claimed;
@@ -356,7 +365,7 @@ namespace Styx.Logic.Relogin
                 {
                     error = "OpenProcess failed (access denied or process exiting)";
                     memory.Dispose();
-                    try { claim?.Dispose(); } catch { }
+                    ReleaseClaim(ref claim);
                     return null;
                 }
 
@@ -366,7 +375,7 @@ namespace Styx.Logic.Relogin
                     error = "EndScene hook could not be installed";
                     ObjectManager.Shutdown();
                     memory.Dispose();
-                    try { claim?.Dispose(); } catch { }
+                    ReleaseClaim(ref claim);
                     return null;
                 }
 
@@ -383,8 +392,25 @@ namespace Styx.Logic.Relogin
                 error = ex.Message;
                 try { ObjectManager.Shutdown(); } catch { }
                 try { memory?.Dispose(); } catch { }
+                ReleaseClaim(ref claim);
                 return null;
             }
+        }
+
+        /// <summary>
+        /// Drops a claim that was made for a client this attempt failed to attach to. The
+        /// manager stores the same mutex when the claim is created, so it is told to forget it
+        /// as well — otherwise the resume path could later hand a disposed mutex to the UI.
+        /// </summary>
+        private static void ReleaseClaim(ref Mutex? claim)
+        {
+            Mutex? held = claim;
+            claim = null;
+            if (held == null)
+                return;
+
+            try { ReleaseClaimFromManager?.Invoke(); } catch { }
+            try { held.Dispose(); } catch { }
         }
 
         /// <summary>

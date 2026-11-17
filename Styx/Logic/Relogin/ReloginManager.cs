@@ -139,8 +139,14 @@ namespace Styx.Logic.Relogin
         /// belongs to the client it attached to, which after a crash is the dead one, so the
         /// replacement has to be claimed here or a second CopilotBuddy could attach to it.
         /// Handed over to MainWindow when the bot resumes.
+        ///
+        /// The claim is owned by one recovery generation: a monitor that outlives the bounded
+        /// join can only ever drop its own claim, never the one a newer run has taken.
         /// </summary>
         private static Mutex? _claimedMutex;
+
+        /// <summary>Recovery generation that owns <see cref="_claimedMutex"/> (0 = none).</summary>
+        private static int _claimedMutexGeneration;
 
         private static Config _config = new Config();
         private static int _processId;
@@ -205,6 +211,10 @@ namespace Styx.Logic.Relogin
 
                 // Claiming is delegated so ReloginClient stays free of manager state. The
                 // returned mutex is stored here and handed to MainWindow on resume.
+                // The delegate is replaced on every Start(), so it carries the generation of
+                // the run that installed it: a claim made by a retired monitor is dropped by
+                // that monitor alone (see ReleaseClaimIfOlderThan).
+                int claimGeneration = generation;
                 ReloginClient.ClaimProcess = pid =>
                 {
                     try
@@ -224,6 +234,7 @@ namespace Styx.Logic.Relogin
                         // delegate is installed, and the sequence runs on the monitor thread
                         // where a re-entrant lock would deadlock. Assignment is atomic.
                         Mutex? previous = Interlocked.Exchange(ref _claimedMutex, mutex);
+                        Volatile.Write(ref _claimedMutexGeneration, claimGeneration);
                         try { previous?.Dispose(); } catch { }
 
                         return (mutex, "");
@@ -233,6 +244,16 @@ namespace Styx.Logic.Relogin
                         Logging.WriteDebug("[Relogin] Could not claim pid {0}: {1}", pid, ex.Message);
                         return (null, "the relaunched client could not be claimed: " + ex.Message);
                     }
+                };
+
+                // The attach path disposes a claim itself when it cannot use it; the manager
+                // must then forget it, or the resume path would hand out a disposed mutex.
+                ReloginClient.ReleaseClaimFromManager = () =>
+                {
+                    // Only the reference is dropped: the attach path owns this instance and
+                    // disposes it itself, so nothing is disposed twice.
+                    Interlocked.Exchange(ref _claimedMutex, null);
+                    Volatile.Write(ref _claimedMutexGeneration, 0);
                 };
 
                 _gaveUp = false;
@@ -306,8 +327,31 @@ namespace Styx.Logic.Relogin
             {
                 Mutex? claimed = _claimedMutex;
                 _claimedMutex = null;
+                Volatile.Write(ref _claimedMutexGeneration, 0);
                 return claimed;
             }
+        }
+
+        /// <summary>
+        /// Drops the claim only if it was made by a generation older than
+        /// <paramref name="generation"/>. A monitor that outlived the bounded join must not
+        /// dispose the claim a newer run is already relying on, and the current run's claim is
+        /// kept until its own failure cleanup or the hand-over to the UI.
+        /// </summary>
+        private static void ReleaseClaimIfOlderThan(int generation)
+        {
+            Mutex? stale = null;
+            lock (_sync)
+            {
+                if (_claimedMutex != null && Volatile.Read(ref _claimedMutexGeneration) < generation)
+                {
+                    stale = _claimedMutex;
+                    _claimedMutex = null;
+                    Volatile.Write(ref _claimedMutexGeneration, 0);
+                }
+            }
+
+            try { stale?.Dispose(); } catch { }
         }
 
         #endregion
@@ -358,6 +402,15 @@ namespace Styx.Logic.Relogin
             var unresponsiveFor = new Stopwatch();
             var notInWorldFor = new Stopwatch();
             bool? lastInWorld = null;
+
+            // Armed once the client is seen leaving the world while the bot is running, and
+            // kept across loading polls. A logout commonly goes world -> loading screen ->
+            // "login", so a loading poll must not disarm the detector; only a return to the
+            // world, a stopped bot, or a fired trigger clears it.
+            bool worldDeparted = false;
+
+            // Confirmation timer running: the client has been sitting on the login or
+            // character screen continuously since it was armed.
             bool pendingLogout = false;
 
             try
@@ -398,6 +451,7 @@ namespace Styx.Logic.Relogin
                         client = null;
                         unresponsiveFor.Reset();
                         notInWorldFor.Reset();
+                        worldDeparted = false;
                         pendingLogout = false;
                         lastInWorld = null;
                         SleepPollSlices(generation);
@@ -426,6 +480,7 @@ namespace Styx.Logic.Relogin
                                 generation);
                             unresponsiveFor.Reset();
                             notInWorldFor.Reset();
+                            worldDeparted = false;
                             pendingLogout = false;
                             lastInWorld = null;
                             continue;
@@ -446,63 +501,97 @@ namespace Styx.Logic.Relogin
                     {
                         if (probe.InGame)
                         {
-                            if (pendingLogout)
+                            // Back in the world: whatever departure was being tracked is over.
+                            if (worldDeparted)
                                 Logging.WriteDebug("[Relogin] Client is back in the world; pending logout cancelled.");
+                            worldDeparted = false;
                             pendingLogout = false;
                             notInWorldFor.Reset();
                         }
-                        else if (probe.Loading)
+                        else
                         {
-                            // Loading screen / connecting: the in-world flag drops to 0 here,
-                            // but this is not a logout, so these polls never count toward it.
-                            pendingLogout = false;
-                            notInWorldFor.Reset();
-                        }
-                        else if (pendingLogout || lastInWorld == true)
-                        {
-                            // Only while the bot is actually running: if the bot is stopped the
-                            // user is in control of the client, and a logout to the login or
-                            // character screen is exactly what they asked for. Relogin only
-                            // covers a client that drops out of the world underneath the bot.
-                            bool botWasRunning = Styx.Logic.BehaviorTree.TreeRoot.IsRunning;
-
-                            if (!botWasRunning)
+                            // The in-world flag dropped. Arm on the departure itself, while the
+                            // client can still be seen leaving, and keep that armed state across
+                            // loading polls — a logout is world -> loading -> "login", so
+                            // arming only once a glue screen is visible would miss it.
+                            //
+                            // Only while the bot is running: if the bot is stopped the user is in
+                            // control of the client, and logging out is exactly what they asked
+                            // for. Relogin only covers a client that drops out underneath the bot.
+                            if (!worldDeparted && lastInWorld == true)
                             {
-                                pendingLogout = false;
-                                notInWorldFor.Reset();
-                                Logging.WriteDebug("[Relogin] Client left the world while the bot is stopped; not a crash, so no relogin.");
-                            }
-                            else if (probe.Glue == GlueKind.Login || probe.Glue == GlueKind.CharSelect)
-                            {
-                                // The glue screen must be stable for a few seconds first: a
-                                // zoning transition briefly races the flag.
-                                if (!pendingLogout)
+                                if (Styx.Logic.BehaviorTree.TreeRoot.IsRunning)
                                 {
-                                    pendingLogout = true;
-                                    notInWorldFor.Restart();
+                                    worldDeparted = true;
+                                    Logging.WriteDebug("[Relogin] Client left the world while the bot is running; watching for a logout.");
                                 }
-                                else if (notInWorldFor.Elapsed.TotalSeconds >= LogoutConfirmSeconds)
+                                else
                                 {
-                                    // Recovery starts: the pending state is cleared so a
-                                    // second logout cannot fire while this one is handled.
+                                    Logging.WriteDebug("[Relogin] Client left the world while the bot is stopped; not a crash, so no relogin.");
+                                }
+                            }
+
+                            if (worldDeparted)
+                            {
+                                // The bot can be stopped mid-way: that hands the client back to
+                                // the user, so nothing is recovered from here on.
+                                if (!Styx.Logic.BehaviorTree.TreeRoot.IsRunning)
+                                {
+                                    worldDeparted = false;
                                     pendingLogout = false;
                                     notInWorldFor.Reset();
-                                    lastInWorld = null;
-                                    FireTrigger(ReloginTrigger.ClientLoggedOut,
-                                        string.Format("client returned to {0} and stayed there for {1}s",
-                                            probe.Glue, LogoutConfirmSeconds),
-                                        generation);
-                                    continue;
                                 }
-                            }
-                            else
-                            {
-                                pendingLogout = false;
-                                notInWorldFor.Reset();
+                                else if (probe.Loading)
+                                {
+                                    // Part of leaving the world, not a settled logout. Keep the
+                                    // armed state, but the confirmation window only starts once
+                                    // a login/character screen is actually showing.
+                                    pendingLogout = false;
+                                    notInWorldFor.Reset();
+                                }
+                                else if (probe.Glue == GlueKind.Login || probe.Glue == GlueKind.CharSelect)
+                                {
+                                    // The screen must be stable for a few seconds first: a
+                                    // zoning transition briefly races the flag.
+                                    if (!pendingLogout)
+                                    {
+                                        pendingLogout = true;
+                                        notInWorldFor.Restart();
+                                    }
+                                    else if (notInWorldFor.Elapsed.TotalSeconds >= LogoutConfirmSeconds)
+                                    {
+                                        // Recovery starts: both states are cleared so a second
+                                        // logout cannot fire while this one is being handled.
+                                        worldDeparted = false;
+                                        pendingLogout = false;
+                                        notInWorldFor.Reset();
+                                        lastInWorld = null;
+                                        FireTrigger(ReloginTrigger.ClientLoggedOut,
+                                            string.Format("client returned to {0} and stayed there for {1}s",
+                                                probe.Glue, LogoutConfirmSeconds),
+                                            generation);
+                                        continue;
+                                    }
+                                }
+                                else
+                                {
+                                    // Some other screen (character creation, credits, ...): not
+                                    // a settled logout, so the confirmation window restarts.
+                                    pendingLogout = false;
+                                    notInWorldFor.Reset();
+                                }
                             }
                         }
 
                         lastInWorld = probe.InGame;
+                    }
+                    else
+                    {
+                        // Unreadable poll: the elapsed time must not be credited towards the
+                        // logout confirmation across a gap in what we could observe. The armed
+                        // departure survives, so a later stable logout still fires.
+                        pendingLogout = false;
+                        notInWorldFor.Reset();
                     }
 
                     SleepPollSlices(generation);
@@ -630,12 +719,10 @@ namespace Styx.Logic.Relogin
                 CurrentStep = ReloginStep.Idle;
 
                 // A claim is only meaningful for a client that was successfully brought back;
-                // anything else must not keep a stale pid claimed.
+                // anything else must not keep a stale pid claimed. Scoped to this run, so a
+                // monitor that was retired mid-sequence cannot dispose a newer claim.
                 if (!resumed)
-                {
-                    Mutex? abandoned = TakeClaimedMutex();
-                    try { abandoned?.Dispose(); } catch { }
-                }
+                    ReleaseClaimIfOlderThan(generation + 1);
 
                 if (resumed && IsCurrent(generation))
                 {

@@ -20,7 +20,27 @@ behaves exactly as before.
 | Settings storage | `Styx.Helpers.Settings` + `[Setting]` / `[DefaultValue]`, one XML per class in `Settings/` | new `ReloginSettings` class, `Settings/ReloginSettings.xml` |
 | Active dynamic profile | `LevelbotSettings.LastUsedPath` (written by `ProfileManager.LoadNew(path, true)`) and `CharacterSettings.LastUsedPath` | reloaded before the bot restarts |
 | Active botbase | `BotManager.Current` (plus `CharacterSettings.SelectedBotIndex`) | left untouched; resume uses `StartBot()` |
+| Process ownership | named `ProcessMutex` claim (`MainWindow.FindAndAttachToWoW`) | re-claimed for a relaunched pid, see below |
 | Logging | `Styx.Helpers.Logging.Write(...)` | all relogin events are logged there (UI + `Logs/*.log`) |
+
+### Process claim for a relaunched client
+
+MainWindow claims the client it attaches to through `ProcessMutex` and holds that mutex until the
+window closes. After a relaunch the claim names the **dead** pid, so the replacement has to be
+claimed or a second CopilotBuddy could attach to it. `TryAttachAndHook` therefore claims the new pid
+before attaching (only for a client this feature launched — a client that was already running is
+already covered by the window's claim).
+
+The claim's lifetime is tied to the recovery generation that created it:
+
+* each attempt that launches a client claims its pid; on a successful resume the mutex is handed to
+  MainWindow (`TakeClaimedMutex`) and becomes the window's new `_processMutex`;
+* if the attach fails, `ReloginClient` disposes the claim it made and tells the manager to forget
+  it, so the resume path can never be handed a disposed mutex;
+* a failed sequence releases only claims made by **its own generation or older**
+  (`ReleaseClaimIfOlderThan`). A monitor that outlives the bounded `Stop()` join therefore cannot
+  dispose the claim a newer run is already relying on;
+* the window releases any claim still outstanding when it closes.
 
 ### Login/character-selection state from memory
 
@@ -121,11 +141,19 @@ Three triggers, each logged with its reason:
 3. **`ClientLoggedOut`** — the client dropped out of the world to `login`/`charselect` **and stayed
    there for 5 s**, **and** the bot was running at that moment (`TreeRoot.IsRunning`).
 
-The logout transition is tracked with an explicit `pendingLogout` state rather than by comparing
-against the previous poll. `lastInWorld` is still updated every poll, but the confirmation timer
-is owned by the pending state, which is what lets it accumulate across the polls that follow the
-transition. It is cleared when the client is back in the world, when the bot is stopped, when the
-loading screen is up, and when recovery starts.
+Two states track the transition, because a logout is not an instant:
+
+* **`worldDeparted`** is armed the first time the client is seen *leaving* the world while the bot
+  is running, and it is **kept across loading polls**. This matters: a logout commonly goes
+  world → loading screen → `login`, so arming only once a glue screen is visible — or clearing the
+  state on the loading poll — would miss the most common path. It also survives an unreadable poll.
+* **`pendingLogout`** is the confirmation timer. It starts only once a `login`/`charselect` screen
+  is actually showing, and it requires `LogoutConfirmSeconds` of *continuous* observation: a
+  loading poll, an unreadable poll, or any other glue screen restarts it.
+
+`worldDeparted` is cleared on return to the world, when the bot is stopped mid-way (which hands the
+client back to the user), and when a trigger fires. `lastInWorld` is still updated every poll, but
+it only detects the *departure*; the confirmation window belongs to the two states above.
 
 ### Why lag / a normal logout never triggers it
 
@@ -134,10 +162,12 @@ loading screen is up, and when recovery starts.
   logout trigger needs five *consecutive* seconds of a *named* glue screen; the hang trigger uses
   the window's `Responding` state, not memory reads, and needs a sustained stall.
 * **Loading screens are read explicitly.** `g_ClientConnectionState` drops to 0 while a loading
-  screen is up, so the probe also reads `IsLoadingOrConnecting` (`0x00B6AA38`). Those polls reset
-  the logout timer instead of counting toward it, which is what keeps zoning and the initial
-  loading screen out of the detector entirely. (EnterWorld → loading → in-world never shows a
-  stable `login` screen, so it cannot fire even without this.)
+  screen is up, so the probe also reads `IsLoadingOrConnecting` (`0x00B6AA38`). Loading polls
+  reset the *confirmation timer* but not the armed departure, so zoning (world → loading → world)
+  never fires, while a real logout that passes through a loading screen still does.
+* **Unreadable polls never count.** A poll whose reads failed restarts the confirmation timer, so
+  elapsed time cannot be credited across a gap in what could actually be observed. The armed
+  departure survives, so a later stable logout still fires after 5 continuous seconds.
 * **A user logout** (`Logout`/`Exit Game` to character select or the login form) is ignored because
   the bot is stopped at that point: the logout trigger requires `TreeRoot.IsRunning`. The
   `ProcessExited` trigger still applies if the user closes the client while the bot is attached —
@@ -221,8 +251,11 @@ is classified correctly in both the fast-reject and the connected-then-dropped c
    * `LoadSettings()` (re-creates per-character settings for the character),
    * reloads `LevelbotSettings.LastUsedPath` / `CharacterSettings.LastUsedPath` via
      `ProfileManager.LoadNew`,
-   * waits for the old `TreeRoot` worker to be fully stopped, then calls the existing `StartBot()`
-     — i.e. the same BotBase through the normal start path. No parallel start mechanism.
+   * waits (5 s) for the old `TreeRoot` worker to be fully stopped. If it does not stop, the
+     resume is **skipped and logged** rather than started over a live worker — `TreeRoot.Start()`
+     guards against exactly that, so attempting it anyway would only produce a confusing failure,
+   * calls the existing `StartBot()` — i.e. the same BotBase through the normal start path. No
+     parallel start mechanism.
 
 Per-attempt log line format:
 
@@ -334,6 +367,10 @@ Prerequisites unless stated: `Enabled = true`, valid account/password/realm/char
   heavy load, or suspend the process with Process Explorer for 10 s below the grace threshold).
   Expect `Client window is not responding; watching for 45s …` followed by `Client window
   responding again after Ns; no relogin needed.` — no attempt.
+* **Logout that passes through a loading screen still triggers.** With the bot running, log the
+  character out with `/logout` (not a kill). The client shows a loading screen before the login
+  form; the detector must still fire ~5 s after the login screen appears. This is the case a
+  loading poll previously disarmed.
 * **User logout while stopped does not trigger.** Stop the bot, log out to character select,
   wait 2 minutes: expect at most a Debug line
   `Client left the world while the bot is stopped; not a crash, so no relogin.`
