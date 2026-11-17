@@ -201,18 +201,17 @@ namespace Styx.Logic.Relogin
                 // claim a run creates is always attributed to the run that made it.
                 int generation = _generation;
 
+                if (processId > 0)
+                    _processId = processId;
+
                 _config = Config.FromSettings(settings);
                 if (!_config.Enabled)
                 {
                     // Disabled (or switched off): leave the monitor stopped. Everything else
                     // in the bot behaves exactly as if the feature did not exist.
-                    _processId = 0;
                     Logging.WriteDebug("[Relogin] Auto-relogin is disabled.");
                     return;
                 }
-
-                if (processId > 0)
-                    _processId = processId;
 
                 // Claiming is delegated so ReloginClient stays free of manager state. The
                 // returned mutex is stored here and handed to MainWindow on resume.
@@ -1070,9 +1069,10 @@ namespace Styx.Logic.Relogin
                 bool inGame = ReloginClient.Probe(pid).InGame;
                 if (inGame)
                 {
-                    try { ObjectManager.Update(); } catch { /* object list not ready yet */ }
+                    bool localPlayerUpdated = false;
+                    try { localPlayerUpdated = ObjectManager.UpdateAndCheckLocalPlayer(); } catch { /* object list not ready yet */ }
 
-                    if (ObjectManager.Me != null && ObjectManager.Me.BaseAddress != 0U)
+                    if (localPlayerUpdated && ObjectManager.Me != null && ObjectManager.Me.BaseAddress != 0U)
                     {
                         Logging.Write("[Relogin] In the world as {0} (level {1} {2} {3}).",
                             ObjectManager.Me.Name, ObjectManager.Me.Level, ObjectManager.Me.Race, ObjectManager.Me.Class);

@@ -361,6 +361,15 @@ namespace Styx.WoWInternals
         #region Update - Core of the system
         public static void Update()
         {
+            UpdateAndCheckLocalPlayer();
+        }
+
+        /// <summary>
+        /// Returns whether this pass completed without a walk failure and reached the local
+        /// player. Me is retained across incomplete passes, so it alone is not a readiness signal.
+        /// </summary>
+        internal static bool UpdateAndCheckLocalPlayer()
+        {
             if (Wow == null)
             {
                 throw new InvalidOperationException("Memory not initialized. Call Initialize() first.");
@@ -404,10 +413,12 @@ namespace Styx.WoWInternals
                     
                     // Retrieve the local GUID
                     ulong localGuid = LocalGuid;
+                    bool localPlayerFound = false;
+                    bool walkSucceeded = true;
                     
                     // Retrieve the first object from the list
                     uint curMgr = CurMgr;
-                    if (curMgr == 0U) return;
+                    if (curMgr == 0U) return false;
                     
                     uint currentObject = Wow.Read<uint>(curMgr + FirstObjectOffset);
                     var visited = new HashSet<uint>(64);
@@ -423,6 +434,7 @@ namespace Styx.WoWInternals
                         if (!Wow.TryReadBytes(currentObject + (uint)minOffset, buffer, buffer.Length))
                         {
                             Logging.WriteDebug("ObjectManager: batch read failed at 0x{0:X8}; aborting this update", currentObject);
+                            walkSucceeded = false;
                             break;
                         }
 
@@ -431,6 +443,7 @@ namespace Styx.WoWInternals
                         if (!visited.Add(currentObject))
                         {
                             Logging.WriteDebug("ObjectManager: cyclic object list at 0x{0:X8}; aborting this update", currentObject);
+                            walkSucceeded = false;
                             break;
                         }
 
@@ -458,6 +471,9 @@ namespace Styx.WoWInternals
                             _objectList.Add(objGuid, newObj);
                         }
                         
+                        if (localGuid != 0 && objGuid == localGuid && Me != null && Me.BaseAddress == currentObject)
+                            localPlayerFound = true;
+
                         // Move to the next object
                         uint nextObject = BitConverter.ToUInt32(buffer, nextOffset);
                         if (nextObject == currentObject) break; // End of list
@@ -483,6 +499,7 @@ namespace Styx.WoWInternals
                     
                     // Trigger the end-of-update event
                     _onObjectListUpdateFinished?.Invoke(Me);
+                    return walkSucceeded && localPlayerFound;
                 }
                 catch (Exception ex)
                 {

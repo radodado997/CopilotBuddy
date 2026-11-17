@@ -31,6 +31,14 @@ namespace Styx.WoWInternals
 
         #region Public Methods
 
+        /// <summary>Forgets the return buffer when the attached client is replaced.</summary>
+        internal static void ResetReturnBuffer()
+        {
+            // AllocatedMemory.Dispose uses the CURRENT executor, not the allocation's
+            // original process. Never free an old client's address in the new client.
+            _returnBuffer = null;
+        }
+
         public static string Escape(string unescaped)
         {
             if (string.IsNullOrEmpty(unescaped))

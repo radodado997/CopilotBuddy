@@ -237,7 +237,7 @@ namespace Styx.Logic.Relogin
             public readonly string GlueRaw;
             /// <summary>Mapped glue screen name.</summary>
             public readonly GlueKind Glue;
-            /// <summary>True when at least one of the reads succeeded.</summary>
+            /// <summary>Both flag reads succeeded, and in-world or glue state is readable.</summary>
             public readonly bool Readable;
             /// <summary>Loading screen / connecting — not in world, but not logged out either.</summary>
             public readonly bool Loading;
@@ -277,15 +277,17 @@ namespace Styx.Logic.Relogin
                 if (!memory.IsProcessOpen)
                     return new ClientProbe(false, "", GlueKind.Unknown, false);
 
-                bool inGame = false;
-                try { inGame = memory.Read<byte>(InGameOffset) != 0; } catch { }
+                var flag = new byte[1];
+                bool inGameReadable = memory.TryReadBytes(InGameOffset, flag);
+                bool inGame = inGameReadable && flag[0] != 0;
 
-                bool loading = false;
-                try { loading = memory.Read<byte>(LoadingOffset) != 0; } catch { }
+                bool loadingReadable = memory.TryReadBytes(LoadingOffset, flag);
+                bool loading = loadingReadable && flag[0] != 0;
 
                 GlueKind glue = ReadGlueScreen(memory, out string raw, out bool glueReadable);
 
-                return new ClientProbe(inGame, raw, glue, inGame || glueReadable, loading);
+                return new ClientProbe(inGame, raw, glue,
+                    inGameReadable && loadingReadable && (inGame || glueReadable), loading);
             }
             catch
             {

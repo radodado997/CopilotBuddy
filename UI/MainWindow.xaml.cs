@@ -43,6 +43,8 @@ namespace CopilotBuddy.UI
         private int _logCount;
         private const int MaxLogLines = 1000;
         private bool _isRunning;
+        // Automatic worker shutdown must preserve this; an explicit Stop cancels it.
+        private bool _resumeBotAfterRelogin;
         private DispatcherTimer? _infoTimer;
 
         /// <summary>
@@ -738,12 +740,13 @@ namespace CopilotBuddy.UI
             var deadline = Stopwatch.StartNew();
             while (deadline.Elapsed < TimeSpan.FromSeconds(ReadyTimeoutSeconds))
             {
-                if (_isClosing || !ReloginManager.IsCurrentGeneration(generation))
+                if (_isClosing || !_resumeBotAfterRelogin || !ReloginManager.IsCurrentGeneration(generation))
                     return false;
 
-                try { ObjectManager.Update(); } catch { /* still loading */ }
+                bool localPlayerUpdated = false;
+                try { localPlayerUpdated = ObjectManager.UpdateAndCheckLocalPlayer(); } catch { /* still loading */ }
 
-                if (ObjectManager.Me != null && ObjectManager.Me.BaseAddress != 0U && StyxWoW.IsInWorld)
+                if (localPlayerUpdated && ObjectManager.Me != null && ObjectManager.Me.BaseAddress != 0U && StyxWoW.IsInWorld)
                     return true;
 
                 await Task.Delay(500);
@@ -985,6 +988,7 @@ namespace CopilotBuddy.UI
             // Save settings before starting bot (HB 4.3.4 pattern)
             SaveSettings();
 
+            _resumeBotAfterRelogin = true;
             _isRunning = true;
             btnStart.Visibility = Visibility.Hidden;
             btnStopGroup.Visibility = Visibility.Visible;
@@ -1032,6 +1036,9 @@ namespace CopilotBuddy.UI
 
         private void StopBot()
         {
+            // Cancel even if an automatic shutdown already marked the bot stopped.
+            // Leave the monitor enabled for subsequent manual starts.
+            _resumeBotAfterRelogin = false;
             if (!_isRunning) return;
 
             _isRunning = false;
@@ -1293,7 +1300,7 @@ namespace CopilotBuddy.UI
         /// in-world state (g_ClientConnectionState + a live LocalPlayer). At that point the
         /// bot restarts the same BotBase with the same profile — the profile comes from
         /// LevelbotSettings.LastUsedPath / CharacterSettings.LastUsedPath, which the bot
-        /// already persists whenever a profile is loaded (ProfileManager.LoadNew(path, true)),
+        /// remembers in memory whenever a profile is loaded (ProfileManager.LoadNew(path, true)),
         /// and TreeRoot.Start() reloads it before the worker thread starts.
         ///
         /// Runs on a ThreadPool thread (the monitor thread must not block on the dispatcher).
@@ -1344,6 +1351,12 @@ namespace CopilotBuddy.UI
                 if (ObjectManager.WoWProcess != null)
                     HotkeysManager.UpdateWindowHandle(ObjectManager.WoWProcess.MainWindowHandle);
 
+                if (!_resumeBotAfterRelogin)
+                {
+                    Logging.WriteDebug("[Relogin] Resume skipped: no automatic resume is pending.");
+                    return;
+                }
+
                 // The client can still be finishing its loading screen when the in-world flag
                 // flips. The bot cannot start from that state ("cannot be started while not
                 // ingame"), so wait for the object manager to be usable first. The wait yields
@@ -1355,14 +1368,16 @@ namespace CopilotBuddy.UI
                     return;
                 }
 
-                LoadSettings();
-
-                // Restore the profile that was active before the crash. TreeRoot.Start()
-                // also does this, but doing it here means the profile is loaded (and any
-                // "no profile loaded" failure is reported) before the bot starts.
+                // LoadNew remembers profile changes in memory, not necessarily on disk.
+                // Capture that path before LoadSettings replaces it with an older saved path.
                 string lastProfile = LevelbotSettings.Instance.LastUsedPath ?? "";
                 if (string.IsNullOrEmpty(lastProfile))
                     lastProfile = CharacterSettings.Instance.LastUsedPath ?? "";
+
+                LoadSettings();
+                LevelbotSettings.Instance.LastUsedPath = lastProfile;
+
+                // Restore the active profile before TreeRoot.Start reloads the same path.
                 if (!string.IsNullOrEmpty(lastProfile) && File.Exists(lastProfile))
                 {
                     ProfileManager.LoadNew(lastProfile);
@@ -1396,7 +1411,7 @@ namespace CopilotBuddy.UI
 
                 // Last gate: the profile load above is file I/O, so cancellation and the
                 // client state are rechecked immediately before the bot is started.
-                if (_isClosing || !ReloginManager.IsCurrentGeneration(generation))
+                if (_isClosing || !_resumeBotAfterRelogin || !ReloginManager.IsCurrentGeneration(generation))
                 {
                     Logging.WriteDebug("[Relogin] Resume cancelled before the bot was started.");
                     return;
