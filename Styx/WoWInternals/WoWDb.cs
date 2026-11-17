@@ -64,6 +64,22 @@ namespace Styx.WoWInternals
             }
         }
 
+        /// <summary>
+        /// Discards the cached table pointers. Called after the bot re-attaches to a
+        /// different client process (auto-relogin): every <see cref="DbTable"/> holds an
+        /// address inside the old process, so keeping them would make every DBC lookup read
+        /// unmapped memory in the new one.
+        /// </summary>
+        internal static void ResetForNewProcess()
+        {
+            lock (_sync)
+            {
+                _tables.Clear();
+                _initialized = false;
+                _lastInitAttemptTick = long.MinValue;
+            }
+        }
+
         private static void InitializeCore(Memory wow)
         {
 

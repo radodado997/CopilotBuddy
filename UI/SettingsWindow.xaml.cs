@@ -4,6 +4,7 @@ using System.Windows.Controls;
 using MahApps.Metro.Controls;
 using Styx.Helpers;
 using Styx;
+using Styx.Logic.Relogin;
 
 namespace CopilotBuddy.UI
 {
@@ -20,8 +21,13 @@ namespace CopilotBuddy.UI
             DataContext = new SettingsDataContext
             {
                 CharSettings = CharacterSettings.Instance,
-                StyxSettings = StyxSettings.Instance
+                StyxSettings = StyxSettings.Instance,
+                ReloginSettings = ReloginSettings.Instance
             };
+
+            // Auto-relogin password is not bindable (PasswordBox intentionally exposes no
+            // Text DP), so it is pushed into the control and read back on save.
+            pwdReloginPassword.Password = ReloginSettings.Instance.Password ?? "";
 
             // Initialize log level ComboBox
             InitializeLogLevelComboBox();
@@ -119,9 +125,34 @@ namespace CopilotBuddy.UI
             // Save both settings
             CharacterSettings.Instance.Save();
             StyxSettings.Instance.Save();
-            
+
+            // Auto-relogin: the PasswordBox is the only value not covered by the binding.
+            ReloginSettings.Instance.Password = pwdReloginPassword.Password ?? "";
+            ReloginSettings.Instance.Save();
+
+            // Apply immediately: (re)start the monitor with the new values, or stop it when
+            // the option was switched off. Re-reads the whole settings file either way.
+            ReloginManager.Start(ReloginManager.AttachedProcessId);
+
             // Close the window
             Close();
+        }
+
+        private void btnReloginBrowse_Click(object sender, RoutedEventArgs e)
+        {
+            var dialog = new Microsoft.Win32.OpenFileDialog
+            {
+                Title = "Select Wow.exe",
+                Filter = "Wow client (Wow.exe)|Wow.exe|Executables (*.exe)|*.exe|All files (*.*)|*.*",
+                CheckFileExists = true
+            };
+
+            if (dialog.ShowDialog(this) == true)
+            {
+                ReloginSettings.Instance.WowExecutablePath = dialog.FileName;
+                // Refresh the TextBox: the OpenFileDialog does not go through the binding.
+                txtReloginWowPath.GetBindingExpression(System.Windows.Controls.TextBox.TextProperty)?.UpdateTarget();
+            }
         }
 
         private void btnClassConfig_Click(object sender, RoutedEventArgs e)
@@ -169,5 +200,6 @@ namespace CopilotBuddy.UI
     {
         public CharacterSettings? CharSettings { get; set; }
         public StyxSettings? StyxSettings { get; set; }
+        public ReloginSettings? ReloginSettings { get; set; }
     }
 }

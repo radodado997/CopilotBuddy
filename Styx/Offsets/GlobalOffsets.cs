@@ -71,6 +71,15 @@ namespace Styx.Offsets
 		/// <summary>Pointer to name cache (for other units).</summary>
 		public const uint NameCacheBase = 0x00C5D940;
 
+		// ==================== Login / Character Selection ====================
+		/// <summary>
+		/// Current glue (login) screen name, ASCII, 32+ bytes: "login", "charselect",
+		/// "charcreate", "patchdownload", "credits", "realmwizard", "movie", "trialconvert".
+		/// WotLK 3.3.5a: byte_B6A9E0 — pushed by sub_4D82C0 (CGlueMgr::UpdateCurrentScreen).
+		/// Same address HBRelog uses for its GlueStateOffset.
+		/// </summary>
+		public const uint GlueScreenString = 0x00B6A9E0;
+
 		/// <summary>Offset within name cache entry to name string.</summary>
 		public const uint NameCacheNameOffset = 0x21;
 

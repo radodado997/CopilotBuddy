@@ -402,6 +402,33 @@
   <data name="ChkLogoutForInactivity" xml:space="preserve">
     <value>Logout For Inactivity</value>
   </data>
+  <data name="GroupRelogin" xml:space="preserve">
+    <value>Auto-Relogin</value>
+  </data>
+  <data name="ChkAutoRelogin" xml:space="preserve">
+    <value>Auto-relogin on crash</value>
+  </data>
+  <data name="LblReloginAccount" xml:space="preserve">
+    <value>Account</value>
+  </data>
+  <data name="LblReloginPassword" xml:space="preserve">
+    <value>Password</value>
+  </data>
+  <data name="LblReloginRealm" xml:space="preserve">
+    <value>Realm</value>
+  </data>
+  <data name="LblReloginCharacter" xml:space="preserve">
+    <value>Character</value>
+  </data>
+  <data name="LblReloginWowPath" xml:space="preserve">
+    <value>Wow.exe path</value>
+  </data>
+  <data name="LblReloginRetry" xml:space="preserve">
+    <value>Retry delay (s) / Max retries</value>
+  </data>
+  <data name="ReloginNote" xml:space="preserve">
+    <value>Credentials are saved in plain text in Settings/ReloginSettings.xml. Used only to relog after a crash or exit.</value>
+  </data>
   <data name="ChkUseFrameLock" xml:space="preserve">
     <value>Use Frame Lock</value>
   </data>

@@ -18,6 +18,11 @@ namespace Styx.WoWInternals.WoWCache
 
         public WoWCache()
         {
+            BuildCaches();
+        }
+
+        private void BuildCaches()
+        {
             // Base address for cache structures in 3.3.5a (HB uses 12965520 = 0xC5D790)
             uint baseAddr = 12965520U; // Was 0xC5D780, correct is 0xC5D790
             
@@ -80,6 +85,17 @@ namespace Styx.WoWInternals.WoWCache
                 _caches.Add(new Cache(baseAddr, functionOffset));
                 baseAddr += 136; // Each cache structure is 136 bytes apart
             }
+        }
+
+        /// <summary>
+        /// Rebuilds the cache table. Each entry caches an address and an entry offset read
+        /// out of the client, so after re-attaching to a different process (auto-relogin)
+        /// the old table would point into the dead client's memory.
+        /// </summary>
+        internal void ResetForNewProcess()
+        {
+            _caches.Clear();
+            BuildCaches();
         }
 
         #endregion

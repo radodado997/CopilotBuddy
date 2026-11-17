@@ -260,6 +260,28 @@ namespace Styx
 
         public static void Reset()
         {
+            // Auto-relogin: the client process may have been replaced. Invalidate every
+            // static that remembers an address inside it, then drop the wrappers so they are
+            // rebuilt against the new client on next use. (When the process did not change
+            // this is just a harmless cache flush: the wrappers rebuild identically.)
+            try
+            {
+                WoWDb.ResetForNewProcess();
+            }
+            catch (Exception ex)
+            {
+                Styx.Helpers.Logging.WriteDebug("StyxWoW.Reset: WoWDb reset failed: {0}", ex.Message);
+            }
+
+            try
+            {
+                _cache?.ResetForNewProcess();
+            }
+            catch (Exception ex)
+            {
+                Styx.Helpers.Logging.WriteDebug("StyxWoW.Reset: WoWCache reset failed: {0}", ex.Message);
+            }
+
             _cache = null;
             _db = null;
             _areaManager = null;

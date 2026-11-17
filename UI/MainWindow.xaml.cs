@@ -22,6 +22,7 @@ using Styx.CommonBot;
 using Styx.Helpers;
 using Styx.Logic.BehaviorTree;
 using Styx.Logic.Profiles;
+using Styx.Logic.Relogin;
 using Styx.WoWInternals;
 
 using WpfFontFamily = System.Windows.Media.FontFamily;
@@ -194,6 +195,12 @@ namespace CopilotBuddy.UI
                         BotEvents.OnBotStarted += BotEvents_OnBotStarted;
                         BotEvents.OnBotStopped += BotEvents_OnBotStopped;
 
+                        // Auto-relogin: the monitor raises this after the in-world state is
+                        // confirmed; resuming the previous routine/profile goes through the
+                        // normal Start path below.
+                        ReloginManager.ResumeBot -= ReloginManager_ResumeBot;
+                        ReloginManager.ResumeBot += ReloginManager_ResumeBot;
+
                         // Log character info (HB 4.3.4 pattern after attach)
                         if (ObjectManager.Me != null)
                         {
@@ -289,6 +296,10 @@ namespace CopilotBuddy.UI
                             ToggleButtons(true);
                             SetStatus("CopilotBuddy Startup Complete");
                             _infoTimer.Start();
+
+                            // Auto-relogin: start the monitor now that we know which client we
+                            // are attached to. Start() is a no-op when the option is disabled.
+                            ReloginManager.Start(_selectedWoWProc ?? ObjectManager.WoWProcess?.Id ?? 0);
 
                             // AfterInitOnAuthSuccess equivalent for HBRelog integration.
                             // Mirrors Honorbuddy 4.3.4 MainWindow.xaml.cs:419-437 + Start():847-866.
@@ -659,6 +670,19 @@ namespace CopilotBuddy.UI
             }
             catch { /* Mutex may already be released */ }
 
+            // Auto-relogin: stop the monitor last. It is stopped before the process mutex is
+            // released so it can never race a new attach, but only after ObjectManager.Shutdown()
+            // so it cannot try to attach while the teardown above is still running.
+            try
+            {
+                ReloginManager.Stop();
+                ReloginManager.ResumeBot -= ReloginManager_ResumeBot;
+            }
+            catch (Exception ex)
+            {
+                Logging.WriteDebug("[Relogin] Monitor shutdown failed: {0}", ex.Message);
+            }
+
             // Cleanup
             Logging.OnLogMessage -= OnLogMessage;
             BotEvents.OnBotStarted -= BotEvents_OnBotStarted;
@@ -910,6 +934,9 @@ namespace CopilotBuddy.UI
             }
 
             if (_isRunning) return;
+
+            // Auto-relogin: a manual start re-arms the retry budget after a give-up.
+            ReloginManager.OnBotStarted();
 
             if (BotManager.Current == null)
             {
@@ -1217,6 +1244,104 @@ namespace CopilotBuddy.UI
             // Save setting
             UISettings.Instance.EnhancedMode = false;
             UISettings.Instance.Save();
+        }
+
+        #endregion
+
+        #region Auto-Relogin
+
+        /// <summary>
+        /// Called by <see cref="ReloginManager"/> once a relogin attempt confirmed the
+        /// in-world state (g_ClientConnectionState + a live LocalPlayer). At that point the
+        /// bot restarts the same BotBase with the same profile — the profile comes from
+        /// LevelbotSettings.LastUsedPath / CharacterSettings.LastUsedPath, which the bot
+        /// already persists whenever a profile is loaded (ProfileManager.LoadNew(path, true)),
+        /// and TreeRoot.Start() reloads it before the worker thread starts.
+        ///
+        /// Runs on a ThreadPool thread (the monitor thread must not block on the dispatcher).
+        /// </summary>
+        private void ReloginManager_ResumeBot()
+        {
+            if (Dispatcher.Thread != Thread.CurrentThread)
+            {
+                Dispatcher.BeginInvoke(new Action(ReloginManager_ResumeBot));
+                return;
+            }
+
+            try
+            {
+                if (_isClosing)
+                {
+                    Logging.WriteDebug("[Relogin] Resume skipped: the application is closing.");
+                    return;
+                }
+
+                // Adopt the (possibly relaunched) client and make sure the bot knows it. The
+                // monitor already attached + hooked it; this re-syncs the pid and the UI.
+                int pid = ReloginManager.AttachedProcessId;
+                if (pid > 0 && pid != _selectedWoWProc)
+                {
+                    _selectedWoWProc = pid;
+                    ReloginManager.SetAttachedProcess(pid);
+                }
+
+                // A relaunched client has a new window: point the hotkeys at it.
+                if (ObjectManager.WoWProcess != null)
+                    HotkeysManager.UpdateWindowHandle(ObjectManager.WoWProcess.MainWindowHandle);
+
+                // The client can still be finishing its loading screen when the in-world flag
+                // flips. The bot cannot start from that state ("cannot be started while not
+                // ingame"), so wait for the object manager to be usable first.
+                var readyWait = Stopwatch.StartNew();
+                while (readyWait.Elapsed < TimeSpan.FromSeconds(30) && !_isClosing)
+                {
+                    try { ObjectManager.Update(); } catch { /* still loading */ }
+                    if (ObjectManager.Me != null && ObjectManager.Me.BaseAddress != 0U && StyxWoW.IsInWorld)
+                        break;
+                    Thread.Sleep(500);
+                }
+
+                LoadSettings();
+
+                // Restore the profile that was active before the crash. TreeRoot.Start()
+                // also does this, but doing it here means the profile is loaded (and any
+                // "no profile loaded" failure is reported) before the bot starts.
+                string lastProfile = LevelbotSettings.Instance.LastUsedPath ?? "";
+                if (string.IsNullOrEmpty(lastProfile))
+                    lastProfile = CharacterSettings.Instance.LastUsedPath ?? "";
+                if (!string.IsNullOrEmpty(lastProfile) && File.Exists(lastProfile))
+                {
+                    ProfileManager.LoadNew(lastProfile);
+                    Logging.Write("[Relogin] Resumed profile: {0}", Path.GetFileName(lastProfile));
+                }
+                else
+                {
+                    Logging.WriteDebug("[Relogin] No previous profile to restore ({0}).", lastProfile ?? "none");
+                }
+
+                if (BotManager.Current == null)
+                {
+                    Logging.Write(Colors.Red, "[Relogin] Cannot resume: no botbase is selected.");
+                    return;
+                }
+
+                // In-world state is confirmed; only now does the routine/profile resume.
+                if (TreeRoot.State != TreeRootState.Stopped)
+                {
+                    // The worker was stopped when the client died ("WoW process has exited").
+                    // Wait for that shutdown to finish so a new worker is not started over it.
+                    if (!WaitForTreeRootStop(5000))
+                        Logging.Write("[Relogin] Previous bot thread did not stop in time; resuming anyway.");
+                }
+
+                Logging.Write("[Relogin] Resuming botbase: {0}", BotManager.Current.Name);
+                StartBot();
+            }
+            catch (Exception ex)
+            {
+                Logging.Write(Colors.Red, "[Relogin] Resume failed: {0}", ex.Message);
+                Logging.WriteException(ex);
+            }
         }
 
         #endregion
