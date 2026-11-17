@@ -1257,7 +1257,7 @@ namespace CopilotBuddy.UI
                     if (restartBot && BotManager.Current != null)
                     {
                         Logging.Write("Auto Relogin: restarting the bot.");
-                        StartBot();
+                        StartBotWhenInGame("Auto Relogin");
                     }
                     else if (restartBot)
                     {
@@ -1844,12 +1844,119 @@ namespace CopilotBuddy.UI
                 // because HBRelog only forwards those two args together with /autostart.
                 bool shouldAutoStart = !string.IsNullOrEmpty(autoLoadProfile) || !string.IsNullOrEmpty(autoStartBot);
                 if (shouldAutoStart)
-                    StartBot();
+                    StartBotWhenInGame("command line auto-start");
             }
             catch (Exception ex)
             {
                 Logging.Write(Colors.Red, "ApplyAutoStartConfig failed: {0}", ex.Message);
                 Logging.WriteException(ex);
+            }
+        }
+
+        /// <summary>
+        /// Starts the bot as soon as the character is really in the world.
+        ///
+        /// TreeRoot.Start() refuses to run on the glue/character-select screens ("The bot
+        /// cannot be started while not ingame"), and ObjectManager.Me can already hold a
+        /// detached object there (it reports level 0 with no race or class), so neither the
+        /// relogin attach nor the command-line auto-start may assume that a running client
+        /// means a loaded character: both used to call StartBot() right after the window
+        /// appeared, which logged "Starting the bot." and immediately failed out of
+        /// TreeRoot.Start() - twice in a row in the reported log.
+        /// </summary>
+        /// <param name="reason">Shown in the log so the caller is identifiable.</param>
+        private void StartBotWhenInGame(string reason)
+        {
+            if (_isClosing || _isRunning)
+                return;
+
+            Task.Run(() =>
+            {
+                var waited = Stopwatch.StartNew();
+                bool warned = false;
+                bool updateFailed = false;
+
+                while (!_isClosing && !_isRunning && waited.Elapsed.TotalSeconds < 300)
+                {
+                    // IsInGame is a single client byte: cheap, and it only turns 1 once the
+                    // character is in the world. Me cannot be trusted on its own - after a
+                    // detach it still holds the object of the session that went away (level
+                    // 0, no race or class), which is exactly what the reported log printed.
+                    if (StyxWoW.IsInGame && ObjectManager.IsInitialized)
+                    {
+                        // Me is only refreshed by ObjectManager.Update(), which normally runs
+                        // from the bot's pulse - and the bot is what is not running yet, so
+                        // the check below would keep seeing the detached object forever.
+                        try
+                        {
+                            ObjectManager.Update();
+                        }
+                        catch (Exception ex)
+                        {
+                            if (!updateFailed)
+                            {
+                                updateFailed = true;
+                                Logging.WriteDebug("StartBot ({0}): ObjectManager is not ready yet ({1}).", reason, ex.Message);
+                            }
+                        }
+
+                        if (HasLoadedCharacter())
+                        {
+                            Logging.WriteDebug("StartBot ({0}): the character is in the world after {1:0.0}s.",
+                                reason, waited.Elapsed.TotalSeconds);
+                            Dispatcher.BeginInvoke(new Action(() =>
+                            {
+                                if (!_isClosing && !_isRunning)
+                                    StartBot();
+                            }));
+
+                            // Give the UI thread a moment to actually start the bot. If it
+                            // did not - the client dropped back to the glue screen in
+                            // between, or no botbase is selected - keep waiting (still
+                            // bounded by the deadline above) instead of leaving the restart
+                            // undone.
+                            Thread.Sleep(1500);
+                            if (_isRunning)
+                                return;
+
+                            continue;
+                        }
+                    }
+
+                    if (!warned && waited.Elapsed.TotalSeconds > 15)
+                    {
+                        warned = true;
+                        Logging.WriteDebug(
+                            "StartBot ({0}): waiting for the character to finish loading before starting the bot.", reason);
+                    }
+
+                    Thread.Sleep(500);
+                }
+
+                if (!_isClosing && !_isRunning)
+                {
+                    Logging.Write(Colors.Red,
+                        "StartBot ({0}): the character did not enter the world within 5 minutes; the bot was not started.",
+                        reason);
+                }
+            });
+        }
+
+        /// <summary>
+        /// True when ObjectManager holds a real, loaded player object. The reads can fail
+        /// while the client is being rebuilt (the object is freed between Update() and the
+        /// read), so a failure means "not loaded yet" rather than an error.
+        /// </summary>
+        private static bool HasLoadedCharacter()
+        {
+            try
+            {
+                var me = ObjectManager.Me;
+                return me != null && me.Level > 0;
+            }
+            catch (Exception)
+            {
+                return false;
             }
         }
 
@@ -1865,6 +1972,17 @@ namespace CopilotBuddy.UI
             }
 
             if (_isRunning) return;
+
+            // TreeRoot.Start() would start and immediately undo the whole start - logging
+            // "The bot cannot be started while not ingame" after the worker was already
+            // created and torn down again. Check it here, where the reason is still known,
+            // and leave the window in its non-running state.
+            if (!StyxWoW.IsInGame)
+            {
+                Logging.Write(Colors.Red,
+                    "The bot cannot be started while not ingame: log the character in first.");
+                return;
+            }
 
             if (BotManager.Current == null)
             {

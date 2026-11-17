@@ -37,6 +37,7 @@ namespace Styx.Logic.Relogin
         public const ushort VkEscape = 0x1B;
         public const ushort VkDelete = 0x2E;
         public const ushort VkControl = 0x11;
+        public const ushort VkShift = 0x10;
         public const ushort VkA = 0x41;
 
         [StructLayout(LayoutKind.Sequential)]
@@ -471,6 +472,36 @@ namespace Styx.Logic.Relogin
             inputs[3].type = InputKeyboard;
             inputs[3].ki.wVk = VkControl;
             inputs[3].ki.wScan = (ushort)MapVirtualKey(VkControl, 0);
+            inputs[3].ki.dwFlags = KeyeventfKeyup;
+
+            SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(Input)));
+        }
+
+        /// <summary>Shift+Tab, i.e. move the caret to the previous control.</summary>
+        public static void SendShiftTab()
+        {
+            // One batch: Shift held down across the Tab press, so the client sees the
+            // chord rather than two independent keystrokes.
+            var inputs = new Input[4];
+
+            inputs[0].type = InputKeyboard;
+            inputs[0].ki.wVk = VkShift;
+            inputs[0].ki.wScan = (ushort)MapVirtualKey(VkShift, 0);
+            inputs[0].ki.dwFlags = 0;
+
+            inputs[1].type = InputKeyboard;
+            inputs[1].ki.wVk = VkTab;
+            inputs[1].ki.wScan = (ushort)MapVirtualKey(VkTab, 0);
+            inputs[1].ki.dwFlags = 0;
+
+            inputs[2].type = InputKeyboard;
+            inputs[2].ki.wVk = VkTab;
+            inputs[2].ki.wScan = (ushort)MapVirtualKey(VkTab, 0);
+            inputs[2].ki.dwFlags = KeyeventfKeyup;
+
+            inputs[3].type = InputKeyboard;
+            inputs[3].ki.wVk = VkShift;
+            inputs[3].ki.wScan = (ushort)MapVirtualKey(VkShift, 0);
             inputs[3].ki.dwFlags = KeyeventfKeyup;
 
             SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(Input)));

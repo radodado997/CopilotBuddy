@@ -539,6 +539,11 @@ namespace Styx.Logic.Relogin
             }
 
             // ------------------------------------------------------------- start client
+            // A client we start ourselves comes up on a clean login screen: there is no
+            // modal box to dismiss, and an Enter before the credentials are typed would
+            // only submit the empty form (the "tries to log in without a password" case).
+            // Only a client that was already running can own such a box.
+            bool launchedClient = false;
             if (client == null)
             {
                 int delay = Math.Max(0, settings.RelaunchDelaySeconds);
@@ -564,6 +569,7 @@ namespace Styx.Logic.Relogin
                 }
 
                 _lastPid = client.Id;
+                launchedClient = true;
             }
 
             // ----------------------------------------------------------- wait for window
@@ -598,65 +604,44 @@ namespace Styx.Logic.Relogin
             if (!SleepInterruptible(800) || ShouldAbortSequence())
                 return;
 
-            // After a disconnect the client shows a modal "You have been disconnected
-            // from the server" box whose OK button is the default, so Enter dismisses
-            // it. Escape is deliberately NOT used: on the glue screen it can open the
-            // exit dialog (and, with the login screen already gone, kill the client).
-            // If the box is not there the Enter simply submits the current, empty
-            // login; the next attempt (a restarted client) starts from a clean screen.
-            ReloginNative.SendKey(ReloginNative.VkReturn);
-
-            if (!SleepInterruptible(1200) || ShouldAbortSequence())
-                return;
-
-            if (!EnsureClientFocus(window, settings))
-                return;
-
-            if (!SleepInterruptible(300) || ShouldAbortSequence())
-                return;
-
-            // Re-checked immediately before the keys: the focus can be lost during the
-            // delay above (screen saver, another window stealing it), and Ctrl+A/Delete
-            // must never land in whatever window is in front.
-            if (!ReloginNative.IsForeground(window))
+            // An already running client can own a modal box: after a disconnect the
+            // client shows "You have been disconnected from the server" whose OK button
+            // is the default, and after a rejected login it shows "Login failed". Enter
+            // dismisses both. Escape is deliberately NOT used: on the glue screen it can
+            // open the exit dialog (and, with the login screen already gone, kill the
+            // client).
+            //
+            // Only an existing client gets this Enter. On a client we started ourselves
+            // there is nothing to dismiss, and the Enter used to submit the pre-filled
+            // account with an empty password - which then left the client in a failed
+            // login state that the rest of the sequence typed into.
+            if (!launchedClient)
             {
-                Logging.Write(System.Windows.Media.Colors.Red,
-                    "[AutoRelogin] The game window lost the foreground before the account field could be cleared; not sending any keystrokes.");
-                ApplyBackoff(settings);
-                return;
+                ReloginNative.SendKey(ReloginNative.VkReturn);
+
+                if (!SleepInterruptible(1200) || ShouldAbortSequence())
+                    return;
+
+                if (!EnsureClientFocus(window, settings))
+                    return;
+
+                if (!SleepInterruptible(300) || ShouldAbortSequence())
+                    return;
+            }
+            else
+            {
+                Logging.WriteDebug("[AutoRelogin] The client was started by us; typing the credentials without submitting first.");
             }
 
-            // The account field is focused by default; clear whatever the client has
-            // pre-filled (after a disconnect it holds the last account name) and retype.
-            ReloginNative.SendSelectAll();
-            ReloginNative.SendKey(ReloginNative.VkDelete);
-
-            if (!SleepInterruptible(200) || ShouldAbortSequence())
-                return;
-
-            // SendText stops by itself as soon as the client loses the foreground, so a
-            // stray Alt+Tab in the middle of the account name cannot leak the password
-            // into another window.
-            if (!ReloginNative.SendText(settings.AccountName, window))
+            // A client we started comes up on a clean login screen: the account field has
+            // the focus and has to be filled in. A client that was already running keeps
+            // the account name (it is the same account by definition) and puts the caret
+            // into the password field, so typing the account there would only push the
+            // password into the wrong control.
+            if (!TypeCredentials(window, settings, withAccount: launchedClient))
             {
                 Logging.Write(System.Windows.Media.Colors.Red,
-                    "[AutoRelogin] Lost the foreground while typing the account name.");
-                ApplyBackoff(settings);
-                return;
-            }
-
-            if (!SleepInterruptible(400) || ShouldAbortSequence())
-                return;
-
-            ReloginNative.SendKey(ReloginNative.VkTab);
-
-            if (!SleepInterruptible(300) || ShouldAbortSequence())
-                return;
-
-            if (!ReloginNative.SendText(settings.Password, window))
-            {
-                Logging.Write(System.Windows.Media.Colors.Red,
-                    "[AutoRelogin] Lost the foreground while typing the password.");
+                    "[AutoRelogin] Could not type the credentials - the game window is not in the foreground.");
                 ApplyBackoff(settings);
                 return;
             }
@@ -664,11 +649,42 @@ namespace Styx.Logic.Relogin
             if (!SleepInterruptible(300) || ShouldAbortSequence())
                 return;
 
+            Logging.WriteDebug("[AutoRelogin] Credentials typed ({0}); submitting the login.",
+                launchedClient ? "account name and password" : "password only");
             ReloginNative.SendKey(ReloginNative.VkReturn);
 
             SetStatus("Waiting for the character list.");
             if (!SleepInterruptible(Math.Max(5, settings.CharSelectDelaySeconds) * 1000))
                 return;
+
+            // A rejected login keeps the client on the login screen instead of the
+            // character list. One Enter is harmless in either state - at the character list
+            // it enters the world, on the login screen it dismisses the "Login failed"
+            // box - so it doubles as the probe that tells the two apart: if the client is
+            // still not in the world after it, we are still on the login screen and the
+            // credentials did not arrive where they were meant to.
+            if (!IsProcessInGame(client) && !ShouldAbortSequence())
+            {
+                if (ReloginNative.FocusWindow(window))
+                    ReloginNative.SendKey(ReloginNative.VkReturn);
+
+                if (!WaitForClientInGame(client, 8000) && !ShouldAbortSequence())
+                {
+                    // The client keeps the account name and puts the caret back into the
+                    // password box after a rejected login, so retype only the password
+                    // first ...
+                    Logging.Write("[AutoRelogin] Still on the login screen; retyping the password.");
+
+                    if (!RetryLoginInSameClient(client, window, settings, withAccount: false, shiftTabFirst: false)
+                        && !ShouldAbortSequence())
+                    {
+                        // ... and if that did not help either, the caret was somewhere else:
+                        // step back to the account field and type both values again.
+                        Logging.Write("[AutoRelogin] Still not in the world; retyping the account name as well.");
+                        RetryLoginInSameClient(client, window, settings, withAccount: true, shiftTabFirst: true);
+                    }
+                }
+            }
 
             // Character select: the first character is preselected and the "Enter World"
             // button has the focus once the list is loaded, so Enter enters the world.
@@ -719,6 +735,121 @@ namespace Styx.Logic.Relogin
             Logging.Write(System.Windows.Media.Colors.Red,
                 "[AutoRelogin] Still not in the world after {0}s.", settings.EnterWorldTimeoutSeconds);
             ApplyBackoff(settings);
+        }
+
+        /// <summary>
+        /// Types the account name and/or the password on the login screen.
+        ///
+        /// Each edit box is cleared (Ctrl+A, Delete) immediately before it is typed into:
+        /// the client keeps whatever it had there - the remembered account name, and the
+        /// password of the previous attempt - and typing on top of that leftover text is
+        /// what produced a password that looked like it had been typed twice.
+        ///
+        /// <paramref name="withAccount"/> is false when only the password is needed, i.e.
+        /// after a rejected login: the client keeps the account name and puts the caret
+        /// back into the password box, so typing the account again would only move the
+        /// focus away and leave the password empty.
+        /// </summary>
+        private bool TypeCredentials(IntPtr window, ReloginSettings settings, bool withAccount)
+        {
+            if (ShouldAbortSequence())
+                return false;
+
+            if (withAccount)
+            {
+                if (!ClearFocusedField(window) || ShouldAbortSequence())
+                    return false;
+
+                if (!ReloginNative.SendText(settings.AccountName, window))
+                {
+                    Logging.Write(System.Windows.Media.Colors.Red,
+                        "[AutoRelogin] Lost the foreground while typing the account name.");
+                    return false;
+                }
+
+                if (!SleepInterruptible(400) || ShouldAbortSequence())
+                    return false;
+
+                // Tab moves the caret from the account field into the password field.
+                ReloginNative.SendKey(ReloginNative.VkTab);
+
+                if (!SleepInterruptible(300) || ShouldAbortSequence())
+                    return false;
+            }
+
+            if (!ClearFocusedField(window) || ShouldAbortSequence())
+                return false;
+
+            if (!ReloginNative.SendText(settings.Password, window))
+            {
+                Logging.Write(System.Windows.Media.Colors.Red,
+                    "[AutoRelogin] Lost the foreground while typing the password.");
+                return false;
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// One login retry in the client that is already running: dismiss the failure box,
+        /// optionally step back to the account field, retype, submit and wait for the
+        /// character list. Returns true when the client reached the world.
+        /// </summary>
+        private bool RetryLoginInSameClient(Process client, IntPtr window, ReloginSettings settings,
+                                            bool withAccount, bool shiftTabFirst)
+        {
+            if (ShouldAbortSequence())
+                return false;
+
+            if (!ReloginNative.FocusWindow(window))
+                return false;
+
+            // Dismisses the "Login failed" box; a no-op when it is already gone.
+            ReloginNative.SendKey(ReloginNative.VkReturn);
+            if (!SleepInterruptible(1200))
+                return false;
+
+            if (!EnsureClientFocus(window, settings))
+                return false;
+
+            if (shiftTabFirst)
+            {
+                // The caret is in the password field (or on the Login button) - Shift+Tab
+                // walks back to the account field.
+                ReloginNative.SendShiftTab();
+                if (!SleepInterruptible(250))
+                    return false;
+            }
+
+            if (!TypeCredentials(window, settings, withAccount))
+                return false;
+
+            if (!SleepInterruptible(300) || ShouldAbortSequence())
+                return false;
+
+            ReloginNative.SendKey(ReloginNative.VkReturn);
+
+            return WaitForClientInGame(client, Math.Max(5, settings.CharSelectDelaySeconds) * 1000);
+        }
+
+        /// <summary>
+        /// Clears the edit box that currently has the caret. Checked against the
+        /// foreground window first, so a focus change can never send Ctrl+A / Delete
+        /// into another application.
+        /// </summary>
+        private bool ClearFocusedField(IntPtr window)
+        {
+            if (!ReloginNative.IsForeground(window))
+            {
+                Logging.Write(System.Windows.Media.Colors.Red,
+                    "[AutoRelogin] The game window lost the foreground; not sending any keystrokes.");
+                return false;
+            }
+
+            ReloginNative.SendSelectAll();
+            ReloginNative.SendKey(ReloginNative.VkDelete);
+
+            return SleepInterruptible(150) && !ShouldAbortSequence();
         }
 
         private void ApplyBackoff(ReloginSettings settings)
