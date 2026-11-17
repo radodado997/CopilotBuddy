@@ -196,6 +196,11 @@ namespace Styx.Logic.Relogin
                 // generation on its next poll and exits without touching anything.
                 RetireMonitorThread();
 
+                // Capture this run's generation once, after the bump above: the claim callback
+                // and the monitor thread must both be stamped with exactly this value, so the
+                // claim a run creates is always attributed to the run that made it.
+                int generation = _generation;
+
                 _config = Config.FromSettings(settings);
                 if (!_config.Enabled)
                 {
@@ -214,7 +219,6 @@ namespace Styx.Logic.Relogin
                 // The delegate is replaced on every Start(), so it carries the generation of
                 // the run that installed it: a claim made by a retired monitor is dropped by
                 // that monitor alone (see ReleaseClaimIfOlderThan).
-                int claimGeneration = generation;
                 ReloginClient.ClaimProcess = pid =>
                 {
                     try
@@ -234,7 +238,7 @@ namespace Styx.Logic.Relogin
                         // delegate is installed, and the sequence runs on the monitor thread
                         // where a re-entrant lock would deadlock. Assignment is atomic.
                         Mutex? previous = Interlocked.Exchange(ref _claimedMutex, mutex);
-                        Volatile.Write(ref _claimedMutexGeneration, claimGeneration);
+                        Volatile.Write(ref _claimedMutexGeneration, generation);
                         try { previous?.Dispose(); } catch { }
 
                         return (mutex, "");
@@ -259,7 +263,6 @@ namespace Styx.Logic.Relogin
                 _gaveUp = false;
                 _attempt = 0;
                 CurrentStep = ReloginStep.Idle;
-                int generation = _generation;
 
                 // Report an incomplete configuration once, up front, instead of making the
                 // user wait for a crash to discover it. Relogin itself still fails safely
