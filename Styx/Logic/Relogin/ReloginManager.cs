@@ -47,6 +47,8 @@ namespace Styx.Logic.Relogin
         /// <summary>Raised once when a client is confirmed to be back in the world.</summary>
         public event Action<int>? ClientLoggedIn;
 
+        internal Func<bool>? CanRecoverClient { get; set; }
+
         private readonly ManualResetEventSlim _wake = new ManualResetEventSlim(false);
         private readonly object _stateLock = new object();
 
@@ -400,7 +402,7 @@ namespace Styx.Logic.Relogin
 
         private void TryRelogin(string reason, Process? client)
         {
-            if (_stopRequested || _busy)
+            if (_busy || ShouldAbortSequence())
                 return;
 
             ReloginSettings settings = ReloginSettings.Instance;
@@ -454,6 +456,9 @@ namespace Styx.Logic.Relogin
                 SetStatus("Restarting the game client.");
                 Logging.Write("[AutoRelogin] Restarting the client after a failed attempt.");
 
+                if (ShouldAbortSequence())
+                    return;
+
                 if (!ReloginNative.KillClient(client))
                 {
                     // Termination failed: do not launch a second client next to the one
@@ -484,6 +489,8 @@ namespace Styx.Logic.Relogin
                 }
 
                 SetStatus("Starting the game client.");
+                if (ShouldAbortSequence())
+                    return;
                 client = ReloginNative.StartClient(settings.WowExePath, settings.WowArguments);
                 if (client == null)
                 {
@@ -526,6 +533,8 @@ namespace Styx.Logic.Relogin
             // exit dialog (and, with the login screen already gone, kill the client).
             // If the box is not there the Enter simply submits the current, empty
             // login; the next attempt (a restarted client) starts from a clean screen.
+            if (!CanSendClientInput(client, window))
+                return;
             ReloginNative.SendKey(ReloginNative.VkReturn);
 
             if (!SleepInterruptible(1200) || ShouldAbortSequence())
@@ -550,7 +559,11 @@ namespace Styx.Logic.Relogin
 
             // The account field is focused by default; clear whatever the client has
             // pre-filled (after a disconnect it holds the last account name) and retype.
+            if (!CanSendClientInput(client, window))
+                return;
             ReloginNative.SendSelectAll();
+            if (!CanSendClientInput(client, window))
+                return;
             ReloginNative.SendKey(ReloginNative.VkDelete);
 
             if (!SleepInterruptible(200) || ShouldAbortSequence())
@@ -559,10 +572,10 @@ namespace Styx.Logic.Relogin
             // SendText stops by itself as soon as the client loses the foreground, so a
             // stray Alt+Tab in the middle of the account name cannot leak the password
             // into another window.
-            if (!ReloginNative.SendText(settings.AccountName, window))
+            if (!ReloginNative.SendText(settings.AccountName, window, () => CanSendClientInput(client, window)))
             {
                 Logging.Write(System.Windows.Media.Colors.Red,
-                    "[AutoRelogin] Lost the foreground while typing the account name.");
+                    "[AutoRelogin] Stopped typing the account name because the client state or focus changed.");
                 ApplyBackoff(settings);
                 return;
             }
@@ -570,15 +583,17 @@ namespace Styx.Logic.Relogin
             if (!SleepInterruptible(400) || ShouldAbortSequence())
                 return;
 
+            if (!CanSendClientInput(client, window))
+                return;
             ReloginNative.SendKey(ReloginNative.VkTab);
 
             if (!SleepInterruptible(300) || ShouldAbortSequence())
                 return;
 
-            if (!ReloginNative.SendText(settings.Password, window))
+            if (!ReloginNative.SendText(settings.Password, window, () => CanSendClientInput(client, window)))
             {
                 Logging.Write(System.Windows.Media.Colors.Red,
-                    "[AutoRelogin] Lost the foreground while typing the password.");
+                    "[AutoRelogin] Stopped typing the password because the client state or focus changed.");
                 ApplyBackoff(settings);
                 return;
             }
@@ -586,6 +601,8 @@ namespace Styx.Logic.Relogin
             if (!SleepInterruptible(300) || ShouldAbortSequence())
                 return;
 
+            if (!CanSendClientInput(client, window))
+                return;
             ReloginNative.SendKey(ReloginNative.VkReturn);
 
             SetStatus("Waiting for the character list.");
@@ -612,12 +629,19 @@ namespace Styx.Logic.Relogin
 
                 if (press++ % 2 == 0)
                 {
+                    if (!CanSendClientInput(client, window))
+                        return;
                     ReloginNative.SendKey(ReloginNative.VkReturn);
                 }
                 else
                 {
+                    if (!CanSendClientInput(client, window))
+                        return;
                     ReloginNative.SendKey(ReloginNative.VkTab);
-                    SleepInterruptible(250);
+                    if (!SleepInterruptible(250))
+                        return;
+                    if (!CanSendClientInput(client, window))
+                        return;
                     ReloginNative.SendKey(ReloginNative.VkReturn);
                 }
 
@@ -641,6 +665,13 @@ namespace Styx.Logic.Relogin
             Logging.Write(System.Windows.Media.Colors.Red,
                 "[AutoRelogin] Still not in the world after {0}s.", settings.EnterWorldTimeoutSeconds);
             ApplyBackoff(settings);
+        }
+
+        private bool CanSendClientInput(Process client, IntPtr window)
+        {
+            return !ShouldAbortSequence()
+                && ReloginNative.IsForeground(window)
+                && ReloginNative.TryReadInGame(client, out bool inGame) && !inGame;
         }
 
         private void ApplyBackoff(ReloginSettings settings)
@@ -668,7 +699,7 @@ namespace Styx.Logic.Relogin
 
             while (stopwatch.ElapsedMilliseconds < timeoutMs)
             {
-                if (_stopRequested)
+                if (ShouldAbortSequence())
                     return IntPtr.Zero;
 
                 try
@@ -728,7 +759,7 @@ namespace Styx.Logic.Relogin
 
             try
             {
-                return !ReloginSettings.Instance.Enabled;
+                return !ReloginSettings.Instance.Enabled || CanRecoverClient?.Invoke() == false;
             }
             catch
             {

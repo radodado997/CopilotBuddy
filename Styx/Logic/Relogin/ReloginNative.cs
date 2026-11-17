@@ -122,10 +122,6 @@ namespace Styx.Logic.Relogin
 
         #region Process handling
 
-        /// <summary>
-        /// Finds a 3.3.5a client. The configured executable wins; otherwise any
-        /// process with a known client name is accepted.
-        /// </summary>
         public static Process? FindClient(string? preferredExePath, int pinnedPid = 0)
         {
             // An explicitly pinned client (the /pid= target the bot was started with)
@@ -191,6 +187,8 @@ namespace Styx.Logic.Relogin
                         // ignore, try the next one
                     }
                 }
+
+                return null;
             }
 
             // OrderBy(StartTime) reads a property that throws for processes we cannot
@@ -388,14 +386,14 @@ namespace Styx.Logic.Relogin
         /// <paramref name="targetWindow"/> is no longer the foreground window, so a stray
         /// focus change can never type the credentials into another application.
         /// </summary>
-        public static bool SendText(string text, IntPtr targetWindow)
+        public static bool SendText(string text, IntPtr targetWindow, Func<bool>? canContinue = null)
         {
             if (string.IsNullOrEmpty(text))
                 return true;
 
             foreach (char c in text)
             {
-                if (targetWindow != IntPtr.Zero && !IsForeground(targetWindow))
+                if (canContinue?.Invoke() == false || !IsForeground(targetWindow))
                     return false;
 
                 SendUnicodeChar(c);

@@ -67,12 +67,15 @@ namespace CopilotBuddy.UI
 
         /// <summary>True when the bot was running at the moment the client went away.</summary>
         private bool _wasRunningBeforeRelogin;
+        private bool _autoStartPendingAfterRelogin;
 
         /// <summary>
         /// Set while the client is being relaunched and the bot re-attached, so a
         /// burst of manager events cannot start two recoveries at once.
         /// </summary>
         private volatile bool _reloginInProgress;
+        private volatile bool _recoveryBlocked;
+        private volatile bool _detachInProgress;
 
         /// <summary>
         /// 0 = no re-attach in flight, 1 = one is running. Guards against two
@@ -690,6 +693,12 @@ namespace CopilotBuddy.UI
                     ReloginManager.Instance.ClientDisconnected += OnReloginClientDisconnected;
                     ReloginManager.Instance.ClientLoggedIn += OnReloginClientLoggedIn;
                     ReloginManager.Instance.StatusChanged += OnReloginStatus;
+                    ReloginManager.Instance.CanRecoverClient = () =>
+                        !_isClosing && !_recoveryBlocked
+                        && !ObjectManager.IsInitialized
+                        && TreeRoot.State == TreeRootState.Stopped && TreeRoot.WaitForStop(0)
+                        && Volatile.Read(ref _reattachRunning) == 0
+                        && !_detachInProgress;
                 }
 
                 ReloginSettings settings = ReloginSettings.Instance;
@@ -797,7 +806,7 @@ namespace CopilotBuddy.UI
                 return;
             }
 
-            if (_isClosing)
+            if (_isClosing || _recoveryBlocked)
                 return;
 
             // Ownership handoff: _reloginInProgress covers a whole recovery (detach,
@@ -820,12 +829,14 @@ namespace CopilotBuddy.UI
             _reloginInProgress = true;
             _reattachFailures = 0;
             Interlocked.Exchange(ref _pendingRecoveryPid, 0);
-            _wasRunningBeforeRelogin = _isRunning || TreeRoot.State != TreeRootState.Stopped;
+            _wasRunningBeforeRelogin |= _isRunning || TreeRoot.State != TreeRootState.Stopped;
 
             Logging.Write(Colors.Orange, "Auto Relogin: {0}. Detaching from the client.", reason);
 
             if (_isRunning)
                 StopBot();
+            else if (TreeRoot.State != TreeRootState.Stopped)
+                TreeRoot.Stop("Auto Relogin recovery");
 
             SetStatus("Reconnecting...");
             ToggleButtons(false);
@@ -837,19 +848,39 @@ namespace CopilotBuddy.UI
 
             _infoTimer?.Stop();
 
+            _detachInProgress = true;
             _detachTask = Task.Run(() =>
             {
-                // The worker must be gone before the EndScene hook and the process
-                // handles are released, or it keeps ticking against a dead client.
-                if (!WaitForTreeRootStop(15000))
-                    Logging.Write("Auto Relogin: the bot thread did not stop in time; detaching anyway.");
+                try
+                {
+                    // The worker must be gone before the EndScene hook and the process
+                    // handles are released, or it keeps ticking against a dead client.
+                    if (!TreeRoot.WaitForStop(15000))
+                    {
+                        _recoveryBlocked = true;
+                        ReloginManager.Instance.Stop();
+                        Logging.Write(Colors.Red,
+                            "Auto Relogin: the bot thread did not stop in time. Recovery is blocked; restart CopilotBuddy.");
+                        Dispatcher.BeginInvoke(new Action(() =>
+                        {
+                            if (_isClosing) return;
+                            SetStatus("Auto Relogin blocked: restart CopilotBuddy");
+                            btnSettings.IsEnabled = true;
+                        }));
+                        return;
+                    }
 
-                // Window_Closing tears the attachment down itself; detaching a second
-                // time here would race with ObjectManager.Shutdown().
-                if (_isClosing || _startupCts.IsCancellationRequested)
-                    return;
+                    // Window_Closing tears the attachment down itself; detaching a second
+                    // time here would race with ObjectManager.Shutdown().
+                    if (_isClosing || _startupCts.IsCancellationRequested)
+                        return;
 
-                DetachFromGame();
+                    DetachFromGame();
+                }
+                finally
+                {
+                    _detachInProgress = false;
+                }
 
                 // A ClientLoggedIn that arrived while we were detaching was parked above;
                 // handle it now that the old attachment is gone, otherwise the client
@@ -857,6 +888,11 @@ namespace CopilotBuddy.UI
                 int pendingPid = Interlocked.Exchange(ref _pendingLoggedInPid, 0);
                 if (pendingPid != 0 && !_isClosing)
                     Dispatcher.BeginInvoke(new Action<int>(OnReloginClientLoggedIn), pendingPid);
+                else if (!_isClosing)
+                {
+                    try { ReloginManager.Instance.RequestLoggedInSignal(); }
+                    catch (Exception ex) { Logging.WriteDebug("Auto Relogin: could not request a login signal after detaching: {0}", ex.Message); }
+                }
             });
         }
 
@@ -915,7 +951,7 @@ namespace CopilotBuddy.UI
                 return;
             }
 
-            if (_isClosing || !_startupCompleted)
+            if (_isClosing || _recoveryBlocked || !_startupCompleted)
                 return;
 
             // An explicit /pid= target is authoritative while it is alive: never attach to
@@ -933,7 +969,7 @@ namespace CopilotBuddy.UI
             // ClientDisconnected has not finished yet (ObjectManager is still initialized
             // for a moment). In the second case the login must not be dropped: park the
             // pid and let the detach task retry once the attachment is gone.
-            if (ObjectManager.IsInitialized)
+            if (_detachInProgress || ObjectManager.IsInitialized)
             {
                 if (!_reloginInProgress)
                     return;
@@ -941,7 +977,7 @@ namespace CopilotBuddy.UI
                 Interlocked.Exchange(ref _pendingLoggedInPid, pid);
                 Logging.WriteDebug("Auto Relogin: client {0} is in the world while detaching; will attach when the detach finishes.", pid);
 
-                if (ObjectManager.IsInitialized)
+                if (_detachInProgress || ObjectManager.IsInitialized)
                     return;
 
                 // The detach finished between the check above and the store, so the detach
@@ -969,6 +1005,7 @@ namespace CopilotBuddy.UI
         private void ReattachAfterRelogin(int pid)
         {
             bool requestAnother = false;
+            Action? complete = null;
 
             try
             {
@@ -1010,18 +1047,16 @@ namespace CopilotBuddy.UI
                         Logging.Write(Colors.Red,
                             "Auto Relogin: giving up on re-attaching. Attach again manually (restart CopilotBuddy) once the problem is solved.");
 
-                    Dispatcher.BeginInvoke(new Action(() =>
+                    complete = () =>
                     {
                         if (_isClosing) return;
-                        _reloginInProgress = false;
-
                         // No attachment exists, so Start/Stop stay disabled - the bot
                         // cannot be started without a client. Settings stay reachable.
                         btnSettings.IsEnabled = true;
                         SetStatus(requestAnother
                             ? "Auto Relogin: waiting for the client"
                             : "Auto Relogin: re-attach failed");
-                    }));
+                    };
                     return;
                 }
 
@@ -1034,7 +1069,7 @@ namespace CopilotBuddy.UI
                 // the global block - which only runs once per process, so a plain reconnect
                 // does not duplicate event subscriptions - then the combat routines.
                 LoadSettings();
-                bool globalInitRanNow = EnsureGlobalBotInitialization();
+                _autoStartPendingAfterRelogin |= EnsureGlobalBotInitialization();
 
                 // The combat routines were compiled against the previous attachment.
                 try
@@ -1047,7 +1082,7 @@ namespace CopilotBuddy.UI
                     Logging.WriteException(ex);
                 }
 
-                Dispatcher.BeginInvoke(new Action(() =>
+                complete = () =>
                 {
                     if (_isClosing) return;
 
@@ -1058,10 +1093,11 @@ namespace CopilotBuddy.UI
                     ToggleButtons(true);
                     _infoTimer?.Start();
                     SetStatus("CopilotBuddy Startup Complete");
-                    _reloginInProgress = false;
 
                     bool restartBot = _wasRunningBeforeRelogin && ReloginSettings.Instance.RestartBotAfterRelogin;
                     _wasRunningBeforeRelogin = false;
+                    bool applyAutoStart = _autoStartPendingAfterRelogin;
+                    _autoStartPendingAfterRelogin = false;
 
                     if (restartBot && BotManager.Current != null)
                     {
@@ -1073,50 +1109,49 @@ namespace CopilotBuddy.UI
                         Logging.Write(Colors.Red,
                             "Auto Relogin: the character is back but no botbase is selected - pick one and press Start.");
                     }
-                    else if (globalInitRanNow)
+                    else if (applyAutoStart)
                     {
                         // The startup path never completed an attach, so its tail -
                         // command-line auto-load/auto-start - still has to run. A normal
                         // reconnect never gets here (restartBot covers that case).
                         ApplyAutoStartConfig();
                     }
-                }));
+                };
             }
             catch (Exception ex)
             {
                 Logging.Write(Colors.Red, "Auto Relogin: re-attach failed: {0}", ex.Message);
                 Logging.WriteException(ex);
-                _reloginInProgress = false;
             }
             finally
             {
-                // Allow the next relogin to start a fresh attach sequence.
-                Interlocked.Exchange(ref _reattachRunning, 0);
-
-                // A login parked while this sequence ran is stale now: on success the
-                // attachment already exists, on failure the re-signal below produces a
-                // fresh ClientLoggedIn. Draining it keeps a later detach from dispatching
-                // an attach for a pid that nobody is waiting for any more.
-                Interlocked.Exchange(ref _pendingLoggedInPid, 0);
-
-                // Only now ask for another ClientLoggedIn: the monitor answers on its
-                // next tick, and that event has to find _reattachRunning released.
-                if (requestAnother)
+                Dispatcher.BeginInvoke(new Action(() =>
                 {
-                    try { ReloginManager.Instance.RequestLoggedInSignal(); }
-                    catch (Exception ex) { Logging.WriteDebug("Auto Relogin: could not request another attempt: {0}", ex.Message); }
-                }
+                    Interlocked.Exchange(ref _reattachRunning, 0);
+                    _reloginInProgress = false;
 
-                // Replay a loss that arrived while this worker owned the attachment. The
-                // UI callbacks above were queued earlier, so _reloginInProgress is cleared
-                // by the time this dispatch runs.
-                int pendingRecovery = Interlocked.Exchange(ref _pendingRecoveryPid, 0);
-                if (pendingRecovery != 0 && !_isClosing)
-                {
-                    Dispatcher.BeginInvoke(new Action<int, string>(DispatchClientRecovery),
-                        pendingRecovery == -1 ? 0 : pendingRecovery,
-                        "the client went away again");
-                }
+                    if (_isClosing)
+                        return;
+
+                    int pendingRecovery = Interlocked.Exchange(ref _pendingRecoveryPid, 0);
+                    if (pendingRecovery != 0)
+                    {
+                        DispatchClientRecovery(pendingRecovery == -1 ? 0 : pendingRecovery,
+                            "the client went away again");
+                        if (_reloginInProgress)
+                            return;
+                    }
+
+                    Interlocked.Exchange(ref _pendingLoggedInPid, 0);
+
+                    if (requestAnother)
+                    {
+                        try { ReloginManager.Instance.RequestLoggedInSignal(); }
+                        catch (Exception ex) { Logging.WriteDebug("Auto Relogin: could not request another attempt: {0}", ex.Message); }
+                    }
+
+                    complete?.Invoke();
+                }));
             }
         }
 
@@ -1660,9 +1695,9 @@ namespace CopilotBuddy.UI
             // Never create a worker while the window is closing: teardown has already
             // stopped TreeRoot and is about to dispose the executor/hook, so anything
             // started here would be left running against a half-torn-down process.
-            if (_isClosing)
+            if (_isClosing || _recoveryBlocked || _reloginInProgress)
             {
-                Logging.WriteDebug("StartBot ignored: the application is closing.");
+                Logging.WriteDebug("StartBot ignored: the application is closing or recovering the client.");
                 return;
             }
 
@@ -1808,6 +1843,13 @@ namespace CopilotBuddy.UI
             // Reset Pause MenuItem header back to "Pause" (HB 6.2.3 method_36 pattern).
             if (btnStopArrow.ContextMenu?.Items[0] is System.Windows.Controls.MenuItem pauseItem)
                 pauseItem.Header = "Pause";
+            if (_reloginInProgress || _recoveryBlocked)
+            {
+                ToggleButtons(false);
+                btnSettings.IsEnabled = true;
+                SetStatus(_recoveryBlocked ? "Auto Relogin blocked: restart CopilotBuddy" : "Reconnecting...");
+                return;
+            }
             btnLoadProfile.IsEnabled = true;
             cmbBotSelector.IsEnabled = true;
             btnSettings.IsEnabled = true;

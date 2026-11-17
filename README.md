@@ -116,7 +116,7 @@ Settings window → **Auto Relogin** group. Fill in the client path (button `...
 Two failure modes are handled unattended (`Styx/Logic/Relogin/ReloginManager.cs`):
 
 - **Disconnect** — the client is still running but the character dropped to the glue screen.
-  After `DisconnectGraceSeconds` (default 60 s, so loading screens and zoning never trigger it)
+  After `DisconnectGraceSeconds` (default 60 s, allowing for normal loading screens and zoning)
   the bot stops, the attachment is torn down, the client is focused, the credentials are typed
   in, the character is entered, and the bot re-attaches and restarts itself. The botbase and
   the last profile are restored, so the grind continues where it left off.
@@ -137,8 +137,16 @@ Notes:
 - An intentional logout (the bot's own inactivity logout) pauses Auto Relogin, so the character
   stays logged out. Press *Save and Close* in the settings window (with Auto Relogin still
   enabled) to resume, or restart CopilotBuddy.
-- Multiple simultaneous clients are out of scope: the monitor follows the configured
-  executable / the first client it finds.
+- Recovery waits for the bot worker to exit and the attachment to be fully released before
+  sending input or restarting a client. If the worker does not exit within 15 seconds,
+  recovery is blocked for the rest of the session; restart CopilotBuddy after resolving the hang.
+- Input requires a readable, out-of-world client and foreground focus, rechecked for every
+  credential character. This is **not authentication-screen verification**: the client-state
+  API cannot distinguish login, character selection and other out-of-world screens. Do not
+  rely on this feature to protect credentials from an unexpected screen or client modification.
+- Multiple simultaneous clients are out of scope. A live explicit `/pid=` target is authoritative;
+  otherwise the monitor only adopts a client whose executable matches the configured path.
+  A same-name process in another directory is not used as a fallback.
 
 ## Developing a botbase or plugin
 
