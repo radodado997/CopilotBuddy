@@ -107,39 +107,6 @@ Under `bin/.../Routines/`, several combat routines are loaded as plugins. Singul
 
 Under `bin/.../Plugins/`: AutoEquip2, BuddyControlPanel, BuddyHelper, BuddyManager, DrinkPotions, MrItemRemover2, RareKiller, Talented, TidyBags. They inherit from `Styx.Plugins.PluginClass` and are loaded by `PluginManager` at startup.
 
-## Auto Relogin
-
-Settings window → **Auto Relogin** group. Fill in the client path (button `...` browses to
-`Wow.exe`), the account name and the password, tick *Enable auto relogin* and press
-*Save and Close*. Values live in `Settings/ReloginSettings.xml`.
-
-Two failure modes are handled unattended (`Styx/Logic/Relogin/ReloginManager.cs`):
-
-- **Disconnect** — the client is still running but the character dropped to the glue screen.
-  After `DisconnectGraceSeconds` (default 60 s, so loading screens and zoning never trigger it)
-  the bot stops, the attachment is torn down, the client is focused, the credentials are typed
-  in, the character is entered, and the bot re-attaches and restarts itself. The botbase and
-  the last profile are restored, so the grind continues where it left off.
-- **Crash / closed client** — the process is gone. The monitor starts `Wow.exe` from the
-  configured path, waits for its window, logs in, enters the world, and the bot re-attaches.
-  If the client stays stuck, it is killed and started again (attempts and delays are
-  configurable).
-
-Notes:
-
-- The bot must run **elevated**, like the game client, or the keystrokes and the memory read of
-  the login screen are blocked by UIPI. A windowed (or fullscreen-windowed) client works best;
-  exclusive fullscreen can refuse to give up the foreground.
-- The feature also works with **no client running at all**: start CopilotBuddy with Auto Relogin
-  enabled and it launches the game and logs in before attaching.
-- The password is stored AES encrypted with a key baked into the binary. That is obfuscation,
-  not protection: use a dedicated account if the machine is shared.
-- An intentional logout (the bot's own inactivity logout) pauses Auto Relogin, so the character
-  stays logged out. Press *Save and Close* in the settings window (with Auto Relogin still
-  enabled) to resume, or restart CopilotBuddy.
-- Multiple simultaneous clients are out of scope: the monitor follows the configured
-  executable / the first client it finds.
-
 ## Developing a botbase or plugin
 
 The API is exposed by `CopilotBuddy.dll` (in `bin/Debug/net10.0-windows7.0/` or `bin/Release/...` after publish).
