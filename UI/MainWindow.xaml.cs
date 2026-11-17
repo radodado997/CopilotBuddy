@@ -69,6 +69,13 @@ namespace CopilotBuddy.UI
         private bool _wasRunningBeforeRelogin;
 
         /// <summary>
+        /// The command-line auto-load/auto-start tail of the startup path has not run yet
+        /// (the startup path never completed an attach, and a replayed loss kept the late
+        /// attach from applying it). Carried until a successful attach applies it.
+        /// </summary>
+        private bool _pendingAutoStartConfig;
+
+        /// <summary>
         /// Set while the client is being relaunched and the bot re-attached, so a
         /// burst of manager events cannot start two recoveries at once.
         /// </summary>
@@ -669,8 +676,35 @@ namespace CopilotBuddy.UI
             if (pendingRecovery == 0 || _isClosing)
                 return false;
 
-            Dispatcher.BeginInvoke(new Action<int, string>(DispatchClientRecovery),
-                pendingRecovery == -1 ? 0 : pendingRecovery, reason);
+            int pid = pendingRecovery == -1 ? 0 : pendingRecovery;
+
+            // A parked loss only concerns the client this window is attached to. When it
+            // names a different process, that client is already gone and a newer one was
+            // attached in its place: replaying the loss would detach a healthy attachment
+            // and throw away a bot that was just restarted. Report "nothing was replayed"
+            // so the caller keeps the running decision for the current client. Nothing is
+            // dropped while no attachment is published (ObjectManager.WoWProcess is only
+            // null until the attach completes), so a genuine loss is never lost here.
+            int attachedPid = 0;
+            try
+            {
+                if (ObjectManager.IsInitialized)
+                    attachedPid = ObjectManager.WoWProcess?.Id ?? 0;
+            }
+            catch (Exception ex)
+            {
+                Logging.WriteDebug("Auto Relogin: could not determine the attached client: {0}", ex.Message);
+            }
+
+            if (pid != 0 && attachedPid != 0 && pid != attachedPid)
+            {
+                Logging.WriteDebug(
+                    "Auto Relogin: dropping a parked client loss for pid {0}; the attached client is {1}.",
+                    pid, attachedPid);
+                return false;
+            }
+
+            Dispatcher.BeginInvoke(new Action<int, string>(DispatchClientRecovery), pid, reason);
             return true;
         }
 
@@ -738,6 +772,12 @@ namespace CopilotBuddy.UI
                 ReloginManager.Instance.PinnedProcessId =
                     ReloginNative.IsProcessAlive(commandLinePid) ? commandLinePid : 0;
 
+                // The startup task may be finishing while the window is already closing;
+                // Window_Closing stops the monitor before it waits for this task, so it must
+                // not be started again afterwards.
+                if (_isClosing || _startupCts.IsCancellationRequested)
+                    return;
+
                 ReloginManager.Instance.Start();
                 Logging.Write("Auto Relogin: monitoring the game client ({0}).", settings.WowExePath);
             }
@@ -778,6 +818,14 @@ namespace CopilotBuddy.UI
             Dispatcher.Invoke(() => SetStatus("Auto Relogin: starting WoW..."));
 
             ReloginManager.Instance.Start();
+
+            // Closing can win the race between the cancellation check above and this start;
+            // the monitor must not relaunch a client during the teardown.
+            if (cancellationToken.IsCancellationRequested || _isClosing)
+            {
+                try { ReloginManager.Instance.Stop(); } catch { /* ignore */ }
+                return false;
+            }
 
             // Cold start of the client + login + world load, with some slack.
             int budgetMs = (settings.ClientStartupTimeoutSeconds
@@ -953,7 +1001,7 @@ namespace CopilotBuddy.UI
             // client back, and it also re-raises ClientLoggedIn when the world is up.
             // Not while closing: Window_Closing has already stopped it and must not have
             // it restarted (and relaunching clients) underneath the teardown.
-            if (!_isClosing)
+            if (!_isClosing && !_startupCts.IsCancellationRequested)
             {
                 try { ReloginManager.Instance.Start(); } catch { /* ignore */ }
             }
@@ -1142,12 +1190,25 @@ namespace CopilotBuddy.UI
                         Logging.Write(Colors.Red,
                             "Auto Relogin: the character is back but no botbase is selected - pick one and press Start.");
                     }
-                    else if (globalInitRanNow && !lossReplayed)
+                    else if (globalInitRanNow || _pendingAutoStartConfig)
                     {
                         // The startup path never completed an attach, so its tail -
                         // command-line auto-load/auto-start - still has to run. A normal
                         // reconnect never gets here (restartBot covers that case).
-                        ApplyAutoStartConfig();
+                        if (lossReplayed)
+                        {
+                            // The client went away again before this attach could settle;
+                            // applying the tail now would race with the replayed loss and
+                            // would be attributed to a client that is already gone. Keep it
+                            // pending for the next successful attach.
+                            _pendingAutoStartConfig = true;
+                            Logging.WriteDebug("Auto Relogin: the client went away again; the command-line auto-start configuration is deferred to the next attach.");
+                        }
+                        else
+                        {
+                            ApplyAutoStartConfig();
+                            _pendingAutoStartConfig = false;
+                        }
                     }
                 }));
             }
