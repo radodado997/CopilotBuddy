@@ -646,9 +646,10 @@ namespace Styx.Logic.Relogin
                 probe = ReloginClient.Probe(pid);
                 if (probe.InGame || probe.Glue != GlueKind.Unknown)
                     break;
-                if (probe.Readable && probe.GlueRaw.Length > 0)
-                    break;
 
+                // Still booting (glue name not written yet) or on a screen we don't model
+                // ('movie', the intro clip, ...). Keep waiting inside the timeout rather than
+                // failing on the first unreadable poll.
                 Thread.Sleep(1000);
             }
 
@@ -660,7 +661,10 @@ namespace Styx.Logic.Relogin
 
             if (probe.Glue == GlueKind.Unknown)
             {
-                failure = string.Format("the login screen did not become readable within {0}s", _config.LoginScreenTimeoutSeconds);
+                failure = probe.Readable
+                    ? string.Format("the client stayed on an unrecognised screen \"{0}\" for {1}s",
+                        probe.GlueRaw, _config.LoginScreenTimeoutSeconds)
+                    : string.Format("the login screen did not become readable within {0}s", _config.LoginScreenTimeoutSeconds);
                 return false;
             }
 
@@ -744,7 +748,8 @@ namespace Styx.Logic.Relogin
                         submissions++;
                         break;
 
-                    case GlueKind.CharCreate:
+                        case GlueKind.CharCreate:
+                        // WotLK opens the creation screen if no character exists; back out of it.
                         Lua.DoString("if (CharCreateRandomizeButton and CharCreateRandomizeButton:IsVisible()) then CharacterCreate_Back() end", "ReloginBack");
                         break;
 
