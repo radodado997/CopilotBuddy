@@ -24,7 +24,21 @@ namespace Styx.Helpers
 		/// Supports migration from an old settings path to a new one.
 		/// </summary>
 		protected Settings(string settingsPath, string? oldSettingsPath = null)
+			: this(settingsPath, oldSettingsPath, autoInitialize: true)
 		{
+		}
+
+		/// <summary>
+		/// Allows subclasses that own synchronized file creation/loading (e.g. under a
+		/// cross-process mutex) to defer disk I/O until their own constructor acquires the lock.
+		/// </summary>
+		protected Settings(string settingsPath, string? oldSettingsPath, bool autoInitialize)
+		{
+			SettingsPath = settingsPath;
+			InitializeDefaultValues();
+			if (!autoInitialize)
+				return;
+
 			// Migration: if old path exists and new doesn't, move the file
 			if (oldSettingsPath != null && File.Exists(oldSettingsPath) && !File.Exists(settingsPath))
 			{
@@ -36,11 +50,13 @@ namespace Styx.Helpers
 				File.Move(oldSettingsPath, settingsPath);
 			}
 
-			SettingsPath = settingsPath;
-			InitializeDefaultValues();
 			if (!File.Exists(SettingsPath))
 			{
-				SaveToFile(SettingsPath);
+				try { SaveToFile(SettingsPath); }
+				catch (UnauthorizedAccessException ex)
+				{
+					Logging.Write("Could not create settings file {0}: {1} (using defaults)", SettingsPath, ex.Message);
+				}
 			}
 			else
 			{

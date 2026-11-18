@@ -87,17 +87,6 @@ namespace Styx.WoWInternals.WoWCache
             }
         }
 
-        /// <summary>
-        /// Rebuilds the cache table. Each entry caches an address and an entry offset read
-        /// out of the client, so after re-attaching to a different process (auto-relogin)
-        /// the old table would point into the dead client's memory.
-        /// </summary>
-        internal void ResetForNewProcess()
-        {
-            _caches.Clear();
-            BuildCaches();
-        }
-
         #endregion
 
         #region Indexer

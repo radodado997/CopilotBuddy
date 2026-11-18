@@ -13,7 +13,9 @@ namespace Styx.WoWInternals
     {
         #region Private Fields
 
-        private static AllocatedMemory? _returnBuffer;
+        private static readonly object _returnBufferLock = new object();
+        private static uint _returnBufferAddress;
+        private static ExecutorRand? _returnBufferExecutor;
         private static readonly Dictionary<string, string> EscapeSequences = new Dictionary<string, string>
         {
             { "\\", "\\\\" },
@@ -32,11 +34,17 @@ namespace Styx.WoWInternals
         #region Public Methods
 
         /// <summary>Forgets the return buffer when the attached client is replaced.</summary>
-        internal static void ResetReturnBuffer()
+        internal static void ResetReturnBuffer(ExecutorRand? expectedExecutor = null)
         {
-            // AllocatedMemory.Dispose uses the CURRENT executor, not the allocation's
-            // original process. Never free an old client's address in the new client.
-            _returnBuffer = null;
+            lock (_returnBufferLock)
+            {
+                if (expectedExecutor != null && !ReferenceEquals(_returnBufferExecutor, expectedExecutor))
+                    return;
+
+                // Never free an old client's address through a different executor/process.
+                _returnBufferAddress = 0U;
+                _returnBufferExecutor = null;
+            }
         }
 
         public static string Escape(string unescaped)
@@ -65,21 +73,18 @@ namespace Styx.WoWInternals
         /// </summary>
         public static List<string> GetReturnValues(string lua, string scriptName)
         {
-            var executor = ObjectManager.Executor;
-            if (executor == null)
-                return new List<string>();
+            return GetReturnValues(lua, scriptName, true);
+        }
 
-            var wow = ObjectManager.Wow;
-            if (wow == null)
+        internal static List<string> GetReturnValues(string lua, string scriptName, bool logScriptOnError)
+        {
+            var executor = ObjectManager.Executor;
+            var memory = executor?.Memory;
+            if (executor == null || memory == null)
                 return new List<string>();
 
             try
             {
-                // Read Lua full state (same offset as HB 3.3.5a)
-                uint fullState = wow.Read<uint>((uint)GlobalOffsets.LuaState);
-                if (fullState == 0)
-                    return new List<string>();
-
                 byte[] bytes = Encoding.UTF8.GetBytes(lua);
                 byte[] bytes2 = Encoding.UTF8.GetBytes(scriptName);
                 List<byte> list = new List<byte>(bytes.Length + 1 + bytes2.Length + 1);
@@ -87,21 +92,47 @@ namespace Styx.WoWInternals
                 list.Add(0);
                 list.AddRange(bytes2);
                 list.Add(0);
+                byte[] scriptPayload = list.ToArray();
 
-                using (var allocatedMemory = new AllocatedMemory(list.Count))
+                int luaStatus;
+                List<string>? results = null;
+
+                lock (executor.AssemblyLock)
                 {
-                    allocatedMemory.WriteBytes(0, list.ToArray());
-                    uint address = allocatedMemory.Address;
-                    uint fileNameOffset = (uint)(allocatedMemory.Address + bytes.Length + 1);
+                    if (!ReferenceEquals(ObjectManager.Executor, executor) || !executor.IsInitialized)
+                        return new List<string>();
 
-                    if (_returnBuffer == null)
-                        _returnBuffer = new AllocatedMemory(4000);
+                    // Read Lua full state through the captured executor's Memory (same offset as HB 3.3.5a)
+                    uint fullState = memory.Read<uint>((uint)GlobalOffsets.LuaState);
+                    if (fullState == 0)
+                        return new List<string>();
 
-                    // Clear buffer (HB 3.3.5a pattern)
-                    _returnBuffer.WriteBytes(0, _luaBuffer);
-
-                    lock (executor.AssemblyLock)
+                    uint returnBufferAddress;
+                    lock (_returnBufferLock)
                     {
+                        if (!ReferenceEquals(_returnBufferExecutor, executor) || _returnBufferAddress == 0U)
+                        {
+                            uint allocated = memory.AllocateMemory(4000);
+                            if (allocated == 0U)
+                                return new List<string>();
+                            _returnBufferAddress = allocated;
+                            _returnBufferExecutor = executor;
+                        }
+                        returnBufferAddress = _returnBufferAddress;
+                    }
+
+                    uint address = memory.AllocateMemory(scriptPayload.Length);
+                    if (address == 0U)
+                        return new List<string>();
+
+                    try
+                    {
+                        memory.WriteBytes(address, scriptPayload);
+                        uint fileNameOffset = (uint)(address + bytes.Length + 1);
+
+                        // Clear buffer (HB 3.3.5a pattern) through the captured executor's Memory
+                        memory.WriteBytes(returnBufferAddress, _luaBuffer);
+
                         executor.Clear();
 
                             // HB 3.3.5a exact ASM sequence:
@@ -144,7 +175,7 @@ namespace Styx.WoWInternals
                             executor.AddLine("sub eax, ebx");
 
                             // 5. Store count in return buffer
-                            executor.AddLine("mov ecx, {0}", _returnBuffer.Address);
+                            executor.AddLine("mov ecx, {0}", returnBufferAddress);
                             executor.AddLine("mov [ecx], eax");
                             executor.AddLine("add eax, ebx");   // eax = new top (for loop comparison)
 
@@ -189,36 +220,45 @@ namespace Styx.WoWInternals
                             executor.AddLine("retn");
 
                             executor.Execute();
-                        }
 
-                    // Read result from executor (disable cache like HB)
-                    using (StyxWoW.Memory.TemporaryCacheState(false))
-                    {
-                        int luaStatus = executor.Memory.Read<int>(executor.ReturnPointer);
-                        if (luaStatus == 0)
+                        // Read result from executor while still holding AssemblyLock (disable cache like HB)
+                        using (memory.TemporaryCacheState(false))
                         {
-                            // Success - read return values
-                            int resultCount = _returnBuffer.Read<int>(0);
-                            var results = new List<string>(resultCount);
-                            for (int i = 0; i < resultCount; i++)
+                            luaStatus = memory.Read<int>(executor.ReturnPointer);
+                            if (luaStatus == 0)
                             {
-                                uint strPtr = _returnBuffer.Read<uint>((i + 1) * 4);
-                                results.Add(executor.Memory.ReadString(strPtr));
+                                // Success - read return values
+                                int resultCount = memory.Read<int>(returnBufferAddress);
+                                results = new List<string>(resultCount);
+                                for (int i = 0; i < resultCount; i++)
+                                {
+                                    uint strPtr = memory.Read<uint>(returnBufferAddress + (uint)((i + 1) * 4));
+                                    results.Add(memory.ReadString(strPtr));
+                                }
                             }
-                            return results;
-                        }
-                        else if (luaStatus < 0)
-                        {
-                            // No return values
-                            return new List<string>();
-                        }
-                        else
-                        {
-                            // log the failing script for diagnostics
-                            Logging.WriteDebug("Lua failed! status={0}, script=\"{1}\"", luaStatus, lua);
-                            return new List<string>();
                         }
                     }
+                    finally
+                    {
+                        try { memory.FreeMemory(address); } catch { }
+                    }
+                }
+
+                if (luaStatus == 0)
+                {
+                    return results ?? new List<string>();
+                }
+                else if (luaStatus < 0)
+                {
+                    // No return values
+                    return new List<string>();
+                }
+                else
+                {
+                    // log the failing script for diagnostics
+                    Logging.WriteDebug("Lua failed! status={0}, script=\"{1}\"", luaStatus,
+                        logScriptOnError ? lua : "[sensitive script omitted]");
+                    return new List<string>();
                 }
             }
             catch (Exception ex)

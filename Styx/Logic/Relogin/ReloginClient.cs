@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using GreenMagic;
@@ -32,6 +33,21 @@ namespace Styx.Logic.Relogin
         PatchDownload,
         /// <summary>"movie", "credits", "trialconvert" — screens that only need dismissing.</summary>
         Other
+    }
+
+    internal enum LoginSubmitResult
+    {
+        NotSubmitted = 0,
+        Submitted,
+        Unknown
+    }
+
+    internal enum ProcessIdentityCheck
+    {
+        Match,
+        Exited,
+        Mismatch,
+        Unreadable
     }
 
     /// <summary>
@@ -139,35 +155,174 @@ namespace Styx.Logic.Relogin
             }
         }
 
+        private const uint ProcessQueryLimitedInformation = 0x1000;
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetProcessTimes(
+            IntPtr hProcess,
+            out System.Runtime.InteropServices.ComTypes.FILETIME lpCreationTime,
+            out System.Runtime.InteropServices.ComTypes.FILETIME lpExitTime,
+            out System.Runtime.InteropServices.ComTypes.FILETIME lpKernelTime,
+            out System.Runtime.InteropServices.ComTypes.FILETIME lpUserTime);
+
+        internal static bool TryGetProcessStartTimeUtcTicksFromHandle(IntPtr processHandle, out long startTimeUtcTicks)
+        {
+            startTimeUtcTicks = 0;
+            if (processHandle == IntPtr.Zero)
+                return false;
+
+            if (!GetProcessTimes(processHandle, out var creationTime, out _, out _, out _))
+                return false;
+
+            long fileTime = ((long)creationTime.dwHighDateTime << 32) | (uint)creationTime.dwLowDateTime;
+            startTimeUtcTicks = DateTime.FromFileTimeUtc(fileTime).Ticks;
+            return true;
+        }
+
+        internal static bool TryGetProcessStartTimeUtcTicksByPid(int pid, out long startTimeUtcTicks)
+        {
+            startTimeUtcTicks = 0;
+            if (pid <= 0)
+                return false;
+
+            IntPtr handle = IntPtr.Zero;
+            try
+            {
+                // Request only PROCESS_QUERY_LIMITED_INFORMATION (minimum right for GetProcessTimes)
+                // instead of Process.Handle which requests PROCESS_ALL_ACCESS.
+                handle = GreenMagic.Native.Imports.OpenProcess(ProcessQueryLimitedInformation, false, pid);
+                if (handle == IntPtr.Zero)
+                    return false;
+
+                return TryGetProcessStartTimeUtcTicksFromHandle(handle, out startTimeUtcTicks);
+            }
+            catch
+            {
+                return false;
+            }
+            finally
+            {
+                if (handle != IntPtr.Zero)
+                    GreenMagic.Native.Imports.CloseHandle(handle);
+            }
+        }
+
+        /// <summary>
+        /// Reads the process creation timestamp (UTC ticks) through a short-lived
+        /// PROCESS_QUERY_LIMITED_INFORMATION handle (never Process.Handle / cached Process.StartTime).
+        /// </summary>
+        internal static long? TryGetProcessStartTimeUtcTicks(Process? proc)
+        {
+            if (proc == null)
+                return null;
+
+            try
+            {
+                if (proc.HasExited)
+                    return null;
+                int pid = proc.Id;
+                if (!TryGetProcessStartTimeUtcTicksByPid(pid, out long ticks))
+                    return null;
+                return proc.HasExited ? (long?)null : ticks;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        internal static ProcessIdentityCheck CheckProcessIdentity(Process? proc, int expectedPid, long? expectedStartTimeUtcTicks, bool requireStartTime = false)
+        {
+            if (proc == null || expectedPid <= 0)
+                return ProcessIdentityCheck.Exited;
+
+            try
+            {
+                if (proc.HasExited)
+                    return ProcessIdentityCheck.Exited;
+            }
+            catch
+            {
+                return ProcessIdentityCheck.Unreadable;
+            }
+
+            try
+            {
+                if (proc.Id != expectedPid)
+                    return ProcessIdentityCheck.Mismatch;
+            }
+            catch
+            {
+                return ProcessIdentityCheck.Unreadable;
+            }
+
+            if (!expectedStartTimeUtcTicks.HasValue)
+                return requireStartTime ? ProcessIdentityCheck.Unreadable : ProcessIdentityCheck.Match;
+
+            if (!TryGetProcessStartTimeUtcTicksByPid(expectedPid, out long actualTicks))
+                return IsAlive(proc) ? ProcessIdentityCheck.Unreadable : ProcessIdentityCheck.Exited;
+
+            if (!IsAlive(proc))
+                return ProcessIdentityCheck.Exited;
+
+            return actualTicks == expectedStartTimeUtcTicks.Value
+                ? ProcessIdentityCheck.Match
+                : ProcessIdentityCheck.Mismatch;
+        }
+
         /// <summary>
         /// Closes a hung client: graceful window close first, then Kill. Returns true when the
         /// process is gone afterwards. Only called for the "window not responding for longer
         /// than the grace period" trigger, never for lag or a normal logout.
         /// </summary>
-        internal static bool TerminateClient(Process? client, out string error)
+        internal static bool TerminateClient(Process? client, out string error, Func<Action, bool>? authorize = null)
         {
             error = "";
             if (!IsAlive(client))
                 return true;
 
+            bool ExecuteAuthorized(Action action)
+            {
+                if (authorize != null)
+                    return authorize(action);
+                action();
+                return true;
+            }
+
             try
             {
-                Logging.Write("[Relogin] Closing the unresponsive client (pid {0}).", client!.Id);
-
+                bool logged = false;
+                bool closedWindow = false;
                 try
                 {
-                    if (client.CloseMainWindow())
-                        client.WaitForExit(5000);
+                    if (!ExecuteAuthorized(() =>
+                    {
+                        Logging.Write("[Relogin] Closing the unresponsive client (pid {0}).", client!.Id);
+                        logged = true;
+                        closedWindow = client.CloseMainWindow();
+                    }))
+                        return false;
+
+                    if (closedWindow)
+                        client!.WaitForExit(5000);
                 }
                 catch
                 {
                     // No main window / already closing — fall through to Kill.
                 }
 
-                if (!client.HasExited)
+                if (!client!.HasExited)
                 {
-                    Logging.WriteDebug("[Relogin] Client did not close gracefully; terminating it.");
-                    client.Kill();
+                    if (!ExecuteAuthorized(() =>
+                    {
+                        if (!logged)
+                            Logging.Write("[Relogin] Closing the unresponsive client (pid {0}).", client.Id);
+                        Logging.WriteDebug("[Relogin] Client did not close gracefully; terminating it.");
+                        client.Kill();
+                    }))
+                        return false;
+
                     client.WaitForExit(10_000);
                 }
 
@@ -261,7 +416,7 @@ namespace Styx.Logic.Relogin
         }
 
         /// <summary>
-        /// Reads the client state through a short-lived Memory handle. Never hooks anything,
+        /// Reads the client state through a short-lived read-only process handle. Never hooks anything,
         /// never publishes ObjectManager state — safe to call at 1 Hz from the monitor thread
         /// while the bot itself is stopped, running, or detaching.
         /// </summary>
@@ -270,22 +425,22 @@ namespace Styx.Logic.Relogin
             if (pid <= 0)
                 return new ClientProbe(false, "", GlueKind.Unknown, false);
 
-            Memory? memory = null;
+            IntPtr handle = IntPtr.Zero;
             try
             {
-                memory = new Memory(pid);
-                if (!memory.IsProcessOpen)
+                // PROCESS_VM_READ only: no debug mode, enumeration, thread handle or executor.
+                handle = GreenMagic.Native.Imports.OpenProcess(0x0010, false, pid);
+                if (handle == IntPtr.Zero)
                     return new ClientProbe(false, "", GlueKind.Unknown, false);
 
                 var flag = new byte[1];
-                bool inGameReadable = memory.TryReadBytes(InGameOffset, flag);
+                bool inGameReadable = GreenMagic.Native.Imports.ReadProcessMemory(handle, InGameOffset, flag, 1, out int read) && read == 1;
                 bool inGame = inGameReadable && flag[0] != 0;
-
-                bool loadingReadable = memory.TryReadBytes(LoadingOffset, flag);
+                bool loadingReadable = GreenMagic.Native.Imports.ReadProcessMemory(handle, LoadingOffset, flag, 1, out read) && read == 1;
                 bool loading = loadingReadable && flag[0] != 0;
-
-                GlueKind glue = ReadGlueScreen(memory, out string raw, out bool glueReadable);
-
+                var bytes = new byte[GlueStringLength];
+                bool glueReadable = GreenMagic.Native.Imports.ReadProcessMemory(handle, GlobalOffsets.GlueScreenString, bytes, bytes.Length, out read) && read == bytes.Length;
+                GlueKind glue = DecodeGlueScreen(glueReadable ? bytes : null, out string raw);
                 return new ClientProbe(inGame, raw, glue,
                     inGameReadable && loadingReadable && (inGame || glueReadable), loading);
             }
@@ -295,7 +450,7 @@ namespace Styx.Logic.Relogin
             }
             finally
             {
-                try { memory?.Dispose(); } catch { }
+                if (handle != IntPtr.Zero) GreenMagic.Native.Imports.CloseHandle(handle);
             }
         }
 
@@ -305,13 +460,229 @@ namespace Styx.Logic.Relogin
         /// mutex, or null plus a reason when the client must not be attached to (already
         /// owned by another instance, or the claim failed).
         /// </summary>
-        internal static Func<int, (Mutex? Mutex, string Error)>? ClaimProcess;
+        // Claim authorization is supplied explicitly by the calling monitor run.
 
         /// <summary>
-        /// Called after a claim is released locally, so the manager does not keep handing out
-        /// a mutex that has been disposed.
+        /// Authorizes release of an exact claim after a failed attach. False retains it
+        /// when an attachment is still active or ownership has changed.
         /// </summary>
-        internal static Action? ReleaseClaimFromManager;
+        // Release authorization is supplied with the same run, never looked up globally.
+
+        // Shared with failed-recovery cleanup, startup attach, and Window_Closing so
+        // ObjectManager.Initialize and ObjectManager.Shutdown never overlap, and claims
+        // cannot be released mid-attach.
+        internal static readonly object AttachmentSync = new object();
+        private static readonly object _closingSync = new object();
+        private static readonly ManualResetEventSlim _closingShutdownDone = new ManualResetEventSlim(false);
+        private static Mutex? _deferredUiClaim;
+        private static bool _closingShutdownCompleted;
+        private static bool _deferredCleanupOwnerStarted;
+        private static volatile bool _deferredShutdownRequested;
+
+        /// <summary>
+        /// Runs startup ObjectManager.Initialize, publication, and attachment-dependent startup
+        /// steps (ObjectManager.Me access, LoadSettings, RoutineManager.Init) under AttachmentSync
+        /// so Window_Closing teardown cannot call ObjectManager.Shutdown() until startup attachment
+        /// ownership ends. Aborts and tears down if closing has started or starts during ownership.
+        /// </summary>
+        internal static bool TryPublishStartupAttachment(Memory memory, Func<bool> isCancelled, Action onPublished)
+        {
+            lock (AttachmentSync)
+            {
+                if (_deferredShutdownRequested || _closingShutdownCompleted || isCancelled())
+                {
+                    try { memory.Dispose(); } catch { }
+                    return false;
+                }
+
+                ObjectManager.Initialize(memory);
+
+                if (_deferredShutdownRequested || _closingShutdownCompleted || isCancelled())
+                {
+                    try { ObjectManager.Shutdown(); } catch { }
+                    _attachedPid = 0;
+                    try { memory.Dispose(); } catch { }
+                    if (_deferredShutdownRequested)
+                        CompleteClosingShutdown();
+                    return false;
+                }
+
+                try
+                {
+                    onPublished();
+                }
+                finally
+                {
+                    bool needsDeferredShutdown;
+                    lock (_closingSync)
+                        needsDeferredShutdown = _deferredShutdownRequested && !_closingShutdownCompleted;
+
+                    if (needsDeferredShutdown)
+                    {
+                        try { ObjectManager.Shutdown(); } catch { }
+                        _attachedPid = 0;
+                        CompleteClosingShutdown();
+                    }
+                }
+
+                return !(_deferredShutdownRequested || _closingShutdownCompleted || isCancelled());
+            }
+        }
+
+        /// <summary>
+        /// Serializes Window_Closing teardown with any in-flight attach while avoiding
+        /// blocking the UI dispatcher without pumping messages. If AttachmentSync cannot be
+        /// acquired immediately, transfers <paramref name="uiProcessMutex"/> and starts a
+        /// dedicated foreground cleanup owner thread so the process stays alive until
+        /// ObjectManager.Shutdown completes and claims are released, then performs a bounded
+        /// message-pumping wait on the completion barrier.
+        /// </summary>
+        internal static bool ShutdownForClosing(ref Mutex? uiProcessMutex, Action? pumpMessages = null)
+        {
+            lock (_closingSync)
+            {
+                _deferredShutdownRequested = true;
+                if (_closingShutdownCompleted)
+                    return true;
+            }
+
+            if (TryEnterAttachmentSyncBounded(TimeSpan.FromSeconds(3), pumpMessages))
+            {
+                try
+                {
+                    bool needsShutdown;
+                    lock (_closingSync)
+                        needsShutdown = !_closingShutdownCompleted;
+
+                    if (needsShutdown)
+                    {
+                        ObjectManager.Shutdown();
+                        _attachedPid = 0;
+                        CompleteClosingShutdown();
+                    }
+                    return true;
+                }
+                finally
+                {
+                    Monitor.Exit(AttachmentSync);
+                }
+            }
+
+            // Transfer UI claim ownership and guarantee a dedicated foreground cleanup owner
+            // acquires AttachmentSync and completes teardown even if the current lock holder
+            // finishes right after TryEnter timed out or is not AttachAndHook.
+            bool alreadyCompleted;
+            bool startOwner = false;
+            lock (_closingSync)
+            {
+                alreadyCompleted = _closingShutdownCompleted;
+                if (!alreadyCompleted)
+                {
+                    if (uiProcessMutex != null)
+                    {
+                        _deferredUiClaim = uiProcessMutex;
+                        uiProcessMutex = null;
+                    }
+                    if (!_deferredCleanupOwnerStarted)
+                    {
+                        _deferredCleanupOwnerStarted = true;
+                        startOwner = true;
+                    }
+                }
+            }
+
+            if (alreadyCompleted)
+                return true;
+
+            if (startOwner)
+            {
+                // Foreground thread keeps the process alive until AttachmentSync is acquired
+                // and ObjectManager.Shutdown + transferred claim disposal complete.
+                var cleanupThread = new Thread(RunDeferredCleanupOwner)
+                {
+                    IsBackground = false,
+                    Name = "Relogin Closing Teardown"
+                };
+                cleanupThread.Start();
+            }
+
+            Logging.WriteDebug("[Relogin] Attachment in progress during window close; waiting (bounded) for deferred ObjectManager.Shutdown to complete.");
+            if (WaitForClosingShutdownBounded(TimeSpan.FromSeconds(5), pumpMessages))
+                return true;
+
+            Logging.Write("[Relogin] Attachment teardown did not finish within the bounded close wait; foreground teardown owner remains active until cleanup completes.");
+            return false;
+        }
+
+        private static bool TryEnterAttachmentSyncBounded(TimeSpan timeout, Action? pumpMessages)
+        {
+            if (Monitor.TryEnter(AttachmentSync))
+                return true;
+
+            var sw = Stopwatch.StartNew();
+            while (sw.Elapsed < timeout)
+            {
+                pumpMessages?.Invoke();
+                if (Monitor.TryEnter(AttachmentSync, 20))
+                    return true;
+            }
+            return false;
+        }
+
+        private static bool WaitForClosingShutdownBounded(TimeSpan timeout, Action? pumpMessages)
+        {
+            if (_closingShutdownDone.IsSet)
+                return true;
+
+            var sw = Stopwatch.StartNew();
+            while (sw.Elapsed < timeout)
+            {
+                pumpMessages?.Invoke();
+                if (_closingShutdownDone.Wait(20))
+                    return true;
+            }
+            return _closingShutdownDone.IsSet;
+        }
+
+        private static void RunDeferredCleanupOwner()
+        {
+            try
+            {
+                lock (AttachmentSync)
+                {
+                    bool needsShutdown;
+                    lock (_closingSync)
+                        needsShutdown = !_closingShutdownCompleted;
+
+                    if (needsShutdown)
+                    {
+                        try { ObjectManager.Shutdown(); } catch { }
+                        _attachedPid = 0;
+                        CompleteClosingShutdown();
+                    }
+                }
+
+                try { ReloginManager.ReleaseDetachedClaim(); } catch { }
+            }
+            catch (Exception ex)
+            {
+                Logging.WriteDebug("[Relogin] Deferred closing teardown error: {0}", ex.Message);
+            }
+        }
+
+        private static void CompleteClosingShutdown()
+        {
+            Mutex? deferredClaim;
+            lock (_closingSync)
+            {
+                _closingShutdownCompleted = true;
+                deferredClaim = _deferredUiClaim;
+                _deferredUiClaim = null;
+                _closingShutdownDone.Set();
+            }
+
+            try { deferredClaim?.Dispose(); } catch { }
+        }
 
         /// <summary>
         /// Opens the client for read/write and installs the EndScene hook, exactly like the
@@ -321,7 +692,19 @@ namespace Styx.Logic.Relogin
         /// The hook is installed while the client is still on the glue screen: the login Lua
         /// needs the executor, and the executor is what the whole bot uses afterwards.
         /// </summary>
-        internal static Memory? TryAttachAndHook(int pid, out string error, bool isReplacement = false)
+        internal static Memory? TryAttachAndHook(int pid, long? expectedStartTimeUtcTicks, out string error, bool isReplacement,
+            Func<bool> canAttach,
+            Func<int, (Mutex? Mutex, string Error)>? claimProcess,
+            Func<Mutex, bool>? releaseClaim)
+        {
+            lock (AttachmentSync)
+                return AttachAndHook(pid, expectedStartTimeUtcTicks, out error, isReplacement, canAttach, claimProcess, releaseClaim);
+        }
+
+        private static Memory? AttachAndHook(int pid, long? expectedStartTimeUtcTicks, out string error, bool isReplacement,
+            Func<bool> canAttach,
+            Func<int, (Mutex? Mutex, string Error)>? claimProcess,
+            Func<Mutex, bool>? releaseClaim)
         {
             error = "";
             Memory? memory = null;
@@ -334,21 +717,39 @@ namespace Styx.Logic.Relogin
             {
                 // A previous attach may still be published (e.g. the client we were attached
                 // to crashed). Release it before publishing a new one, otherwise the stale
-                // Executor keeps being used by Lua.DoString.
+                // Executor keeps being used by Lua.DoString. Native shutdown runs outside
+                // ReloginManager's _stateSync so Stop() stays bounded.
+                if (_deferredShutdownRequested || !canAttach())
+                {
+                    if (_deferredShutdownRequested)
+                    {
+                        try { ObjectManager.Shutdown(); } catch { }
+                        _attachedPid = 0;
+                    }
+                    error = "stopped";
+                    return null;
+                }
+
                 if (ObjectManager.Wow != null && !IsAttached(pid))
                 {
                     Logging.WriteDebug("[Relogin] Releasing the previous client attachment before re-attaching.");
-                    try { ObjectManager.Shutdown(); } catch { }
+                    ObjectManager.Shutdown();
                     _attachedPid = 0;
                 }
 
                 // A client this feature launched is a new pid: the mutex MainWindow holds still
                 // names the dead client, so claim the replacement before attaching to it. If the
                 // claim fails, another instance owns that client and attaching would fight it.
-                if (isReplacement && ClaimProcess != null)
+                if (isReplacement)
                 {
+                    if (claimProcess == null)
+                    {
+                        error = "the relaunched client cannot be attached without a process claim";
+                        return null;
+                    }
+
                     (Mutex? Mutex, string Error) claimed;
-                    try { claimed = ClaimProcess(pid); }
+                    try { claimed = claimProcess(pid); }
                     catch (Exception ex) { claimed = (null, ex.Message); }
 
                     if (claimed.Mutex == null)
@@ -367,17 +768,51 @@ namespace Styx.Logic.Relogin
                 {
                     error = "OpenProcess failed (access denied or process exiting)";
                     memory.Dispose();
-                    ReleaseClaim(ref claim);
+                    ReleaseClaim(ref claim, releaseClaim);
                     return null;
                 }
 
+                // Verify the kernel process behind the opened Memory handle matches the tracked
+                // process instance before initializing ObjectManager / installing the hook.
+                if (!TryGetProcessStartTimeUtcTicksFromHandle(memory.ProcessHandle, out long openedStartTicks)
+                    || (expectedStartTimeUtcTicks.HasValue && openedStartTicks != expectedStartTimeUtcTicks.Value))
+                {
+                    error = "the target process exited or its PID was reused before attach";
+                    memory.Dispose();
+                    ReleaseClaim(ref claim, releaseClaim);
+                    return null;
+                }
+
+                if (_deferredShutdownRequested || !canAttach())
+                {
+                    error = "stopped";
+                    memory.Dispose();
+                    ReleaseClaim(ref claim, releaseClaim);
+                    return null;
+                }
+
+                // Initialize outside _stateSync so Stop() cannot block behind native hooking,
+                // while AttachmentSync serializes with Window_Closing teardown. Recheck
+                // generation/shutdown immediately afterwards and tear down if retired or closing.
                 ObjectManager.Initialize(memory);
+
+                if (_deferredShutdownRequested || !canAttach())
+                {
+                    error = "stopped";
+                    ObjectManager.Shutdown();
+                    _attachedPid = 0;
+                    memory.Dispose();
+                    ReleaseClaim(ref claim, releaseClaim);
+                    return null;
+                }
+
                 if (ObjectManager.Executor == null || !ObjectManager.Executor.IsInitialized)
                 {
                     error = "EndScene hook could not be installed";
                     ObjectManager.Shutdown();
+                    _attachedPid = 0;
                     memory.Dispose();
-                    ReleaseClaim(ref claim);
+                    ReleaseClaim(ref claim, releaseClaim);
                     return null;
                 }
 
@@ -387,32 +822,68 @@ namespace Styx.Logic.Relogin
                 StyxWoW.Reset();
                 _attachedPid = pid;
 
+                if (_deferredShutdownRequested || !canAttach())
+                {
+                    error = "stopped";
+                    ObjectManager.Shutdown();
+                    _attachedPid = 0;
+                    memory.Dispose();
+                    ReleaseClaim(ref claim, releaseClaim);
+                    return null;
+                }
+
                 return memory;
             }
             catch (Exception ex)
             {
                 error = ex.Message;
                 try { ObjectManager.Shutdown(); } catch { }
+                _attachedPid = 0;
                 try { memory?.Dispose(); } catch { }
-                ReleaseClaim(ref claim);
+                ReleaseClaim(ref claim, releaseClaim);
                 return null;
+            }
+            finally
+            {
+                if (_deferredShutdownRequested)
+                {
+                    try { ObjectManager.Shutdown(); } catch { }
+                    _attachedPid = 0;
+                    ReleaseClaim(ref claim, releaseClaim);
+                    CompleteClosingShutdown();
+                }
             }
         }
 
         /// <summary>
-        /// Drops a claim that was made for a client this attempt failed to attach to. The
-        /// manager stores the same mutex when the claim is created, so it is told to forget it
-        /// as well — otherwise the resume path could later hand a disposed mutex to the UI.
+        /// Releases a failed attempt's claim only after the manager confirms that its
+        /// attachment is gone and ownership has not changed. Otherwise the manager keeps it.
         /// </summary>
-        private static void ReleaseClaim(ref Mutex? claim)
+        private static void ReleaseClaim(ref Mutex? claim, Func<Mutex, bool>? releaseClaim)
         {
             Mutex? held = claim;
             claim = null;
             if (held == null)
                 return;
 
-            try { ReleaseClaimFromManager?.Invoke(); } catch { }
-            try { held.Dispose(); } catch { }
+            try
+            {
+                if (releaseClaim?.Invoke(held) != true)
+                    return;
+                held.Dispose();
+            }
+            catch { /* Keep the claim rather than risk releasing an active attachment. */ }
+        }
+
+        /// <summary>Includes partial attachments whose executor is not initialized.</summary>
+        internal static bool HasAttachment(int pid)
+        {
+            Memory? wow = ObjectManager.Wow;
+            if (wow == null)
+                return false;
+
+            try { return wow.ProcessId == pid; }
+            catch { return true; } // Unknown ownership: conservatively keep the claim.
         }
 
         /// <summary>
@@ -493,6 +964,13 @@ namespace Styx.Logic.Relogin
                 return GlueKind.Unknown; // read failed
 
             readable = true;
+            return DecodeGlueScreen(bytes, out raw);
+        }
+
+        private static GlueKind DecodeGlueScreen(byte[]? bytes, out string raw)
+        {
+            raw = "";
+            if (bytes == null) return GlueKind.Unknown;
 
             // A fully zeroed buffer means the client has not written a screen name yet (it
             // does that very early at boot), which is not a usable screen state.
@@ -559,16 +1037,21 @@ namespace Styx.Logic.Relogin
             "local acct = \"{0}\" " +
             "local user = \"{1}\" " +
             "local pass = \"{2}\" " +
+            "local allowSubmit = {4} " +
             "if (WoWAccountSelectDialog and WoWAccountSelectDialog:IsShown()) then " +
                 "for i = 1, GetNumGameAccounts() do " +
                     "if GetGameAccountInfo(i):upper() == acct:upper() then WoWAccountSelect_SelectAccount(i) end " +
                 "end " +
             "elseif (AccountLoginUI and AccountLoginUI:IsVisible()) then " +
-                "DefaultServerLogin(user, pass) " +
-                "AccountLoginUI:Hide() " +
+                "if allowSubmit then " +
+                    "DefaultServerLogin(user, pass) " +
+                    "AccountLoginUI:Hide() " +
+                    "return 1 " +
+                "end " +
             "elseif (RealmList and RealmList:IsVisible()) then " +
                 "{3}" +
-            "end ";
+            "end " +
+            "return 0 ";
 
         // Realm loop: {0} is the (escaped) realm name. Declares its own local so it can be
         // used both from the login chunk and from the character-selection chunk.
@@ -587,24 +1070,26 @@ namespace Styx.Logic.Relogin
 
         // Character selection. Returns one value so the caller can tell the states apart:
         //   1 = matched character selected and EnterWorld() issued
-        //   0 = at character selection, no character of that name (list may still be loading)
+        //   0 = character list empty / still loading
         //   2 = not at character selection
         //   3 = a realm switch was requested; character list not available yet
-        //   4 = configured realm is not in the realm list
+        //   4 = nonempty character list has no matching character
         // Modelled on HBRelog's CharSelectLuaFormat for this client.
         private const string CharSelectScriptFormat =
             "local name = \"{0}\" " +
             "local server = \"{1}\" " +
             "if (CharacterSelectUI and CharacterSelectUI:IsVisible()) then " +
                 "{2}" +
-                "for i = 1, GetNumCharacters() do " +
+                "local count = GetNumCharacters() " +
+                "if not count or count == 0 then return 0 end " +
+                "for i = 1, count do " +
                     "if GetCharacterInfo(i):upper() == name:upper() then " +
                         "CharacterSelect_SelectCharacter(i) " +
                         "EnterWorld() " +
                         "return 1 " +
                     "end " +
                 "end " +
-                "return 0 " +
+                "return 4 " +
             "elseif (CharCreateRandomizeButton and CharCreateRandomizeButton:IsVisible()) then " +
                 "CharacterCreate_Back() " +
                 "return 2 " +
@@ -624,21 +1109,30 @@ namespace Styx.Logic.Relogin
         /// so non-ASCII passwords survive the Lua string round-trip — the same encoding
         /// HBRelog uses for DefaultServerLogin.
         /// </summary>
-        internal static void SendLogin(string accountName, string password, string realmName)
+        internal static LoginSubmitResult SendLogin(string accountName, string password, string realmName, bool allowCredentialSubmit = true)
         {
             // The account name also has to match GetGameAccountInfo()/the account-select
             // dialog, so it is compared as plain text — only escaped for Lua syntax.
             string acct = Lua.Escape(accountName ?? "");
-            string user = EncodeLuaBytes(accountName);
-            string pass = EncodeLuaBytes(password);
+            string user = allowCredentialSubmit ? EncodeLuaBytes(accountName) : "";
+            string pass = allowCredentialSubmit ? EncodeLuaBytes(password) : "";
             string realmLoop = string.IsNullOrEmpty(realmName)
                 ? ""
                 : string.Format(CultureInfo.InvariantCulture, RealmLoopFormat, Lua.Escape(realmName));
 
             string script = string.Format(CultureInfo.InvariantCulture, LoginScriptFormat,
-                acct, user, pass, realmLoop);
+                acct, user, pass, realmLoop, allowCredentialSubmit ? "true" : "false");
 
-            Lua.DoString(script, "ReloginLogin");
+            List<string> values = Lua.GetReturnValues(script, "ReloginLogin", logScriptOnError: false);
+            if (!allowCredentialSubmit)
+                return LoginSubmitResult.NotSubmitted;
+            if (values == null || values.Count == 0)
+                return LoginSubmitResult.Unknown;
+            if (values[0] == "1")
+                return LoginSubmitResult.Submitted;
+            if (values[0] == "0")
+                return LoginSubmitResult.NotSubmitted;
+            return LoginSubmitResult.Unknown;
         }
 
         /// <summary>

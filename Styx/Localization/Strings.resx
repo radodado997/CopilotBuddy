@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <root>
   <xsd:schema id="root" xmlns="" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:msdata="urn:schemas-microsoft-com:xml-msdata">
     <xsd:import namespace="http://www.w3.org/XML/1998/namespace" />
@@ -406,7 +406,7 @@
     <value>Auto-Relogin</value>
   </data>
   <data name="ChkAutoRelogin" xml:space="preserve">
-    <value>Auto-relogin on crash</value>
+    <value>Auto-relogin on crash, logout or disconnect</value>
   </data>
   <data name="LblReloginAccount" xml:space="preserve">
     <value>Account</value>
@@ -426,8 +426,39 @@
   <data name="LblReloginRetry" xml:space="preserve">
     <value>Retry delay (s) / Max retries</value>
   </data>
+  <data name="ReloginRetryDelay" xml:space="preserve"><value>Relogin retry delay in seconds</value></data>
+  <data name="ReloginMaxRetries" xml:space="preserve"><value>Maximum relogin attempts</value></data>
+  <data name="BrowseReloginClient" xml:space="preserve"><value>Browse for the WoW client executable</value></data>
+  <data name="CancelReloginResume" xml:space="preserve"><value>Cancel auto-resume</value></data>
   <data name="ReloginNote" xml:space="preserve">
-    <value>Credentials are saved in plain text in Settings/ReloginSettings.xml. Used only to relog after a crash or exit.</value>
+    <value>The password is saved in your Windows Credential Manager. Enabling relogin permits saved credentials to be submitted after a crash, exit, or return to the login screen after logout or disconnect while the bot is running.</value>
+  </data>
+  <data name="ReloginInvalidSettingTitle" xml:space="preserve">
+    <value>Invalid relogin setting</value>
+  </data>
+  <data name="ReloginMustBeWholeNumberFormat" xml:space="preserve">
+    <value>{0} must be a whole number.</value>
+  </data>
+  <data name="ReloginRetryRangeError" xml:space="preserve">
+    <value>Retry delay must be at least 1 second; maximum retries cannot be negative.</value>
+  </data>
+  <data name="ReloginSaveFailedTitle" xml:space="preserve">
+    <value>Settings save failed</value>
+  </data>
+  <data name="ReloginSaveFailedMessage" xml:space="preserve">
+    <value>Relogin settings or the Windows credential could not be saved. No relogin changes were applied.</value>
+  </data>
+  <data name="ReloginSaveConflictMessage" xml:space="preserve">
+    <value>Relogin settings changed since this window was opened. Reopen Settings to review and save.</value>
+  </data>
+  <data name="ReloginMalformedFileMessage" xml:space="preserve">
+    <value>ReloginSettings.xml is malformed and could not be updated. Move {0} aside, reopen Settings, and re-enter your full relogin configuration (including the password) before retrying the save.</value>
+  </data>
+  <data name="ReloginScrubFailedMessage" xml:space="preserve">
+    <value>ReloginSettings.xml could not be rewritten to remove the legacy password. Restore write access to {0} and reopen Settings.</value>
+  </data>
+  <data name="ReloginLoadFailedMessage" xml:space="preserve">
+    <value>ReloginSettings.xml could not be loaded for editing ({0}). Check access to {1} and reopen Settings.</value>
   </data>
   <data name="ChkUseFrameLock" xml:space="preserve">
     <value>Use Frame Lock</value>

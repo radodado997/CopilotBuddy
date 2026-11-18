@@ -273,15 +273,6 @@ namespace Styx
                 Styx.Helpers.Logging.WriteDebug("StyxWoW.Reset: WoWDb reset failed: {0}", ex.Message);
             }
 
-            try
-            {
-                _cache?.ResetForNewProcess();
-            }
-            catch (Exception ex)
-            {
-                Styx.Helpers.Logging.WriteDebug("StyxWoW.Reset: WoWCache reset failed: {0}", ex.Message);
-            }
-
             Lua.ResetReturnBuffer();
             _cache = null;
             _db = null;

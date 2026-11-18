@@ -1,8 +1,8 @@
 # Auto-Relogin
 
-Opt-in feature: when the WoW client crashes or exits while CopilotBuddy is running, the bot
-relaunches the client, logs back in, selects the configured character, waits for the in-world
-state, and only then resumes the previously active routine/botbase and profile.
+Opt-in feature: after a client crash/exit or a return to the login screen after logout/disconnect
+while the bot is running, the bot relaunches the client if needed, logs back in, selects and verifies
+the configured character and realm, and only then resumes the previous routine/botbase and profile.
 
 Off by default. With the option off, no monitor thread is created and every existing code path
 behaves exactly as before.
@@ -37,10 +37,10 @@ The claim's lifetime is tied to the recovery generation that created it:
   MainWindow (`TakeClaimedMutex`) and becomes the window's new `_processMutex`;
 * if the attach fails, `ReloginClient` disposes the claim it made and tells the manager to forget
   it, so the resume path can never be handed a disposed mutex;
-* a failed sequence releases only claims made by **its own generation or older**
-  (`ReleaseClaimIfOlderThan`). A monitor that outlives the bounded `Stop()` join therefore cannot
-  dispose the claim a newer run is already relying on;
-* the window releases any claim still outstanding when it closes.
+* a failed sequence releases only **detached** claims made by its own generation or older
+  (`ReleaseClaimIfOlderThan`). An active/partial/in-flight attachment retains its claim even
+  after retry exhaustion. A retired run cannot release a newer run's claim;
+* the window releases outstanding recovery claims only after attachment shutdown.
 
 ### Login/character-selection state from memory
 
@@ -54,7 +54,7 @@ Added to the existing offset table as `GlobalOffsets.GlueScreenString` — no of
 in the relogin code.
 
 In-world state stays on `g_ClientConnectionState` (`0x00BD0792`), which the bot already reads.
-Both are read through a **short-lived** `Memory` handle (`ReloginClient.Probe`), so detection
+Both are read through a **short-lived, read-only** Win32 process handle (`ReloginClient.Probe`), so detection
 still works when the bot is not attached — which is the normal state after a crash.
 
 ### Input mechanism
@@ -77,9 +77,9 @@ character, and the file must exist before the bot has ever attached).
 
 | Setting (XML element) | UI | Default | Meaning |
 | --- | --- | --- | --- |
-| `Enabled` | "Auto-relogin on crash" checkbox | `false` | master switch |
+| `Enabled` | "Auto-relogin on crash, logout or disconnect" checkbox | `false` | master switch |
 | `AccountName` | Account | `""` | 3.3.5a account name (no realm suffix) |
-| `Password` | Password (`PasswordBox`) | `""` | account password |
+| `PasswordReference` | Password (`PasswordBox`; not serialized) | `""` | reference to the password in the current Windows user's Credential Manager vault |
 | `RealmName` | Realm | `""` | realm as shown in the realm list; empty = leave the realm alone |
 | `CharacterName` | Character | `""` | character to select before `EnterWorld()` |
 | `WowExecutablePath` | Wow.exe path (+ browse) | `""` | used only when no client process exists |
@@ -90,21 +90,25 @@ character, and the file must exist before the bot has ever attached).
 | `HangGraceSeconds` | (file only) | `45` | sustained non-responsiveness before a hang counts as a crash; `0` disables hang detection |
 | `LoginRejectSeconds` | (file only) | `20` | a login that fails faster than this *and* never reached the connecting state is a credential rejection, not an unreachable server |
 
-### Storage format — plain text
+### Storage format — user-bound password vault
 
-The project has an `EncryptedAttribute` (`Styx/Helpers/EncryptedAttribute.cs`), but **no settings
-class in this repository uses it** and there is no OS credential store integration anywhere
-(`grep EncryptedAttribute` finds the attribute definition only). There is therefore no existing
-encrypted store to adopt.
+The password is stored as a generic credential in **Windows Credential Manager**, scoped to the
+current Windows user. XML stores only `PasswordReference`; other settings remain ordinary XML.
+A settings export or backup cannot supply the password on another account/machine. Re-enter it
+there. The runtime still needs the password in memory to call the client's login API.
 
-The credentials are stored **in plain text**, matching every other profile value the project
-persists (`MailRecipient`, `LastUsedPath`, `Settings/CharacterSettings_*.xml` as a whole):
+Legacy `<Password>` entries are migrated into the vault and removed from the settings file on
+load. If vault access or migration fails, relogin is disabled and the user must re-enter/save the
+password. Existing historical backups containing plaintext must be removed separately. Settings
+edits are committed together on **Save & Close**; closing with X discards relogin edits.
+
+Example (the reference is installation-specific):
 
 ```xml
 <ReloginSettings>
   <Enabled>True</Enabled>
   <AccountName>myaccount</AccountName>
-  <Password>hunter2</Password>
+  <PasswordReference>CopilotBuddy/Relogin/credential-id</PasswordReference>
   <RealmName>MyRealm</RealmName>
   <CharacterName>Mytoon</CharacterName>
   <WowExecutablePath>C:\WoW\Wow.exe</WowExecutablePath>
@@ -117,11 +121,10 @@ persists (`MailRecipient`, `LastUsedPath`, `Settings/CharacterSettings_*.xml` as
 </ReloginSettings>
 ```
 
-> Note the UI panel says the same thing ("Credentials are saved in plain text in
-> Settings/ReloginSettings.xml"). If an encrypted store is added to the project later,
-> `EncryptedAttribute` is ready to be applied to `Password` — it derives from `SettingAttribute`,
-> but `Settings.GetXML`/`LoadFromXML` do not currently encrypt/decrypt, so using it would require
-> changing the shared serializer (out of scope for this feature).
+> The opt-in UI discloses that credentials may be submitted after a crash/exit and when the
+> running bot returns to the login screen after a logout or disconnect. Stop the bot before an
+> intentional logout. **Cancel auto-resume** remains available after automatic worker shutdown;
+> it leaves client monitoring enabled but prevents the recovered client from starting the bot.
 
 ---
 
@@ -192,7 +195,8 @@ it only detects the *departure*; the confirmation window belongs to the two stat
   [Relogin] Giving up after 3 attempt(s), maximum retries exhausted. Last failure — step LoggingIn: ...
   ```
 
-  `_gaveUp` latches: the monitor keeps watching (it will notice a *new* crash) but does not
+  Each monitor run owns its configuration, retry budget, give-up latch and status. Retired runs
+  cannot change the current run's state. The give-up latch keeps the monitor watching but it does not
   re-enter a sequence until the user presses Start again (`ReloginManager.OnBotStarted` re-arms
   the budget) or saves the settings.
 
@@ -204,7 +208,9 @@ before calling it a credential problem:
 
 1. the client **never** entered the loading/connecting state (`IsLoadingOrConnecting`) after the
    credentials were submitted — authentication never got far enough to reach the world server, and
-2. it came back within `LoginRejectSeconds`.
+2. it came back within `LoginRejectSeconds` of an **actual** `DefaultServerLogin` submission.
+   Realm-list actions do not start this clock. Any unreadable connecting-state poll makes the
+   interval uncertain and prevents a fatal credential classification.
 
 Only then is it reported as **"the server refused the login …"** and treated as **fatal**, so the
 same wrong password is not retried in a loop. If the client *did* connect (the flag went up) the
@@ -220,7 +226,9 @@ is classified correctly in both the fast-reject and the connected-then-dropped c
 
 1. **Client process.** If none exists: validate `WowExecutablePath`, `Process.Start` with the
    working directory set to the executable's folder, wait (bounded) for input idle.
-   If the trigger was `ClientHung`, the frozen process is closed first.
+   If the trigger was `ClientHung`, only the original frozen PID is closed first; retries reuse
+   a live replacement. If a launch completes after cancellation, its window is left open and
+   unattached for manual use; it never replaces the newer monitor's PID.
 2. **Attach + hook.** `ReloginClient.TryAttachAndHook(pid)`:
    * releases a stale attachment if it belongs to a *different* pid (the crashed client),
    * `new Memory(pid)` → `ObjectManager.Initialize(memory)` → EndScene hook,
@@ -238,8 +246,9 @@ is classified correctly in both the fast-reject and the connected-then-dropped c
      counted; after `MaxRealmSwitches` (5) the attempt fails with "the client could not switch to
      realm …" instead of spinning until the screen timeout,
    * `patchdownload` → fatal.
-4. **In-world confirmation** (`ConfirmInWorld`): `g_ClientConnectionState != 0` **and**
-   `ObjectManager.Me != null`. `EnterWorld` is re-issued at 15 s / 30 s / 45 s in case the first
+4. **In-world confirmation** (`ConfirmInWorld`): readable `g_ClientConnectionState != 0`, a
+   successful fresh object walk, and the configured character/realm identity. A mismatch is
+   fatal and leaves the bot stopped. `EnterWorld` is re-issued at 15 s / 30 s / 45 s in case the first
    call raced the character-list refresh, then the attempt fails at `InWorldTimeoutSeconds`.
 5. **Resume** — only after step 4 returns true. `ReloginManager.ResumeBot` is raised, and
    `MainWindow.ReloginManager_ResumeBot` (on the UI thread):
@@ -255,7 +264,7 @@ is classified correctly in both the fast-reject and the connected-then-dropped c
      resume is **skipped and logged** rather than started over a live worker — `TreeRoot.Start()`
      guards against exactly that, so attempting it anyway would only produce a confusing failure,
    * calls the existing `StartBot()` — i.e. the same BotBase through the normal start path. No
-     parallel start mechanism.
+     parallel start mechanism. The final start gate performs another fresh object walk.
 
 Per-attempt log line format:
 
@@ -294,7 +303,7 @@ Per-attempt log line format:
 | `Styx/Offsets/GlobalOffsets.cs` | `GlueScreenString = 0x00B6A9E0` |
 | `Styx/StyxWoW.cs` | `Reset()` also invalidates `WoWDb` / `WoWCache` client-address caches |
 | `Styx/WoWInternals/WoWDb.cs` | `internal static ResetForNewProcess()` |
-| `Styx/WoWInternals/WoWCache/WoWCache.cs` | `internal ResetForNewProcess()` + `BuildCaches()` extracted from the ctor |
+| `Styx/WoWInternals/WoWCache/WoWCache.cs` | fresh wrapper on reset; old wrappers are not cleared in place |
 | `Styx/Common/HotkeysManager.cs` | `UpdateWindowHandle(IntPtr)` (additive) |
 | `UI/SettingsWindow.xaml` | "Auto-Relogin" cards (toggle, credentials, path, retry) |
 | `UI/SettingsWindow.xaml.cs` | bind `ReloginSettings`, password round-trip, browse button, apply on save |
@@ -322,7 +331,8 @@ Prerequisites unless stated: `Enabled = true`, valid account/password/realm/char
 ### T1 — Normal crash, successful relogin
 
 1. Attach, load a profile, select e.g. Questing, press **Start**, let the bot run for a minute.
-2. Kill the client: Task Manager → *End task* on `Wow.exe` (or `taskkill /f /im Wow.exe`).
+2. Identify the attached PID in CopilotBuddy's log. In Task Manager's **Details** tab, end only
+   that `Wow.exe` PID (or run `taskkill /f /pid <attached-pid>`); leave other clients running.
 3. Expect within ~1 s: `Relogin triggered: ProcessExited — client process is gone`,
    `Attempt 1/3`, `Starting client`, `Client started, pid …`, `Attached … and hooked EndScene`,
    `Logging in as …`, `At character selection`, `Character '…' selected`, `In the world as …`,
@@ -346,18 +356,34 @@ Prerequisites unless stated: `Enabled = true`, valid account/password/realm/char
 ### T3 — Wrong password
 
 1. Set `Password = wrongpassword`, keep everything else valid.
-2. Kill the client (or log the character out to the login screen while the bot is running).
-3. Expect: relaunch, `Logging in as …`, then
-   `Attempt 1/3 failed at …: credentials rejected by the server (wrong account name or password)`
-   followed by `Not retrying this attempt: …` — exactly **one** attempt, no retry loop.
+2. **Default path:** kill the attached `Wow.exe` process so `RunAttempt` relaunches directly to the
+   account login form.
+   *(Optional live-client alternative: while the bot is running, force a server/network disconnect
+   that drops the client **directly** to the account login form—never via `/logout` or character
+   select—so the client reaches account login before recovery can start. Keep the bot running until
+   the trigger log line `client returned to Login and stayed there for 5s` appears—stopping the bot
+   earlier cancels the trigger—and verify it identifies `Login` rather than `CharSelect`.)*
+3. Expect: a relaunch on the default kill path (or, on the live-client disconnect path after
+   `client returned to Login`, `Client still running (pid …); logging it back in.`), then login
+   submission. Confirm that T3 exercised the configured password by checking the Debug log entry
+   `[Relogin] Login submission result: Submitted.` (vs. `Unknown.` to distinguish a confirmed
+   submission from an unknown Lua outcome). When `SendLogin` logs `Submitted.`, the bounce
+   back to the login screen occurs in strictly less than `LoginRejectSeconds`, polls remain
+   readable, and no connecting/loading state was observed, expect
+   `Attempt 1/3 failed at …: the server refused the login for 'myaccount' (wrong account name or password, or the account is not allowed to log in)`
+   followed by `Not retrying this attempt: …` — exactly **one** attempt, no retry loop. Otherwise
+   (`Login submission result: Unknown.` such as when the login Lua call returns no status, an
+   elapsed time `>= LoginRejectSeconds`, an unreadable poll, or an observed connecting state),
+   retrying is allowed per Section 4.
 
 ### T4 — Option disabled (no behaviour change)
 
-1. Uncheck "Auto-relogin on crash", Save. Log shows `Auto-relogin is disabled.` at Debug level.
+1. Uncheck "Auto-relogin on crash, logout or disconnect", Save. Log shows `Auto-relogin is disabled.` at Debug level.
 2. Kill the client. Expect the pre-existing behaviour only:
    `WoW process has exited. Stopping bot.` / `Bot stopping! Reason: WoW process exited` — **no
    `[Relogin]` lines**, no relaunch, no login, the client stays closed.
-3. Log the character out normally (bot stopped), then back in: nothing happens.
+3. Restart WoW, log in, and restart/reattach CopilotBuddy to that PID with relogin still disabled.
+   With the bot stopped, log the character out normally, then back in: nothing happens.
 4. Close CopilotBuddy: no delay and no `[Relogin] Monitor stopped` line (no thread was created —
    verifiable in a debugger/Process Explorer thread list: no "Auto-Relogin Monitor").
 

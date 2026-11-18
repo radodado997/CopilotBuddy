@@ -42,12 +42,11 @@ namespace Styx.WoWInternals
         {
             if (_initialized) return;
 
-            var wow = ObjectManager.Wow;
-            if (wow == null) return;   // not attached yet - nothing to walk
-
             lock (_sync)
             {
                 if (_initialized) return;
+                var wow = ObjectManager.Wow;
+                if (wow == null) return;   // not attached yet - nothing to walk
 
                 long now = Environment.TickCount64;
                 // Check the sentinel first: `now - long.MinValue` overflows (the result wraps
@@ -112,7 +111,7 @@ namespace Styx.WoWInternals
                     
                     if (!_tables.ContainsKey((ClientDb)tableId))
                     {
-                        _tables.Add((ClientDb)tableId, new DbTable(pointer));
+                        _tables.Add((ClientDb)tableId, new DbTable(pointer, wow));
                     }
                     
                     addr += 17; // Each entry is 17 bytes
@@ -192,20 +191,28 @@ namespace Styx.WoWInternals
         {
             private readonly IntPtr _tablePtr;
             private readonly DbTableHeader _header;
+            private readonly Memory _owner;
 
-            internal DbTable(IntPtr tablePtr)
+            internal DbTable(IntPtr tablePtr, Memory wow)
             {
                 _tablePtr = tablePtr;
-                var wow = ObjectManager.Wow;
+                _owner = wow;
                 _header = wow != null ? wow.ReadStruct<DbTableHeader>((uint)tablePtr.ToInt32() - 24) : default;
             }
+
+            private Memory? GetValidatedMemory()
+            {
+                return _owner != null && ReferenceEquals(ObjectManager.Wow, _owner) ? _owner : null;
+            }
+
+            public bool IsValid => GetValidatedMemory() != null;
             public bool IsLoaded => _header.IsLoaded != 0;
             public int NumRows => _header.NumRows;
             public int MaxIndex => _header.MaxIndex;
             public int MinIndex => _header.MinIndex;
             public Row? GetRow(uint index)
             {
-                var wow = ObjectManager.Wow;
+                var wow = GetValidatedMemory();
                 if (wow == null) return null;
                 
                 if (index < MinIndex || index > MaxIndex)
@@ -218,12 +225,12 @@ namespace Styx.WoWInternals
                 if (rowPtr == 0)
                     return null;
 
-                return new Row(new IntPtr(unchecked((int)rowPtr)));
+                return new Row(new IntPtr(unchecked((int)rowPtr)), wow);
             }
 
             public Row? GetLocalizedRow(int index)
             {
-                var wow = ObjectManager.Wow;
+                var wow = GetValidatedMemory();
                 if (wow == null)
                     return null;
 
@@ -238,7 +245,7 @@ namespace Styx.WoWInternals
                 IntPtr buffer;
                 if (wow.Read<byte>((uint)GlobalOffsets.ClientDb_IsCompressed) == 1)
                 {
-                    buffer = Unpack(rowPtr, 704);
+                    buffer = Unpack(wow, rowPtr, 704);
                 }
                 else
                 {
@@ -246,12 +253,11 @@ namespace Styx.WoWInternals
                     buffer = Marshal.AllocHGlobal(704);
                     Marshal.Copy(bytes, 0, buffer, 704);
                 }
-                return new Row(buffer, true);
+                return new Row(buffer, true, wow);
             }
 
-            private static IntPtr Unpack(uint source, int size)
+            private static IntPtr Unpack(Memory wow, uint source, int size)
             {
-                var wow = ObjectManager.Wow;
                 byte[] bytes = new byte[20480];
                 bytes[0] = wow.Read<byte>(source);
                 int written = 1;
@@ -282,23 +288,31 @@ namespace Styx.WoWInternals
         {
             private readonly IntPtr _address;
             private readonly bool _ownsMemory;
+            private readonly Memory? _owner;
 
-            internal Row(IntPtr address)
+            internal Row(IntPtr address, Memory? owner = null)
             {
                 _address = address;
                 _ownsMemory = false;
+                _owner = owner;
             }
 
-            internal Row(IntPtr address, bool ownsMemory) : this(address)
+            internal Row(IntPtr address, bool ownsMemory, Memory? owner = null) : this(address, owner)
             {
                 _ownsMemory = ownsMemory;
             }
-            public bool IsValid => _address != IntPtr.Zero;
+
+            private Memory? GetValidatedMemory()
+            {
+                return _owner != null && ReferenceEquals(ObjectManager.Wow, _owner) ? _owner : null;
+            }
+
+            public bool IsValid => _address != IntPtr.Zero && (_ownsMemory || GetValidatedMemory() != null);
             public T? GetField<T>(uint index)
             {
                 try
                 {
-                    var wow = ObjectManager.Wow;
+                    var wow = GetValidatedMemory();
                     if (wow == null || _ownsMemory)
                         return default;
 
@@ -318,7 +332,10 @@ namespace Styx.WoWInternals
             }
             public void SetField<T>(uint index, T value)
             {
-                var wow = ObjectManager.Wow;
+                if (_ownsMemory)
+                    return;
+
+                var wow = GetValidatedMemory();
                 if (wow != null)
                     wow.Write((uint)_address.ToInt32() + index * 4, value);
             }
@@ -329,7 +346,7 @@ namespace Styx.WoWInternals
                     if (_ownsMemory)
                         return Marshal.PtrToStructure<T>(_address);
 
-                    var wow = ObjectManager.Wow;
+                    var wow = GetValidatedMemory();
                     if (wow == null)
                         return default;
                     return wow.ReadStruct<T>((uint)_address.ToInt32());
