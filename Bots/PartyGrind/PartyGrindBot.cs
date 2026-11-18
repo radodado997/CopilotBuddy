@@ -62,6 +62,44 @@ namespace CopilotBuddy.Bots.PartyGrind
         private long _deathStartedUtcMs;
         private bool _localWasNeedingRest;
         private bool _lootFilterAttached;
+        private SquadTravelProgress _travelProgress = new();
+        private static Composite? _activeCombatRoutine, _activeRestRoutine;
+        private static bool _combatTicked, _restTicked;
+
+        private sealed class RoutineAwareRoot : PrioritySelector
+        {
+            public RoutineAwareRoot(params Composite[] children) : base(children) { }
+            public override RunStatus Tick(object context)
+            {
+                if (IsRunning) { base.Stop(context); base.Start(context); }
+                _combatTicked = _restTicked = false;
+                try { return base.Tick(context); }
+                finally
+                {
+                    if (!_combatTicked) StopRoutine(ref _activeCombatRoutine);
+                    if (!_restTicked) StopRoutine(ref _activeRestRoutine);
+                }
+            }
+        }
+
+        private static void StopRoutine(ref Composite? active)
+        {
+            active?.Stop(null);
+            active = null;
+        }
+
+        private static RunStatus TickRoutine(ref Composite? active, Composite behavior)
+        {
+            if (!ReferenceEquals(active, behavior))
+            {
+                StopRoutine(ref active);
+                active = behavior;
+                active.Start(null);
+            }
+            var status = active.Tick(null);
+            if (status != RunStatus.Running) StopRoutine(ref active);
+            return status;
+        }
 
         public PartyGrindBot()
         {
@@ -90,6 +128,7 @@ namespace CopilotBuddy.Bots.PartyGrind
         {
             SquadSettings settings = SquadSettings.Instance;
             settings.ApplyCliOverrides();
+            _travelProgress = new SquadTravelProgress();
 
             _coordinator.Reset();
             _townRun.Reset();
@@ -109,7 +148,7 @@ namespace CopilotBuddy.Bots.PartyGrind
             SquadContext.ActiveSettings = settings;
             SquadContext.EffectiveLevelOverride = StyxWoW.Me?.Level ?? 1;
 
-            ProfileManager.LevelOverrideSelector = () => SquadContext.GetEffectiveProfileLevel();
+            ProfileManager.LevelOverrideSelector = () => _lastAppliedEffectiveLevel > 0 ? _lastAppliedEffectiveLevel : SquadContext.GetEffectiveProfileLevel();
 
             SquadTankBridge.AttachTargetingFilters();
             if (!_lootFilterAttached)
@@ -134,6 +173,7 @@ namespace CopilotBuddy.Bots.PartyGrind
         public override void Stop()
         {
             ProfileManager.LevelOverrideSelector = null;
+            ProfileManager.RefreshProfileForLevel();
             Mount.OnMountUp -= SquadFormationService.HandleMountUpEvent;
             SquadTankBridge.DetachTargetingFilters();
 
@@ -143,6 +183,9 @@ namespace CopilotBuddy.Bots.PartyGrind
                 _lootFilterAttached = false;
             }
 
+            StopRoutine(ref _activeCombatRoutine);
+            StopRoutine(ref _activeRestRoutine);
+            _provisioning.Stop();
             _partySync.DetachEvents();
             StopIpc();
             SquadOverlay.Detach();
@@ -153,6 +196,8 @@ namespace CopilotBuddy.Bots.PartyGrind
 
         public override void OnPaused()
         {
+            StopRoutine(ref _activeCombatRoutine);
+            StopRoutine(ref _activeRestRoutine);
             _coordinator.IsPausedManually = true;
             _coordinator.ManualPauseReason = "Bot paused";
             var settings = SquadContext.ActiveSettings ?? SquadSettings.Instance;
@@ -204,6 +249,14 @@ namespace CopilotBuddy.Bots.PartyGrind
             }
         }
 
+        private static Dictionary<string, string> LoadMemberSecrets(SquadSettings settings)
+        {
+            if (string.IsNullOrWhiteSpace(settings.IpcMemberSecretsPath))
+                throw new InvalidOperationException("Configure IpcMemberSecretsPath with per-member random base64 secrets (at least 32 bytes each).");
+            return new Dictionary<string, string>(System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, string>>(
+                File.ReadAllText(settings.IpcMemberSecretsPath)) ?? throw new InvalidOperationException("Invalid member secrets file."), StringComparer.OrdinalIgnoreCase);
+        }
+
         private void StartIpc(SquadSettings settings)
         {
             StopIpc();
@@ -211,13 +264,18 @@ namespace CopilotBuddy.Bots.PartyGrind
             {
                 if (settings.IsCoordinator)
                 {
-                    _ipcServer = new SquadIpcServer(settings.IpcPort, settings.TeamId);
+                    var secrets = LoadMemberSecrets(settings);
+                    var expected = new HashSet<string>(settings.GetExpectedMemberNames(), StringComparer.OrdinalIgnoreCase);
+                    secrets = secrets.Where(kv => expected.Contains(kv.Key)).ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.OrdinalIgnoreCase);
+                    _ipcServer = new SquadIpcServer(settings.IpcPort, settings.TeamId, memberSecrets: secrets);
                     _ipcServer.Start();
                     SquadContext.IsIpcConnected = true;
                 }
                 else
                 {
-                    _ipcClient = new SquadIpcClient(settings.IpcPort, settings.TeamId);
+                    var secrets = LoadMemberSecrets(settings);
+                    if (!secrets.TryGetValue(StyxWoW.Me!.Name, out string? secret)) throw new InvalidOperationException("No IPC secret configured for this character.");
+                    _ipcClient = new SquadIpcClient(settings.IpcPort, settings.TeamId, memberSecret: secret);
                     _ipcClient.Start(BuildLocalHandshake);
                     SquadContext.IsIpcConnected = false;
                 }
@@ -269,7 +327,15 @@ namespace CopilotBuddy.Bots.PartyGrind
                 _currentSecondaryGuid,
                 _pullStartedUtcMs,
                 StyxWoW.Me?.Rotation ?? 0f,
-                now);
+                now, resolveProfile: level =>
+                {
+                    if (_lastAppliedEffectiveLevel != level)
+                    {
+                        _lastAppliedEffectiveLevel = level;
+                        if (ProfileManager.CurrentOuterProfile != null) ProfileManager.RefreshProfileForLevel();
+                    }
+                    return CaptureProfileSnapshot(now);
+                });
 
             SquadContext.IsIpcConnected = _ipcServer?.IsListening == true;
             SquadContext.UpdateLeaderState(leaderState);
@@ -299,6 +365,11 @@ namespace CopilotBuddy.Bots.PartyGrind
             if (leaderState == null) SquadContext.UpdateLeaderState(null);
             if (leaderState != null)
             {
+                if (settings.AutoLoadCoordinatorProfile && !EnsureLeaderProfile(leaderState))
+                {
+                    SquadContext.UpdateLeaderState(null);
+                    return;
+                }
                 SquadContext.UpdateLeaderState(leaderState);
 
                 if (leaderState.EffectiveSquadMinLevel > 0 && leaderState.EffectiveSquadMinLevel != _lastAppliedEffectiveLevel)
@@ -317,6 +388,31 @@ namespace CopilotBuddy.Bots.PartyGrind
             _wasInCombat = localState.IsInCombat;
         }
 
+        private bool EnsureLeaderProfile(SquadLeaderState leader)
+        {
+            if (string.IsNullOrWhiteSpace(leader.ProfileXmlHash)) return false;
+            if (!string.IsNullOrEmpty(ProfileManager.XmlLocation) &&
+                string.Equals(ComputeFileHash(ProfileManager.XmlLocation), leader.ProfileXmlHash, StringComparison.OrdinalIgnoreCase))
+                return true;
+            string root = Path.Combine(AppContext.BaseDirectory, "Profiles");
+            var candidates = Directory.Exists(root) ? Directory.EnumerateFiles(root, "*.xml", new EnumerationOptions
+            {
+                RecurseSubdirectories = true, AttributesToSkip = FileAttributes.ReparsePoint
+            }) : Enumerable.Empty<string>();
+            string? local = candidates.FirstOrDefault(p => string.Equals(ComputeFileHash(p), leader.ProfileXmlHash, StringComparison.OrdinalIgnoreCase));
+            if (local == null)
+            {
+                if (_lastAttemptedLeaderProfilePath != leader.ProfileXmlPath)
+                    Logging.Write("[PartyGrind] Missing trusted local profile: {0}. Place the matching XML under Profiles.", leader.ProfileXmlPath);
+                _lastAttemptedLeaderProfilePath = leader.ProfileXmlPath;
+                return false;
+            }
+            ProfileManager.LoadNew(local, rememberMe: false);
+            _lastAppliedEffectiveLevel = leader.EffectiveSquadMinLevel;
+            ProfileManager.RefreshProfileForLevel();
+            return true;
+        }
+
         private void UpdateCoordinatorTargets(long now)
         {
             var me = StyxWoW.Me;
@@ -331,8 +427,8 @@ namespace CopilotBuddy.Bots.PartyGrind
 
             ulong newFocusGuid = (focus != null && focus.IsValid && !focus.Dead && !focus.IsFriendly) ? focus.Guid : 0UL;
             if (newFocusGuid != 0 && focus != null && !focus.Combat && !focus.IsTargetingMyPartyMember &&
-                !SquadTankBridge.CanInitiatePull(SquadContext.GetLeaderStateSnapshot(),
-                    (SquadContext.ActiveSettings ?? SquadSettings.Instance).MaxPullGatherDistance))
+                (_coordinator.IsWaitingForFollower || !SquadTankBridge.CanInitiatePull(SquadContext.GetLeaderStateSnapshot(),
+                    (SquadContext.ActiveSettings ?? SquadSettings.Instance).MaxPullGatherDistance)))
                 newFocusGuid = 0;
             if (newFocusGuid != 0 && newFocusGuid != _currentFocusGuid)
             {
@@ -362,7 +458,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                 _cachedProfileHash = ComputeFileHash(xmlPath);
             }
 
-            var grindArea = StyxWoW.AreaManager?.CurrentGrindArea ?? current?.GrindArea;
+            var grindArea = current?.GrindArea ?? StyxWoW.AreaManager?.CurrentGrindArea;
             WoWPoint hotspot = (grindArea != null && grindArea.Hotspots.Count > 0)
                 ? grindArea.CurrentHotSpot.Position
                 : (StyxWoW.Me?.Location ?? WoWPoint.Zero);
@@ -462,7 +558,7 @@ namespace CopilotBuddy.Bots.PartyGrind
             var currentSub = ProfileManager.CurrentOuterProfile != null ? ProfileManager.CurrentProfile : null;
             bool isResting = !me.Combat && (me.HasAura("Food") || me.HasAura("Drink") || _localWasNeedingRest);
             bool isLooting = me.FreeNormalBagSlots > 0 && !me.Combat && !isDead && !isGhost &&
-                (LootFrame.Instance.IsVisible || LootTargeting.Instance.FirstObject != null);
+                (LootFrame.Instance.IsVisible || FindEligibleLoot() != null);
 
             return new SquadMemberState
             {
@@ -493,7 +589,10 @@ namespace CopilotBuddy.Bots.PartyGrind
                 NeedsPeel = needsPeel,
                 NeedsRest = _localWasNeedingRest,
                 IsResting = isResting,
+                TownBlockedReason = _townRun.BlockedReason,
                 IsLooting = isLooting,
+                KnownBlessings = new[] { "Blessing of Sanctuary", "Blessing of Kings", "Blessing of Might", "Blessing of Wisdom" }.Where(SpellManager.HasSpell).ToList(),
+                CanResurrect = SquadHealBridge.GetResurrectionSpell(me.Class) is string resSpell && SpellManager.HasSpell(resSpell),
                 CanMount = me.Level >= 20,
                 CanFly = me.Level >= 60,
                 MaxMountSpeed = me.Level >= 40 ? 100f : (me.Level >= 20 ? 60f : 0f),
@@ -505,8 +604,8 @@ namespace CopilotBuddy.Bots.PartyGrind
                 WantsDrink = provNeeds.WantsDrink,
                 WantsHealthstone = provNeeds.WantsHealthstone,
                 IsProvisioningBusy = _provisioning.IsTradeBusy,
-                CanProvideMageFood = me.Class == WoWClass.Mage && settings.EnableMageProvisioning && me.Level >= 6,
-                CanProvideMageDrink = me.Class == WoWClass.Mage && settings.EnableMageProvisioning && me.Level >= 4,
+                CanProvideMageFood = me.Class == WoWClass.Mage && settings.EnableMageProvisioning && SpellManager.HasSpell("Conjure Food"),
+                CanProvideMageDrink = me.Class == WoWClass.Mage && settings.EnableMageProvisioning && SpellManager.HasSpell("Conjure Water"),
                 CanProvideHealthstone = me.Class == WoWClass.Warlock && settings.EnableWarlockHealthstones && me.Level >= 10,
                 NeedsSell = townNeeds.NeedsSell,
                 NeedsRepair = townNeeds.NeedsRepair,
@@ -524,7 +623,7 @@ namespace CopilotBuddy.Bots.PartyGrind
 
         private Composite BuildRootBehavior()
         {
-            return new PrioritySelector(
+            return new RoutineAwareRoot(
                 // 1. Paused or follower disconnected safety pause
                 new Decorator(
                     ctx => ShouldPauseMovement(),
@@ -876,9 +975,8 @@ namespace CopilotBuddy.Bots.PartyGrind
             if (behavior == null)
                 return RunStatus.Failure;
 
-            behavior.Start(null);
-            RunStatus status = behavior.Tick(null);
-            behavior.Stop(null);
+            _combatTicked = true;
+            RunStatus status = TickRoutine(ref _activeCombatRoutine, behavior);
             return status == RunStatus.Failure ? RunStatus.Success : status;
         }
 
@@ -915,9 +1013,8 @@ namespace CopilotBuddy.Bots.PartyGrind
             var restBehavior = RoutineManager.Current?.RestBehavior;
             if (restBehavior != null && (me.HealthPercent < settings.ResumeRestHealthPct || (usesMana && me.PowerPercent < settings.ResumeRestManaPct)))
             {
-                restBehavior.Start(null);
-                restBehavior.Tick(null);
-                restBehavior.Stop(null);
+                _restTicked = true;
+                TickRoutine(ref _activeRestRoutine, restBehavior);
             }
 
             return RunStatus.Success;
@@ -949,7 +1046,14 @@ namespace CopilotBuddy.Bots.PartyGrind
             if (leader != null && leader.Phase != SquadPhase.Looting && leader.Phase != SquadPhase.Grinding)
                 return false;
 
-            return LootTargeting.Instance.FirstObject != null;
+            return FindEligibleLoot() != null;
+        }
+
+        private static WoWObject? FindEligibleLoot()
+        {
+            var leader = SquadContext.GetLeaderStateSnapshot();
+            return LootTargeting.Instance.LootingList.FirstOrDefault(o => o != null && o.IsValid &&
+                (leader == null || o.Location.Distance(new WoWPoint(leader.X, leader.Y, leader.Z)) <= 25f));
         }
 
         private static RunStatus RunLootBehavior()
@@ -963,7 +1067,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                 return RunStatus.Success;
             }
 
-            var lootObj = LootTargeting.Instance.FirstObject;
+            var lootObj = FindEligibleLoot();
             if (lootObj == null || !lootObj.IsValid)
                 return RunStatus.Failure;
 
@@ -1072,7 +1176,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                     return RunStatus.Success;
 
                 int slotIdx = SquadContext.GetMySlotIndex(me.Name, leader);
-                WoWPoint followPos = SquadFormationService.ComputeTravelFollowPosition(me.Location, leader, slotIdx);
+                WoWPoint followPos = SquadFormationService.ComputeTravelFollowPosition(me.Location, leader, slotIdx, _travelProgress);
                 if (me.Location.Distance(followPos) > 4.0f)
                 {
                     Navigator.MoveTo(followPos, "Following " + leader.LeaderName);

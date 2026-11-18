@@ -11,6 +11,9 @@ namespace CopilotBuddy.PartyGrind.Tests
 {
     public sealed class SquadIpcTests
     {
+        private static string Secret(string name) => Convert.ToBase64String(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes("synthetic-test-only-" + name)));
+        private static Dictionary<string, string> Secrets => new[] { "Follower", "LegitHealer", "Member_01", "Member_02", "Member_03", "Member_04" }.ToDictionary(n => n, Secret);
+
         private static async Task WaitUntilAsync(Func<bool> predicate, int timeoutMs = 4000)
         {
             long deadline = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() + timeoutMs;
@@ -23,17 +26,51 @@ namespace CopilotBuddy.PartyGrind.Tests
         }
 
         [Fact]
+        public async Task SameClient_ReconnectsAutomaticallyAfterListenerRestart()
+        {
+            using var server = new SquadIpcServer(0, "Retry", memberSecrets: Secrets);
+            server.Start();
+            int port = server.Port;
+            using var client = new SquadIpcClient(port, "Retry", memberSecret: Secret("Follower"));
+            client.Start(() => new SquadHandshake { CharacterName = "Follower", Level = 5 });
+            await WaitUntilAsync(() => server.GetMemberSnapshots().Count == 1);
+            server.BroadcastLeaderState(new SquadLeaderState { EffectiveSquadMinLevel = 5 });
+            await WaitUntilAsync(() => client.LatestLeaderState?.EffectiveSquadMinLevel == 5);
+            server.Stop();
+            await WaitUntilAsync(() => !client.IsConnected);
+            using var replacement = new SquadIpcServer(port, "Retry", memberSecrets: Secrets);
+            replacement.Start();
+            await WaitUntilAsync(() => replacement.GetMemberSnapshots().Count == 1);
+            replacement.BroadcastLeaderState(new SquadLeaderState { EffectiveSquadMinLevel = 6 });
+            await WaitUntilAsync(() => client.LatestLeaderState?.EffectiveSquadMinLevel == 6);
+        }
+
+        [Fact]
+        public async Task WrongSecret_CannotReplaceAuthenticatedMember()
+        {
+            using var server = new SquadIpcServer(0, "Retry", memberSecrets: Secrets);
+            server.Start();
+            using var client = new SquadIpcClient(server.Port, "Retry", memberSecret: Secret("Follower"));
+            client.Start(() => new SquadHandshake { CharacterName = "Follower", Guid = 42, Level = 5 });
+            await WaitUntilAsync(() => server.GetMemberSnapshots().Count == 1);
+            using var impostor = new SquadIpcClient(server.Port, "Retry", memberSecret: Secret("Wrong"));
+            impostor.Start(() => new SquadHandshake { CharacterName = "Follower", Guid = 99, Level = 80 });
+            await Task.Delay(750);
+            Assert.Equal(42UL, Assert.Single(server.GetMemberSnapshots()).Handshake.Guid);
+        }
+
+        [Fact]
         public async Task Server_BindFailureCanRetry_AndClientWaitsForLeaderReadiness()
         {
             using var occupied = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
             occupied.Start();
             int port = ((System.Net.IPEndPoint)occupied.LocalEndpoint).Port;
-            using var server = new SquadIpcServer(port, "Retry");
+            using var server = new SquadIpcServer(port, "Retry", memberSecrets: Secrets);
             Assert.Throws<System.Net.Sockets.SocketException>(() => server.Start());
             Assert.False(server.IsListening);
             occupied.Stop();
             server.Start();
-            using var client = new SquadIpcClient(port, "Retry");
+            using var client = new SquadIpcClient(port, "Retry", memberSecret: Secret("Follower"));
             client.Start(() => new SquadHandshake { CharacterName = "Follower", Level = 5 });
             await WaitUntilAsync(() => server.GetMemberSnapshots().Count == 1);
             Assert.False(client.IsConnected);
@@ -68,7 +105,7 @@ namespace CopilotBuddy.PartyGrind.Tests
         [InlineData(4)] // 5-client squad: 1 coordinator + 4 clients
         public async Task ServerAndClients_AssignUniqueSlotsAndPropagateLeaderState(int followerCount)
         {
-            using var server = new SquadIpcServer(0, "AlphaTeam");
+            using var server = new SquadIpcServer(0, "AlphaTeam", memberSecrets: Secrets);
             server.DisconnectTimeoutMs = 5000;
             server.Start();
             Assert.True(server.IsListening);
@@ -84,7 +121,7 @@ namespace CopilotBuddy.PartyGrind.Tests
                     string name = $"Member_{followerCount - i:D2}"; // intentionally reverse order to verify sorting
                     expectedNames.Add(name);
 
-                    var client = new SquadIpcClient(server.Port, "AlphaTeam")
+                    var client = new SquadIpcClient(server.Port, "AlphaTeam", memberSecret: Secret(name))
                     {
                         DisconnectTimeoutMs = 5000
                     };
@@ -176,7 +213,7 @@ namespace CopilotBuddy.PartyGrind.Tests
         [Fact]
         public async Task Server_RejectsWrongTeamId_AndClientReconnectsAfterRestart()
         {
-            using var server = new SquadIpcServer(0, "SquadBlue");
+            using var server = new SquadIpcServer(0, "SquadBlue", memberSecrets: Secrets);
             server.DisconnectTimeoutMs = 5000;
             server.Start();
 
@@ -185,14 +222,11 @@ namespace CopilotBuddy.PartyGrind.Tests
             using var wrongWriter = new System.IO.StreamWriter(wrongTeamClient.GetStream()) { AutoFlush = true };
             await wrongWriter.WriteLineAsync(SquadJson.SerializeEnvelope(SquadMessageTypes.Handshake, "SquadRed", 1,
                 new SquadHandshake { CharacterName = "Intruder", Level = 80 }));
-            await wrongWriter.WriteLineAsync(SquadJson.SerializeEnvelope(SquadMessageTypes.Handshake, "SquadBlue", 2,
-                new SquadHandshake { CharacterName = "Barrier", Level = 1 }));
-            await WaitUntilAsync(() => server.GetMemberSnapshots().Any(s => s.CharacterName == "Barrier"));
-            Assert.DoesNotContain(server.GetMemberSnapshots(), s => s.CharacterName == "Intruder");
-            wrongTeamClient.Close();
-            await WaitUntilAsync(() => server.GetMemberSnapshots().Count == 0);
+            using var wrongReader = new System.IO.StreamReader(wrongTeamClient.GetStream());
+            Assert.Null(await wrongReader.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(4)));
+            Assert.Empty(server.GetMemberSnapshots());
 
-            using var validClient = new SquadIpcClient(server.Port, "SquadBlue")
+            using var validClient = new SquadIpcClient(server.Port, "SquadBlue", memberSecret: Secret("LegitHealer"))
             {
                 DisconnectTimeoutMs = 5000
             };
@@ -225,7 +259,7 @@ namespace CopilotBuddy.PartyGrind.Tests
 
             await WaitUntilAsync(() => server.GetMemberSnapshots().Count == 0);
 
-            using var restartedClient = new SquadIpcClient(server.Port, "SquadBlue")
+            using var restartedClient = new SquadIpcClient(server.Port, "SquadBlue", memberSecret: Secret("LegitHealer"))
             {
                 DisconnectTimeoutMs = 5000
             };

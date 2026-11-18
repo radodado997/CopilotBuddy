@@ -34,6 +34,17 @@ namespace CopilotBuddy.PartyGrind.Tests
             }
         }
 
+        [Fact]
+        public void BreadcrumbFollow_AdvancesPastReachedPoint()
+        {
+            var leader = new SquadLeaderState { X = 100, MapId = 0, Breadcrumbs = new List<SquadBreadcrumb>
+            {
+                new() { X = 0 }, new() { X = 10 }, new() { X = 20 }
+            } };
+            var next = SquadFormationService.ComputeTravelFollowPosition(new WoWPoint(10, 0, 0), leader, 0);
+            Assert.Equal(20f, next.X);
+        }
+
         [Theory]
         [InlineData(0f)]
         [InlineData(1.047f)]
@@ -49,7 +60,7 @@ namespace CopilotBuddy.PartyGrind.Tests
             for (int slot = 0; slot < 3; slot++)
             {
                 meleeSlots.Add(SquadFormationService.ComputeMeleeFlankPosition(
-                    mobPos, facingRad, meleeFlankRadius: 3.2f, meleeSlotIndex: slot, totalMeleeCount: 3));
+                    mobPos, facingRad, meleeFlankRadius: 2f, meleeSlotIndex: slot, totalMeleeCount: 3));
             }
 
             for (int i = 0; i < meleeSlots.Count; i++)
@@ -114,8 +125,8 @@ namespace CopilotBuddy.PartyGrind.Tests
             Assert.Equal(3, countM);
             Assert.Equal(3, countL);
             Assert.Equal(3, countH);
-            Assert.Equal(0, mageIdx);
-            Assert.Equal(1, lockIdx);
+            Assert.Equal(1, mageIdx);
+            Assert.Equal(0, lockIdx);
             Assert.Equal(2, healIdx); // center index for 3-slot lateral pattern (-4.5, +4.5, 0)
         }
 

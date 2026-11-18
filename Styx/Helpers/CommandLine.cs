@@ -30,7 +30,8 @@ namespace Styx.Helpers
         public static string AutoSelectCustomClass => Arguments.GetString("customclass");
 
         /// <summary>Optional named instance for isolated global settings (-instance).</summary>
-        public static string? InstanceName => GetSingleValue("instance");
+        public static string? InstanceName => !Arguments.Exists("instance") ? null
+            : GetSingleValue("instance") ?? throw new ArgumentException("-instance requires a nonempty name.");
 
         /// <summary>Squad role override passed on CLI (-squadrole).</summary>
         public static string? SquadRole => GetSingleValue("squadrole");

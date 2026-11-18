@@ -187,6 +187,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Forms
             s.EnableCrossPartyBuffs = ChkEnableCrossBuffs.IsChecked == true;
             s.SetRaidTargetMarkers = ChkRaidMarkers.IsChecked == true;
 
+            if (s.ResumeRestHealthPct < s.TriggerRestHealthPct || s.ResumeRestManaPct < s.TriggerRestManaPct)
+                throw new ArgumentException("Rest resume thresholds must be at least their trigger thresholds.");
             s.GetXML().Save(s.SettingsPath);
         }
 
@@ -207,8 +209,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Forms
                 return;
 
             string[] defaults = { "TankLeader", "Healer", "DpsMelee", "DpsRanged", "HybridOffHeal" };
-            var names = TxtScriptNames.Text.Split(',', StringSplitOptions.RemoveEmptyEntries).Take(count).ToList();
-            var roles = TxtScriptRoles.Text.Split(',', StringSplitOptions.RemoveEmptyEntries).Take(count).ToList();
+            var names = TxtScriptNames.Text.Split(new[] { ',', ';', ' ' }, StringSplitOptions.RemoveEmptyEntries).Take(count).ToList();
+            var roles = TxtScriptRoles.Text.Split(new[] { ',', ';', ' ' }, StringSplitOptions.RemoveEmptyEntries).Take(count).ToList();
             while (names.Count < count) names.Add($"Char{names.Count + 1}");
             while (roles.Count < count) roles.Add(defaults[roles.Count]);
             TxtScriptNames.Text = string.Join(",", names);
@@ -243,8 +245,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Forms
                 var pending = new SquadSettings(current.SettingsPath);
                 pending.LoadFromXML(current.GetXML());
                 SaveToSettings(pending);
-                if (!SquadContext.IsActive)
-                    SquadSettings.Instance = pending;
+                SquadSettings.Instance = pending;
                 DialogResult = true;
                 Close();
             }

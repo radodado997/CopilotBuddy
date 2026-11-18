@@ -69,6 +69,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private string _activeTradeTarget = string.Empty;
         private long _tradeStartedUtcMs;
         private bool _tradeItemsPlaced;
+        private readonly List<(int Slot, uint Entry, int Count)> _offeredItems = new();
 
         public bool IsTradeBusy => !string.IsNullOrEmpty(_activeTradeTarget) || TradeFrame.Instance.IsVisible;
 
@@ -188,8 +189,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             return me.BagItems.Any(i => i != null && i.IsValid && IsHealthstoneName(i.Name));
         }
 
-        public void OnTradeCancelledOrTimeout(string targetName, int cooldownSeconds)
+        private void OnTradeCancelledOrTimeout(string targetName, int cooldownSeconds)
         {
+            if (!TradeFrame.IsPartnerAuthorized(targetName, _activeTradeTarget)) return;
             if (!string.IsNullOrWhiteSpace(targetName))
             {
                 long until = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() + Math.Max(1, cooldownSeconds) * 1000L;
@@ -198,16 +200,21 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             ResetActiveTradeState();
         }
 
-        public void OnTradeClosed()
+        public void Stop()
         {
+            if (!string.IsNullOrEmpty(_activeTradeTarget) && (!TradeFrame.Instance.IsVisible ||
+                TradeFrame.IsPartnerAuthorized(TradeFrame.Instance.PartnerName, _activeTradeTarget)))
+                TradeFrame.Instance.CancelTrade();
             ResetActiveTradeState();
         }
+
 
         private void ResetActiveTradeState()
         {
             _activeTradeTarget = string.Empty;
             _tradeStartedUtcMs = 0;
             _tradeItemsPlaced = false;
+            _offeredItems.Clear();
         }
 
         private bool IsOnCooldown(string targetName)
@@ -321,40 +328,37 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     bool wantHs = targetSummary?.WantsHealthstone ?? false;
 
                     int tradeSlot = 1;
-                    if (wantFood)
+                    bool placed = true;
+                    foreach (var request in new[] { (wantFood, true, false, false, settings.TargetMemberFoodStack),
+                        (wantDrink, false, true, false, settings.TargetMemberDrinkStack), (wantHs, false, false, true, 1) })
                     {
-                        var food = FindTradableBagItem(me, receiverLevel, isFood: true, isDrink: false, isHealthstone: false);
-                        if (food != null)
-                        {
-                            int split = (int)Math.Min(food.StackCount, (uint)Math.Max(1, settings.TargetMemberFoodStack));
-                            if (TradeFrame.Instance.PutItem(food, tradeSlot, split))
-                                tradeSlot++;
-                        }
+                        if (!request.Item1) continue;
+                        var item = FindTradableBagItem(me, receiverLevel, request.Item2, request.Item3, request.Item4);
+                        if (item == null) { placed = false; break; }
+                        int count = (int)Math.Min(item.StackCount, (uint)Math.Max(1, request.Item5));
+                        if (_offeredItems.Any(i => i.Entry == item.Entry && i.Count >= count)) continue;
+                        if (!TradeFrame.Instance.PutItem(item, tradeSlot, count) ||
+                            !TradeFrame.Instance.ContainsPlayerItem(tradeSlot, item.Entry, count))
+                        { placed = false; break; }
+                        _offeredItems.Add((tradeSlot, item.Entry, count));
+                        tradeSlot++;
                     }
-
-                    if (wantDrink && tradeSlot <= 6)
+                    if (!placed || tradeSlot == 1)
                     {
-                        var drink = FindTradableBagItem(me, receiverLevel, isFood: false, isDrink: true, isHealthstone: false);
-                        if (drink != null)
-                        {
-                            int split = (int)Math.Min(drink.StackCount, (uint)Math.Max(1, settings.TargetMemberDrinkStack));
-                            if (TradeFrame.Instance.PutItem(drink, tradeSlot, split))
-                                tradeSlot++;
-                        }
-                    }
-
-                    if (wantHs && tradeSlot <= 6)
-                    {
-                        var hs = FindTradableBagItem(me, receiverLevel, isFood: false, isDrink: false, isHealthstone: true);
-                        if (hs != null && TradeFrame.Instance.PutItem(hs, tradeSlot, 1))
-                        {
-                            tradeSlot++;
-                        }
+                        TradeFrame.Instance.CancelTrade();
+                        OnTradeCancelledOrTimeout(_activeTradeTarget, settings.ProvisionCooldownSeconds);
+                        return true;
                     }
 
                     _tradeItemsPlaced = true;
                 }
 
+                if (_offeredItems.Count == 0 || _offeredItems.Any(i => !TradeFrame.Instance.ContainsPlayerItem(i.Slot, i.Entry, i.Count)))
+                {
+                    TradeFrame.Instance.CancelTrade();
+                    OnTradeCancelledOrTimeout(_activeTradeTarget, settings.ProvisionCooldownSeconds);
+                    return true;
+                }
                 if (!TradeFrame.Instance.PlayerAccepted)
                     TradeFrame.Instance.AcceptTrade();
 
@@ -363,7 +367,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
             // Otherwise we are the RECEIVER: enforce strict partner check against ActiveProvisionerName.
             string expectedProvisioner = leader?.ActiveProvisionerName ?? string.Empty;
-            if (!TradeFrame.IsPartnerAuthorized(partner, expectedProvisioner))
+            if (!TradeFrame.IsPartnerAuthorized(partner, expectedProvisioner) ||
+                !TradeFrame.IsPartnerAuthorized(me.Name, leader?.ActiveTradeTargetName))
             {
                 Logging.Write("[PartyGrind Provision] Rejecting unauthorized trade from '{0}' (expected '{1}').",
                     partner, expectedProvisioner);
@@ -371,11 +376,18 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 return true;
             }
 
-            if (TradeFrame.Instance.TargetAccepted && !TradeFrame.Instance.PlayerAccepted)
+            if (TradeFrame.Instance.HasEmptyPlayerOffer && TradeFrame.Instance.TargetAccepted && !TradeFrame.Instance.PlayerAccepted)
             {
                 TradeFrame.Instance.AcceptTrade();
             }
             return true;
+        }
+
+        private static bool CanUseRefreshment(int receiverLevel)
+        {
+            if (!SpellManager.Spells.TryGetValue("Conjure Refreshment", out var spell) || spell.CreatesItemId <= 0) return false;
+            var item = ItemInfo.FromId((uint)spell.CreatesItemId);
+            return item != null && item.RequiredLevel <= receiverLevel;
         }
 
         private bool RunMageProvisionerTick(LocalPlayer me, SquadSettings settings, SquadLeaderState leader, long now)
@@ -412,7 +424,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             // Ensure we have tradable food if receiver wants food.
             if (targetSummary.WantsFood && FindTradableBagItem(me, receiverLevel, true, false, false) == null)
             {
-                if (me.Level >= 75 && SpellManager.CanCast("Conjure Refreshment", me, false, false))
+                if (me.Level >= 75 && CanUseRefreshment(receiverLevel) && SpellManager.CanCast("Conjure Refreshment", me, false, false))
                 {
                     if (me.IsMoving) WoWMovement.MoveStop();
                     return SpellManager.Cast("Conjure Refreshment", me);
@@ -430,7 +442,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             // Ensure we have tradable water if receiver wants drink.
             if (targetSummary.WantsDrink && FindTradableBagItem(me, receiverLevel, false, true, false) == null)
             {
-                if (me.Level >= 75 && SpellManager.CanCast("Conjure Refreshment", me, false, false))
+                if (me.Level >= 75 && CanUseRefreshment(receiverLevel) && SpellManager.CanCast("Conjure Refreshment", me, false, false))
                 {
                     if (me.IsMoving) WoWMovement.MoveStop();
                     return SpellManager.Cast("Conjure Refreshment", me);
@@ -509,9 +521,13 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (me.CurrentTargetGuid != targetPlayer.Guid)
                 targetPlayer.Target();
 
+            if (me.CurrentTargetGuid != targetPlayer.Guid)
+                return false;
+
             _activeTradeTarget = targetSummary.CharacterName;
             _tradeStartedUtcMs = now;
             _tradeItemsPlaced = false;
+            _offeredItems.Clear();
             TradeFrame.Instance.InitiateTrade("target");
             return true;
         }
@@ -577,17 +593,15 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
         private static bool TryMaintainSoulstone(LocalPlayer me, SquadLeaderState? leader)
         {
-            var targetSummary = leader?.Members?.FirstOrDefault(m => m.Role == SquadRole.Healer && m.IsConnected && !m.IsDead)
-                ?? leader?.Members?.FirstOrDefault(m => m.Role == SquadRole.TankLeader && m.IsConnected && !m.IsDead);
-
-            if (targetSummary == null)
-                return false;
-
-            WoWPlayer? target = targetSummary.Guid != 0
-                ? ObjectManager.GetObjectByGuid<WoWPlayer>(targetSummary.Guid)
-                : null;
-            if (target == null || !target.IsValid || target.Dead || target.Distance > 30f || target.HasAura("Soulstone Resurrection"))
-                return false;
+            var target = leader?.Members?
+                .Where(m => m.IsConnected && !m.IsDead && !m.IsGhost &&
+                    (m.Role == SquadRole.Healer || m.Role == SquadRole.TankLeader))
+                .Select(m => new { Member = m, Unit = ObjectManager.GetObjectByGuid<WoWPlayer>(m.Guid) })
+                .Where(p => p.Unit != null && p.Unit.IsValid && !p.Unit.Dead && !p.Unit.IsGhost &&
+                    p.Unit.Distance <= 30f && !p.Unit.HasAura("Soulstone Resurrection"))
+                .OrderBy(p => p.Member.Role == SquadRole.Healer ? 0 : 1)
+                .Select(p => p.Unit).FirstOrDefault();
+            if (target == null) return false;
 
             WoWItem? stone = me.BagItems.FirstOrDefault(i => i != null && i.IsValid && IsSoulstoneName(i.Name));
             if (stone != null)

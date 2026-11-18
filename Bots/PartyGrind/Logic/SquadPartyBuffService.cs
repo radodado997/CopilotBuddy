@@ -79,6 +79,11 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             {
                 Lua.DoString("if UnitExists('target') and GetRaidTargetIndex('target') ~= 8 then SetRaidTarget('target', 8) end");
             }
+            else if (leader.SecondaryTargetGuid != 0 && leader.SecondaryTargetGuid != leader.FocusTargetGuid &&
+                StyxWoW.Me.CurrentTargetGuid == leader.SecondaryTargetGuid)
+            {
+                Lua.DoString("if UnitExists('target') and GetRaidTargetIndex('target') ~= 7 then SetRaidTarget('target', 7) end");
+            }
         }
 
         private static void EnsurePartyUnitMarker(string? charName, int icon)
@@ -225,6 +230,14 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                            (ally.Guid == me.Guid ? SquadContext.ActiveRole : SquadRole.DpsMelee);
 
                 string desiredBlessing = SelectBlessingForRole(role, ally.Class, paladinIndex);
+                if (role == SquadRole.TankLeader && paladinNames.Count > 1)
+                {
+                    var capabilities = paladinNames.Select(name => (IReadOnlyList<string>)(
+                        string.Equals(name, me.Name, StringComparison.OrdinalIgnoreCase)
+                            ? new[] { "Blessing of Sanctuary", "Blessing of Kings", "Blessing of Might", "Blessing of Wisdom" }.Where(SpellManager.HasSpell).ToList()
+                            : leader!.Members.First(m => m.CharacterName == name).KnownBlessings)).ToList();
+                    desiredBlessing = SelectTankBlessing(paladinIndex, capabilities);
+                }
                 if (!ally.HasAura(desiredBlessing) &&
                     !ally.HasAura("Greater " + desiredBlessing) &&
                     SpellManager.CanCast(desiredBlessing, ally, true, false))
@@ -234,6 +247,22 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             }
 
             return false;
+        }
+
+        public static string SelectTankBlessing(int index, IReadOnlyList<IReadOnlyList<string>> known)
+        {
+            var assigned = new HashSet<string>();
+            for (int i = 0; i <= index && i < known.Count; i++)
+            {
+                string[] preference = i == 0
+                    ? new[] { "Blessing of Sanctuary", "Blessing of Might", "Blessing of Kings", "Blessing of Wisdom" }
+                    : new[] { "Blessing of Kings", "Blessing of Might", "Blessing of Sanctuary", "Blessing of Wisdom" };
+                var available = preference.Where(s => known[i].Contains(s) && !assigned.Contains(s)).ToList();
+                string choice = available.OrderByDescending(s => i + 1 >= known.Count || known[i + 1].Any(other => other != s && !assigned.Contains(other))).FirstOrDefault() ?? string.Empty;
+                if (i == index) return choice;
+                assigned.Add(choice);
+            }
+            return string.Empty;
         }
 
         public static string SelectBlessingForRole(SquadRole role, WoWClass targetClass, int paladinIndex)

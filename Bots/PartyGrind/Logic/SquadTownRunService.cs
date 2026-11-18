@@ -43,10 +43,22 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private bool _stage1MailDone;
         private bool _stage2TrainDone;
         private bool _wasInTownRun;
+        private bool _mailRequested;
+        private int _mailAttempts, _vendorAttempts;
+        private long _stageStarted;
+        public string BlockedReason { get; private set; } = string.Empty;
+
+        private bool Block(string reason, out bool complete)
+        {
+            BlockedReason = reason;
+            Logging.Write("[PartyGrind Town] Blocked: {0}", reason);
+            complete = false;
+            return true;
+        }
 
         public void ObservePhase(SquadPhase? phase)
         {
-            if (_wasInTownRun && phase != SquadPhase.TownRun) Reset();
+            if (_wasInTownRun && phase != SquadPhase.TownRun && phase != SquadPhase.Paused) Reset();
         }
 
         public void Reset()
@@ -55,6 +67,10 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             _stage1MailDone = false;
             _stage2TrainDone = false;
             _wasInTownRun = false;
+            _mailRequested = false;
+            _mailAttempts = _vendorAttempts = 0;
+            _stageStarted = Environment.TickCount64;
+            BlockedReason = string.Empty;
         }
 
         /// <summary>
@@ -71,16 +87,17 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             bool needClassTraining,
             bool hasMailRecipient,
             bool preferMageFoodOverVendor,
-            bool squadHasActiveMageLvl4Plus,
+            bool mageCanProvideFood,
+            bool mageCanProvideDrink,
             SquadSettings settings)
         {
             bool needsSell = freeNormalBagSlots <= settings.TriggerTownFreeBagSlots;
             bool needsRepair = double.IsFinite(lowestDurabilityPct) && lowestDurabilityPct >= 0 && lowestDurabilityPct <= settings.TriggerTownDurabilityPct;
-            bool suppressFoodDrinkBuy = preferMageFoodOverVendor && squadHasActiveMageLvl4Plus;
+            bool foodProvided = preferMageFoodOverVendor && mageCanProvideFood;
+            bool drinkProvided = preferMageFoodOverVendor && mageCanProvideDrink;
 
-            bool needsBuy = !suppressFoodDrinkBuy &&
-                ((desiredFoodAmount > 0 && !hasFood) ||
-                 (usesMana && desiredDrinkAmount > 0 && !hasDrink));
+            bool needsBuy = (desiredFoodAmount > 0 && !hasFood && !foodProvided) ||
+                 (usesMana && desiredDrinkAmount > 0 && !hasDrink && !drinkProvided);
 
             bool needsTrain = settings.TrainSkillsInGroupTownRun && needClassTraining;
             bool needsMail = hasMailRecipient && needsSell;
@@ -116,15 +133,16 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 (int)me.FreeNormalBagSlots,
                 me.Inventory.Equipped.PhysicalItems.Where(i => i.MaxDurability > 0)
                     .Select(i => 100.0 * i.Durability / i.MaxDurability).DefaultIfEmpty(double.NaN).Min(),
-                hasFood || foodProvided,
-                hasDrink || drinkProvided,
+                hasFood,
+                hasDrink,
                 usesMana,
                 CharacterSettings.Instance.FoodAmount,
                 CharacterSettings.Instance.DrinkAmount,
                 needsTrain,
                 hasMail,
                 settings.PreferMageFoodOverVendor,
-                false,
+                foodProvided,
+                drinkProvided,
                 settings);
         }
 
@@ -175,7 +193,13 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (rallyPoint == WoWPoint.Zero)
                 rallyPoint = ResolveTownRallyPoint().Location;
 
+            if (BlockedReason.Length > 0) { townTasksComplete = false; return true; }
+            if (leader.TownRallyMapId.HasValue && leader.TownRallyMapId != me.MapId)
+                return Block("Rally is on another map; cross-map town travel is unavailable.", out townTasksComplete);
             var needs = EvaluateLiveLocalNeeds(settings, leader);
+            _mailRequested |= needs.NeedsMail;
+            if (Environment.TickCount64 - _stageStarted > 120000)
+                return Block("Town task timed out before completion.", out townTasksComplete);
 
             // Stage 1A: Travel to rally vendor & Sell/Repair/Buy.
             if (!_stage1SellRepairBuyDone)
@@ -187,7 +211,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 else
                 {
                     Vendor? vendor = ResolveSellOrRepairVendor(needs);
-                    WoWPoint targetLoc = vendor?.Location ?? rallyPoint;
+                    if (vendor == null) return Block("No eligible vendor found.", out townTasksComplete);
+                    WoWPoint targetLoc = vendor.Location;
                     if (me.Location.Distance(targetLoc) > 5.0f)
                     {
                         Navigator.MoveTo(targetLoc, "TownRun: moving to vendor");
@@ -201,6 +226,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                         var remaining = EvaluateLiveLocalNeeds(settings, leader);
                         _stage1SellRepairBuyDone = !remaining.NeedsBuy && !remaining.NeedsRepair && !remaining.NeedsSell;
                     }
+                    if (++_vendorAttempts >= 5 && !_stage1SellRepairBuyDone)
+                        return Block("Vendor tasks remain unmet after five attempts.", out townTasksComplete);
                     townTasksComplete = false;
                     return true;
                 }
@@ -209,7 +236,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             // Stage 1B: Mailbox (optional if MailRecipient configured & needed).
             if (!_stage1MailDone)
             {
-                if (!needs.NeedsMail || string.IsNullOrWhiteSpace(CharacterSettings.Instance.MailRecipient))
+                if (!_mailRequested || string.IsNullOrWhiteSpace(CharacterSettings.Instance.MailRecipient) ||
+                    !Styx.Logic.Inventory.InventoryManager.GetItemsToMail().Any())
                 {
                     _stage1MailDone = true;
                 }
@@ -218,7 +246,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     var mailbox = ProfileManager.CurrentProfile?.MailboxManager?.GetClosestMailbox();
                     if (mailbox == null)
                     {
-                        _stage1MailDone = true;
+                        return Block("No mailbox found.", out townTasksComplete);
                     }
                     else if (me.Location.Distance(mailbox.Location) > 5.0f)
                     {
@@ -243,9 +271,15 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                             {
                                 Vendors.MailAllItems();
                                 MailFrame.Instance.Close();
+                                _stage1MailDone = !Styx.Logic.Inventory.InventoryManager.GetItemsToMail().Any();
                             }
                         }
-                        _stage1MailDone = true;
+                        if (!_stage1MailDone)
+                        {
+                            if (++_mailAttempts >= 3) return Block("Mailbox failed to open or finish mailing after three attempts.", out townTasksComplete);
+                            townTasksComplete = false;
+                            return true;
+                        }
                     }
                 }
             }
@@ -262,9 +296,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     WoWPoint? trainerLoc = ResolveClassTrainerLocation(me, out int trainerEntry, out string trainerName);
                     if (!trainerLoc.HasValue)
                     {
-                        Vendors.NeedClassTraining = false;
-                        Vendors.ForceTrainer = false;
-                        _stage2TrainDone = true;
+                        return Block("Class trainer not found; training remains pending.", out townTasksComplete);
                     }
                     else if (me.Location.Distance(trainerLoc.Value) > 4.5f)
                     {
@@ -409,8 +441,10 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         {
             WoWUnit? trainer = ObjectManager.GetObjectsOfType<WoWUnit>(false, false)
                 .Where(u => u != null && u.IsValid && !u.Dead && u.IsAnyTrainer &&
-                            (trainerEntry == 0 || u.Entry == (uint)trainerEntry || u.Location.Distance(me.Location) <= 10f))
-                .OrderBy(u => u.Location.Distance(me.Location))
+                            (u.Entry == (uint)trainerEntry || (u.Location.Distance(me.Location) <= 10f &&
+                             NpcQueries.GetNpcById(u.Entry)?.TrainerClass == (int)me.Class)))
+                .OrderBy(u => u.Entry == (uint)trainerEntry ? 0 : 1)
+                .ThenBy(u => u.Location.Distance(me.Location))
                 .FirstOrDefault();
 
             if (trainer == null)

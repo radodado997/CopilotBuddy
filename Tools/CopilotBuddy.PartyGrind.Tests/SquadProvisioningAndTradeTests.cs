@@ -46,6 +46,14 @@ namespace CopilotBuddy.PartyGrind.Tests
         }
 
         [Fact]
+        public void WaterOnlyMage_DoesNotSuppressFoodVendorNeed()
+        {
+            var need = SquadTownRunService.EvaluateLocalTownNeeds(10, 90, false, false, true,
+                20, 20, false, false, true, false, true, MakeSettings());
+            Assert.True(need.NeedsBuy);
+        }
+
+        [Fact]
         public void EvaluateConsumableNeeds_RespectsThresholdsCombatAndBagSpace()
         {
             var settings = MakeSettings();
@@ -157,7 +165,8 @@ namespace CopilotBuddy.PartyGrind.Tests
                 needClassTraining: false,
                 hasMailRecipient: false,
                 preferMageFoodOverVendor: true,
-                squadHasActiveMageLvl4Plus: true,
+                mageCanProvideFood: true,
+                mageCanProvideDrink: true,
                 settings: settings);
 
             Assert.False(withMage.NeedsBuy);
@@ -175,7 +184,8 @@ namespace CopilotBuddy.PartyGrind.Tests
                 needClassTraining: false,
                 hasMailRecipient: false,
                 preferMageFoodOverVendor: true,
-                squadHasActiveMageLvl4Plus: false,
+                mageCanProvideFood: false,
+                mageCanProvideDrink: false,
                 settings: settings);
 
             Assert.True(withoutMage.NeedsBuy);

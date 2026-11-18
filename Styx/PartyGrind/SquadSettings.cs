@@ -92,6 +92,10 @@ namespace Styx.PartyGrind
         public string TeamId { get; set; } = "Squad1";
 
         [Setting]
+        [Styx.Helpers.DefaultValueAttribute("")]
+        public string IpcMemberSecretsPath { get; set; } = string.Empty;
+
+        [Setting]
         [Styx.Helpers.DefaultValueAttribute(1339)]
         public int IpcPort { get; set; } = 1339;
 

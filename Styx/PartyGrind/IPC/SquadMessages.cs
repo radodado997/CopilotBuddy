@@ -119,6 +119,8 @@ namespace Styx.PartyGrind.IPC
     /// </summary>
     public class SquadMemberSummary
     {
+        public bool HasTelemetry { get; set; } = true;
+        public List<string> KnownBlessings { get; set; } = new();
         public string CharacterName { get; set; } = string.Empty;
         public ulong Guid { get; set; }
         public SquadRole Role { get; set; }
@@ -220,6 +222,9 @@ namespace Styx.PartyGrind.IPC
 
     public class SquadMemberState
     {
+        public List<string> KnownBlessings { get; set; } = new();
+        public bool CanResurrect { get; set; }
+        public string TownBlockedReason { get; set; } = string.Empty;
         // Identity & Progress
         public string CharacterName { get; set; } = string.Empty;
         public ulong Guid { get; set; }

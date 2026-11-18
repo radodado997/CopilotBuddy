@@ -38,6 +38,7 @@ namespace Styx.PartyGrind.IPC
             public readonly StreamWriter Writer;
             public readonly Channel<string> Outbound;
             public readonly CancellationTokenSource Cts = new CancellationTokenSource();
+            public SquadPeerAuthentication? Authentication;
             public string CharacterName = string.Empty;
             public SquadHandshake Handshake = new SquadHandshake();
             public SquadMemberState? LatestState;
@@ -79,6 +80,7 @@ namespace Styx.PartyGrind.IPC
             }
         }
 
+        private readonly IReadOnlyDictionary<string, string> _memberSecrets;
         private readonly int _requestedPort;
         private readonly string _teamId;
         private readonly Func<long> _utcNowMs;
@@ -105,8 +107,9 @@ namespace Styx.PartyGrind.IPC
         public event Action<SquadMemberState>? MemberStateReceived;
         public event Action<SquadHandshake>? MemberConnected;
 
-        public SquadIpcServer(int port, string teamId, Func<long>? utcNowMs = null)
+        public SquadIpcServer(int port, string teamId, Func<long>? utcNowMs = null, IReadOnlyDictionary<string, string>? memberSecrets = null)
         {
+            _memberSecrets = new Dictionary<string, string>(memberSecrets ?? new Dictionary<string, string>(), StringComparer.OrdinalIgnoreCase);
             _requestedPort = port;
             _teamId = teamId ?? string.Empty;
             _utcNowMs = utcNowMs ?? (() => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
@@ -291,7 +294,7 @@ namespace Styx.PartyGrind.IPC
             using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(serverCt, session.Cts.Token);
             CancellationToken ct = linkedCts.Token;
 
-            Task sendTask = Task.Run(() => SendLoopAsync(session, ct), ct);
+            Task sendTask = Task.CompletedTask;
             Task deadline = Task.Run(async () =>
             {
                 try
@@ -309,6 +312,8 @@ namespace Styx.PartyGrind.IPC
             try
             {
                 using var reader = new StreamReader(session.Tcp.GetStream(), new UTF8Encoding(false));
+                session.Authentication = await SquadPeerAuthentication.Server(reader, session.Writer, _memberSecrets, _teamId, ct).ConfigureAwait(false);
+                sendTask = Task.Run(() => SendLoopAsync(session, ct), ct);
                 while (!ct.IsCancellationRequested)
                 {
                     string? line = await SquadJson.ReadFrameAsync(reader, ct).ConfigureAwait(false);
@@ -318,7 +323,7 @@ namespace Styx.PartyGrind.IPC
                     if (string.IsNullOrWhiteSpace(line))
                         continue;
 
-                    try { HandleIncomingLine(session, line); }
+                    try { HandleIncomingLine(session, session.Authentication.Unprotect(line)); }
                     catch (System.Text.Json.JsonException) { }
                 }
             }
@@ -352,7 +357,7 @@ namespace Styx.PartyGrind.IPC
             {
                 await foreach (string line in session.Outbound.Reader.ReadAllAsync(ct).ConfigureAwait(false))
                 {
-                    await session.Writer.WriteLineAsync(line.AsMemory(), ct).ConfigureAwait(false);
+                    await session.Writer.WriteLineAsync(session.Authentication!.Protect(line).AsMemory(), ct).ConfigureAwait(false);
                     await session.Writer.FlushAsync(ct).ConfigureAwait(false);
                 }
             }
@@ -393,13 +398,13 @@ namespace Styx.PartyGrind.IPC
             if (string.Equals(envelope.MessageType, SquadMessageTypes.Handshake, StringComparison.OrdinalIgnoreCase))
             {
                 var hs = SquadJson.DeserializePayload<SquadHandshake>(envelope);
-                if (hs == null || string.IsNullOrWhiteSpace(hs.CharacterName))
+                if (hs == null || !string.Equals(hs.CharacterName, session.Authentication?.MemberName, StringComparison.OrdinalIgnoreCase))
                     return;
 
                 MemberSession? replaced = null;
                 lock (_sessionsLock)
                 {
-                    if (session.CharacterName.Length > 0 && !string.Equals(session.CharacterName, hs.CharacterName.Trim(), StringComparison.OrdinalIgnoreCase))
+                    if (session.CharacterName.Length > 0)
                         return;
                     session.CharacterName = hs.CharacterName.Trim();
                     session.Handshake = hs;
@@ -426,7 +431,9 @@ namespace Styx.PartyGrind.IPC
                 lock (_sessionsLock)
                 {
                     if (string.IsNullOrEmpty(session.CharacterName) ||
-                        !string.Equals(session.CharacterName, state.CharacterName?.Trim(), StringComparison.OrdinalIgnoreCase))
+                        !string.Equals(session.CharacterName, state.CharacterName?.Trim(), StringComparison.OrdinalIgnoreCase) ||
+                        state.Guid != session.Handshake.Guid || state.Class != session.Handshake.Class || state.Role != session.Handshake.Role ||
+                        !_namedSessions.TryGetValue(session.CharacterName, out var current) || !ReferenceEquals(current, session))
                         return;
                     session.LastReceivedUtcMs = now;
                     session.LatestState = state;

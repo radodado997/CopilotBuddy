@@ -34,6 +34,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
     /// </summary>
     public static class SquadHealBridge
     {
+        private static readonly SquadApproach HealApproach = new();
         private static readonly string[] RangedAssistSpells =
         {
             "Smite", "Holy Fire", "Shadow Word: Pain",
@@ -107,73 +108,88 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 }
             }
 
-            var priorityCandidate = SelectPriorityHealTarget(
-                candidates,
-                threshold,
-                prioritizeSelfCritical: settings.UseEmergencySelfHealBeforeParty);
-
-            if (priorityCandidate == null)
-                return false;
-
-            WoWUnit? targetUnit = priorityCandidate.IsSelf
-                ? me
-                : ObjectManager.GetObjectByGuid<WoWUnit>(priorityCandidate.Guid);
-
-            if (targetUnit == null || !targetUnit.IsValid || targetUnit.Dead)
-                return false;
-
-            // Stage 1: Try Routine's HealBehavior when level >= 10 and not in Hybrid emergency-only mode.
-            if (!emergencyOnly && me.Level >= 10)
+            var remaining = candidates.ToList();
+            while (remaining.Count > 0)
             {
-                var healBehavior = RoutineManager.Current?.HealBehavior;
-                if (healBehavior != null)
+                var priorityCandidate = SelectPriorityHealTarget(
+                    remaining,
+                    threshold,
+                    prioritizeSelfCritical: settings.UseEmergencySelfHealBeforeParty);
+
+                if (priorityCandidate == null)
+                    return false;
+
+                remaining.Remove(priorityCandidate);
+                WoWUnit? targetUnit = priorityCandidate.IsSelf
+                    ? me
+                    : ObjectManager.GetObjectByGuid<WoWUnit>(priorityCandidate.Guid);
+
+                if (targetUnit == null || !targetUnit.IsValid || targetUnit.Dead)
+                    continue;
+
+                // Stage 1: Try Routine's HealBehavior when level >= 10 and not in Hybrid emergency-only mode.
+                if (!emergencyOnly && me.Level >= 10 && targetUnit.Distance <= 35f && targetUnit.InLineOfSpellSight)
                 {
-                    try
+                    var healBehavior = RoutineManager.Current?.HealBehavior;
+                    if (healBehavior != null)
                     {
-                        HealTargeting.Instance.Pulse();
-                        healBehavior.Start(null);
-                        RunStatus status = healBehavior.Tick(null);
-                        healBehavior.Stop(null);
-                        if (status == RunStatus.Success || me.IsCasting || me.ChanneledCastingSpellId != 0)
-                            return true;
-                    }
-                    catch (Exception ex)
-                    {
-                        Logging.WriteDebug("[PartyGrind Heal] Routine HealBehavior fallback: {0}", ex.Message);
+                        try
+                        {
+                            HealTargeting.Instance.Pulse();
+                            healBehavior.Start(null);
+                            RunStatus status = healBehavior.Tick(null);
+                            healBehavior.Stop(null);
+                            if (status == RunStatus.Success || me.IsCasting || me.ChanneledCastingSpellId != 0)
+                                return true;
+                        }
+                        catch (Exception ex)
+                        {
+                            Logging.WriteDebug("[PartyGrind Heal] Routine HealBehavior fallback: {0}", ex.Message);
+                        }
                     }
                 }
+
+                // Stage 2: Explicit class-aware party heal fallback (Level 1-80, open world & instances).
+                if (targetUnit.Distance > 35f || !targetUnit.InLineOfSpellSight)
+                {
+                    if (HealApproach.TryMove(targetUnit, "Moving to heal " + targetUnit.Name)) return true;
+                    continue;
+                }
+
+                int injured78 = CountInjuredAllies(candidates, 78.0);
+                int injured82 = CountInjuredAllies(candidates, 82.0);
+
+                string? spellName = SelectHealSpellForClass(me, targetUnit, injured78, injured82, emergencyOnly);
+                if (string.IsNullOrEmpty(spellName))
+                    continue;
+
+                if (SpellManager.Spells.TryGetValue(spellName, out WoWSpell? spellInfo) && spellInfo.CastTime > 0 && me.IsMoving)
+                {
+                    WoWMovement.MoveStop();
+                }
+
+                if (SpellManager.CanCast(spellName, targetUnit, true, false))
+                {
+                    if (SpellManager.Cast(spellName, targetUnit)) return true;
+                }
+
             }
-
-            // Stage 2: Explicit class-aware party heal fallback (Level 1-80, open world & instances).
-            if (targetUnit.Distance > 35f || !targetUnit.InLineOfSpellSight)
-            {
-                Navigator.MoveTo(targetUnit.Location, "Moving to heal " + targetUnit.Name);
-                return true;
-            }
-
-            int injured78 = CountInjuredAllies(candidates, 78.0);
-            int injured82 = CountInjuredAllies(candidates, 82.0);
-
-            string? spellName = SelectHealSpellForClass(me, targetUnit, injured78, injured82, emergencyOnly);
-            if (string.IsNullOrEmpty(spellName))
-                return false;
-
-            if (SpellManager.Spells.TryGetValue(spellName, out WoWSpell? spellInfo) && spellInfo.CastTime > 0 && me.IsMoving)
-            {
-                WoWMovement.MoveStop();
-            }
-
-            if (SpellManager.CanCast(spellName, targetUnit, true, false))
-            {
-                return SpellManager.Cast(spellName, targetUnit);
-            }
-
             return false;
         }
 
         /// <summary>
         /// Out-of-combat resurrection behavior for Healer / HybridOffHeal / res-capable classes.
         /// </summary>
+        public static string? GetResurrectionSpell(WoWClass wowClass) => wowClass switch
+            {
+                WoWClass.Priest => "Resurrection",
+                WoWClass.Paladin => "Redemption",
+                WoWClass.Druid => "Revive",
+                WoWClass.Shaman => "Ancestral Spirit",
+                _ => null
+            };
+
+
         public static bool RunPostCombatResurrectionTick()
         {
             var me = StyxWoW.Me;
@@ -183,14 +199,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (me.IsCasting || me.ChanneledCastingSpellId != 0)
                 return true;
 
-            string? resSpell = me.Class switch
-            {
-                WoWClass.Priest => "Resurrection",
-                WoWClass.Paladin => "Redemption",
-                WoWClass.Druid => "Revive",
-                WoWClass.Shaman => "Ancestral Spirit",
-                _ => null
-            };
+            string? resSpell = GetResurrectionSpell(me.Class);
 
             if (string.IsNullOrEmpty(resSpell) || !SpellManager.HasSpell(resSpell))
                 return false;

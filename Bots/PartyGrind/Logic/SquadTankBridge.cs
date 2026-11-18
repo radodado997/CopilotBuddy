@@ -22,6 +22,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
     public static class SquadTankBridge
     {
         private static bool _filtersAttached;
+        private static readonly SquadApproach PeelApproach = new();
 
         public static void AttachTargetingFilters()
         {
@@ -64,7 +65,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             {
                 if (!m.IsConnected)
                     continue;
-                if (m.IsDead || m.IsGhost || m.NeedsRest || m.IsLooting || m.NeedsTown && !m.TownTasksComplete)
+                if (!m.HasTelemetry || m.IsDead || m.IsGhost || m.NeedsRest || m.IsLooting || m.NeedsTown && !m.TownTasksComplete)
                     return false;
                 if (m.MapId != leader.MapId)
                     return false;
@@ -333,57 +334,59 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (looseMobs.Count == 0)
                 return false;
 
-            WoWUnit loose = looseMobs[0];
-            if (me.CurrentTargetGuid != loose.Guid)
-                loose.Target();
-
-            // Approach if outside spell taunt range (typically 30 yd; warrior Taunt 30 yd, Growl 30 yd, HoR 30 yd, Dark Command 30 yd)
-            if (loose.Distance > 28f || !loose.InLineOfSpellSight)
+            foreach (WoWUnit loose in looseMobs)
             {
-                Navigator.MoveTo(loose.Location, "Peeling " + loose.Name);
-                return true;
+                if (me.CurrentTargetGuid != loose.Guid)
+                    loose.Target();
+
+                // Approach if outside spell taunt range (typically 30 yd; warrior Taunt 30 yd, Growl 30 yd, HoR 30 yd, Dark Command 30 yd)
+                if (loose.Distance > 28f || !loose.InLineOfSpellSight)
+                {
+                    if (PeelApproach.TryMove(loose, "Peeling " + loose.Name)) return true;
+                    continue;
+                }
+
+                if (!me.IsFacing(loose))
+                    loose.Face();
+
+                switch (me.Class)
+                {
+                    case WoWClass.Warrior:
+                        if (looseMobs.Count >= 2 && loose.Distance <= 9f && SpellManager.CanCast("Challenging Shout", me, false, false))
+                            return SpellManager.Cast("Challenging Shout", me);
+                        if (SpellManager.CanCast("Taunt", loose, true, false))
+                            return SpellManager.Cast("Taunt", loose);
+                        if (loose.Distance <= 5.5f && SpellManager.CanCast("Mocking Blow", loose, true, false))
+                            return SpellManager.Cast("Mocking Blow", loose);
+                        break;
+
+                    case WoWClass.Druid:
+                        if (looseMobs.Count >= 2 && loose.Distance <= 9f && SpellManager.CanCast("Challenging Roar", me, false, false))
+                            return SpellManager.Cast("Challenging Roar", me);
+                        if (SpellManager.CanCast("Growl", loose, true, false))
+                            return SpellManager.Cast("Growl", loose);
+                        break;
+
+                    case WoWClass.Paladin:
+                        if (SpellManager.CanCast("Hand of Reckoning", loose, true, false))
+                            return SpellManager.Cast("Hand of Reckoning", loose);
+                        WoWUnit? attackedAlly = ObjectManager.GetObjectByGuid<WoWUnit>(loose.CurrentTargetGuid);
+                        if (attackedAlly != null && attackedAlly.IsValid && !attackedAlly.Dead &&
+                            SpellManager.CanCast("Righteous Defense", attackedAlly, true, false))
+                        {
+                            return SpellManager.Cast("Righteous Defense", attackedAlly);
+                        }
+                        break;
+
+                    case WoWClass.DeathKnight:
+                        if (SpellManager.CanCast("Dark Command", loose, true, false))
+                            return SpellManager.Cast("Dark Command", loose);
+                        if (SpellManager.CanCast("Death Grip", loose, true, false))
+                            return SpellManager.Cast("Death Grip", loose);
+                        break;
+                }
+
             }
-
-            if (!me.IsFacing(loose))
-                loose.Face();
-
-            switch (me.Class)
-            {
-                case WoWClass.Warrior:
-                    if (looseMobs.Count >= 2 && loose.Distance <= 9f && SpellManager.CanCast("Challenging Shout", me, false, false))
-                        return SpellManager.Cast("Challenging Shout", me);
-                    if (SpellManager.CanCast("Taunt", loose, true, false))
-                        return SpellManager.Cast("Taunt", loose);
-                    if (loose.Distance <= 5.5f && SpellManager.CanCast("Mocking Blow", loose, true, false))
-                        return SpellManager.Cast("Mocking Blow", loose);
-                    break;
-
-                case WoWClass.Druid:
-                    if (looseMobs.Count >= 2 && loose.Distance <= 9f && SpellManager.CanCast("Challenging Roar", me, false, false))
-                        return SpellManager.Cast("Challenging Roar", me);
-                    if (SpellManager.CanCast("Growl", loose, true, false))
-                        return SpellManager.Cast("Growl", loose);
-                    break;
-
-                case WoWClass.Paladin:
-                    if (SpellManager.CanCast("Hand of Reckoning", loose, true, false))
-                        return SpellManager.Cast("Hand of Reckoning", loose);
-                    WoWUnit? attackedAlly = ObjectManager.GetObjectByGuid<WoWUnit>(loose.CurrentTargetGuid);
-                    if (attackedAlly != null && attackedAlly.IsValid && !attackedAlly.Dead &&
-                        SpellManager.CanCast("Righteous Defense", attackedAlly, true, false))
-                    {
-                        return SpellManager.Cast("Righteous Defense", attackedAlly);
-                    }
-                    break;
-
-                case WoWClass.DeathKnight:
-                    if (SpellManager.CanCast("Dark Command", loose, true, false))
-                        return SpellManager.Cast("Dark Command", loose);
-                    if (SpellManager.CanCast("Death Grip", loose, true, false))
-                        return SpellManager.Cast("Death Grip", loose);
-                    break;
-            }
-
             return false;
         }
     }

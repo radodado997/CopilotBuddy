@@ -26,12 +26,12 @@ namespace Styx.Logic.Inventory.Frames.Trade
 
         public bool PlayerAccepted =>
             Lua.GetReturnVal<int>(
-                "if TradeFramePlayerAcceptState == 1 then return 1 else return 0 end",
+                "if TradeFrame and TradeFrame.acceptState == 1 then return 1 else return 0 end",
                 0U) == 1;
 
         public bool TargetAccepted =>
             Lua.GetReturnVal<int>(
-                "if TradeFrameTargetAcceptState == 1 then return 1 else return 0 end",
+                "if TradeHighlightRecipient and TradeHighlightRecipient:IsVisible() then return 1 else return 0 end",
                 0U) == 1;
 
         /// <summary>
@@ -97,6 +97,12 @@ namespace Styx.Logic.Inventory.Frames.Trade
 
             return true;
         }
+
+        public bool ContainsPlayerItem(int slot, uint entry, int count) => Lua.GetReturnVal<int>(
+            $"local link=GetTradePlayerItemLink({slot}); local _,_,n=GetTradePlayerItemInfo({slot}); if link and tonumber(string.match(link,'item:(%d+)')) == {entry} and n == {count} then return 1 end return 0", 0U) == 1;
+
+        public bool HasEmptyPlayerOffer => Lua.GetReturnVal<int>(
+            "if GetPlayerTradeMoney() ~= 0 then return 0 end for i=1,7 do if GetTradePlayerItemLink(i) then return 0 end end return 1", 0U) == 1;
 
         public void AcceptTrade()
         {

@@ -115,15 +115,16 @@ namespace Styx.Logic.Profiles
 
 		private static void LoadProfileForLevel()
 		{
-			int effectiveLevel = LevelOverrideSelector?.Invoke() ?? ObjectManager.Me?.Level ?? 1;
-			var profile = GetProfileForLevel(effectiveLevel);
-			_selectedOffline = ObjectManager.Me == null;
+			var me = ObjectManager.Me;
+			int effectiveLevel = LevelOverrideSelector?.Invoke() ?? me?.Level ?? 1;
+			var profile = GetProfileForLevel(effectiveLevel, me);
+			_selectedOffline = me == null;
 			CurrentProfile = profile;
 			if (profile != null)
 				Logging.WriteDebug("Selected sub-profile: {0} (L{1}-{2})", profile.Name, profile.MinLevel, profile.MaxLevel);
 		}
 
-		private static Profile? GetProfileForLevel(int level)
+		private static Profile? GetProfileForLevel(int level, Styx.WoWInternals.WoWObjects.LocalPlayer? me)
 		{
 			if (CurrentOuterProfile == null)
 			{
@@ -131,7 +132,6 @@ namespace Styx.Logic.Profiles
 			}
 
 			var sortedProfiles = CurrentOuterProfile.GetScopeSortedProfiles();
-			var me = ObjectManager.Me;
 			uint mapId = me?.MapId ?? 0;
 			for (int i = 0; i < sortedProfiles.Count; i++)
 			{

@@ -64,7 +64,10 @@ namespace Styx.CommonBot.CharacterManagement
         /// <summary>
         /// Evaluates an item based on character class and basic stats
         /// </summary>
-        private float EvaluateItem(ItemInfo item, int count)
+        public bool IsUpgrade(ItemInfo item) => item != null && ObjectManager.Me?.Inventory != null &&
+            GetItemSlot(item) != WoWInventorySlot.None && EvaluateItem(item, 1) > 0;
+
+        private float EvaluateItem(ItemInfo item, int count, bool compareEquipped = true)
         {
             if (item == null)
                 return 0f;
@@ -107,7 +110,7 @@ namespace Styx.CommonBot.CharacterManagement
             // HB 6.2.3 yields Finger1+Finger2 and Trinket1+Trinket2 for dual-slot types.
             // Previously only Finger1/Trinket1 was checked, meaning Finger2/Trinket2 was never replaced.
             WoWInventorySlot slot1 = GetItemSlot(item);
-            if (slot1 != WoWInventorySlot.None)
+            if (compareEquipped && slot1 != WoWInventorySlot.None)
             {
                 WoWInventorySlot slot2 = GetSecondaryItemSlot(item);
                 WoWInventorySlot[] slotsToCheck = slot2 != WoWInventorySlot.None
@@ -126,7 +129,7 @@ namespace Styx.CommonBot.CharacterManagement
                         anySlotEmpty = true;
                         break;
                     }
-                    float equippedScore = EvaluateItem(equipped.ItemInfo, 1);
+                    float equippedScore = EvaluateItem(equipped.ItemInfo, 1, false);
                     if (equippedScore < weakestEquippedScore)
                         weakestEquippedScore = equippedScore;
                 }

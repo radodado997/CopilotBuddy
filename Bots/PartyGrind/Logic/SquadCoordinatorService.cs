@@ -118,7 +118,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             long pullStartedUtcMs,
             float leaderFacing,
             long nowUtcMs,
-            float? effectiveProfileLevelHint = null)
+            float? effectiveProfileLevelHint = null,
+            Func<int, SquadProfileSnapshot>? resolveProfile = null)
         {
             if (settings == null) throw new ArgumentNullException(nameof(settings));
             if (leaderLocal == null) throw new ArgumentNullException(nameof(leaderLocal));
@@ -160,6 +161,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     connectedNames.Add(name);
                     rosterStates.Add(state);
                     UpsertHistory(state, settings, nowUtcMs);
+                    if (snap.LatestState == null) _history[name].LastState = null;
                 }
             }
 
@@ -210,6 +212,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 nowUtcMs - kv.Value.LastSeenUtcMs > graceMs).Select(kv => kv.Key).ToList())
                 _history.Remove(name);
 
+            if (resolveProfile != null) profile = resolveProfile(effectiveMinLevel);
+
             // Detect sub-profile transition -> MigratingZone.
             string subProfileKey = $"{profile.ProfileXmlPath}|{profile.ProfileXmlHash}|{profile.SubProfileName}|{profile.SubProfileMinLevel}|{profile.SubProfileMaxLevel}|{profile.MapId}";
             if (profile.HasProfile)
@@ -256,9 +260,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             bool allDead = rosterStates.Count > 0 && rosterStates.All(m => m.IsDead || m.IsGhost);
             bool hasLivingResCapable = rosterStates.Any(m =>
                 !m.IsDead && !m.IsGhost &&
-                (m.Role == SquadRole.Healer || m.Role == SquadRole.HybridOffHeal ||
-                 m.Class == WoWClass.Priest || m.Class == WoWClass.Paladin ||
-                 m.Class == WoWClass.Druid || m.Class == WoWClass.Shaman));
+                m.CanResurrect);
 
             if (_wasAnyInCombat && !anyInCombat && !allDead)
             {
@@ -266,11 +268,6 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 _lootWindowEndsUtcMs = nowUtcMs + Math.Max(1, settings.MaxLootWindowSeconds) * 1000L;
             }
             _wasAnyInCombat = anyInCombat;
-
-            if (_inLootWindow && (!rosterStates.Any(m => m.IsLooting) && nowUtcMs >= _lootWindowEndsUtcMs || anyInCombat))
-            {
-                // Keep loot window active only while someone is looting or briefly post-combat until timeout.
-            }
 
             if (_inLootWindow)
             {
@@ -380,6 +377,11 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             {
                 phase = SquadPhase.Paused;
                 pauseReason = ManualPauseReason;
+            }
+            else if (rosterStates.Any(m => !string.IsNullOrEmpty(m.TownBlockedReason)))
+            {
+                phase = SquadPhase.Paused;
+                pauseReason = rosterStates.First(m => !string.IsNullOrEmpty(m.TownBlockedReason)).TownBlockedReason;
             }
             else if (!profile.HasProfile)
             {
@@ -700,7 +702,17 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             {
                 if (activeByName.ContainsKey(kv.Key))
                     continue;
-                if (kv.Value.LastState != null)
+                if (kv.Value.LastState == null)
+                {
+                    result.Add(new SquadMemberSummary
+                    {
+                        CharacterName = kv.Value.Name, Guid = kv.Value.Guid,
+                        Role = kv.Value.Role, Class = kv.Value.Class, Level = kv.Value.Level,
+                        HasTelemetry = false, IsConnected = connectedNames.Contains(kv.Key),
+                        DistanceToLeader = -1f, StateLabel = "Awaiting telemetry"
+                    });
+                }
+                else
                 {
                     var summary = ToSummary(kv.Value.LastState, isConnected: connectedNames.Contains(kv.Key), leaderPoint, leaderMapId);
                     summary.StateLabel = connectedNames.Contains(kv.Key) ? "Awaiting telemetry" : "Disconnected";
@@ -750,6 +762,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 IsLooting = m.IsLooting,
                 NeedsTown = m.NeedsSell || m.NeedsRepair || m.NeedsBuy || m.NeedsTrain || m.NeedsMail,
                 TownTasksComplete = m.TownTasksComplete,
+                KnownBlessings = m.KnownBlessings,
                 CanMount = m.CanMount,
                 CanFly = m.CanFly,
                 IsMounted = m.IsMounted,

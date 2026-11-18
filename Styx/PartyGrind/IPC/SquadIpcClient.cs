@@ -15,6 +15,7 @@ namespace Styx.PartyGrind.IPC
     /// </summary>
     public sealed class SquadIpcClient : IDisposable
     {
+        private readonly string _memberSecret;
         private readonly int _port;
         private readonly string _teamId;
         private readonly Func<long> _utcNowMs;
@@ -72,8 +73,9 @@ namespace Styx.PartyGrind.IPC
 
         public event Action<SquadLeaderState>? LeaderStateReceived;
 
-        public SquadIpcClient(int port, string teamId, Func<long>? utcNowMs = null)
+        public SquadIpcClient(int port, string teamId, Func<long>? utcNowMs = null, string memberSecret = "")
         {
+            _memberSecret = memberSecret;
             _port = port;
             _teamId = teamId ?? string.Empty;
             _utcNowMs = utcNowMs ?? (() => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
@@ -204,9 +206,12 @@ namespace Styx.PartyGrind.IPC
             using var writer = new StreamWriter(stream, new UTF8Encoding(false)) { AutoFlush = false, NewLine = "\n" };
             using var reader = new StreamReader(stream, new UTF8Encoding(false));
 
+            using var authenticationTimeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            authenticationTimeout.CancelAfter(DisconnectTimeoutMs);
+            var auth = await SquadPeerAuthentication.Client(reader, writer, handshake.CharacterName, _memberSecret, _teamId, authenticationTimeout.Token).ConfigureAwait(false);
             long seq = Interlocked.Increment(ref _nextSequenceId);
             string hsLine = SquadJson.SerializeEnvelope(SquadMessageTypes.Handshake, _teamId, seq, handshake);
-            await writer.WriteLineAsync(hsLine.AsMemory(), ct).ConfigureAwait(false);
+            await writer.WriteLineAsync(auth.Protect(hsLine).AsMemory(), ct).ConfigureAwait(false);
             await writer.FlushAsync(ct).ConfigureAwait(false);
 
             Task sendTask = Task.Run(async () =>
@@ -218,7 +223,7 @@ namespace Styx.PartyGrind.IPC
                         var pending = SquadJson.DeserializeEnvelope(line);
                         if (pending == null || _utcNowMs() - pending.TimestampUtcMs > DisconnectTimeoutMs)
                             continue;
-                        await writer.WriteLineAsync(line.AsMemory(), ct).ConfigureAwait(false);
+                        await writer.WriteLineAsync(auth.Protect(line).AsMemory(), ct).ConfigureAwait(false);
                         await writer.FlushAsync(ct).ConfigureAwait(false);
                     }
                 }
@@ -258,7 +263,7 @@ namespace Styx.PartyGrind.IPC
 
                     try
                     {
-                        if (HandleIncomingLine(line, run))
+                        if (HandleIncomingLine(auth.Unprotect(line), run))
                             Interlocked.Exchange(ref sessionLastReceived, _utcNowMs());
                     }
                     catch (System.Text.Json.JsonException) { }

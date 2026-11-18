@@ -14,6 +14,13 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
     /// Handles deterministic non-overlapping combat positioning (melee flank arcs,
     /// ranged/healer standoff slots), breadcrumb travel following, and mount policy gating.
     /// </summary>
+    public sealed class SquadTravelProgress
+    {
+        public long LastReachedTimestamp { get; set; }
+        public uint MapId { get; set; }
+        public ulong LeaderGuid { get; set; }
+    }
+
     public static class SquadFormationService
     {
         private const float Deg2Rad = MathF.PI / 180f;
@@ -29,7 +36,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             int meleeSlotIndex,
             int totalMeleeCount)
         {
-            float radius = MathF.Max(totalMeleeCount >= 4 ? 3.4f : 2.2f, meleeFlankRadius);
+            float radius = MathF.Max(totalMeleeCount >= 4 ? 3.4f : totalMeleeCount == 3 ? 3.0f : 2.2f, meleeFlankRadius);
             float behindAngle = targetFacingRadians + MathF.PI;
 
             float[] offsetsDeg = totalMeleeCount switch
@@ -110,7 +117,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         public static WoWPoint ComputeTravelFollowPosition(
             WoWPoint memberPos,
             SquadLeaderState leader,
-            int memberSlotIndex)
+            int memberSlotIndex,
+            SquadTravelProgress? progress = null)
         {
             var leaderPos = new WoWPoint(leader.X, leader.Y, leader.Z);
             WoWPoint baseAnchor = leaderPos;
@@ -122,22 +130,35 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 float distToLeader = memberPos.Distance(leaderPos);
                 if (distToLeader > 22f)
                 {
-                    SquadBreadcrumb? chosen = null;
-                    float bestDist = float.MaxValue;
-                    foreach (var bc in leader.Breadcrumbs)
+                    var route = leader.Breadcrumbs.Where(b => b.MapId == leader.MapId).ToList();
+                    if (progress != null && (progress.MapId != leader.MapId || progress.LeaderGuid != leader.LeaderGuid))
                     {
-                        if (bc.MapId != leader.MapId) continue;
-                        var p = new WoWPoint(bc.X, bc.Y, bc.Z);
-                        float d = memberPos.Distance(p);
-                        if (d >= 5f && d < bestDist)
+                        progress.LastReachedTimestamp = 0;
+                        progress.MapId = leader.MapId;
+                        progress.LeaderGuid = leader.LeaderGuid;
+                    }
+                    int nearest = -1;
+                    float bestDist = float.MaxValue;
+                    for (int i = 0; i < route.Count; i++)
+                    {
+                        var bc = route[i];
+                        if (progress != null && bc.TimestampUtcMs <= progress.LastReachedTimestamp) continue;
+                        float d = memberPos.Distance(new WoWPoint(bc.X, bc.Y, bc.Z));
+                        if (d <= bestDist)
                         {
+                            nearest = i;
                             bestDist = d;
-                            chosen = bc;
                         }
                     }
-
-                    if (chosen != null)
+                    if (progress != null && nearest >= 0 && bestDist < 5f)
+                        progress.LastReachedTimestamp = route[nearest].TimestampUtcMs;
+                    int next = bestDist < 5f ? nearest + 1 : nearest;
+                    if (next >= 0 && next < route.Count)
+                    {
+                        var chosen = route[next];
                         return new WoWPoint(chosen.X, chosen.Y, chosen.Z);
+                    }
+
                 }
             }
 
@@ -223,8 +244,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     if (leader == null || leader.Members == null || leader.Members.Count == 0)
                         return localCanMount;
                     return leader.Members
-                        .Where(m => m.IsConnected && !m.IsDead && !m.IsGhost)
-                        .All(m => m.CanMount);
+                        .Where(m => m.IsConnected)
+                        .All(m => m.HasTelemetry && (m.IsDead || m.IsGhost || m.CanMount));
             }
         }
 

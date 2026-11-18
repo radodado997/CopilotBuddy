@@ -36,8 +36,6 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             Lua.Events.AttachEvent("START_LOOT_ROLL", OnStartLootRoll);
             Lua.Events.AttachEvent("CONFIRM_SUMMON", OnConfirmSummon);
             Lua.Events.AttachEvent("QUEST_ACCEPT_CONFIRM", OnQuestAcceptConfirm);
-            Lua.Events.AttachEvent("TRADE_REQUEST_CANCEL", OnTradeRequestCancel);
-            Lua.Events.AttachEvent("TRADE_CLOSED", OnTradeClosed);
             _eventsAttached = true;
         }
 
@@ -53,8 +51,6 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 Lua.Events.DetachEvent("START_LOOT_ROLL", OnStartLootRoll);
                 Lua.Events.DetachEvent("CONFIRM_SUMMON", OnConfirmSummon);
                 Lua.Events.DetachEvent("QUEST_ACCEPT_CONFIRM", OnQuestAcceptConfirm);
-                Lua.Events.DetachEvent("TRADE_REQUEST_CANCEL", OnTradeRequestCancel);
-                Lua.Events.DetachEvent("TRADE_CLOSED", OnTradeClosed);
             }
             catch (Exception ex)
             {
@@ -193,7 +189,13 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
                 if (canNeed.StartsWith("true|", StringComparison.OrdinalIgnoreCase))
                 {
-                    return 1; // Need when WoW considers this class/spec eligible for Need
+                    var match = System.Text.RegularExpressions.Regex.Match(canNeed.Substring(5), @"item:(\d+)");
+                    if (match.Success && uint.TryParse(match.Groups[1].Value, out uint entry))
+                    {
+                        var item = Styx.WoWInternals.WoWObjects.ItemInfo.FromId(entry);
+                        if (item != null && new Styx.CommonBot.CharacterManagement.AutoEquipper().IsUpgrade(item))
+                            return 1;
+                    }
                 }
             }
             catch
@@ -219,17 +221,5 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             Lua.DoString("ConfirmAcceptQuest()");
         }
 
-        private void OnTradeRequestCancel(object sender, LuaEventArgs args)
-        {
-            var settings = SquadContext.ActiveSettings;
-            var leader = SquadContext.GetLeaderStateSnapshot();
-            string target = leader?.ActiveTradeTargetName ?? string.Empty;
-            _provisioning.OnTradeCancelledOrTimeout(target, settings?.ProvisionCooldownSeconds ?? 30);
-        }
-
-        private void OnTradeClosed(object sender, LuaEventArgs args)
-        {
-            _provisioning.OnTradeClosed();
-        }
     }
 }

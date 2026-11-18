@@ -1,3 +1,4 @@
+using System.Linq;
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -44,6 +45,18 @@ namespace CopilotBuddy.PartyGrind.Tests
         }
 
         [Fact]
+        public void UntrainedLivingHealer_DoesNotDelayCorpseRecovery()
+        {
+            var coord = new SquadCoordinatorService();
+            var state = coord.EvaluateTick(CreateDefaultSettings(), MakeLeaderState(10), new[]
+            {
+                MakeConnectedClient("Healer", 0, SquadRole.Healer, WoWClass.Priest, 10, 1000),
+                MakeConnectedClient("Dead", 1, SquadRole.DpsMelee, WoWClass.Rogue, 10, 1000, isDead: true)
+            }, new SquadProfileSnapshot(), 0, 0, 0, 0, 1000);
+            Assert.Equal(SquadPhase.CorpseRun, state.Phase);
+        }
+
+        [Fact]
         public void HandshakeOnlyMember_GatesLevelWithoutRestOrDistance_ThenUsesTelemetry()
         {
             var coordinator = new SquadCoordinatorService();
@@ -58,6 +71,9 @@ namespace CopilotBuddy.PartyGrind.Tests
             Assert.Equal(2, state.EffectiveSquadMinLevel);
             Assert.Equal(SquadPhase.Grinding, state.Phase);
             Assert.False(coordinator.IsWaitingForFollower);
+            Assert.False(state.Members.Single(m => m.CharacterName == "Pending").HasTelemetry);
+            Assert.False(SquadTankBridge.CanInitiatePull(state, 30));
+            Assert.False(SquadFormationService.CanSquadMount(SquadMountPolicy.SyncWithSlowestMember, true, state));
             var real = MakeConnectedClient("Pending", 0, SquadRole.Healer, WoWClass.Priest, 2, 2000, healthPct: 10);
             state = coordinator.EvaluateTick(settings, MakeLeaderState(6), new[] { real },
                 new SquadProfileSnapshot(), 0, 0, 0, 0, 2000);
@@ -106,7 +122,8 @@ namespace CopilotBuddy.PartyGrind.Tests
             bool inCombat = false,
             bool isDead = false,
             bool townComplete = false,
-            bool needsTrain = false)
+            bool needsTrain = false,
+            bool canResurrect = false)
         {
             return new SquadConnectedMemberSnapshot
             {
@@ -124,6 +141,7 @@ namespace CopilotBuddy.PartyGrind.Tests
                 },
                 LatestState = new SquadMemberState
                 {
+                    CanResurrect = canResurrect,
                     CharacterName = name,
                     Guid = (ulong)(200 + slot),
                     Class = wowClass,
@@ -276,24 +294,31 @@ namespace CopilotBuddy.PartyGrind.Tests
                     MakeConnectedClient("HealB", 0, SquadRole.Healer, WoWClass.Priest, 6, t),
                     MakeConnectedClient("DpsC", 1, SquadRole.DpsRanged, WoWClass.Mage, 6, t)
                 },
-                profileSnap, 0, 0, 0, 0f, t);
-
+                profileSnap, 0, 0, 0, 0f, t, resolveProfile: level =>
+                {
+                    ProfileManager.LevelOverrideSelector = () => level;
+                    ProfileManager.RefreshProfileForLevel();
+                    var profile = ProfileManager.CurrentProfile!;
+                    var hotspot = profile.GrindArea!.CurrentHotSpot.Position;
+                    return new SquadProfileSnapshot
+                    {
+                        ProfileXmlPath = xmlPath, SubProfileName = profile.Name,
+                        SubProfileMinLevel = profile.MinLevel, SubProfileMaxLevel = profile.MaxLevel,
+                        MapId = 0, HotspotX = hotspot.X, HotspotY = hotspot.Y, HotspotZ = hotspot.Z
+                    };
+                });
             Assert.Equal(6, state3.EffectiveSquadMinLevel);
-            SquadContext.UpdateLeaderState(state3);
-            ProfileManager.RefreshProfileForLevel();
-            Assert.Equal("Mid L6-10", ProfileManager.CurrentProfile!.Name);
-
-            // Coordinator notices sub-profile snapshot change -> enters MigratingZone until all reach Spot2
+            Assert.Equal("Mid L6-10", state3.ActiveSubProfileName);
+            Assert.Equal(6, state3.ActiveSubProfileMinLevel);
+            Assert.Equal(10, state3.ActiveSubProfileMaxLevel);
+            Assert.Equal(500f, state3.ActiveHotspotX);
+            Assert.Equal(500f, state3.ActiveHotspotY);
+            Assert.Equal(SquadPhase.MigratingZone, state3.Phase);
             var newSnap = new SquadProfileSnapshot
             {
-                ProfileXmlPath = xmlPath,
-                SubProfileName = "Mid L6-10",
-                SubProfileMinLevel = 6,
-                SubProfileMaxLevel = 10,
-                MapId = 0,
-                HotspotX = 500f,
-                HotspotY = 500f,
-                HotspotZ = 0f
+                ProfileXmlPath = xmlPath, SubProfileName = state3.ActiveSubProfileName,
+                SubProfileMinLevel = state3.ActiveSubProfileMinLevel, SubProfileMaxLevel = state3.ActiveSubProfileMaxLevel,
+                MapId = 0, HotspotX = state3.ActiveHotspotX, HotspotY = state3.ActiveHotspotY, HotspotZ = state3.ActiveHotspotZ
             };
             t += 200;
             var migrating = coord.EvaluateTick(
@@ -455,7 +480,7 @@ namespace CopilotBuddy.PartyGrind.Tests
                 MakeLeaderState(10),
                 new[]
                 {
-                    MakeConnectedClient("HealB", 0, SquadRole.Healer, WoWClass.Priest, 10, t, isDead: false),
+                    MakeConnectedClient("HealB", 0, SquadRole.Healer, WoWClass.Priest, 10, t, isDead: false, canResurrect: true),
                     MakeConnectedClient("DpsC", 1, SquadRole.DpsRanged, WoWClass.Mage, 10, t, isDead: true)
                 },
                 snap, 0, 0, 0, 0f, t);
@@ -469,7 +494,7 @@ namespace CopilotBuddy.PartyGrind.Tests
                 MakeLeaderState(10),
                 new[]
                 {
-                    MakeConnectedClient("HealB", 0, SquadRole.Healer, WoWClass.Priest, 10, t, isDead: false),
+                    MakeConnectedClient("HealB", 0, SquadRole.Healer, WoWClass.Priest, 10, t, isDead: false, canResurrect: true),
                     MakeConnectedClient("DpsC", 1, SquadRole.DpsRanged, WoWClass.Mage, 10, t, isDead: true)
                 },
                 snap, 0, 0, 0, 0f, t);
