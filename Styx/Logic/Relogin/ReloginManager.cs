@@ -1678,15 +1678,49 @@ namespace Styx.Logic.Relogin
                     bool localPlayerUpdated = false;
                     try { localPlayerUpdated = ObjectManager.UpdateAndCheckLocalPlayer(); } catch { /* object list not ready yet */ }
 
-                    if (localPlayerUpdated && ObjectManager.Me != null && ObjectManager.Me.BaseAddress != 0U)
+                    var me = localPlayerUpdated ? ObjectManager.Me : null;
+                    if (me != null && me.BaseAddress != 0U)
                     {
                         if (!IsCurrent(run.Generation)) { failure = "stopped"; return false; }
-                        string name = ObjectManager.Me.Name;
-                        string realm = string.IsNullOrEmpty(run.Config.RealmName) ? "" : ObjectManager.Me.RealmName;
-                        if (string.IsNullOrEmpty(name) || (!string.IsNullOrEmpty(run.Config.RealmName) && string.IsNullOrEmpty(realm)))
-                        { Thread.Sleep(1000); continue; }
-                        if (!string.Equals(name, run.Config.CharacterName, StringComparison.OrdinalIgnoreCase)
-                            || (!string.IsNullOrEmpty(run.Config.RealmName) && !string.Equals(realm, run.Config.RealmName, StringComparison.OrdinalIgnoreCase)))
+                        string name = me.Name;
+                        string realm = string.IsNullOrEmpty(run.Config.RealmName) ? "" : me.RealmName;
+
+                        bool nameMatches = !string.IsNullOrEmpty(name)
+                            && string.Equals(name, run.Config.CharacterName, StringComparison.OrdinalIgnoreCase);
+                        bool realmRequired = !string.IsNullOrEmpty(run.Config.RealmName);
+                        bool realmMatches = !realmRequired
+                            || (!string.IsNullOrEmpty(realm)
+                                && string.Equals(realm, run.Config.RealmName, StringComparison.OrdinalIgnoreCase));
+
+                        // Immediately after entering the world, WoW's local player name cache
+                        // (SMSG_NAME_QUERY_RESPONSE) may not be populated yet, so GetObjectName()
+                        // temporarily returns "Unknown" (or localized UNKNOWNOBJECT / "Object_*").
+                        // Keep waiting for unresolved placeholders or transient placeholder-lookup
+                        // failures before declaring a resolved identity mismatch.
+                        if (!nameMatches)
+                        {
+                            var nameState = ClassifyCharacterName(name);
+                            if (nameState == CharacterNameState.UnresolvedPlaceholder)
+                            {
+                                me.ClearCachedName();
+                                Logging.WriteDebug("[Relogin] Waiting for character name to resolve (currently '{0}').", name ?? "");
+                                Thread.Sleep(1000);
+                                continue;
+                            }
+                            if (nameState == CharacterNameState.LookupFailed)
+                            {
+                                me.ClearCachedName();
+                                Logging.WriteDebug("[Relogin] Could not verify localized unknown-name placeholder for '{0}'; retrying.", name ?? "");
+                                Thread.Sleep(1000);
+                                continue;
+                            }
+                        }
+                        if (realmRequired && string.IsNullOrEmpty(realm))
+                        {
+                            Thread.Sleep(1000);
+                            continue;
+                        }
+                        if (!nameMatches || !realmMatches)
                         {
                             failure = string.Format("character identity mismatch: expected '{0}' on '{1}', found '{2}' on '{3}'; bot left stopped",
                                 run.Config.CharacterName, run.Config.RealmName, name, realm);
@@ -1710,7 +1744,7 @@ namespace Styx.Logic.Relogin
                             return false;
                         }
                         Logging.Write("[Relogin] In the world as {0} (level {1} {2} {3}).",
-                            ObjectManager.Me.Name, ObjectManager.Me.Level, ObjectManager.Me.Race, ObjectManager.Me.Class);
+                            me.Name, me.Level, me.Race, me.Class);
 
                         return true;
                     }
@@ -1730,6 +1764,43 @@ namespace Styx.Logic.Relogin
 
             failure = string.Format("the in-world state was not reached within {0}s", run.Config.InWorldTimeoutSeconds);
             return false;
+        }
+
+        private enum CharacterNameState
+        {
+            Resolved,
+            UnresolvedPlaceholder,
+            LookupFailed
+        }
+
+        private static CharacterNameState ClassifyCharacterName(string? name)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+                return CharacterNameState.UnresolvedPlaceholder;
+            if (string.Equals(name, "Unknown", StringComparison.OrdinalIgnoreCase)
+                || name.StartsWith("Object_", StringComparison.OrdinalIgnoreCase))
+                return CharacterNameState.UnresolvedPlaceholder;
+
+            try
+            {
+                List<string> values = Lua.GetReturnValues(
+                    "return 'ok', UNKNOWNOBJECT or '', UNKNOWN or ''",
+                    "ReloginNameCheck");
+                if (values == null || values.Count < 3 || !string.Equals(values[0], "ok", StringComparison.Ordinal))
+                    return CharacterNameState.LookupFailed;
+
+                string unknownObject = values[1] ?? "";
+                string unknown = values[2] ?? "";
+                if ((!string.IsNullOrEmpty(unknownObject) && string.Equals(name, unknownObject, StringComparison.OrdinalIgnoreCase))
+                    || (!string.IsNullOrEmpty(unknown) && string.Equals(name, unknown, StringComparison.OrdinalIgnoreCase)))
+                    return CharacterNameState.UnresolvedPlaceholder;
+
+                return CharacterNameState.Resolved;
+            }
+            catch
+            {
+                return CharacterNameState.LookupFailed;
+            }
         }
 
         #endregion

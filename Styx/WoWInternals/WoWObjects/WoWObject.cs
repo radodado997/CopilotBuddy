@@ -545,6 +545,8 @@ namespace Styx.WoWInternals.WoWObjects
         
         #region Internal Methods
         protected static Memory? Memory => ObjectManager.Wow;
+        internal void ClearCachedName() => _cachedName = null;
+
         internal void UpdateBaseAddress(uint ptr)
         {
             BaseAddress = ptr;
