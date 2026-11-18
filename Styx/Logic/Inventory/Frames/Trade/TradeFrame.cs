@@ -101,6 +101,19 @@ namespace Styx.Logic.Inventory.Frames.Trade
         public bool ContainsPlayerItem(int slot, uint entry, int count) => Lua.GetReturnVal<int>(
             $"local link=GetTradePlayerItemLink({slot}); local _,_,n=GetTradePlayerItemInfo({slot}); if link and tonumber(string.match(link,'item:(%d+)')) == {entry} and n == {count} then return 1 end return 0", 0U) == 1;
 
+        /// <summary>
+        /// True when the player's side of the open trade window contains no gold.
+        /// </summary>
+        public bool HasEmptyPlayerMoney => Lua.GetReturnVal<int>(
+            "if (GetPlayerTradeMoney() or 0) == 0 then return 1 end return 0", 0U) == 1;
+
+        /// <summary>
+        /// Number of item slots the player has filled in the open trade window (0-6).
+        /// Evaluated in a single Lua chunk to avoid one round-trip per slot.
+        /// </summary>
+        public int PlayerOfferedItemCount => Lua.GetReturnVal<int>(
+            "local n=0 for i=1,6 do if GetTradePlayerItemLink(i) then n=n+1 end end return n", 0U);
+
         public bool HasEmptyPlayerOffer => Lua.GetReturnVal<int>(
             "if GetPlayerTradeMoney() ~= 0 then return 0 end for i=1,7 do if GetTradePlayerItemLink(i) then return 0 end end return 1", 0U) == 1;
 

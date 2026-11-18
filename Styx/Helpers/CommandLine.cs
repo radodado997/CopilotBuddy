@@ -33,14 +33,22 @@ namespace Styx.Helpers
         public static string? InstanceName => !Arguments.Exists("instance") ? null
             : GetSingleValue("instance") ?? throw new ArgumentException("-instance requires a nonempty name.");
 
-        /// <summary>Squad role override passed on CLI (-squadrole).</summary>
-        public static string? SquadRole => GetSingleValue("squadrole");
+        /// <summary>
+        /// Squad role override passed on CLI (-squadrole). A present flag without a usable operand
+        /// fails explicitly here, before the settings CLI overrides are applied.
+        /// </summary>
+        public static string? SquadRole => !Arguments.Exists("squadrole") ? null
+            : GetSingleValue("squadrole") ?? throw new ArgumentException("-squadrole requires a nonempty value.");
 
         /// <summary>Whether this client is the squad coordinator (-squadcoordinator).</summary>
         public static bool? SquadCoordinator => GetNullableBool("squadcoordinator");
 
-        /// <summary>Team identifier for IPC isolation (-squadteam).</summary>
-        public static string? SquadTeam => GetSingleValue("squadteam");
+        /// <summary>
+        /// Team identifier for IPC isolation (-squadteam). A present flag without a usable operand
+        /// fails explicitly here, before the settings CLI overrides are applied.
+        /// </summary>
+        public static string? SquadTeam => !Arguments.Exists("squadteam") ? null
+            : GetSingleValue("squadteam") ?? throw new ArgumentException("-squadteam requires a nonempty value.");
 
         /// <summary>TCP loopback port for squad IPC (-squadport).</summary>
         public static int? SquadPort => GetNullableInt("squadport");

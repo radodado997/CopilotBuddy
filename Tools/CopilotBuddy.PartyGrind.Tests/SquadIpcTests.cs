@@ -79,9 +79,16 @@ namespace CopilotBuddy.PartyGrind.Tests
             using var client = new SquadIpcClient(server.Port, "Retry", memberSecret: Secret("Follower"));
             client.Start(() => new SquadHandshake { CharacterName = "Follower", Guid = 42, Level = 5 });
             await WaitUntilAsync(() => server.GetMemberSnapshots().Count == 1);
-            using var impostor = new SquadIpcClient(server.Port, "Retry", memberSecret: Secret("Wrong"));
-            impostor.Start(() => new SquadHandshake { CharacterName = "Follower", Guid = 99, Level = 80 });
-            await Task.Delay(750);
+            // Bounded authentication attempt: the server must reject the wrong secret outright.
+            using var impostorTcp = new System.Net.Sockets.TcpClient();
+            await impostorTcp.ConnectAsync(System.Net.IPAddress.Loopback, server.Port);
+            using var impostorReader = new System.IO.StreamReader(impostorTcp.GetStream());
+            using var impostorWriter = new System.IO.StreamWriter(impostorTcp.GetStream()) { AutoFlush = true };
+            using var impostorTimeout = new System.Threading.CancellationTokenSource(TimeSpan.FromSeconds(4));
+            await Assert.ThrowsAsync<System.IO.IOException>(() => SquadPeerAuthentication.Client(
+                impostorReader, impostorWriter, "Follower", Secret("Wrong"), "Retry", impostorTimeout.Token));
+
+            // The incumbent session on the same character name is untouched.
             Assert.Equal(42UL, Assert.Single(server.GetMemberSnapshots()).Handshake.Guid);
         }
 
@@ -218,12 +225,14 @@ namespace CopilotBuddy.PartyGrind.Tests
                     Assert.Equal(slot, assignments[expectedSorted[slot]]);
                 }
 
-                foreach (var client in clients)
+                for (int i = 0; i < clients.Count; i++)
                 {
+                    var client = clients[i];
                     foreach (var hs in handshakes.Values)
                         Assert.Equal(hs.Role, client.LatestLeaderState!.MemberRoles[hs.CharacterName]);
                     Assert.True(client.IsConnected);
-                    Assert.NotNull(client.AssignedSlotIndex);
+                    // Each client must hold exactly the slot the server assigned to its own character.
+                    Assert.Equal(assignments[expectedNames[i]], client.AssignedSlotIndex);
                     Assert.Equal(5, client.LatestLeaderState!.EffectiveSquadMinLevel);
                     Assert.Equal(SquadPhase.Grinding, client.LatestLeaderState.Phase);
                     Assert.Equal("Zone 1-6", client.LatestLeaderState.ActiveSubProfileName);

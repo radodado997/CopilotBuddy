@@ -46,12 +46,23 @@ namespace CopilotBuddy.Bots.PartyGrind
         private SquadIpcClient? _ipcClient;
         private Composite? _root;
 
+        /// <summary>
+        /// Distance (yards) within which a ghost can retrieve its corpse; the squad corpse rally may
+        /// only steer movement inside this range.
+        /// </summary>
+        private const float CorpseRetrievalRange = 30f;
+
         private long _lastIpcSendUtcMs;
         private long _lastTownRallySearchUtcMs;
         private uint _cachedTownRallyMapId;
         private WoWPoint _cachedTownRallyPoint;
         private string _cachedProfilePath = string.Empty;
         private string _cachedProfileHash = string.Empty;
+        private object? _cachedProfileRevision;
+        private string _profileSearchHash = string.Empty;
+        private long _lastProfileSearchUtcMs;
+        private System.Threading.Timer? _pauseBroadcastTimer;
+        private SquadLeaderState? _pausedLeaderState;
         private string _lastAttemptedLeaderProfilePath = string.Empty;
         private int _lastAppliedEffectiveLevel;
         private ulong _currentFocusGuid;
@@ -71,6 +82,16 @@ namespace CopilotBuddy.Bots.PartyGrind
             public RoutineAwareRoot(params Composite[] children) : base(children) { }
             public override RunStatus Tick(object context)
             {
+                // When PartyGrind is not active the root must complete without touching movement,
+                // combat or travel branches.
+                if (!SquadContext.IsActive)
+                {
+                    _combatTicked = _restTicked = false;
+                    StopRoutine(ref _activeCombatRoutine);
+                    StopRoutine(ref _activeRestRoutine);
+                    return RunStatus.Success;
+                }
+
                 if (IsRunning) { base.Stop(context); base.Start(context); }
                 _combatTicked = _restTicked = false;
                 try { return base.Tick(context); }
@@ -185,6 +206,9 @@ namespace CopilotBuddy.Bots.PartyGrind
 
             StopRoutine(ref _activeCombatRoutine);
             StopRoutine(ref _activeRestRoutine);
+            ClearPauseBroadcast();
+            SquadHealBridge.ResetSession();
+            SquadTankBridge.ResetSession();
             _provisioning.Stop();
             _partySync.DetachEvents();
             StopIpc();
@@ -216,14 +240,69 @@ namespace CopilotBuddy.Bots.PartyGrind
                     StyxWoW.Me.Rotation,
                     now);
                 SquadContext.UpdateLeaderState(leaderState);
+                _pausedLeaderState = leaderState;
                 _ipcServer.BroadcastLeaderState(leaderState, populateRoster: false);
+                StartPauseBroadcastTimer();
             }
         }
 
         public override void OnResumed()
         {
+            ClearPauseBroadcast();
             _coordinator.IsPausedManually = false;
             _coordinator.ManualPauseReason = string.Empty;
+        }
+
+        /// <summary>
+        /// Keeps broadcasting the cached pause-time leader state so followers never trip their
+        /// DisconnectTimeoutMs while the coordinator is paused (Pulse is not called then).
+        /// </summary>
+        private void StartPauseBroadcastTimer()
+        {
+            StopPauseBroadcastTimer();
+
+            var server = _ipcServer;
+            if (server == null)
+                return;
+
+            int intervalMs = Math.Max(250, Math.Min(1000, Math.Max(500, server.DisconnectTimeoutMs / 3)));
+            _pauseBroadcastTimer = new System.Threading.Timer(
+                _ => BroadcastPausedLeaderState(server),
+                null,
+                intervalMs,
+                intervalMs);
+        }
+
+        private void BroadcastPausedLeaderState(SquadIpcServer server)
+        {
+            if (!ReferenceEquals(server, _ipcServer))
+                return;
+
+            var state = _pausedLeaderState;
+            if (state == null)
+                return;
+
+            try
+            {
+                server.BroadcastLeaderState(state, populateRoster: false);
+            }
+            catch
+            {
+                // A pause broadcast must never fault the timer thread.
+            }
+        }
+
+        private void StopPauseBroadcastTimer()
+        {
+            var timer = _pauseBroadcastTimer;
+            _pauseBroadcastTimer = null;
+            try { timer?.Dispose(); } catch { }
+        }
+
+        private void ClearPauseBroadcast()
+        {
+            StopPauseBroadcastTimer();
+            _pausedLeaderState = null;
         }
 
         public override void Pulse()
@@ -257,6 +336,44 @@ namespace CopilotBuddy.Bots.PartyGrind
                 File.ReadAllText(settings.IpcMemberSecretsPath)) ?? throw new InvalidOperationException("Invalid member secrets file."), StringComparer.OrdinalIgnoreCase);
         }
 
+        /// <summary>
+        /// Validates one member secret before the IPC worker starts. Returns null when the secret is
+        /// usable, otherwise a description of the problem. The secret value is never returned.
+        /// </summary>
+        private static string? ValidateMemberSecret(string? secret)
+        {
+            if (string.IsNullOrWhiteSpace(secret))
+                return "no secret configured";
+
+            byte[] decoded;
+            try
+            {
+                decoded = Convert.FromBase64String(secret);
+            }
+            catch (FormatException)
+            {
+                return "secret is not valid base64";
+            }
+
+            return decoded.Length >= 32
+                ? null
+                : $"secret decodes to {decoded.Length} bytes but at least 32 are required";
+        }
+
+        private static string RequireMemberSecret(Dictionary<string, string> secrets, string characterName)
+        {
+            if (!secrets.TryGetValue(characterName, out string? secret))
+                throw new InvalidOperationException(
+                    $"IPC member secret validation failed for '{characterName}': no secret configured for this character.");
+
+            string? error = ValidateMemberSecret(secret);
+            if (error != null)
+                throw new InvalidOperationException(
+                    $"IPC member secret validation failed for '{characterName}': {error}.");
+
+            return secret;
+        }
+
         private void StartIpc(SquadSettings settings)
         {
             StopIpc();
@@ -266,15 +383,21 @@ namespace CopilotBuddy.Bots.PartyGrind
                 {
                     var secrets = LoadMemberSecrets(settings);
                     var expected = new HashSet<string>(settings.GetExpectedMemberNames(), StringComparer.OrdinalIgnoreCase);
-                    secrets = secrets.Where(kv => expected.Contains(kv.Key)).ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.OrdinalIgnoreCase);
-                    _ipcServer = new SquadIpcServer(settings.IpcPort, settings.TeamId, memberSecrets: secrets);
+
+                    // Every configured member must have a usable secret before the worker starts.
+                    var validated = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                    foreach (string name in expected)
+                        validated[name] = RequireMemberSecret(secrets, name);
+
+                    _ipcServer = new SquadIpcServer(settings.IpcPort, settings.TeamId, memberSecrets: validated);
                     _ipcServer.Start();
                     SquadContext.IsIpcConnected = true;
                 }
                 else
                 {
                     var secrets = LoadMemberSecrets(settings);
-                    if (!secrets.TryGetValue(StyxWoW.Me!.Name, out string? secret)) throw new InvalidOperationException("No IPC secret configured for this character.");
+                    string characterName = StyxWoW.Me?.Name ?? string.Empty;
+                    string secret = RequireMemberSecret(secrets, characterName);
                     _ipcClient = new SquadIpcClient(settings.IpcPort, settings.TeamId, memberSecret: secret);
                     _ipcClient.Start(BuildLocalHandshake);
                     SquadContext.IsIpcConnected = false;
@@ -362,17 +485,22 @@ namespace CopilotBuddy.Bots.PartyGrind
             SquadContext.IsIpcConnected = connected;
 
             var leaderState = connected ? _ipcClient?.LatestLeaderState : null;
-            if (leaderState == null) SquadContext.UpdateLeaderState(null);
-            if (leaderState != null)
-            {
-                if (settings.AutoLoadCoordinatorProfile && !EnsureLeaderProfile(leaderState))
-                {
-                    SquadContext.UpdateLeaderState(null);
-                }
-                else
-                    SquadContext.UpdateLeaderState(leaderState);
+            bool accepted = leaderState != null &&
+                (!settings.AutoLoadCoordinatorProfile || EnsureLeaderProfile(leaderState));
 
-                if (leaderState.EffectiveSquadMinLevel > 0 && leaderState.EffectiveSquadMinLevel != _lastAppliedEffectiveLevel)
+            if (!accepted)
+            {
+                // Losing the accepted leader state also drops the effective level we applied.
+                _lastAppliedEffectiveLevel = 0;
+                SquadContext.UpdateLeaderState(null);
+            }
+            else
+            {
+                SquadContext.UpdateLeaderState(leaderState);
+
+                // Apply the leader's effective level only for an accepted state.
+                if (leaderState!.EffectiveSquadMinLevel > 0 &&
+                    leaderState.EffectiveSquadMinLevel != _lastAppliedEffectiveLevel)
                 {
                     _lastAppliedEffectiveLevel = leaderState.EffectiveSquadMinLevel;
                     if (ProfileManager.CurrentOuterProfile != null)
@@ -388,12 +516,30 @@ namespace CopilotBuddy.Bots.PartyGrind
             _wasInCombat = localState.IsInCombat;
         }
 
+        /// <summary>
+        /// How long an unsuccessful profile search for one leader hash is trusted before the local
+        /// Profiles tree is enumerated and hashed again.
+        /// </summary>
+        private const long ProfileSearchRetryMs = 5000L;
+
         private bool EnsureLeaderProfile(SquadLeaderState leader)
         {
             if (string.IsNullOrWhiteSpace(leader.ProfileXmlHash)) return false;
             if (!string.IsNullOrEmpty(ProfileManager.XmlLocation) &&
                 string.Equals(ComputeFileHash(ProfileManager.XmlLocation), leader.ProfileXmlHash, StringComparison.OrdinalIgnoreCase))
                 return true;
+
+            // Cache unsuccessful searches by the requested hash instead of re-hashing every candidate
+            // on each follower pulse; retry on a bounded interval so a newly installed profile is
+            // still picked up.
+            long now = Environment.TickCount64;
+            bool sameRequest = string.Equals(_profileSearchHash, leader.ProfileXmlHash, StringComparison.OrdinalIgnoreCase);
+            if (sameRequest && (now - _lastProfileSearchUtcMs) < ProfileSearchRetryMs)
+                return false;
+
+            _profileSearchHash = leader.ProfileXmlHash;
+            _lastProfileSearchUtcMs = now;
+
             string root = Path.Combine(AppContext.BaseDirectory, "Profiles");
             var candidates = Directory.Exists(root) ? Directory.EnumerateFiles(root, "*.xml", new EnumerationOptions
             {
@@ -407,10 +553,52 @@ namespace CopilotBuddy.Bots.PartyGrind
                 _lastAttemptedLeaderProfilePath = leader.ProfileXmlPath;
                 return false;
             }
+
+            _profileSearchHash = string.Empty;
+            _lastProfileSearchUtcMs = 0;
             ProfileManager.LoadNew(local, rememberMe: false);
             _lastAppliedEffectiveLevel = leader.EffectiveSquadMinLevel;
+            RefreshProfileHashCache();
             ProfileManager.RefreshProfileForLevel();
             return true;
+        }
+
+        /// <summary>
+        /// Keeps <see cref="_cachedProfileHash"/> in sync with the loaded profile revision: a reload
+        /// from the same path invalidates the digest, an unloaded profile clears it, and a failed
+        /// hash read stays uncached so the next pulse retries.
+        /// </summary>
+        private void RefreshProfileHashCache()
+        {
+            string xmlPath = ProfileManager.XmlLocation ?? string.Empty;
+            if (string.IsNullOrEmpty(xmlPath))
+            {
+                _cachedProfilePath = string.Empty;
+                _cachedProfileHash = string.Empty;
+                _cachedProfileRevision = null;
+                return;
+            }
+
+            object? revision = ProfileManager.CurrentOuterProfile;
+            if (_cachedProfileHash.Length > 0 &&
+                string.Equals(xmlPath, _cachedProfilePath, StringComparison.OrdinalIgnoreCase) &&
+                ReferenceEquals(revision, _cachedProfileRevision))
+                return;
+
+            if (!string.Equals(xmlPath, _cachedProfilePath, StringComparison.OrdinalIgnoreCase))
+            {
+                // Never keep reporting a digest that belongs to a different profile file.
+                _cachedProfileHash = string.Empty;
+                _cachedProfileRevision = null;
+            }
+
+            string hash = ComputeFileHash(xmlPath);
+            if (hash.Length == 0)
+                return; // failed read: leave it uncached and retry on the next pulse
+
+            _cachedProfilePath = xmlPath;
+            _cachedProfileRevision = revision;
+            _cachedProfileHash = hash;
         }
 
         private void UpdateCoordinatorTargets(long now)
@@ -450,13 +638,8 @@ namespace CopilotBuddy.Bots.PartyGrind
         {
             var outer = ProfileManager.CurrentOuterProfile;
             var current = outer != null ? ProfileManager.CurrentProfile : null;
+            RefreshProfileHashCache();
             string xmlPath = ProfileManager.XmlLocation ?? string.Empty;
-
-            if (!string.IsNullOrEmpty(xmlPath) && !string.Equals(xmlPath, _cachedProfilePath, StringComparison.OrdinalIgnoreCase))
-            {
-                _cachedProfilePath = xmlPath;
-                _cachedProfileHash = ComputeFileHash(xmlPath);
-            }
 
             var grindArea = current?.GrindArea ?? StyxWoW.AreaManager?.CurrentGrindArea;
             WoWPoint hotspot = (grindArea != null && grindArea.Hotspots.Count > 0)
@@ -549,12 +732,7 @@ namespace CopilotBuddy.Bots.PartyGrind
             if (leader == null || leader.Phase != SquadPhase.TownRun)
                 _townTasksCompleteLocal = false;
 
-            string xmlPath = ProfileManager.XmlLocation ?? string.Empty;
-            if (!string.IsNullOrEmpty(xmlPath) && !string.Equals(xmlPath, _cachedProfilePath, StringComparison.OrdinalIgnoreCase))
-            {
-                _cachedProfilePath = xmlPath;
-                _cachedProfileHash = ComputeFileHash(xmlPath);
-            }
+            RefreshProfileHashCache();
 
             var currentSub = ProfileManager.CurrentOuterProfile != null ? ProfileManager.CurrentProfile : null;
             bool isResting = !me.Combat && (me.HasAura("Food") || me.HasAura("Drink") || _localWasNeedingRest);
@@ -594,7 +772,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                 IsLooting = isLooting,
                 KnownBlessings = new[] { "Blessing of Sanctuary", "Blessing of Kings", "Blessing of Might", "Blessing of Wisdom" }.Where(SpellManager.HasSpell).ToList(),
                 CanResurrect = SquadHealBridge.GetResurrectionSpell(me.Class) is string resSpell && SpellManager.HasSpell(resSpell),
-                CanMount = me.Level >= 20,
+                CanMount = SquadFormationService.HasUsableMount(me),
                 CanFly = me.Level >= 60,
                 MaxMountSpeed = me.Level >= 40 ? 100f : (me.Level >= 20 ? 60f : 0f),
                 IsMounted = me.Mounted,
@@ -767,15 +945,20 @@ namespace CopilotBuddy.Bots.PartyGrind
 
             _deathStartedUtcMs = 0;
             WoWPoint corpsePoint = me.CorpsePoint;
+
+            // The squad corpse rally may only steer movement while the ghost is still inside the
+            // corpse-retrieval range; further out the ghost always walks back toward its own corpse.
             WoWPoint targetPoint = corpsePoint;
-            if (leader != null && leader.SquadCorpseRallyX != 0 && leader.SquadCorpseRallyY != 0)
+            float distanceToCorpse = me.Location.Distance(corpsePoint);
+            if (leader != null && leader.SquadCorpseRallyX != 0 && leader.SquadCorpseRallyY != 0 &&
+                distanceToCorpse <= CorpseRetrievalRange)
             {
                 var rally = new WoWPoint(leader.SquadCorpseRallyX, leader.SquadCorpseRallyY, leader.SquadCorpseRallyZ);
                 if (rally.Distance(corpsePoint) <= 40f)
                     targetPoint = rally;
             }
 
-            if (me.Location.Distance(targetPoint) > 30f && me.Location.Distance(corpsePoint) > 30f)
+            if (me.Location.Distance(targetPoint) > CorpseRetrievalRange)
             {
                 Navigator.MoveTo(targetPoint, "CorpseRun: returning to squad corpse");
                 return RunStatus.Success;
@@ -861,7 +1044,8 @@ namespace CopilotBuddy.Bots.PartyGrind
             var local = SquadContext.GetLocalMemberStateSnapshot();
 
             // 1. Aggro Peel Rule: if a non-tank pulled aggro and tank is alive nearby, run within 12 yd of Tank.
-            if (local != null && local.NeedsPeel && leader != null && !leader.IsDead && !leader.IsGhost)
+            if (local != null && local.NeedsPeel && leader != null && !leader.IsDead && !leader.IsGhost &&
+                leader.MapId == me.MapId)
             {
                 var tankPos = new WoWPoint(leader.X, leader.Y, leader.Z);
                 if (me.Location.Distance(tankPos) > 12f)
@@ -929,7 +1113,8 @@ namespace CopilotBuddy.Bots.PartyGrind
 
         private static bool PositionBackline(float standoffDistance, SquadLeaderState? leader, LocalPlayer me)
         {
-            if (leader == null || leader.IsDead || leader.IsGhost)
+            // Never position against a leader on another map: its coordinates are meaningless here.
+            if (leader == null || leader.IsDead || leader.IsGhost || leader.MapId != me.MapId)
                 return false;
 
             var tankPos = new WoWPoint(leader.X, leader.Y, leader.Z);

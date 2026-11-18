@@ -113,6 +113,9 @@ namespace Styx.Logic.Inventory
         /// </summary>
         private static bool IsFood(WoWItem item)
         {
+            if (item?.ItemInfo == null)
+                return false;
+
             if ((int)item.ItemInfo.ItemClass != (int)WoWItemClass.Consumable)
                 return false;
 
@@ -128,6 +131,9 @@ namespace Styx.Logic.Inventory
         /// </summary>
         private static bool IsDrink(WoWItem item)
         {
+            if (item?.ItemInfo == null)
+                return false;
+
             if ((int)item.ItemInfo.ItemClass != (int)WoWItemClass.Consumable)
                 return false;
 

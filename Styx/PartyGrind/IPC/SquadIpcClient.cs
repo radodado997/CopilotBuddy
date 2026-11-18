@@ -27,6 +27,7 @@ namespace Styx.PartyGrind.IPC
         private Func<SquadHandshake>? _handshakeProvider;
         private SquadLeaderState? _latestLeaderState;
         private long _lastReceivedUtcMs;
+        private long _lastSessionFrameUtcMs;
         private long _nextSequenceId;
         private volatile bool _socketConnected;
         private string _localCharacterName = string.Empty;
@@ -155,7 +156,6 @@ namespace Styx.PartyGrind.IPC
                 {
                     tcp = new TcpClient { NoDelay = true };
                     await tcp.ConnectAsync(IPAddress.Loopback, _port, ct).ConfigureAwait(false);
-                    backoffMs = 500; // reset on successful TCP connect
 
                     SquadHandshake hs = handshakeProvider.Invoke();
                     lock (_stateLock)
@@ -164,7 +164,11 @@ namespace Styx.PartyGrind.IPC
                         _localCharacterName = hs.CharacterName?.Trim() ?? string.Empty;
                     }
 
-                    await RunConnectedSessionAsync(tcp, hs, run, outbound, ct).ConfigureAwait(false);
+                    // The backoff is only reset once the session actually delivers leader state, so
+                    // repeated authentication failures keep backing off.
+                    bool sessionReady = await RunConnectedSessionAsync(tcp, hs, run, outbound, ct).ConfigureAwait(false);
+                    if (sessionReady)
+                        backoffMs = 500;
                 }
                 catch (OperationCanceledException)
                 {
@@ -195,12 +199,17 @@ namespace Styx.PartyGrind.IPC
             }
         }
 
-        private async Task RunConnectedSessionAsync(TcpClient tcp, SquadHandshake handshake, CancellationTokenSource run, Channel<string> outbound, CancellationToken outerCt)
+        private async Task<bool> RunConnectedSessionAsync(TcpClient tcp, SquadHandshake handshake, CancellationTokenSource run, Channel<string> outbound, CancellationToken outerCt)
         {
             using var sessionCts = CancellationTokenSource.CreateLinkedTokenSource(outerCt);
             CancellationToken ct = sessionCts.Token;
             long connectedUtcMs = _utcNowMs();
-            long sessionLastReceived = connectedUtcMs;
+            bool sessionReady = false;
+            lock (_stateLock)
+            {
+                if (ReferenceEquals(_cts, run))
+                    _lastSessionFrameUtcMs = connectedUtcMs;
+            }
 
             var stream = tcp.GetStream();
             using var writer = new StreamWriter(stream, new UTF8Encoding(false)) { AutoFlush = false, NewLine = "\n" };
@@ -239,13 +248,11 @@ namespace Styx.PartyGrind.IPC
                     while (!ct.IsCancellationRequested)
                     {
                         await Task.Delay(250, ct).ConfigureAwait(false);
-                        long last = Interlocked.Read(ref sessionLastReceived);
-                        if (last > 0 && (_utcNowMs() - last) > DisconnectTimeoutMs)
-                        {
-                            ClearSession(run);
-                            sessionCts.Cancel();
-                            break;
-                        }
+                        if (!ExpireIdleSession(run, connectedUtcMs))
+                            continue;
+
+                        sessionCts.Cancel();
+                        break;
                     }
                 }
                 catch (OperationCanceledException) { }
@@ -261,10 +268,22 @@ namespace Styx.PartyGrind.IPC
                     if (string.IsNullOrWhiteSpace(line))
                         continue;
 
+                    // Mark session activity under the same lock the watchdog uses, so a frame that
+                    // arrived just before the timeout check always wins.
+                    lock (_stateLock)
+                    {
+                        if (!ReferenceEquals(_cts, run))
+                            break;
+                        _lastSessionFrameUtcMs = _utcNowMs();
+                    }
+
                     try
                     {
                         if (HandleIncomingLine(auth.Unprotect(line), run))
-                            Interlocked.Exchange(ref sessionLastReceived, _utcNowMs());
+                        {
+                            sessionReady = true;
+                            Interlocked.Exchange(ref _lastReceivedUtcMs, _utcNowMs());
+                        }
                     }
                     catch (System.Text.Json.JsonException) { }
                 }
@@ -277,6 +296,37 @@ namespace Styx.PartyGrind.IPC
                 try { await sendTask.ConfigureAwait(false); } catch { }
                 try { await watchdogTask.ConfigureAwait(false); } catch { }
             }
+
+            return sessionReady;
+        }
+
+        /// <summary>
+        /// Marks the session expired only when, under the publish lock, it is still idle past
+        /// <see cref="DisconnectTimeoutMs"/>. Returns true when the caller must tear the session down.
+        /// </summary>
+        private bool ExpireIdleSession(CancellationTokenSource run, long sessionStartUtcMs)
+        {
+            lock (_stateLock)
+            {
+                if (!ReferenceEquals(_cts, run))
+                    return true;
+
+                long lastActivity = Math.Max(sessionStartUtcMs, LastReceivedOrFrameActivity(sessionStartUtcMs));
+                if ((_utcNowMs() - lastActivity) <= DisconnectTimeoutMs)
+                    return false;
+
+                _socketConnected = false;
+                _latestLeaderState = null;
+                Interlocked.Exchange(ref _lastReceivedUtcMs, 0);
+                return true;
+            }
+        }
+
+        private long LastReceivedOrFrameActivity(long sessionStartUtcMs)
+        {
+            long frame = _lastSessionFrameUtcMs;
+            long received = Interlocked.Read(ref _lastReceivedUtcMs);
+            return Math.Max(frame, received > 0 ? received : sessionStartUtcMs);
         }
 
         private void ClearSession(CancellationTokenSource run)

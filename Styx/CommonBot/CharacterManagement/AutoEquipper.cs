@@ -1,6 +1,7 @@
 #nullable disable
 using Styx.Combat.CombatRoutine;
 using Styx.Helpers;
+using Styx.Logic.Combat;
 using Styx.WoWInternals;
 using Styx.WoWInternals.WoWObjects;
 using System;
@@ -64,8 +65,62 @@ namespace Styx.CommonBot.CharacterManagement
         /// <summary>
         /// Evaluates an item based on character class and basic stats
         /// </summary>
-        public bool IsUpgrade(ItemInfo item) => item != null && ObjectManager.Me?.Inventory != null &&
-            GetItemSlot(item) != WoWInventorySlot.None && EvaluateItem(item, 1) > 0;
+        public bool IsUpgrade(ItemInfo item)
+        {
+            if (item == null || ObjectManager.Me?.Inventory == null)
+                return false;
+
+            WoWInventorySlot slot = GetItemSlot(item);
+            if (slot == WoWInventorySlot.None)
+                return false;
+
+            // Keep the usability check: an unusable item can never be an upgrade.
+            if (!ObjectManager.Me.CanEquipItem(item))
+                return false;
+
+            // An eligible item is always an upgrade when its target slot is free, regardless of score.
+            if (IsSlotEmpty(slot) || IsSlotEmpty(GetSecondaryItemSlot(item)))
+                return true;
+
+            // Occupied slot: a positive evaluated score is still required.
+            return EvaluateItem(item, 1) > 0;
+        }
+
+        private static bool IsSlotEmpty(WoWInventorySlot slot)
+        {
+            if (slot == WoWInventorySlot.None)
+                return false;
+
+            WoWPlayerInventory inventory = ObjectManager.Me?.Inventory;
+            if (inventory == null)
+                return false;
+
+            WoWItem equipped = inventory.GetItemBySlot((uint)slot);
+            return equipped == null || equipped.ItemInfo == null;
+        }
+
+        /// <summary>
+        /// True when the candidate is a two-handed weapon that also removes the current off-hand item
+        /// (Titan's Grip keeps the off-hand, so it is excluded).
+        /// </summary>
+        private static bool DisplacesOffHand(ItemInfo item)
+        {
+            if (item == null || item.InventoryType != InventoryType.TwoHandWeapon)
+                return false;
+            return !SpellManager.HasSpell("Titan's Grip");
+        }
+
+        /// <summary>
+        /// True when the character can legally wield this one-handed weapon in the off-hand.
+        /// </summary>
+        private static bool CanDualWield(ItemInfo item)
+        {
+            if (item == null)
+                return false;
+            if (item.InventoryType != InventoryType.Weapon && item.InventoryType != InventoryType.WeaponOffHand)
+                return false;
+            return SpellManager.HasSpell("Dual Wield") || SpellManager.HasSpell("Titan's Grip");
+        }
 
         private float EvaluateItem(ItemInfo item, int count, bool compareEquipped = true)
         {
@@ -117,37 +172,69 @@ namespace Styx.CommonBot.CharacterManagement
             if (compareEquipped && slot1 != WoWInventorySlot.None)
             {
                 WoWInventorySlot slot2 = GetSecondaryItemSlot(item);
-                WoWInventorySlot[] slotsToCheck = slot2 != WoWInventorySlot.None
-                    ? new[] { slot1, slot2 }
-                    : new[] { slot1 };
-
-                // Find the weakest equipped item across all valid slots for this item type
-                float weakestEquippedScore = float.MaxValue;
-                bool anySlotEmpty = false;
-                foreach (WoWInventorySlot checkSlot in slotsToCheck)
+                if (slot2 != WoWInventorySlot.None)
                 {
-                    WoWItem equipped = inventory.GetItemBySlot((uint)checkSlot);
-                    if (equipped == null || equipped.ItemInfo == null)
+                    // Dual-slot types (rings, trinkets, dual-wield weapons): compare against the weaker
+                    // of the two slots so the weaker slot can still be replaced.
+                    float weakestEquippedScore = float.MaxValue;
+                    bool anySlotEmpty = false;
+                    foreach (WoWInventorySlot checkSlot in new[] { slot1, slot2 })
                     {
-                        // Empty slot — item is automatically an upgrade
-                        anySlotEmpty = true;
-                        break;
+                        WoWItem equipped = inventory.GetItemBySlot((uint)checkSlot);
+                        if (equipped == null || equipped.ItemInfo == null)
+                        {
+                            // Empty slot — item is automatically an upgrade
+                            anySlotEmpty = true;
+                            break;
+                        }
+                        float equippedScore = EvaluateItem(equipped.ItemInfo, 1, false);
+                        if (equippedScore < weakestEquippedScore)
+                            weakestEquippedScore = equippedScore;
                     }
-                    float equippedScore = EvaluateItem(equipped.ItemInfo, 1, false);
-                    if (equippedScore < weakestEquippedScore)
-                        weakestEquippedScore = equippedScore;
-                }
 
-                // Only consider it if it's at least 5% better than the weakest slot
-                if (!anySlotEmpty && score <= weakestEquippedScore * 1.05f)
-                    return 0f;
+                    // Only consider it if it's at least 5% better than the weakest slot
+                    if (!anySlotEmpty && score <= weakestEquippedScore * 1.05f)
+                        return 0f;
+                }
+                else
+                {
+                    // Single-slot types: compare against the combined score of every item the equip
+                    // action would remove (a two-hander also displaces the off-hand item).
+                    float replacedScore = 0f;
+                    bool anySlotEmpty = false;
+                    foreach (WoWInventorySlot checkSlot in SlotsReplacedBy(item))
+                    {
+                        WoWItem equipped = inventory.GetItemBySlot((uint)checkSlot);
+                        if (equipped == null || equipped.ItemInfo == null)
+                        {
+                            anySlotEmpty = true;
+                            continue;
+                        }
+                        replacedScore += EvaluateItem(equipped.ItemInfo, 1, false);
+                    }
+
+                    if (!anySlotEmpty && score <= replacedScore * 1.05f)
+                        return 0f;
+                }
             }
 
             return score;
         }
 
         /// <summary>
-        /// Returns the secondary inventory slot for dual-slot item types (rings, trinkets).
+        /// Every inventory slot the equip action would replace for this candidate.
+        /// </summary>
+        private IReadOnlyList<WoWInventorySlot> SlotsReplacedBy(ItemInfo item)
+        {
+            var slots = new List<WoWInventorySlot> { GetItemSlot(item) };
+            if (DisplacesOffHand(item))
+                slots.Add(WoWInventorySlot.OffHand);
+            return slots;
+        }
+
+        /// <summary>
+        /// Returns the secondary inventory slot for dual-slot item types (rings, trinkets, and
+        /// one-handed weapons the character can dual-wield).
         /// Returns <see cref="WoWInventorySlot.None"/> for single-slot types.
         /// HB 6.2.3 pattern: yield Finger1 + Finger2, Trinket1 + Trinket2.
         /// </summary>
@@ -157,6 +244,10 @@ namespace Styx.CommonBot.CharacterManagement
             {
                 case InventoryType.Finger:  return WoWInventorySlot.Finger2;
                 case InventoryType.Trinket: return WoWInventorySlot.Trinket2;
+                case InventoryType.Weapon:
+                case InventoryType.WeaponOffHand:
+                    // A one-hander can also replace the off-hand when the class can dual-wield.
+                    return CanDualWield(item) ? WoWInventorySlot.OffHand : WoWInventorySlot.None;
                 default:                    return WoWInventorySlot.None;
             }
         }
@@ -216,7 +307,8 @@ namespace Styx.CommonBot.CharacterManagement
                 case InventoryType.Holdable: return WoWInventorySlot.OffHand;
                 case InventoryType.Ranged:
                 case InventoryType.RangedRight:
-                case InventoryType.Thrown: return WoWInventorySlot.Ranged;
+                case InventoryType.Thrown:
+                case InventoryType.Relic: return WoWInventorySlot.Ranged;
                 case InventoryType.Tabard: return WoWInventorySlot.Tabard;
                 default: return WoWInventorySlot.None;
             }

@@ -210,8 +210,36 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (settings == null || !SquadContext.IsActive)
                 return;
 
-            Logging.Write("[PartyGrind Sync] Accepting party summon.");
+            string summoner = Lua.GetReturnVal<string>("return GetSummonConfirmSummoner() or ''", 0U) ?? string.Empty;
+            if (!IsConfiguredSquadMember(summoner, settings))
+            {
+                Logging.Write("[PartyGrind Sync] Declined summon from unauthorized player '{0}'.", summoner);
+                Lua.DoString("DeclineSummon(); StaticPopup_Hide('CONFIRM_SUMMON');");
+                return;
+            }
+
+            Logging.Write("[PartyGrind Sync] Accepting party summon from {0}.", summoner);
             Lua.DoString("ConfirmSummon(); StaticPopup_Hide('CONFIRM_SUMMON');");
+        }
+
+        /// <summary>
+        /// True when <paramref name="name"/> is the configured coordinator or a member of the
+        /// configured squad roster. Summons/trades are only accepted from these characters.
+        /// </summary>
+        private static bool IsConfiguredSquadMember(string? name, SquadSettings settings)
+        {
+            if (string.IsNullOrWhiteSpace(name) || settings == null)
+                return false;
+
+            string trimmed = name.Trim();
+            if (!string.IsNullOrWhiteSpace(settings.CoordinatorName) &&
+                string.Equals(trimmed, settings.CoordinatorName.Trim(), StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            return settings.GetExpectedMemberNames()
+                .Any(n => string.Equals(n, trimmed, StringComparison.OrdinalIgnoreCase));
         }
 
         private void OnQuestAcceptConfirm(object sender, LuaEventArgs args)

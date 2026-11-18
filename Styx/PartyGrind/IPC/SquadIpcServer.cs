@@ -38,7 +38,7 @@ namespace Styx.PartyGrind.IPC
             public readonly StreamWriter Writer;
             public readonly Channel<string> Outbound;
             public readonly CancellationTokenSource Cts = new CancellationTokenSource();
-            public SquadPeerAuthentication? Authentication;
+            public volatile SquadPeerAuthentication? Authentication;
             public string CharacterName = string.Empty;
             public SquadHandshake Handshake = new SquadHandshake();
             public SquadMemberState? LatestState;
@@ -85,6 +85,8 @@ namespace Styx.PartyGrind.IPC
         private readonly string _teamId;
         private readonly Func<long> _utcNowMs;
         private readonly object _sessionsLock = new object();
+        private readonly object _callbackGate = new object();
+        private bool _callbacksAllowed = true;
         private readonly Dictionary<string, MemberSession> _namedSessions = new Dictionary<string, MemberSession>(StringComparer.OrdinalIgnoreCase);
         private readonly ConcurrentDictionary<long, MemberSession> _allSessions = new ConcurrentDictionary<long, MemberSession>();
 
@@ -127,6 +129,10 @@ namespace Styx.PartyGrind.IPC
             catch { listener.Stop(); throw; }
             var cts = new CancellationTokenSource();
             var token = cts.Token;
+            lock (_callbackGate)
+            {
+                _callbacksAllowed = true;
+            }
             _listener = listener;
             _serverCts = cts;
             _actualPort = ((IPEndPoint)listener.LocalEndpoint).Port;
@@ -155,6 +161,13 @@ namespace Styx.PartyGrind.IPC
             try { _acceptTask?.Wait(500); } catch { }
             _acceptTask = null;
             try { cts?.Dispose(); } catch { }
+
+            // Waits for an in-flight MemberConnected callback (the gate is held while invoking) and
+            // blocks every later one, so no callback can run after Stop() returns.
+            lock (_callbackGate)
+            {
+                _callbacksAllowed = false;
+            }
         }
 
         public void Dispose()
@@ -299,7 +312,22 @@ namespace Styx.PartyGrind.IPC
             {
                 try
                 {
-                    await Task.Delay(DisconnectTimeoutMs, ct).ConfigureAwait(false);
+                    // Unauthenticated sockets only get a short, fixed window: a local process must not
+                    // be able to occupy the pending-session budget for a whole disconnect timeout.
+                    int preAuthMs = Math.Min(DisconnectTimeoutMs, 5000);
+                    await Task.Delay(preAuthMs, ct).ConfigureAwait(false);
+                    if (session.Authentication == null)
+                    {
+                        linkedCts.Cancel();
+                        session.Tcp.Close();
+                        return;
+                    }
+
+                    // Authenticated sessions keep the configured window to send their handshake.
+                    int handshakeMs = Math.Max(0, DisconnectTimeoutMs - preAuthMs);
+                    if (handshakeMs > 0)
+                        await Task.Delay(handshakeMs, ct).ConfigureAwait(false);
+
                     lock (_sessionsLock)
                         if (string.IsNullOrEmpty(session.CharacterName))
                         {
@@ -323,7 +351,7 @@ namespace Styx.PartyGrind.IPC
                     if (string.IsNullOrWhiteSpace(line))
                         continue;
 
-                    try { HandleIncomingLine(session, session.Authentication.Unprotect(line)); }
+                    try { HandleIncomingLine(session, session.Authentication.Unprotect(line), ct); }
                     catch (System.Text.Json.JsonException) { }
                 }
             }
@@ -372,7 +400,7 @@ namespace Styx.PartyGrind.IPC
             }
         }
 
-        private void HandleIncomingLine(MemberSession session, string line)
+        private void HandleIncomingLine(MemberSession session, string line, CancellationToken serverRunToken)
         {
             SquadEnvelope? envelope;
             try
@@ -402,10 +430,17 @@ namespace Styx.PartyGrind.IPC
                     return;
 
                 MemberSession? replaced = null;
+                bool registered = false;
                 lock (_sessionsLock)
                 {
                     if (session.CharacterName.Length > 0)
                         return;
+
+                    // A handshake that completes while the server is shutting down must never join the
+                    // roster or raise MemberConnected.
+                    if (serverRunToken.IsCancellationRequested || session.Closed || !IsListening)
+                        return;
+
                     session.CharacterName = hs.CharacterName.Trim();
                     session.Handshake = hs;
                     session.LastReceivedUtcMs = now;
@@ -417,10 +452,18 @@ namespace Styx.PartyGrind.IPC
 
                     _namedSessions[session.CharacterName] = session;
                     ReassignSlotsLocked();
+                    registered = true;
                 }
 
+                if (!registered)
+                    return;
+
                 replaced?.Dispose();
-                MemberConnected?.Invoke(hs);
+                lock (_callbackGate)
+                {
+                    if (_callbacksAllowed)
+                        MemberConnected?.Invoke(hs);
+                }
             }
             else if (string.Equals(envelope.MessageType, SquadMessageTypes.MemberState, StringComparison.OrdinalIgnoreCase))
             {
@@ -448,7 +491,11 @@ namespace Styx.PartyGrind.IPC
                     };
                 }
 
-                MemberStateReceived?.Invoke(state);
+                lock (_callbackGate)
+                {
+                    if (_callbacksAllowed)
+                        MemberStateReceived?.Invoke(state);
+                }
             }
         }
 

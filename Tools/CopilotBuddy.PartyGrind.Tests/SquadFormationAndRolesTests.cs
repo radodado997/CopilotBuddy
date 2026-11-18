@@ -42,7 +42,8 @@ namespace CopilotBuddy.PartyGrind.Tests
                 new() { X = 0 }, new() { X = 10 }, new() { X = 20 }
             } };
             var next = SquadFormationService.ComputeTravelFollowPosition(new WoWPoint(10, 0, 0), leader, 0);
-            Assert.Equal(20f, next.X);
+            // Slot 0 of the breadcrumb anchor at X=20 with facing 0 sits 3.5 yd behind it.
+            Assert.Equal(16.5f, next.X);
         }
 
         [Fact]
@@ -57,15 +58,16 @@ namespace CopilotBuddy.PartyGrind.Tests
                     new() { X = 20, MapId = 1, TimestampUtcMs = 3 },
                     new() { X = 30, MapId = 1, TimestampUtcMs = 4 }
                 } };
-            Assert.Equal(20f, SquadFormationService.ComputeTravelFollowPosition(new WoWPoint(10, 0, 0), leader, 0, progress).X);
-            Assert.Equal(30f, SquadFormationService.ComputeTravelFollowPosition(new WoWPoint(20, 0, 0), leader, 0, progress).X);
-            Assert.Equal(30f, SquadFormationService.ComputeTravelFollowPosition(new WoWPoint(10, 0, 0), leader, 0, progress).X);
+            // Slot 0 offsets each breadcrumb anchor by 3.5 yd opposite the leader facing (0 rad).
+            Assert.Equal(16.5f, SquadFormationService.ComputeTravelFollowPosition(new WoWPoint(10, 0, 0), leader, 0, progress).X);
+            Assert.Equal(26.5f, SquadFormationService.ComputeTravelFollowPosition(new WoWPoint(20, 0, 0), leader, 0, progress).X);
+            Assert.Equal(26.5f, SquadFormationService.ComputeTravelFollowPosition(new WoWPoint(10, 0, 0), leader, 0, progress).X);
             Assert.Equal(3, progress.LastReachedTimestamp);
             leader.LeaderGuid = 11;
-            Assert.Equal(20f, SquadFormationService.ComputeTravelFollowPosition(new WoWPoint(10, 0, 0), leader, 0, progress).X);
+            Assert.Equal(16.5f, SquadFormationService.ComputeTravelFollowPosition(new WoWPoint(10, 0, 0), leader, 0, progress).X);
             leader.MapId = 2;
             foreach (var breadcrumb in leader.Breadcrumbs) breadcrumb.MapId = 2;
-            Assert.Equal(10f, SquadFormationService.ComputeTravelFollowPosition(WoWPoint.Zero, leader, 0, progress).X);
+            Assert.Equal(6.5f, SquadFormationService.ComputeTravelFollowPosition(WoWPoint.Zero, leader, 0, progress).X);
             Assert.Equal(1, progress.LastReachedTimestamp);
         }
 

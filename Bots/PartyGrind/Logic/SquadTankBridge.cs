@@ -24,6 +24,11 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private static bool _filtersAttached;
         private static readonly SquadApproach PeelApproach = new();
 
+        /// <summary>
+        /// Clears cached peel approach records so retry budgets do not persist across bot sessions.
+        /// </summary>
+        public static void ResetSession() => PeelApproach.Clear();
+
         public static void AttachTargetingFilters()
         {
             if (_filtersAttached)
@@ -207,13 +212,21 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 ? StyxWoW.Me.Location.Distance(new WoWPoint(leader.X, leader.Y, leader.Z))
                 : 999f;
 
+            ulong myGuid = StyxWoW.Me.Guid;
+            ulong myPetGuid = StyxWoW.Me.Pet?.Guid ?? 0UL;
+
             units.RemoveAll(obj =>
             {
                 if (obj is not WoWUnit unit || !unit.IsValid || unit.Dead)
                     return true;
 
-                bool targetingParty = unit.IsTargetingMyPartyMember ||
-                    (unit.CurrentTargetGuid != 0 && memberGuids.Contains(unit.CurrentTargetGuid));
+                // "Party target" here means another party member. Targets on the local player or the
+                // local pet stay covered by the dedicated IsTargetingMeOrPet exception below.
+                ulong draggedGuid = unit.CurrentTargetGuid;
+                bool targetsOtherPartyMember = draggedGuid != 0 &&
+                    draggedGuid != myGuid && draggedGuid != myPetGuid &&
+                    memberGuids.Contains(draggedGuid);
+                bool targetingParty = unit.IsTargetingMyPartyMember || targetsOtherPartyMember;
 
                 return !IsAllowedDpsTarget(
                     unit.Guid,

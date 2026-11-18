@@ -39,9 +39,13 @@ namespace Styx.PartyGrind
         {
             lock (_sync)
             {
+                // Clearing must happen before the reference-equality early return so a repeated
+                // null-state update still drops the effective level override.
+                if (state == null)
+                    EffectiveLevelOverride = null;
+
                 if (ReferenceEquals(LatestLeaderState, state)) return;
                 LatestLeaderState = state;
-                if (state == null) EffectiveLevelOverride = null;
                 if (state != null)
                 {
                     if (state.EffectiveSquadMinLevel > 0)

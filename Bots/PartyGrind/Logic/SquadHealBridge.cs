@@ -35,6 +35,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
     public static class SquadHealBridge
     {
         private static readonly SquadApproach HealApproach = new();
+        private static Composite? _activeHealBehavior;
         private static readonly string[] RangedAssistSpells =
         {
             "Smite", "Holy Fire", "Shadow Word: Pain",
@@ -98,11 +99,16 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             var candidates = CollectLiveHealCandidates(leader);
             double threshold = emergencyOnly ? 55.0 : 92.0;
 
-            // Check if a HybridOffHeal should step in aggressively because main healer is dead or < 20% mana.
+            // Check if a HybridOffHeal should step in aggressively because no connected healer with
+            // usable telemetry can cover the party (dead, ghost, disconnected or mana-starved).
             if (emergencyOnly && leader?.Members != null)
             {
-                var mainHealer = leader.Members.FirstOrDefault(m => m.Role == SquadRole.Healer);
-                if (mainHealer != null && (mainHealer.IsDead || mainHealer.IsGhost || !mainHealer.IsConnected || mainHealer.PowerPercent < 20f))
+                bool healerCoversParty = leader.Members.Any(m =>
+                    m.Role == SquadRole.Healer &&
+                    m.IsConnected && m.HasTelemetry &&
+                    !m.IsDead && !m.IsGhost &&
+                    m.PowerPercent >= 20f);
+                if (!healerCoversParty)
                 {
                     threshold = 80.0;
                 }
@@ -136,14 +142,25 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                         try
                         {
                             HealTargeting.Instance.Pulse();
-                            healBehavior.Start(null);
+                            if (!ReferenceEquals(_activeHealBehavior, healBehavior))
+                            {
+                                StopHealBehavior();
+                                _activeHealBehavior = healBehavior;
+                                healBehavior.Start(null);
+                            }
+
+                            // Keep the started behavior across ticks while it reports Running and only
+                            // stop it once it completes or the routine switches/interrupts.
                             RunStatus status = healBehavior.Tick(null);
-                            healBehavior.Stop(null);
+                            if (status != RunStatus.Running)
+                                StopHealBehavior();
+
                             if (status == RunStatus.Success || me.IsCasting || me.ChanneledCastingSpellId != 0)
                                 return true;
                         }
                         catch (Exception ex)
                         {
+                            StopHealBehavior();
                             Logging.WriteDebug("[PartyGrind Heal] Routine HealBehavior fallback: {0}", ex.Message);
                         }
                     }
@@ -177,6 +194,33 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             return false;
         }
 
+        private static void StopHealBehavior()
+        {
+            var behavior = _activeHealBehavior;
+            _activeHealBehavior = null;
+            if (behavior == null)
+                return;
+
+            try
+            {
+                behavior.Stop(null);
+            }
+            catch (Exception ex)
+            {
+                Logging.WriteDebug("[PartyGrind Heal] HealBehavior stop failed: {0}", ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// Releases cached approach records and stops any started heal behavior when the
+        /// PartyGrind bot session ends.
+        /// </summary>
+        public static void ResetSession()
+        {
+            StopHealBehavior();
+            HealApproach.Clear();
+        }
+
         /// <summary>
         /// Out-of-combat resurrection behavior for Healer / HybridOffHeal / res-capable classes.
         /// </summary>
@@ -205,28 +249,34 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 return false;
 
             var memberGuids = SquadContext.GetKnownMemberGuids();
-            var deadAlly = ObjectManager.GetObjectsOfType<WoWPlayer>(false, false)
+            var deadAllies = ObjectManager.GetObjectsOfType<WoWPlayer>(false, false)
                 .Where(p => p != null && p.IsValid && p.Dead && !p.IsGhost &&
                             memberGuids.Contains(p.Guid) && p.Location.Distance(me.Location) <= 45f)
                 .OrderBy(p => p.Location.Distance(me.Location))
-                .FirstOrDefault();
+                .ToList();
 
-            if (deadAlly == null)
+            if (deadAllies.Count == 0)
                 return false;
 
-            if (deadAlly.Distance > 28f || !deadAlly.InLineOfSpellSight)
+            foreach (var deadAlly in deadAllies)
             {
-                Navigator.MoveTo(deadAlly.Location, "Moving to resurrect " + deadAlly.Name);
-                return true;
-            }
+                if (deadAlly.Distance > 28f || !deadAlly.InLineOfSpellSight)
+                {
+                    // SquadApproach bounds repeated attempts per corpse, so an unreachable corpse is
+                    // skipped instead of blocking every other eligible ally forever.
+                    if (HealApproach.TryMove(deadAlly, "Moving to resurrect " + deadAlly.Name))
+                        return true;
+                    continue;
+                }
 
-            if (me.IsMoving)
-                WoWMovement.MoveStop();
+                if (me.IsMoving)
+                    WoWMovement.MoveStop();
 
-            if (SpellManager.CanCast(resSpell, deadAlly, true, false))
-            {
-                Logging.Write("[PartyGrind] Resurrecting {0} with {1}", deadAlly.Name, resSpell);
-                return SpellManager.Cast(resSpell, deadAlly);
+                if (SpellManager.CanCast(resSpell, deadAlly, true, false))
+                {
+                    Logging.Write("[PartyGrind] Resurrecting {0} with {1}", deadAlly.Name, resSpell);
+                    return SpellManager.Cast(resSpell, deadAlly);
+                }
             }
 
             return false;

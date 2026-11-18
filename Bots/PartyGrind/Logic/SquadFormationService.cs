@@ -7,6 +7,7 @@ using Styx.Logic.Pathing;
 using Styx.PartyGrind;
 using Styx.PartyGrind.IPC;
 using Styx.WoWInternals;
+using Styx.WoWInternals.WoWObjects;
 
 namespace CopilotBuddy.Bots.PartyGrind.Logic
 {
@@ -156,13 +157,25 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     if (next >= 0 && next < route.Count)
                     {
                         var chosen = route[next];
-                        return new WoWPoint(chosen.X, chosen.Y, chosen.Z);
+                        // The breadcrumb stays the route anchor; the follower slot offset is applied on
+                        // top of it so squadmates on the same breadcrumb do not stack on one point.
+                        return ApplyFollowerSlotOffset(
+                            new WoWPoint(chosen.X, chosen.Y, chosen.Z), leader.Facing, memberSlotIndex);
                     }
 
                 }
             }
 
-            float backAngle = leader.Facing + MathF.PI;
+            return ApplyFollowerSlotOffset(baseAnchor, leader.Facing, memberSlotIndex);
+        }
+
+        /// <summary>
+        /// Applies the deterministic follower slot offset (trail distance + lateral stagger) around
+        /// a route anchor so followers never stack on identical coordinates.
+        /// </summary>
+        public static WoWPoint ApplyFollowerSlotOffset(WoWPoint anchor, float facing, int memberSlotIndex)
+        {
+            float backAngle = facing + MathF.PI;
             float dirX = MathF.Cos(backAngle);
             float dirY = MathF.Sin(backAngle);
             float perpX = -dirY;
@@ -172,9 +185,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             float lateral = (memberSlotIndex % 2 == 0 ? 1f : -1f) * (1.8f + (memberSlotIndex / 2) * 1.5f);
 
             return new WoWPoint(
-                baseAnchor.X + dirX * trailDist + perpX * lateral,
-                baseAnchor.Y + dirY * trailDist + perpY * lateral,
-                baseAnchor.Z);
+                anchor.X + dirX * trailDist + perpX * lateral,
+                anchor.Y + dirY * trailDist + perpY * lateral,
+                anchor.Z);
         }
 
         /// <summary>
@@ -250,6 +263,38 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         }
 
         /// <summary>
+        /// True when the character actually owns a usable ground mount. Mount availability is a
+        /// capability reported to the squad; it must not be inferred from level alone.
+        /// </summary>
+        public static bool HasUsableMount(LocalPlayer? me)
+        {
+            if (me == null || me.Level < 20)
+                return false;
+
+            try
+            {
+                return (MountHelper.GroundMounts?.Count ?? 0) > 0;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Local mounting gate: mount capability plus the transient conditions (combat, death,
+        /// mount/combat cooldowns) that only apply to this client.
+        /// </summary>
+        public static bool CanMountLocally(LocalPlayer? me)
+        {
+            if (!HasUsableMount(me))
+                return false;
+            if (me!.Combat || me.Dead || me.IsGhost)
+                return false;
+            return Mount.AreMountTimersReady;
+        }
+
+        /// <summary>
         /// Mount.OnMountUp guard installed while PartyGrindBot is running so Navigator's
         /// internal StateMount does not leave non-mount squadmates behind.
         /// </summary>
@@ -259,8 +304,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 return;
 
             var me = StyxWoW.Me;
-            bool localCanMount = me != null && me.Level >= 20;
-            if (!CanSquadMount(SquadContext.ActiveSettings.MountPolicy, localCanMount, SquadContext.GetLeaderStateSnapshot()))
+            if (!CanMountLocally(me) ||
+                !CanSquadMount(SquadContext.ActiveSettings.MountPolicy, true, SquadContext.GetLeaderStateSnapshot()))
             {
                 args.Cancel = true;
             }

@@ -278,18 +278,21 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 }
             }
 
-            if (anyDead && !anyInCombat)
+            if (anyDead)
             {
+                // The shared WaitForPartyRessSeconds deadline starts as soon as any casualty exists,
+                // including while the party is still fighting, so it is not extended by combat.
                 if (_resWaitStartedUtcMs == 0)
                     _resWaitStartedUtcMs = nowUtcMs;
             }
-            else if (!anyDead)
+            else
             {
                 _resWaitStartedUtcMs = 0;
                 _inCorpseRun = false;
             }
 
-            bool resTimeoutExceeded = _resWaitStartedUtcMs > 0 &&
+            // Death recovery only overrides an ongoing fight once combat has actually stopped.
+            bool resTimeoutExceeded = _resWaitStartedUtcMs > 0 && !anyInCombat &&
                 (nowUtcMs - _resWaitStartedUtcMs) >= Math.Max(5, settings.WaitForPartyRessSeconds) * 1000L;
 
             if (allDead || (anyDead && !hasLivingResCapable && !anyInCombat) || resTimeoutExceeded)
@@ -342,8 +345,10 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             else if (_inTownRun)
             {
                 var living = rosterStates;
-                bool anyStillHasNeed = living.Any(m =>
-                    !m.TownTasksComplete && (m.NeedsSell || m.NeedsRepair || m.NeedsBuy || m.NeedsTrain || m.NeedsMail));
+                // Re-evaluate live needs instead of trusting the completion flag alone, so a member
+                // whose needs returned is not ignored by the town-run gate.
+                bool anyStillHasNeed = living.Any(m => !m.IsDead && !m.IsGhost &&
+                    (m.NeedsSell || m.NeedsRepair || m.NeedsBuy || m.NeedsTrain || m.NeedsMail));
                 bool allDoneAndAtRally = living.Count > 0 && living.All(m =>
                     m.TownTasksComplete &&
                     (!profile.TownRallyMapId.HasValue || m.MapId == profile.TownRallyMapId.Value) &&
@@ -360,14 +365,16 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 }
             }
 
-            // Provisioning arbitration.
+            // Provisioning arbitration. Looting outranks provisioning, so it may not create new
+            // assignments and an outstanding assignment must not burn its timeout while it waits.
+            bool provisioningBlocked = _inLootWindow || rosterStates.Any(m => m.IsLooting);
             if (anyInCombat || anyDead || _inTownRun || anyNeedsRest || _migratingZone)
             {
                 ClearProvisioning();
             }
             else
             {
-                EvaluateProvisioningArbitration(settings, rosterStates, nowUtcMs);
+                EvaluateProvisioningArbitration(settings, rosterStates, nowUtcMs, provisioningBlocked);
             }
 
             // 6. Determine authoritative SquadPhase.
@@ -377,11 +384,6 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             {
                 phase = SquadPhase.Paused;
                 pauseReason = ManualPauseReason;
-            }
-            else if (rosterStates.Any(m => !string.IsNullOrEmpty(m.TownBlockedReason)))
-            {
-                phase = SquadPhase.Paused;
-                pauseReason = rosterStates.First(m => !string.IsNullOrEmpty(m.TownBlockedReason)).TownBlockedReason;
             }
             else if (!profile.HasProfile)
             {
@@ -402,6 +404,13 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             else if (_migratingZone)
             {
                 phase = SquadPhase.MigratingZone;
+            }
+            // A blocked town task pauses the squad, but only after combat and death recovery have had
+            // their chance to run; it still outranks normal town progress below.
+            else if (rosterStates.Any(m => !string.IsNullOrEmpty(m.TownBlockedReason)))
+            {
+                phase = SquadPhase.Paused;
+                pauseReason = rosterStates.First(m => !string.IsNullOrEmpty(m.TownBlockedReason)).TownBlockedReason;
             }
             else if (_inLootWindow || rosterStates.Any(m => m.IsLooting))
             {
@@ -577,12 +586,21 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private void EvaluateProvisioningArbitration(
             SquadSettings settings,
             List<SquadMemberState> rosterStates,
-            long nowUtcMs)
+            long nowUtcMs,
+            bool blockedByHigherPriorityPhase)
         {
             long timeoutMs = Math.Max(4, settings.TradeOfferTimeoutSeconds + 3) * 1000L;
 
             if (!string.IsNullOrEmpty(_activeProvisioner))
             {
+                if (blockedByHigherPriorityPhase)
+                {
+                    // The assigned pair cannot act yet; keep the assignment and restart the deadline
+                    // once the higher-priority phase is over.
+                    _provisionStartedUtcMs = nowUtcMs;
+                    return;
+                }
+
                 bool timedOut = (nowUtcMs - _provisionStartedUtcMs) > timeoutMs;
                 var prov = rosterStates.FirstOrDefault(m => string.Equals(m.CharacterName, _activeProvisioner, StringComparison.OrdinalIgnoreCase));
                 var recv = string.IsNullOrEmpty(_activeTradeTarget)
@@ -608,6 +626,10 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     ClearProvisioning();
                 }
             }
+
+            // Never start a new assignment while a higher-priority phase blocks provisioning.
+            if (blockedByHigherPriorityPhase)
+                return;
 
             // Pick next provisioner -> target pair (Mage first, then Warlock).
             if (settings.EnableMageProvisioning)

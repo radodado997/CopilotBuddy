@@ -46,9 +46,10 @@ namespace Styx.Logic
 	/// <summary>
 	/// True when both the post-combat and post-mount cooldown timers are ready.
 	/// Used by Flightor.MountHelper.CanMount so it respects the same cooldowns as
-	/// Mount.CanMount() without routing through the LevelBot mount path.
+	/// Mount.CanMount() without routing through the LevelBot mount path. Public so
+	/// runtime-compiled bots (PartyGrind) can apply the same local mount gate.
 	/// </summary>
-	internal static bool AreMountTimersReady => _combatTimer.IsFinished && _mountTimer.IsFinished;
+	public static bool AreMountTimersReady => _combatTimer.IsFinished && _mountTimer.IsFinished;
 
 	/// <summary>
 	/// Resets the mount timer after a Flightor-initiated mount attempt, preventing

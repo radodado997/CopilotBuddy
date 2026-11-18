@@ -66,9 +66,13 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         };
 
         private readonly Dictionary<string, long> _cooldownUntilUtcMs = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<ulong, long> _tableSkipUntilUtcMs = new();
         private string _activeTradeTarget = string.Empty;
         private long _tradeStartedUtcMs;
         private bool _tradeItemsPlaced;
+        private bool _tradeBothAccepted;
+        private long _lastTradeRequestAcceptUtcMs;
+        private (ulong Guid, long StartedUtcMs, int FoodBefore, int DrinkBefore)? _pendingTableUse;
         private readonly List<(int Slot, uint Entry, int Count)> _offeredItems = new();
 
         public bool IsTradeBusy => !string.IsNullOrEmpty(_activeTradeTarget) || TradeFrame.Instance.IsVisible;
@@ -150,6 +154,82 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             return best;
         }
 
+        /// <summary>
+        /// Highest rank of <paramref name="baseName"/> that is both eligible for the receiver and
+        /// actually present in the local spellbook.
+        /// </summary>
+        public static int? SelectTrainedConjureRank(bool isWater, int receiverLevel, int casterLevel)
+        {
+            return SelectHighestTrainedRank(
+                isWater ? "Conjure Water" : "Conjure Food",
+                isWater ? ConjureWaterRanks : ConjureFoodRanks,
+                receiverLevel,
+                casterLevel);
+        }
+
+        /// <summary>
+        /// Highest Create Healthstone rank that is both eligible for the receiver and trained.
+        /// </summary>
+        public static int? SelectTrainedHealthstoneRank(int receiverLevel, int casterLevel)
+        {
+            return SelectHighestTrainedRank("Create Healthstone", CreateHealthstoneRanks, receiverLevel, casterLevel);
+        }
+
+        private static int? SelectHighestTrainedRank(
+            string baseName,
+            (int Rank, int CasterLevel, int ItemReqLevel)[] table,
+            int receiverLevel,
+            int casterLevel)
+        {
+            int? best = null;
+            foreach (var row in table)
+            {
+                if (casterLevel < row.CasterLevel || receiverLevel < row.ItemReqLevel)
+                    continue;
+                if (!IsSpellRankTrained(baseName, row.Rank))
+                    continue;
+                best = row.Rank;
+            }
+            return best;
+        }
+
+        /// <summary>
+        /// True when the spellbook contains <paramref name="baseName"/> at <paramref name="rank"/>.
+        /// </summary>
+        public static bool IsSpellRankTrained(string baseName, int rank)
+        {
+            if (string.IsNullOrWhiteSpace(baseName) || rank <= 0)
+                return false;
+
+            foreach (var spell in SpellManager.Spells.Values)
+            {
+                string name = spell.Name?.Trim() ?? string.Empty;
+                if (!name.StartsWith(baseName, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                // The rank may live in the rank field or be part of the spell name.
+                int spellRank = ParseRankNumber(spell.Rank);
+                if (spellRank == 0)
+                    spellRank = ParseRankNumber(name.Substring(baseName.Length));
+                if (spellRank == 0)
+                    spellRank = 1; // unranked spellbook entry == base rank
+
+                if (spellRank == rank)
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static int ParseRankNumber(string? rankText)
+        {
+            if (string.IsNullOrWhiteSpace(rankText))
+                return 0;
+
+            var match = System.Text.RegularExpressions.Regex.Match(rankText, "\\d+");
+            return match.Success && int.TryParse(match.Value, out int rank) ? rank : 0;
+        }
+
         public static bool IsHealthstoneName(string? name)
         {
             return !string.IsNullOrEmpty(name) &&
@@ -214,6 +294,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             _activeTradeTarget = string.Empty;
             _tradeStartedUtcMs = 0;
             _tradeItemsPlaced = false;
+            _tradeBothAccepted = false;
             _offeredItems.Clear();
         }
 
@@ -239,15 +320,28 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
             long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
-            // 1. Handle currently open TradeFrame first (both receiver and provider safety checks).
+            // 1. Receiver side: the trade window only opens once we accept the request, so handle the
+            // coordinator-assigned request before the TradeFrame visibility check below.
+            TryAcceptAssignedTradeRequest(me, leader, now);
+
+            // 2. Handle currently open TradeFrame first (both receiver and provider safety checks).
             if (TradeFrame.Instance.IsVisible)
             {
                 return HandleOpenTradeFrame(me, settings, leader, now);
             }
 
-            // 2. Clean up stale initiated trade timeout if frame never opened.
+            // 3. Distinguish a completed transfer from a cancelled or never-opened request.
             if (!string.IsNullOrEmpty(_activeTradeTarget))
             {
+                if (_tradeBothAccepted)
+                {
+                    // Both sides accepted and the window is gone: the transfer succeeded. Release the
+                    // assignment immediately (IsTradeBusy must go false) and skip the failure cooldown.
+                    Logging.WriteDebug("[PartyGrind Provision] Trade with {0} completed.", _activeTradeTarget);
+                    ResetActiveTradeState();
+                    return false;
+                }
+
                 long elapsed = now - _tradeStartedUtcMs;
                 if (elapsed > Math.Max(4, settings.TradeOfferTimeoutSeconds) * 1000L)
                 {
@@ -260,15 +354,15 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 return true;
             }
 
-            // 3. Interact with nearby Refreshment Table / Soulwell / Ritual objects if needed!
+            // 4. Interact with nearby Refreshment Table / Soulwell / Ritual objects if needed!
             if (settings.UseRitualTablesWhenAvailable && TryUseNearbyRitualOrTable(me, settings))
                 return true;
 
-            // 4. Warlock Soulstone on Healer (or Tank fallback) out of combat when missing.
+            // 5. Warlock Soulstone on Healer (or Tank fallback) out of combat when missing.
             if (me.Class == WoWClass.Warlock && settings.EnableWarlockHealthstones && TryMaintainSoulstone(me, leader))
                 return true;
 
-            // 5. Provider behavior when Coordinator authorized us (or solo in phase Provisioning).
+            // 6. Provider behavior when Coordinator authorized us (or solo in phase Provisioning).
             if (leader == null || string.IsNullOrEmpty(leader.ActiveProvisionerName) ||
                 !string.Equals(leader.ActiveProvisionerName, me.Name, StringComparison.OrdinalIgnoreCase))
             {
@@ -295,6 +389,34 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 return RunWarlockProvisionerTick(me, settings, leader, now);
 
             return false;
+        }
+
+        /// <summary>
+        /// Receiver side of the two-party trade: when the coordinator assigned this character as the
+        /// active trade target and the provisioner is in range, accept the pending trade request so
+        /// the window can open. The partner identity is verified again by
+        /// <see cref="HandleOpenTradeFrame"/> once the frame is visible.
+        /// </summary>
+        private void TryAcceptAssignedTradeRequest(LocalPlayer me, SquadLeaderState? leader, long now)
+        {
+            if (leader == null || TradeFrame.Instance.IsVisible)
+                return;
+
+            if (string.IsNullOrEmpty(leader.ActiveProvisionerName) ||
+                !string.Equals(leader.ActiveTradeTargetName, me.Name, StringComparison.OrdinalIgnoreCase))
+                return;
+
+            if ((now - _lastTradeRequestAcceptUtcMs) < 1000L)
+                return;
+
+            var provisioner = leader.Members?.FirstOrDefault(m =>
+                string.Equals(m.CharacterName, leader.ActiveProvisionerName, StringComparison.OrdinalIgnoreCase));
+            if (provisioner == null || provisioner.MapId != me.MapId ||
+                me.Location.Distance(new WoWPoint(provisioner.X, provisioner.Y, provisioner.Z)) > 8f)
+                return;
+
+            _lastTradeRequestAcceptUtcMs = now;
+            TradeFrame.Instance.AcceptTrade();
         }
 
         private bool HandleOpenTradeFrame(LocalPlayer me, SquadSettings settings, SquadLeaderState? leader, long now)
@@ -353,14 +475,26 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     _tradeItemsPlaced = true;
                 }
 
-                if (_offeredItems.Count == 0 || _offeredItems.Any(i => !TradeFrame.Instance.ContainsPlayerItem(i.Slot, i.Entry, i.Count)))
+                // The whole outgoing offer must match the plan: every planned slot holds exactly the
+                // planned item/count, nothing else is offered, and no gold is sent.
+                bool offerMatchesPlan = _offeredItems.Count > 0 &&
+                    _offeredItems.All(i => TradeFrame.Instance.ContainsPlayerItem(i.Slot, i.Entry, i.Count)) &&
+                    TradeFrame.Instance.HasEmptyPlayerMoney &&
+                    TradeFrame.Instance.PlayerOfferedItemCount == _offeredItems.Count;
+                if (!offerMatchesPlan)
                 {
                     TradeFrame.Instance.CancelTrade();
                     OnTradeCancelledOrTimeout(_activeTradeTarget, settings.ProvisionCooldownSeconds);
                     return true;
                 }
+
                 if (!TradeFrame.Instance.PlayerAccepted)
                     TradeFrame.Instance.AcceptTrade();
+
+                // Remember that both sides had accepted so the closed window is treated as success
+                // instead of a cancellation.
+                if (TradeFrame.Instance.PlayerAccepted && TradeFrame.Instance.TargetAccepted)
+                    _tradeBothAccepted = true;
 
                 return true;
             }
@@ -430,8 +564,10 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     return SpellManager.Cast("Conjure Refreshment", me);
                 }
 
-                int? foodRank = SelectBestConjureRank(isWater: false, receiverLevel, me.Level);
-                if (foodRank.HasValue && SpellManager.HasSpell("Conjure Food"))
+                // Intersect ranks eligible for the receiver with ranks actually in the spellbook: a
+                // base-name HasSpell check does not prove a specific rank is trained.
+                int? foodRank = SelectTrainedConjureRank(isWater: false, receiverLevel, me.Level);
+                if (foodRank.HasValue)
                 {
                     if (me.IsMoving) WoWMovement.MoveStop();
                     Lua.DoString($"CastSpellByName('Conjure Food(Rank {foodRank.Value})')");
@@ -448,8 +584,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     return SpellManager.Cast("Conjure Refreshment", me);
                 }
 
-                int? waterRank = SelectBestConjureRank(isWater: true, receiverLevel, me.Level);
-                if (waterRank.HasValue && SpellManager.HasSpell("Conjure Water"))
+                int? waterRank = SelectTrainedConjureRank(isWater: true, receiverLevel, me.Level);
+                if (waterRank.HasValue)
                 {
                     if (me.IsMoving) WoWMovement.MoveStop();
                     Lua.DoString($"CastSpellByName('Conjure Water(Rank {waterRank.Value})')");
@@ -488,8 +624,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
             if (FindTradableBagItem(me, targetSummary.Level, false, false, true) == null)
             {
-                int? hsRank = SelectBestHealthstoneRank(targetSummary.Level, me.Level);
-                if (hsRank.HasValue && SpellManager.HasSpell("Create Healthstone"))
+                int? hsRank = SelectTrainedHealthstoneRank(targetSummary.Level, me.Level);
+                if (hsRank.HasValue)
                 {
                     if (me.IsMoving) WoWMovement.MoveStop();
                     Lua.DoString($"CastSpellByName('Create Healthstone(Rank {hsRank.Value})')");
@@ -532,8 +668,10 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             return true;
         }
 
-        private static bool TryUseNearbyRitualOrTable(LocalPlayer me, SquadSettings settings)
+        private bool TryUseNearbyRitualOrTable(LocalPlayer me, SquadSettings settings)
         {
+            long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
             if (me.FreeNormalBagSlots < 2)
                 return false;
 
@@ -563,13 +701,40 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
             if (wantsFoodOrDrink)
             {
-                var table = gameObjects.FirstOrDefault(g => g.Entry == RefreshmentTableObjectEntry);
+                var table = gameObjects.FirstOrDefault(g =>
+                    g.Entry == RefreshmentTableObjectEntry && !IsTableSkipped(g.Guid, now));
                 if (table != null)
                 {
                     if (table.Location.Distance(me.Location) > 4.5f)
+                    {
                         Navigator.MoveTo(table.Location, "Moving to Refreshment Table");
-                    else
-                        table.Interact();
+                        return true;
+                    }
+
+                    // Give an interacted table a bounded window to actually put food/drink in the
+                    // bags; a table that yields nothing is skipped so the remaining provisioning
+                    // steps still run instead of returning true on every tick.
+                    if (_pendingTableUse.HasValue && _pendingTableUse.Value.Guid == table.Guid)
+                    {
+                        var pending = _pendingTableUse.Value;
+                        bool gotItems = CountFoodInBags() > pending.FoodBefore || CountDrinksInBags() > pending.DrinkBefore;
+                        if (gotItems)
+                        {
+                            _pendingTableUse = null;
+                            return true;
+                        }
+                        if (now - pending.StartedUtcMs <= 4000L)
+                            return true;
+
+                        _pendingTableUse = null;
+                        _tableSkipUntilUtcMs[table.Guid] = now + 60000L;
+                        Logging.WriteDebug("[PartyGrind Provision] Refreshment table yielded no items; skipping it for 60s.");
+                        return false;
+                    }
+
+                    if (me.IsMoving) WoWMovement.MoveStop();
+                    table.Interact();
+                    _pendingTableUse = (table.Guid, now, CountFoodInBags(), CountDrinksInBags());
                     return true;
                 }
             }
@@ -589,6 +754,11 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             }
 
             return false;
+        }
+
+        private bool IsTableSkipped(ulong tableGuid, long now)
+        {
+            return _tableSkipUntilUtcMs.TryGetValue(tableGuid, out long until) && now < until;
         }
 
         private static bool TryMaintainSoulstone(LocalPlayer me, SquadLeaderState? leader)

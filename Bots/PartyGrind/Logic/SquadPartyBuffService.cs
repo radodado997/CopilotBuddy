@@ -200,12 +200,23 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private static bool BuffPaladin(LocalPlayer me, List<WoWUnit> allies, SquadLeaderState? leader)
         {
             // Determine Paladin index among party Paladins so multiple Paladins pick distinct auras & blessings.
+            // Only connected paladins with telemetry can cover buffs; disconnected members stay in the
+            // roster for display but must not influence buff coverage or assignment decisions.
             var paladinNames = (leader?.Members ?? new List<SquadMemberSummary>())
-                .Where(m => m.Class == WoWClass.Paladin)
-                .Select(m => m.CharacterName)
+                .Where(m => m.Class == WoWClass.Paladin && m.IsConnected && m.HasTelemetry &&
+                            !string.IsNullOrWhiteSpace(m.CharacterName))
+                .Select(m => m.CharacterName.Trim())
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .OrderBy(n => n, StringComparer.OrdinalIgnoreCase)
                 .ToList();
+
+            // The local paladin always participates using its live spellbook.
+            if (!string.IsNullOrWhiteSpace(me.Name) &&
+                !paladinNames.Any(n => string.Equals(n, me.Name, StringComparison.OrdinalIgnoreCase)))
+            {
+                paladinNames.Add(me.Name);
+                paladinNames = paladinNames.OrderBy(n => n, StringComparer.OrdinalIgnoreCase).ToList();
+            }
 
             int paladinIndex = Math.Max(0, paladinNames.FindIndex(n => string.Equals(n, me.Name, StringComparison.OrdinalIgnoreCase)));
 
@@ -232,10 +243,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 string desiredBlessing = SelectBlessingForRole(role, ally.Class, paladinIndex);
                 if (role == SquadRole.TankLeader && paladinNames.Count > 1)
                 {
-                    var capabilities = paladinNames.Select(name => (IReadOnlyList<string>)(
-                        string.Equals(name, me.Name, StringComparison.OrdinalIgnoreCase)
-                            ? new[] { "Blessing of Sanctuary", "Blessing of Kings", "Blessing of Might", "Blessing of Wisdom" }.Where(SpellManager.HasSpell).ToList()
-                            : leader!.Members.First(m => m.CharacterName == name).KnownBlessings)).ToList();
+                    var capabilities = paladinNames
+                        .Select(name => GetKnownBlessings(name, me, leader))
+                        .ToList();
                     desiredBlessing = SelectTankBlessing(paladinIndex, capabilities);
                 }
                 if (!ally.HasAura(desiredBlessing) &&
@@ -249,20 +259,88 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             return false;
         }
 
+        private static IReadOnlyList<string> GetKnownBlessings(string name, LocalPlayer me, SquadLeaderState? leader)
+        {
+            if (string.Equals(name, me.Name, StringComparison.OrdinalIgnoreCase))
+            {
+                return new[] { "Blessing of Sanctuary", "Blessing of Kings", "Blessing of Might", "Blessing of Wisdom" }
+                    .Where(SpellManager.HasSpell)
+                    .ToList();
+            }
+
+            var member = leader?.Members?.FirstOrDefault(m =>
+                string.Equals(m.CharacterName, name, StringComparison.OrdinalIgnoreCase));
+            return (IReadOnlyList<string>?)member?.KnownBlessings ?? Array.Empty<string>();
+        }
+
+        private static IEnumerable<string> BlessingPreference(int paladinIndex, IReadOnlyList<string> availableBlessings)
+        {
+            string[] preference = paladinIndex == 0
+                ? new[] { "Blessing of Sanctuary", "Blessing of Might", "Blessing of Kings", "Blessing of Wisdom" }
+                : new[] { "Blessing of Kings", "Blessing of Might", "Blessing of Sanctuary", "Blessing of Wisdom" };
+
+            if (availableBlessings == null)
+                return Array.Empty<string>();
+
+            return preference.Where(blessing => availableBlessings.Contains(blessing));
+        }
+
+        /// <summary>
+        /// Chooses the blessing for <paramref name="index"/> by evaluating the full paladin roster:
+        /// the assignment maximises the number of distinct blessings handed out, and each paladin's
+        /// preference order breaks ties between equally good matchings.
+        /// </summary>
         public static string SelectTankBlessing(int index, IReadOnlyList<IReadOnlyList<string>> known)
         {
-            var assigned = new HashSet<string>();
-            for (int i = 0; i <= index && i < known.Count; i++)
+            if (known == null || index < 0 || index >= known.Count)
+                return string.Empty;
+
+            var choices = new string[known.Count];
+            var owner = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+            for (int paladin = 0; paladin < known.Count; paladin++)
             {
-                string[] preference = i == 0
-                    ? new[] { "Blessing of Sanctuary", "Blessing of Might", "Blessing of Kings", "Blessing of Wisdom" }
-                    : new[] { "Blessing of Kings", "Blessing of Might", "Blessing of Sanctuary", "Blessing of Wisdom" };
-                var available = preference.Where(s => known[i].Contains(s) && !assigned.Contains(s)).ToList();
-                string choice = available.OrderByDescending(s => i + 1 >= known.Count || known[i + 1].Any(other => other != s && !assigned.Contains(other))).FirstOrDefault() ?? string.Empty;
-                if (i == index) return choice;
-                assigned.Add(choice);
+                TryAssignBlessing(
+                    paladin,
+                    known,
+                    owner,
+                    choices,
+                    new HashSet<string>(StringComparer.OrdinalIgnoreCase));
             }
-            return string.Empty;
+
+            return choices[index] ?? string.Empty;
+        }
+
+        private static bool TryAssignBlessing(
+            int paladinIndex,
+            IReadOnlyList<IReadOnlyList<string>> known,
+            Dictionary<string, int> owner,
+            string[] choices,
+            HashSet<string> visitedBlessings)
+        {
+            foreach (string blessing in BlessingPreference(paladinIndex, known[paladinIndex]))
+            {
+                if (!visitedBlessings.Add(blessing))
+                    continue;
+
+                if (!owner.TryGetValue(blessing, out int currentOwner))
+                {
+                    owner[blessing] = paladinIndex;
+                    choices[paladinIndex] = blessing;
+                    return true;
+                }
+
+                // Augment the matching: let the paladin currently holding this blessing move on so a
+                // more distinct blessing can be assigned overall.
+                if (!TryAssignBlessing(currentOwner, known, owner, choices, visitedBlessings))
+                    continue;
+
+                owner[blessing] = paladinIndex;
+                choices[paladinIndex] = blessing;
+                return true;
+            }
+
+            return false;
         }
 
         public static string SelectBlessingForRole(SquadRole role, WoWClass targetClass, int paladinIndex)

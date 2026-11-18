@@ -44,13 +44,16 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private bool _stage2TrainDone;
         private bool _wasInTownRun;
         private bool _mailRequested;
-        private int _mailAttempts, _vendorAttempts;
+        private int _mailAttempts, _vendorAttempts, _trainerAttempts;
         private long _stageStarted;
+        private long _blockedAtUtcMs;
+        private const long RecoveryDelayMs = 30000L;
         public string BlockedReason { get; private set; } = string.Empty;
 
         private bool Block(string reason, out bool complete)
         {
             BlockedReason = reason;
+            _blockedAtUtcMs = Environment.TickCount64;
             Logging.Write("[PartyGrind Town] Blocked: {0}", reason);
             complete = false;
             return true;
@@ -58,7 +61,30 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
         public void ObservePhase(SquadPhase? phase)
         {
-            if (_wasInTownRun && phase != SquadPhase.TownRun && phase != SquadPhase.Paused) Reset();
+            if (!_wasInTownRun)
+                return;
+
+            if (phase != SquadPhase.TownRun && phase != SquadPhase.Paused)
+            {
+                Reset();
+                return;
+            }
+
+            // Still inside the town run but no longer paused: the coordinator has dropped the block,
+            // so resume only the failed stage with a fresh retry budget while keeping completed work.
+            if (BlockedReason.Length > 0 && phase == SquadPhase.TownRun)
+            {
+                BlockedReason = string.Empty;
+                _blockedAtUtcMs = 0;
+                ResetRetryBudgets();
+            }
+        }
+
+        private void ResetRetryBudgets()
+        {
+            _vendorAttempts = 0;
+            _mailAttempts = 0;
+            _trainerAttempts = 0;
         }
 
         public void RecheckBlocked(SquadSettings settings, SquadLeaderState? leader)
@@ -66,6 +92,10 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             var me = StyxWoW.Me;
             if (me == null || BlockedReason.Length == 0) return;
             var needs = EvaluateLiveLocalNeeds(settings, leader);
+            // Exhausted retry budgets and the town deadline are recoverable only after a bounded
+            // delay (or once the underlying need disappears); completed stages are always retained.
+            bool recoveryDelayElapsed = _blockedAtUtcMs == 0 ||
+                (Environment.TickCount64 - _blockedAtUtcMs) >= RecoveryDelayMs;
             bool resolved = BlockedReason switch
             {
                 "No eligible vendor found." => ResolveSellOrRepairVendor(needs) != null ||
@@ -77,12 +107,22 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     ResolveClassTrainerLocation(me, out _, out _).HasValue,
                 "Rally is on another map; cross-map town travel is unavailable." => leader != null &&
                     (!leader.TownRallyMapId.HasValue || leader.TownRallyMapId == me.MapId),
+                "Vendor tasks remain unmet after five attempts." =>
+                    (!needs.NeedsSell && !needs.NeedsRepair && !needs.NeedsBuy) || recoveryDelayElapsed,
+                "Mailbox failed to open or finish mailing after three attempts." =>
+                    string.IsNullOrWhiteSpace(CharacterSettings.Instance.MailRecipient) ||
+                    !Styx.Logic.Inventory.InventoryManager.GetItemsToMail().Any() || recoveryDelayElapsed,
+                "Class trainer has skills that could not be trained." =>
+                    !needs.NeedsTrain || recoveryDelayElapsed,
+                "Town task timed out before completion." => recoveryDelayElapsed,
                 _ => false
             };
             if (resolved)
             {
                 BlockedReason = string.Empty;
+                _blockedAtUtcMs = 0;
                 _stageStarted = Environment.TickCount64;
+                ResetRetryBudgets();
             }
         }
 
@@ -94,6 +134,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             _wasInTownRun = false;
             _mailRequested = false;
             _mailAttempts = _vendorAttempts = 0;
+            _trainerAttempts = 0;
+            _blockedAtUtcMs = 0;
             _stageStarted = Environment.TickCount64;
             BlockedReason = string.Empty;
         }
@@ -144,8 +186,13 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 return default;
 
             bool usesMana = me.PowerType == WoWPowerType.Mana || me.Class == WoWClass.Druid;
+            // A mage can only suppress vendor needs when it is actually able to trade with us, which
+            // includes being on the same map. Food and drink stay independent so a mage that only
+            // provides one of them does not suppress the other.
             var mages = (leader?.Members ?? new List<SquadMemberSummary>())
-                .Where(m => m.IsConnected && !m.IsDead && !m.IsGhost && m.Class == WoWClass.Mage);
+                .Where(m => m.IsConnected && m.HasTelemetry && !m.IsDead && !m.IsGhost &&
+                            m.Class == WoWClass.Mage && m.MapId == me.MapId)
+                .ToList();
             bool foodProvided = settings.PreferMageFoodOverVendor && mages.Any(m => m.CanProvideMageFood);
             bool drinkProvided = settings.PreferMageFoodOverVendor && mages.Any(m => m.CanProvideMageDrink);
 
@@ -352,8 +399,23 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     else
                     {
                         if (me.IsMoving) WoWMovement.MoveStop();
-                        _stage2TrainDone = PerformTrainerInteraction(me, trainerEntry);
-                        if (!_stage2TrainDone) { townTasksComplete = false; return true; }
+                        _stage2TrainDone = PerformTrainerInteraction(me, trainerEntry, out bool purchaseAttempted);
+                        if (!_stage2TrainDone)
+                        {
+                            // Only a real purchase attempt counts towards the retry budget; a closed
+                            // trainer frame is just retried.
+                            if (purchaseAttempted)
+                            {
+                                _trainerAttempts++;
+                                if (_trainerAttempts >= 3)
+                                {
+                                    return Block("Class trainer has skills that could not be trained.", out townTasksComplete);
+                                }
+                            }
+                            townTasksComplete = false;
+                            return true;
+                        }
+                        _trainerAttempts = 0;
                     }
                 }
             }
@@ -362,6 +424,22 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (me.Location.Distance2D(rallyPoint) > 15.0f)
             {
                 Navigator.MoveTo(rallyPoint, "TownRun: returning to squad rally point");
+                townTasksComplete = false;
+                return true;
+            }
+
+            // Never report completion while a need came back: reopen the affected vendor stage.
+            var finalNeeds = EvaluateLiveLocalNeeds(settings, leader);
+            if (finalNeeds.NeedsSell || finalNeeds.NeedsRepair || finalNeeds.NeedsBuy)
+            {
+                _stage1SellRepairBuyDone = false;
+                if (finalNeeds.NeedsMail) _mailRequested = true;
+                townTasksComplete = false;
+                return true;
+            }
+            if (settings.TrainSkillsInGroupTownRun && finalNeeds.NeedsTrain)
+            {
+                _stage2TrainDone = false;
                 townTasksComplete = false;
                 return true;
             }
@@ -386,11 +464,27 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             var me = StyxWoW.Me;
             if (me == null) return false;
 
-            WoWUnit? npc = ObjectManager.GetObjectsOfType<WoWUnit>(false, false)
+            var nearbyVendors = ObjectManager.GetObjectsOfType<WoWUnit>(false, false)
                 .Where(u => u != null && u.IsValid && !u.Dead && u.IsAnyVendor &&
-                            (vendor == null || u.Entry == (uint)vendor.Entry || u.Location.Distance(me.Location) <= 10f))
+                            u.Location.Distance(me.Location) <= 10f)
                 .OrderBy(u => u.Location.Distance(me.Location))
-                .FirstOrDefault();
+                .ToList();
+
+            // The configured profile vendor always wins over nearer unrelated merchants.
+            WoWUnit? npc = null;
+            if (vendor != null)
+            {
+                npc = nearbyVendors.FirstOrDefault(u => u.Entry == (uint)vendor.Entry);
+            }
+
+            bool usingFallbackMerchant = false;
+            if (npc == null)
+            {
+                // A fallback merchant is only acceptable when it can finish the remaining task;
+                // otherwise failing here must not be attributed to the configured vendor.
+                npc = nearbyVendors.FirstOrDefault(u => CanCompleteVendorTask(u, needs));
+                usingFallbackMerchant = npc != null;
+            }
 
             if (npc == null)
                 return false;
@@ -414,29 +508,51 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             }
 
             if (!MerchantFrame.Instance.IsVisible) return false;
-            if (MerchantFrame.Instance.IsVisible)
+
+            // Confirm the merchant that actually opened is the one we selected before buying.
+            WoWUnit? openMerchant = MerchantFrame.Instance.Merchant;
+            if (openMerchant != null && openMerchant.Guid != npc.Guid)
+                return false;
+
+            bool matchesConfiguredVendor = vendor != null && npc.Entry == (uint)vendor.Entry;
+            if (needs.NeedsSell)
+                Vendors.SellAllItems();
+            if (needs.NeedsRepair)
+                Vendors.RepairAllItems();
+            if (needs.NeedsBuy)
             {
-                if (needs.NeedsSell)
-                    Vendors.SellAllItems();
-                if (needs.NeedsRepair)
-                    Vendors.RepairAllItems();
-                if (needs.NeedsBuy)
+                if (!usingFallbackMerchant && matchesConfiguredVendor &&
+                    (vendor!.Type == Vendor.VendorType.Food || vendor.Type == Vendor.VendorType.Restock))
                 {
-                    if (vendor != null && (vendor.Type == Vendor.VendorType.Food || vendor.Type == Vendor.VendorType.Restock))
-                    {
-                        BotPoi.Current = new BotPoi(vendor, PoiType.Buy);
-                        Vendors.BuyItems();
-                    }
-                    else
-                    {
-                        BuyFoodAndDrinkDirectly(me);
-                    }
+                    BotPoi.Current = new BotPoi(vendor, PoiType.Buy);
+                    Vendors.BuyItems();
                 }
-                if (MerchantFrame.Instance.IsVisible)
-                    MerchantFrame.Instance.Close();
+                else
+                {
+                    // Fallback merchants are restocked directly so a failure is never attributed to
+                    // the configured vendor entry.
+                    BuyFoodAndDrinkDirectly(me);
+                }
             }
+            if (MerchantFrame.Instance.IsVisible)
+                MerchantFrame.Instance.Close();
 
             return true;
+        }
+
+        /// <summary>
+        /// True when the given vendor is able to finish the outstanding town task (restock, sell or
+        /// repair) on its own.
+        /// </summary>
+        private static bool CanCompleteVendorTask(WoWUnit merchant, TownNeedsEvaluation needs)
+        {
+            if (merchant == null || !merchant.IsAnyVendor)
+                return false;
+
+            if (needs.NeedsBuy && !merchant.IsFoodVendor && !merchant.IsAmmoVendor)
+                return false;
+
+            return needs.NeedsSell || needs.NeedsRepair || needs.NeedsBuy;
         }
 
         private static void BuyFoodAndDrinkDirectly(LocalPlayer me)
@@ -482,8 +598,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             return null;
         }
 
-        private static bool PerformTrainerInteraction(LocalPlayer me, int trainerEntry)
+        private static bool PerformTrainerInteraction(LocalPlayer me, int trainerEntry, out bool purchaseAttempted)
         {
+            purchaseAttempted = false;
             WoWUnit? trainer = ObjectManager.GetObjectsOfType<WoWUnit>(false, false)
                 .Where(u => u != null && u.IsValid && !u.Dead && u.IsAnyTrainer &&
                             (u.Entry == (uint)trainerEntry || (u.Location.Distance(me.Location) <= 10f &&
@@ -517,9 +634,26 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
             if (TrainerFrame.Instance.IsVisible)
             {
+                purchaseAttempted = true;
+                int servicesBefore = TrainerFrame.Instance.NumTrainerServices;
+                bool hadPendingTraining = Vendors.NeedClassTraining || Vendors.ForceTrainer;
+
                 Vendors.TrainSkills();
                 StyxWoW.Sleep(400);
+
+                int servicesAfter = TrainerFrame.Instance.NumTrainerServices;
                 TrainerFrame.Instance.Close();
+
+                bool trainedSomething = servicesAfter < servicesBefore;
+                if (hadPendingTraining && !trainedSomething && servicesAfter > 0)
+                {
+                    // The purchase produced no progress (no gold, level gate, ...). Keep the pending
+                    // state instead of reporting success so the stage retries.
+                    Vendors.NeedClassTraining = true;
+                    Vendors.ForceTrainer = true;
+                    return false;
+                }
+
                 Vendors.NeedClassTraining = false;
                 Vendors.ForceTrainer = false;
                 return true;
