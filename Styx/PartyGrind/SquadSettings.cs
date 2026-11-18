@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.ComponentModel;
 using System.IO;
 using System.Xml.Linq;
 using Styx.Helpers;
@@ -83,33 +82,33 @@ namespace Styx.PartyGrind
         private static string BuildDefaultSettingsPath()
         {
             string charName = StyxWoW.Me != null ? (StyxWoW.Me.Name ?? "") : "";
-            return Path.Combine(Logging.ApplicationPath, "Settings", $"SquadSettings_{charName}.xml");
+            return Path.Combine(SettingsDirectory, $"SquadSettings_{charName}.xml");
         }
 
         #region 1. Identity & IPC
 
         [Setting]
-        [DefaultValue("Squad1")]
+        [Styx.Helpers.DefaultValueAttribute("Squad1")]
         public string TeamId { get; set; } = "Squad1";
 
         [Setting]
-        [DefaultValue(1339)]
+        [Styx.Helpers.DefaultValueAttribute(1339)]
         public int IpcPort { get; set; } = 1339;
 
         [Setting]
-        [DefaultValue(SquadRole.DpsMelee)]
+        [Styx.Helpers.DefaultValueAttribute(SquadRole.DpsMelee)]
         public SquadRole Role { get; set; } = SquadRole.DpsMelee;
 
         [Setting]
-        [DefaultValue(false)]
+        [Styx.Helpers.DefaultValueAttribute(false)]
         public bool IsCoordinator { get; set; } = false;
 
         [Setting]
-        [DefaultValue("")]
+        [Styx.Helpers.DefaultValueAttribute("")]
         public string CoordinatorName { get; set; } = "";
 
         [Setting]
-        [DefaultValue("")]
+        [Styx.Helpers.DefaultValueAttribute("")]
         public string ExpectedMemberNamesCsv { get; set; } = "";
 
         #endregion
@@ -117,31 +116,31 @@ namespace Styx.PartyGrind
         #region 2. Party & Loot
 
         [Setting]
-        [DefaultValue(true)]
+        [Styx.Helpers.DefaultValueAttribute(true)]
         public bool AutoInviteMembers { get; set; } = true;
 
         [Setting]
-        [DefaultValue(10)]
+        [Styx.Helpers.DefaultValueAttribute(10)]
         public int InviteIntervalSeconds { get; set; } = 10;
 
         [Setting]
-        [DefaultValue(true)]
+        [Styx.Helpers.DefaultValueAttribute(true)]
         public bool AutoAcceptCoordinatorInvite { get; set; } = true;
 
         [Setting]
-        [DefaultValue(true)]
+        [Styx.Helpers.DefaultValueAttribute(true)]
         public bool StrictInviteWhitelist { get; set; } = true;
 
         [Setting]
-        [DefaultValue(SquadLootMethod.FreeForAll)]
+        [Styx.Helpers.DefaultValueAttribute(SquadLootMethod.FreeForAll)]
         public SquadLootMethod LootMethod { get; set; } = SquadLootMethod.FreeForAll;
 
         [Setting]
-        [DefaultValue(SquadRollRule.Greed)]
+        [Styx.Helpers.DefaultValueAttribute(SquadRollRule.Greed)]
         public SquadRollRule RollRule { get; set; } = SquadRollRule.Greed;
 
         [Setting]
-        [DefaultValue(6)]
+        [Styx.Helpers.DefaultValueAttribute(6)]
         public int MaxLootWindowSeconds { get; set; } = 6;
 
         #endregion
@@ -149,15 +148,15 @@ namespace Styx.PartyGrind
         #region 3. Level Sync & Profiles
 
         [Setting]
-        [DefaultValue(SquadLevelAdvanceMode.WaitForLowestMember)]
+        [Styx.Helpers.DefaultValueAttribute(SquadLevelAdvanceMode.WaitForLowestMember)]
         public SquadLevelAdvanceMode LevelAdvanceMode { get; set; } = SquadLevelAdvanceMode.WaitForLowestMember;
 
         [Setting]
-        [DefaultValue(120)]
+        [Styx.Helpers.DefaultValueAttribute(120)]
         public int DisconnectGraceSeconds { get; set; } = 120;
 
         [Setting]
-        [DefaultValue(true)]
+        [Styx.Helpers.DefaultValueAttribute(true)]
         public bool AutoLoadCoordinatorProfile { get; set; } = true;
 
         #endregion
@@ -165,35 +164,36 @@ namespace Styx.PartyGrind
         #region 4. Distances, Formation & Pace
 
         [Setting]
-        [DefaultValue(35f)]
+        [Styx.Helpers.DefaultValueAttribute(35f)]
         public float SoftWaitDistance { get; set; } = 35f;
 
         [Setting]
-        [DefaultValue(20f)]
-        public float ResumeDistance { get; set; } = 20f;
+        [Styx.Helpers.DefaultValueAttribute(20f)]
+        public float ResumeDistance { get => _resumeDistance; set => _resumeDistance = float.IsFinite(value) ? value : 20f; }
+        private float _resumeDistance = 20f;
 
         [Setting]
-        [DefaultValue(65f)]
+        [Styx.Helpers.DefaultValueAttribute(65f)]
         public float HardBacktrackDistance { get; set; } = 65f;
 
         [Setting]
-        [DefaultValue(28f)]
+        [Styx.Helpers.DefaultValueAttribute(28f)]
         public float MaxPullGatherDistance { get; set; } = 28f;
 
         [Setting]
-        [DefaultValue(21f)]
+        [Styx.Helpers.DefaultValueAttribute(21f)]
         public float RangedStandoffDistance { get; set; } = 21f;
 
         [Setting]
-        [DefaultValue(22f)]
+        [Styx.Helpers.DefaultValueAttribute(22f)]
         public float HealerStandoffDistance { get; set; } = 22f;
 
         [Setting]
-        [DefaultValue(3.2f)]
+        [Styx.Helpers.DefaultValueAttribute(3.2f)]
         public float MeleeFlankRadius { get; set; } = 3.2f;
 
         [Setting]
-        [DefaultValue(SquadMountPolicy.SyncWithSlowestMember)]
+        [Styx.Helpers.DefaultValueAttribute(SquadMountPolicy.SyncWithSlowestMember)]
         public SquadMountPolicy MountPolicy { get; set; } = SquadMountPolicy.SyncWithSlowestMember;
 
         #endregion
@@ -201,19 +201,19 @@ namespace Styx.PartyGrind
         #region 5. Rest
 
         [Setting]
-        [DefaultValue(50)]
+        [Styx.Helpers.DefaultValueAttribute(50)]
         public int TriggerRestHealthPct { get; set; } = 50;
 
         [Setting]
-        [DefaultValue(35)]
+        [Styx.Helpers.DefaultValueAttribute(35)]
         public int TriggerRestManaPct { get; set; } = 35;
 
         [Setting]
-        [DefaultValue(85)]
+        [Styx.Helpers.DefaultValueAttribute(85)]
         public int ResumeRestHealthPct { get; set; } = 85;
 
         [Setting]
-        [DefaultValue(80)]
+        [Styx.Helpers.DefaultValueAttribute(80)]
         public int ResumeRestManaPct { get; set; } = 80;
 
         #endregion
@@ -221,23 +221,23 @@ namespace Styx.PartyGrind
         #region 6. Combat & Roles
 
         [Setting]
-        [DefaultValue(700)]
+        [Styx.Helpers.DefaultValueAttribute(700)]
         public int DpsEngageDelayMs { get; set; } = 700;
 
         [Setting]
-        [DefaultValue(70)]
+        [Styx.Helpers.DefaultValueAttribute(70)]
         public int HealerDpsAboveManaPct { get; set; } = 70;
 
         [Setting]
-        [DefaultValue(true)]
+        [Styx.Helpers.DefaultValueAttribute(true)]
         public bool HealerAssistDps { get; set; } = true;
 
         [Setting]
-        [DefaultValue(true)]
+        [Styx.Helpers.DefaultValueAttribute(true)]
         public bool UseEmergencySelfHealBeforeParty { get; set; } = true;
 
         [Setting]
-        [DefaultValue(true)]
+        [Styx.Helpers.DefaultValueAttribute(true)]
         public bool ForceTankDefensiveStanceOrAura { get; set; } = true;
 
         #endregion
@@ -245,23 +245,24 @@ namespace Styx.PartyGrind
         #region 7. Town & Death
 
         [Setting]
-        [DefaultValue(true)]
+        [Styx.Helpers.DefaultValueAttribute(true)]
         public bool SyncTownRuns { get; set; } = true;
 
         [Setting]
-        [DefaultValue(2)]
+        [Styx.Helpers.DefaultValueAttribute(2)]
         public int TriggerTownFreeBagSlots { get; set; } = 2;
 
         [Setting]
-        [DefaultValue(20)]
+        [Styx.Helpers.DefaultValueAttribute(20)]
         public int TriggerTownDurabilityPct { get; set; } = 20;
 
         [Setting]
-        [DefaultValue(true)]
+        [Styx.Helpers.DefaultValueAttribute(true)]
         public bool TrainSkillsInGroupTownRun { get; set; } = true;
 
         [Setting]
-        [DefaultValue(45)]
+        [Styx.Helpers.DefaultValueAttribute(45)]
+        [System.ComponentModel.Description("Seconds to wait per squad recovery period, starting with the first casualty; later casualties share that deadline.")]
         public int WaitForPartyRessSeconds { get; set; } = 45;
 
         #endregion
@@ -269,51 +270,51 @@ namespace Styx.PartyGrind
         #region 8. Provisioning & Party Buffs
 
         [Setting]
-        [DefaultValue(true)]
+        [Styx.Helpers.DefaultValueAttribute(true)]
         public bool EnableMageProvisioning { get; set; } = true;
 
         [Setting]
-        [DefaultValue(true)]
+        [Styx.Helpers.DefaultValueAttribute(true)]
         public bool PreferMageFoodOverVendor { get; set; } = true;
 
         [Setting]
-        [DefaultValue(10)]
+        [Styx.Helpers.DefaultValueAttribute(10)]
         public int MinMemberFoodStack { get; set; } = 10;
 
         [Setting]
-        [DefaultValue(20)]
+        [Styx.Helpers.DefaultValueAttribute(20)]
         public int TargetMemberFoodStack { get; set; } = 20;
 
         [Setting]
-        [DefaultValue(10)]
+        [Styx.Helpers.DefaultValueAttribute(10)]
         public int MinMemberDrinkStack { get; set; } = 10;
 
         [Setting]
-        [DefaultValue(20)]
+        [Styx.Helpers.DefaultValueAttribute(20)]
         public int TargetMemberDrinkStack { get; set; } = 20;
 
         [Setting]
-        [DefaultValue(12)]
+        [Styx.Helpers.DefaultValueAttribute(12)]
         public int TradeOfferTimeoutSeconds { get; set; } = 12;
 
         [Setting]
-        [DefaultValue(30)]
+        [Styx.Helpers.DefaultValueAttribute(30)]
         public int ProvisionCooldownSeconds { get; set; } = 30;
 
         [Setting]
-        [DefaultValue(true)]
+        [Styx.Helpers.DefaultValueAttribute(true)]
         public bool EnableWarlockHealthstones { get; set; } = true;
 
         [Setting]
-        [DefaultValue(true)]
+        [Styx.Helpers.DefaultValueAttribute(true)]
         public bool UseRitualTablesWhenAvailable { get; set; } = true;
 
         [Setting]
-        [DefaultValue(true)]
+        [Styx.Helpers.DefaultValueAttribute(true)]
         public bool EnableCrossPartyBuffs { get; set; } = true;
 
         [Setting]
-        [DefaultValue(true)]
+        [Styx.Helpers.DefaultValueAttribute(true)]
         public bool SetRaidTargetMarkers { get; set; } = true;
 
         #endregion
@@ -366,7 +367,7 @@ namespace Styx.PartyGrind
         {
             bool any = false;
 
-            if (!string.IsNullOrWhiteSpace(squadRole) && Enum.TryParse<SquadRole>(squadRole.Trim(), true, out SquadRole parsedRole))
+            if (!string.IsNullOrWhiteSpace(squadRole) && !squadRole.Contains(",") && Enum.TryParse<SquadRole>(squadRole.Trim(), true, out SquadRole parsedRole) && Enum.IsDefined(parsedRole))
             {
                 Role = parsedRole;
                 if (!squadCoordinator.HasValue)

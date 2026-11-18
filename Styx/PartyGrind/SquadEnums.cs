@@ -66,7 +66,6 @@ namespace Styx.PartyGrind
     /// </summary>
     public enum SquadLevelAdvanceMode
     {
-        WaitForLowestMember = 0,
-        WaitForAllAtTargetLevel = 1
+        WaitForLowestMember = 0
     }
 }

@@ -10,6 +10,8 @@ namespace Styx.Helpers
     {
         private readonly Dictionary<string, Collection<string>> _args;
         private string _pendingFlag;
+        private readonly HashSet<string> _valueless = new(StringComparer.OrdinalIgnoreCase);
+        public bool HasOperand(string key) => Exists(key) && !_valueless.Contains(key);
 
         internal static string[] Tokenize(string input)
         {
@@ -59,7 +61,7 @@ namespace Styx.Helpers
                     case 3:
                         FlushPendingFlag();
                         string val = UnquoteString(parts[2]);
-                        AddTokens(parts[1], val.Split(new char[] { ',' }));
+                        AddTokens(parts[1], string.Equals(parts[1], "loadprofile", StringComparison.OrdinalIgnoreCase) ? new[] { val } : val.Split(new char[] { ',' }));
                         break;
                 }
             }
@@ -76,6 +78,7 @@ namespace Styx.Helpers
         {
             if (_pendingFlag != null)
             {
+                _valueless.Add(_pendingFlag);
                 AddSingleStrict(_pendingFlag, "true");
                 _pendingFlag = null;
             }

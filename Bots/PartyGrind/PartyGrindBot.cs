@@ -122,6 +122,7 @@ namespace CopilotBuddy.Bots.PartyGrind
             _partySync.AttachEvents();
 
             StartIpc(settings);
+            if (!SquadContext.IsActive) return;
             if (ProfileManager.CurrentOuterProfile != null)
                 ProfileManager.RefreshProfileForLevel();
             SquadOverlay.Attach();
@@ -170,7 +171,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                     StyxWoW.Me.Rotation,
                     now);
                 SquadContext.UpdateLeaderState(leaderState);
-                _ipcServer.BroadcastLeaderState(leaderState);
+                _ipcServer.BroadcastLeaderState(leaderState, populateRoster: false);
             }
         }
 
@@ -185,7 +186,7 @@ namespace CopilotBuddy.Bots.PartyGrind
             if (!SquadContext.IsActive || StyxWoW.Me == null)
                 return;
 
-            Navigator.PathPrecision = MathEx.Clamp(StyxWoW.Me.MovementInfo.CurrentSpeed * 0.15f, 1.5f, 10f);
+            Navigator.PathPrecision = Math.Clamp(StyxWoW.Me.MovementInfo.CurrentSpeed * 0.15f, 1.5f, 10f);
 
             SquadSettings settings = SquadContext.ActiveSettings ?? SquadSettings.Instance;
             long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
@@ -217,14 +218,15 @@ namespace CopilotBuddy.Bots.PartyGrind
                 else
                 {
                     _ipcClient = new SquadIpcClient(settings.IpcPort, settings.TeamId);
-                    _ipcClient.LeaderStateReceived += leader => SquadContext.UpdateLeaderState(leader);
                     _ipcClient.Start(BuildLocalHandshake);
                     SquadContext.IsIpcConnected = false;
                 }
             }
             catch (Exception ex)
             {
-                Logging.Write("[PartyGrind IPC] Non-fatal IPC startup error: {0}", ex.Message);
+                StopIpc();
+                Stop();
+                Logging.Write("[PartyGrind IPC] Startup failed: {0}", ex.Message);
             }
         }
 
@@ -269,7 +271,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                 StyxWoW.Me?.Rotation ?? 0f,
                 now);
 
-            SquadContext.IsIpcConnected = true;
+            SquadContext.IsIpcConnected = _ipcServer?.IsListening == true;
             SquadContext.UpdateLeaderState(leaderState);
 
             if (leaderState.EffectiveSquadMinLevel > 0 && leaderState.EffectiveSquadMinLevel != _lastAppliedEffectiveLevel)
@@ -284,7 +286,7 @@ namespace CopilotBuddy.Bots.PartyGrind
             if (_ipcServer != null && (now - _lastIpcSendUtcMs) >= 100)
             {
                 _lastIpcSendUtcMs = now;
-                _ipcServer.BroadcastLeaderState(leaderState);
+                _ipcServer.BroadcastLeaderState(leaderState, populateRoster: false);
             }
         }
 
@@ -293,30 +295,11 @@ namespace CopilotBuddy.Bots.PartyGrind
             bool connected = _ipcClient != null && _ipcClient.IsConnected;
             SquadContext.IsIpcConnected = connected;
 
-            var leaderState = _ipcClient?.LatestLeaderState;
+            var leaderState = connected ? _ipcClient?.LatestLeaderState : null;
+            if (leaderState == null) SquadContext.UpdateLeaderState(null);
             if (leaderState != null)
             {
                 SquadContext.UpdateLeaderState(leaderState);
-
-                // Auto-load coordinator profile XML if enabled and local profile differs.
-                if (settings.AutoLoadCoordinatorProfile &&
-                    !string.IsNullOrWhiteSpace(leaderState.ProfileXmlPath) &&
-                    File.Exists(leaderState.ProfileXmlPath) &&
-                    !string.Equals(leaderState.ProfileXmlPath, _lastAttemptedLeaderProfilePath, StringComparison.OrdinalIgnoreCase) &&
-                    !string.Equals(leaderState.ProfileXmlHash, localState.LoadedProfileHash, StringComparison.OrdinalIgnoreCase))
-                {
-                    _lastAttemptedLeaderProfilePath = leaderState.ProfileXmlPath;
-                    try
-                    {
-                        ProfileManager.LoadNew(leaderState.ProfileXmlPath, rememberMe: false);
-                        _cachedProfilePath = string.Empty;
-                        _cachedProfileHash = string.Empty;
-                    }
-                    catch (Exception ex)
-                    {
-                        Logging.Write("[PartyGrind] Could not auto-load coordinator profile '{0}': {1}", leaderState.ProfileXmlPath, ex.Message);
-                    }
-                }
 
                 if (leaderState.EffectiveSquadMinLevel > 0 && leaderState.EffectiveSquadMinLevel != _lastAppliedEffectiveLevel)
                 {
@@ -347,6 +330,10 @@ namespace CopilotBuddy.Bots.PartyGrind
             }
 
             ulong newFocusGuid = (focus != null && focus.IsValid && !focus.Dead && !focus.IsFriendly) ? focus.Guid : 0UL;
+            if (newFocusGuid != 0 && focus != null && !focus.Combat && !focus.IsTargetingMyPartyMember &&
+                !SquadTankBridge.CanInitiatePull(SquadContext.GetLeaderStateSnapshot(),
+                    (SquadContext.ActiveSettings ?? SquadSettings.Instance).MaxPullGatherDistance))
+                newFocusGuid = 0;
             if (newFocusGuid != 0 && newFocusGuid != _currentFocusGuid)
             {
                 _pullStartedUtcMs = now;
@@ -419,7 +406,8 @@ namespace CopilotBuddy.Bots.PartyGrind
 
             bool isDead = me.Dead && !me.IsGhost;
             bool isGhost = me.IsGhost;
-            bool usesMana = me.PowerType == WoWPowerType.Mana || me.Class == WoWClass.Druid;
+            if (!isDead && !isGhost) _deathStartedUtcMs = 0;
+            bool usesMana = me.PowerType == WoWPowerType.Mana;
 
             _localWasNeedingRest = !me.Combat && !isDead && !isGhost &&
                 SquadCoordinatorService.EvaluateRestHysteresis(
@@ -459,6 +447,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                 squadHasWarlock,
                 settings);
 
+            _townRun.ObservePhase(leader?.Phase);
             var townNeeds = SquadTownRunService.EvaluateLiveLocalNeeds(settings, leader);
             if (leader == null || leader.Phase != SquadPhase.TownRun)
                 _townTasksCompleteLocal = false;
@@ -472,7 +461,7 @@ namespace CopilotBuddy.Bots.PartyGrind
 
             var currentSub = ProfileManager.CurrentOuterProfile != null ? ProfileManager.CurrentProfile : null;
             bool isResting = !me.Combat && (me.HasAura("Food") || me.HasAura("Drink") || _localWasNeedingRest);
-            bool isLooting = !me.Combat && !isDead && !isGhost &&
+            bool isLooting = me.FreeNormalBagSlots > 0 && !me.Combat && !isDead && !isGhost &&
                 (LootFrame.Instance.IsVisible || LootTargeting.Instance.FirstObject != null);
 
             return new SquadMemberState
@@ -594,7 +583,20 @@ namespace CopilotBuddy.Bots.PartyGrind
                     new Action(ctx =>
                     {
                         var settings = SquadContext.ActiveSettings ?? SquadSettings.Instance;
-                        return _provisioning.RunProvisioningTick(settings, SquadContext.GetLeaderStateSnapshot())
+                        var provisionLeader = SquadContext.GetLeaderStateSnapshot();
+                        var me = StyxWoW.Me;
+                        if (me != null && me.Mounted && provisionLeader != null &&
+                            (string.Equals(me.Name, provisionLeader.ActiveProvisionerName, StringComparison.OrdinalIgnoreCase) ||
+                             string.Equals(me.Name, provisionLeader.ActiveTradeTargetName, StringComparison.OrdinalIgnoreCase)))
+                        {
+                            Mount.Dismount("Squad provisioning");
+                            return RunStatus.Success;
+                        }
+                        if (provisionLeader?.Members.Any(m => m.IsMounted &&
+                            (string.Equals(m.CharacterName, provisionLeader.ActiveProvisionerName, StringComparison.OrdinalIgnoreCase) ||
+                             string.Equals(m.CharacterName, provisionLeader.ActiveTradeTargetName, StringComparison.OrdinalIgnoreCase))) == true)
+                            return RunStatus.Success;
+                        return _provisioning.RunProvisioningTick(settings, provisionLeader)
                             ? RunStatus.Success
                             : RunStatus.Failure;
                     })
@@ -831,9 +833,6 @@ namespace CopilotBuddy.Bots.PartyGrind
                 return false;
 
             var tankPos = new WoWPoint(leader.X, leader.Y, leader.Z);
-            float distToTank = me.Location.Distance(tankPos);
-            if (distToTank >= 16f && distToTank <= 26f)
-                return false;
 
             WoWPoint? focusPos = null;
             if (leader.FocusTargetGuid != 0)
@@ -909,7 +908,7 @@ namespace CopilotBuddy.Bots.PartyGrind
             if (me.HealthPercent < settings.ResumeRestHealthPct && !me.HasAura("Food") && !me.HasAura("Refreshment"))
                 Rest.FeedImmediate();
 
-            bool usesMana = me.PowerType == WoWPowerType.Mana || me.Class == WoWClass.Druid;
+            bool usesMana = me.PowerType == WoWPowerType.Mana;
             if (usesMana && me.PowerPercent < settings.ResumeRestManaPct && !me.HasAura("Drink") && !me.HasAura("Refreshment"))
                 Rest.DrinkImmediate();
 
@@ -1072,7 +1071,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                 if (leader == null || leader.MapId != me.MapId)
                     return RunStatus.Success;
 
-                int slotIdx = SquadContext.GetMySlotIndex(me.Name);
+                int slotIdx = SquadContext.GetMySlotIndex(me.Name, leader);
                 WoWPoint followPos = SquadFormationService.ComputeTravelFollowPosition(me.Location, leader, slotIdx);
                 if (me.Location.Distance(followPos) > 4.0f)
                 {

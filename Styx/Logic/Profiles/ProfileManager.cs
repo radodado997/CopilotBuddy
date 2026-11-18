@@ -10,6 +10,7 @@ namespace Styx.Logic.Profiles
 	{
 		private static Profile? _currentOuterProfile;
 		private static Profile? _currentProfile;
+        private static bool _selectedOffline;
 		private static bool _profileless = false; // Flag for bots that don't use profiles
 
 		static ProfileManager()
@@ -59,7 +60,7 @@ namespace Styx.Logic.Profiles
 				if (_profileless)
 					return _currentProfile;
 					
-				if (_currentProfile == null)
+				if (_currentProfile == null || (_selectedOffline && ObjectManager.Me != null))
 				{
 					LoadProfileForLevel();
 				}
@@ -116,6 +117,7 @@ namespace Styx.Logic.Profiles
 		{
 			int effectiveLevel = LevelOverrideSelector?.Invoke() ?? ObjectManager.Me?.Level ?? 1;
 			var profile = GetProfileForLevel(effectiveLevel);
+			_selectedOffline = ObjectManager.Me == null;
 			CurrentProfile = profile;
 			if (profile != null)
 				Logging.WriteDebug("Selected sub-profile: {0} (L{1}-{2})", profile.Name, profile.MinLevel, profile.MaxLevel);

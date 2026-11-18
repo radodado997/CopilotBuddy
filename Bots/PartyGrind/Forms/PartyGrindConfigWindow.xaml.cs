@@ -108,7 +108,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Forms
                 TxtScriptNames.Text = existing.Length >= 3
                     ? string.Join(",", existing)
                     : "TankNick,HealNick,DpsNick1";
-                TxtScriptRoles.Text = "TankLeader,Healer,DpsMelee";
+                int count = Math.Clamp(existing.Length, 3, 5);
+                CmbClientCount.SelectedItem = count;
+                TxtScriptRoles.Text = string.Join(",", new[] { "TankLeader", "Healer", "DpsMelee", "DpsRanged", "HybridOffHeal" }.Take(count));
             }
             finally
             {
@@ -118,6 +120,11 @@ namespace CopilotBuddy.Bots.PartyGrind.Forms
 
         private void SaveToSettings(SquadSettings s)
         {
+            float resume = ParseFloat(TxtResumeDist.Text, s.ResumeDistance, 5f, 100f);
+            float soft = ParseFloat(TxtSoftWait.Text, s.SoftWaitDistance, 10f, 150f);
+            float hard = ParseFloat(TxtHardBacktrack.Text, s.HardBacktrackDistance, 20f, 250f);
+            if (!(resume < soft && soft < hard))
+                throw new ArgumentException("Require Resume Distance < Soft Wait Distance < Hard Backtrack Distance.");
             s.TeamId = string.IsNullOrWhiteSpace(TxtTeamId.Text) ? "Squad1" : TxtTeamId.Text.Trim();
             s.IpcPort = ParseInt(TxtIpcPort.Text, s.IpcPort, 1024, 65535);
             if (CmbRole.SelectedItem is SquadRole role)
@@ -180,7 +187,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Forms
             s.EnableCrossPartyBuffs = ChkEnableCrossBuffs.IsChecked == true;
             s.SetRaidTargetMarkers = ChkRaidMarkers.IsChecked == true;
 
-            s.Save();
+            s.GetXML().Save(s.SettingsPath);
         }
 
         private void CmbRole_SelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -199,21 +206,13 @@ namespace CopilotBuddy.Bots.PartyGrind.Forms
             if (_isLoading || CmbClientCount.SelectedItem is not int count)
                 return;
 
-            switch (count)
-            {
-                case 3:
-                    TxtScriptNames.Text = "TankNick,HealNick,DpsNick1";
-                    TxtScriptRoles.Text = "TankLeader,Healer,DpsMelee";
-                    break;
-                case 4:
-                    TxtScriptNames.Text = "TankNick,HealNick,DpsNick1,DpsNick2";
-                    TxtScriptRoles.Text = "TankLeader,Healer,DpsMelee,DpsRanged";
-                    break;
-                default:
-                    TxtScriptNames.Text = "TankNick,HealNick,DpsNick1,DpsNick2,DpsNick3";
-                    TxtScriptRoles.Text = "TankLeader,Healer,DpsMelee,DpsRanged,HybridOffHeal";
-                    break;
-            }
+            string[] defaults = { "TankLeader", "Healer", "DpsMelee", "DpsRanged", "HybridOffHeal" };
+            var names = TxtScriptNames.Text.Split(',', StringSplitOptions.RemoveEmptyEntries).Take(count).ToList();
+            var roles = TxtScriptRoles.Text.Split(',', StringSplitOptions.RemoveEmptyEntries).Take(count).ToList();
+            while (names.Count < count) names.Add($"Char{names.Count + 1}");
+            while (roles.Count < count) roles.Add(defaults[roles.Count]);
+            TxtScriptNames.Text = string.Join(",", names);
+            TxtScriptRoles.Text = string.Join(",", roles);
             GenerateScriptPreview();
         }
 
@@ -226,6 +225,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Forms
         {
             try
             {
+                if (!GenerateScriptPreview()) return;
                 WpfClipboard.SetText(TxtGeneratedScript.Text ?? string.Empty);
                 WpfMessageBox.Show(this, "Launcher script copied to clipboard.", "Party Grind", MessageBoxButton.OK, MessageBoxImage.Information);
             }
@@ -237,9 +237,21 @@ namespace CopilotBuddy.Bots.PartyGrind.Forms
 
         private void BtnSave_Click(object sender, RoutedEventArgs e)
         {
-            SaveToSettings(SquadSettings.Instance);
-            DialogResult = true;
-            Close();
+            try
+            {
+                var current = SquadSettings.Instance;
+                var pending = new SquadSettings(current.SettingsPath);
+                pending.LoadFromXML(current.GetXML());
+                SaveToSettings(pending);
+                if (!SquadContext.IsActive)
+                    SquadSettings.Instance = pending;
+                DialogResult = true;
+                Close();
+            }
+            catch (Exception ex)
+            {
+                WpfMessageBox.Show(this, ex.Message, "Party Grind", MessageBoxButton.OK, MessageBoxImage.Warning);
+            }
         }
 
         private void BtnCancel_Click(object sender, RoutedEventArgs e)
@@ -248,7 +260,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Forms
             Close();
         }
 
-        private void GenerateScriptPreview()
+        private bool GenerateScriptPreview()
         {
             int count = CmbClientCount.SelectedItem is int c ? c : 3;
             string teamId = string.IsNullOrWhiteSpace(TxtTeamId.Text) ? "Squad1" : TxtTeamId.Text.Trim();
@@ -262,7 +274,16 @@ namespace CopilotBuddy.Bots.PartyGrind.Forms
             string[] roles = (TxtScriptRoles.Text ?? "")
                 .Split(new[] { ',', ';', ' ' }, StringSplitOptions.RemoveEmptyEntries);
 
-            TxtGeneratedScript.Text = BuildLauncherScript(count, teamId, port, profilePath, names, roles);
+            try
+            {
+                TxtGeneratedScript.Text = BuildLauncherScript(count, teamId, port, profilePath, names, roles);
+                return true;
+            }
+            catch (ArgumentException ex)
+            {
+                TxtGeneratedScript.Text = ex.Message;
+                return false;
+            }
         }
 
         public static string BuildLauncherScript(
@@ -273,6 +294,11 @@ namespace CopilotBuddy.Bots.PartyGrind.Forms
             IReadOnlyList<string> characterNames,
             IReadOnlyList<string> roleNames)
         {
+            foreach (var value in new[] { teamId, profilePath }.Concat(characterNames).Concat(roleNames))
+                if (string.IsNullOrEmpty(value) || value.Any(c => char.IsControl(c) || "\"%!=&|<>^()".Contains(c)))
+                    throw new ArgumentException("Launcher fields contain unsupported shell characters.");
+            if (teamId.Any(char.IsWhiteSpace) || roleNames.Any(r => r.Any(char.IsWhiteSpace)))
+                throw new ArgumentException("Team and role names cannot contain whitespace.");
             int count = Math.Clamp(clientCount, 3, 5);
             string[] defaultRoles = { "TankLeader", "Healer", "DpsMelee", "DpsRanged", "HybridOffHeal" };
             var finalNames = new List<string>(count);
@@ -331,7 +357,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Forms
         {
             if (float.TryParse(raw?.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out float v) ||
                 float.TryParse(raw?.Trim(), NumberStyles.Float, CultureInfo.CurrentCulture, out v))
-                return Math.Clamp(v, min, max);
+                return float.IsFinite(v) ? Math.Clamp(v, min, max) : fallback;
             return fallback;
         }
     }

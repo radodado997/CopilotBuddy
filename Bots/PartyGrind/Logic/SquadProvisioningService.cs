@@ -250,6 +250,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     OnTradeCancelledOrTimeout(_activeTradeTarget, settings.ProvisionCooldownSeconds);
                     return false;
                 }
+                return true;
             }
 
             // 3. Interact with nearby Refreshment Table / Soulwell / Ritual objects if needed!
@@ -594,8 +595,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 if (stone.Cooldown == 0)
                 {
                     if (me.IsMoving) WoWMovement.MoveStop();
-                    stone.Use(target.Guid);
-                    return true;
+                    return stone.Use(target.Guid);
                 }
                 return false;
             }

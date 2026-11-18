@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using Styx;
 using Styx.Combat.CombatRoutine;
 using Styx.Logic.Pathing;
 using Styx.PartyGrind;
@@ -23,7 +24,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         public float HotspotX { get; set; }
         public float HotspotY { get; set; }
         public float HotspotZ { get; set; }
-        public uint TownRallyMapId { get; set; }
+        public uint? TownRallyMapId { get; set; }
         public float TownRallyX { get; set; }
         public float TownRallyY { get; set; }
         public float TownRallyZ { get; set; }
@@ -72,6 +73,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private string _activeProvisioner = string.Empty;
         private string _activeTradeTarget = string.Empty;
         private long _provisionStartedUtcMs;
+        private bool _assignedFood, _assignedDrink, _assignedHealthstone;
 
         public bool IsPausedManually { get; set; }
         public string ManualPauseReason { get; set; } = string.Empty;
@@ -80,6 +82,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
         public void Reset()
         {
+            IsPausedManually = false;
+            ManualPauseReason = string.Empty;
             _history.Clear();
             _provisionCooldownUntilMs.Clear();
             _breadcrumbs.Clear();
@@ -197,8 +201,17 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 lowestXpPct = lowest.XpPct;
             }
 
+            var telemetryNames = new HashSet<string>(
+                connectedClients.Where(s => s.IsConnected && s.LatestState != null).Select(s => s.CharacterName.Trim()),
+                StringComparer.OrdinalIgnoreCase);
+            telemetryNames.Add(leaderLocal.CharacterName.Trim());
+            rosterStates.RemoveAll(m => !telemetryNames.Contains(m.CharacterName.Trim()));
+            foreach (var name in _history.Where(kv => !connectedNames.Contains(kv.Key) &&
+                nowUtcMs - kv.Value.LastSeenUtcMs > graceMs).Select(kv => kv.Key).ToList())
+                _history.Remove(name);
+
             // Detect sub-profile transition -> MigratingZone.
-            string subProfileKey = $"{profile.SubProfileName}|{profile.SubProfileMinLevel}|{profile.SubProfileMaxLevel}|{profile.MapId}";
+            string subProfileKey = $"{profile.ProfileXmlPath}|{profile.ProfileXmlHash}|{profile.SubProfileName}|{profile.SubProfileMinLevel}|{profile.SubProfileMaxLevel}|{profile.MapId}";
             if (profile.HasProfile)
             {
                 if (!string.IsNullOrEmpty(_lastSubProfileKey) &&
@@ -307,7 +320,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     continue;
                 string key = m.CharacterName?.Trim() ?? string.Empty;
                 bool wasResting = !string.IsNullOrEmpty(key) && _history.TryGetValue(key, out var rec) && rec.NeedsRest;
-                bool usesMana = m.PowerType == WoWPowerType.Mana || m.Class == WoWClass.Druid;
+                bool usesMana = m.PowerType == WoWPowerType.Mana;
                 bool evaluated = EvaluateRestHysteresis(wasResting, m.HealthPercent, m.PowerPercent, usesMana, settings);
                 bool combinedRest = evaluated || m.NeedsRest;
                 if (!string.IsNullOrEmpty(key) && _history.TryGetValue(key, out var histRec))
@@ -331,12 +344,12 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             }
             else if (_inTownRun)
             {
-                var living = rosterStates.Where(m => !m.IsDead && !m.IsGhost).ToList();
+                var living = rosterStates;
                 bool anyStillHasNeed = living.Any(m =>
                     !m.TownTasksComplete && (m.NeedsSell || m.NeedsRepair || m.NeedsBuy || m.NeedsTrain || m.NeedsMail));
                 bool allDoneAndAtRally = living.Count > 0 && living.All(m =>
                     m.TownTasksComplete &&
-                    (profile.TownRallyMapId == 0 || m.MapId == profile.TownRallyMapId) &&
+                    (!profile.TownRallyMapId.HasValue || m.MapId == profile.TownRallyMapId.Value) &&
                     new WoWPoint(m.X, m.Y, m.Z).Distance2D(townRally) <= 20.0f);
 
                 if (allDoneAndAtRally && !anyStillHasNeed)
@@ -351,7 +364,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             }
 
             // Provisioning arbitration.
-            if (anyInCombat || anyDead || _inTownRun || anyNeedsRest)
+            if (anyInCombat || anyDead || _inTownRun || anyNeedsRest || _migratingZone)
             {
                 ClearProvisioning();
             }
@@ -410,7 +423,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             }
 
             // 7. Build member summaries for HUD & peer services.
-            var summaries = BuildMemberSummaries(rosterStates, connectedNames, leaderPoint, nowUtcMs);
+            var summaries = BuildMemberSummaries(rosterStates, connectedNames, leaderPoint, leaderLocal.MapId, nowUtcMs);
 
             return new SquadLeaderState
             {
@@ -500,7 +513,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             {
                 var bc = _breadcrumbs[i];
                 var pt = new WoWPoint(bc.X, bc.Y, bc.Z);
-                if (pt.Distance(currentLeaderPos) >= 10f)
+                if (pt.Distance(currentLeaderPos) >= 10f &&
+                    pt.Distance(trailingMemberPos) < currentLeaderPos.Distance(trailingMemberPos))
                     return pt;
             }
             return trailingMemberPos;
@@ -574,7 +588,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     : rosterStates.FirstOrDefault(m => string.Equals(m.CharacterName, _activeTradeTarget, StringComparison.OrdinalIgnoreCase));
 
                 bool stillNeeded = prov != null && (prov.IsProvisioningBusy ||
-                    (recv != null && (recv.WantsFood || recv.WantsDrink || recv.WantsHealthstone)));
+                    (recv != null && ((_assignedFood && recv.WantsFood) ||
+                        (_assignedDrink && recv.WantsDrink) || (_assignedHealthstone && recv.WantsHealthstone))));
 
                 if (timedOut)
                 {
@@ -595,8 +610,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             // Pick next provisioner -> target pair (Mage first, then Warlock).
             if (settings.EnableMageProvisioning)
             {
-                var mage = rosterStates.FirstOrDefault(m => !m.IsDead && !m.IsGhost && (m.CanProvideMageFood || m.CanProvideMageDrink));
-                if (mage != null)
+                foreach (var mage in rosterStates.Where(m => !m.IsDead && !m.IsGhost && (m.CanProvideMageFood || m.CanProvideMageDrink)))
                 {
                     var magePos = new WoWPoint(mage.X, mage.Y, mage.Z);
                     var target = rosterStates.FirstOrDefault(m =>
@@ -610,6 +624,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
                     if (target != null)
                     {
+                        _assignedFood = mage.CanProvideMageFood && target.WantsFood;
+                        _assignedDrink = mage.CanProvideMageDrink && target.WantsDrink;
+                        _assignedHealthstone = false;
                         _activeProvisioner = mage.CharacterName;
                         _activeTradeTarget = target.CharacterName;
                         _provisionStartedUtcMs = nowUtcMs;
@@ -620,8 +637,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
             if (settings.EnableWarlockHealthstones)
             {
-                var warlock = rosterStates.FirstOrDefault(m => !m.IsDead && !m.IsGhost && m.CanProvideHealthstone);
-                if (warlock != null)
+                foreach (var warlock in rosterStates.Where(m => !m.IsDead && !m.IsGhost && m.CanProvideHealthstone))
                 {
                     var lockPos = new WoWPoint(warlock.X, warlock.Y, warlock.Z);
                     var target = rosterStates.FirstOrDefault(m =>
@@ -635,9 +651,12 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
                     if (target != null)
                     {
+                        _assignedFood = _assignedDrink = false;
+                        _assignedHealthstone = true;
                         _activeProvisioner = warlock.CharacterName;
                         _activeTradeTarget = target.CharacterName;
                         _provisionStartedUtcMs = nowUtcMs;
+                        return;
                     }
                 }
             }
@@ -661,6 +680,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             List<SquadMemberState> activeRoster,
             HashSet<string> connectedNames,
             WoWPoint leaderPoint,
+            uint leaderMapId,
             long nowUtcMs)
         {
             var result = new List<SquadMemberSummary>();
@@ -673,7 +693,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
             foreach (var m in activeRoster)
             {
-                result.Add(ToSummary(m, isConnected: true, leaderPoint));
+                result.Add(ToSummary(m, isConnected: true, leaderPoint, leaderMapId));
             }
 
             foreach (var kv in _history)
@@ -682,8 +702,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     continue;
                 if (kv.Value.LastState != null)
                 {
-                    var summary = ToSummary(kv.Value.LastState, isConnected: false, leaderPoint);
-                    summary.StateLabel = "Disconnected";
+                    var summary = ToSummary(kv.Value.LastState, isConnected: connectedNames.Contains(kv.Key), leaderPoint, leaderMapId);
+                    summary.StateLabel = connectedNames.Contains(kv.Key) ? "Awaiting telemetry" : "Disconnected";
                     result.Add(summary);
                 }
             }
@@ -694,7 +714,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 .ToList();
         }
 
-        private SquadMemberSummary ToSummary(SquadMemberState m, bool isConnected, WoWPoint leaderPoint)
+        private SquadMemberSummary ToSummary(SquadMemberState m, bool isConnected, WoWPoint leaderPoint, uint leaderMapId)
         {
             string label = m.IsDead || m.IsGhost ? "Dead"
                 : m.IsInCombat ? "Combat"
@@ -704,7 +724,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 : m.IsProvisioningBusy ? "Provisioning"
                 : "Grinding";
 
-            float dist = leaderPoint.Distance(new WoWPoint(m.X, m.Y, m.Z));
+            float dist = m.MapId == leaderMapId ? leaderPoint.Distance(new WoWPoint(m.X, m.Y, m.Z)) : -1f;
             return new SquadMemberSummary
             {
                 CharacterName = m.CharacterName,

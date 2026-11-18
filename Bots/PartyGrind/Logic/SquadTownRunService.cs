@@ -44,6 +44,11 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private bool _stage2TrainDone;
         private bool _wasInTownRun;
 
+        public void ObservePhase(SquadPhase? phase)
+        {
+            if (_wasInTownRun && phase != SquadPhase.TownRun) Reset();
+        }
+
         public void Reset()
         {
             _stage1SellRepairBuyDone = false;
@@ -70,7 +75,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             SquadSettings settings)
         {
             bool needsSell = freeNormalBagSlots <= settings.TriggerTownFreeBagSlots;
-            bool needsRepair = lowestDurabilityPct > 0 && lowestDurabilityPct <= settings.TriggerTownDurabilityPct;
+            bool needsRepair = double.IsFinite(lowestDurabilityPct) && lowestDurabilityPct >= 0 && lowestDurabilityPct <= settings.TriggerTownDurabilityPct;
             bool suppressFoodDrinkBuy = preferMageFoodOverVendor && squadHasActiveMageLvl4Plus;
 
             bool needsBuy = !suppressFoodDrinkBuy &&
@@ -97,8 +102,10 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 return default;
 
             bool usesMana = me.PowerType == WoWPowerType.Mana || me.Class == WoWClass.Druid;
-            bool hasActiveMage = (leader?.Members ?? new List<SquadMemberSummary>())
-                .Any(m => m.IsConnected && !m.IsDead && m.Class == WoWClass.Mage && m.Level >= 4);
+            var mages = (leader?.Members ?? new List<SquadMemberSummary>())
+                .Where(m => m.IsConnected && !m.IsDead && !m.IsGhost && m.Class == WoWClass.Mage);
+            bool foodProvided = settings.PreferMageFoodOverVendor && mages.Any(m => m.CanProvideMageFood);
+            bool drinkProvided = settings.PreferMageFoodOverVendor && mages.Any(m => m.CanProvideMageDrink);
 
             bool hasFood = SquadProvisioningService.CountFoodInBags() > 0;
             bool hasDrink = SquadProvisioningService.CountDrinksInBags() > 0;
@@ -107,16 +114,17 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
             return EvaluateLocalTownNeeds(
                 (int)me.FreeNormalBagSlots,
-                me.LowestDurabilityPercent,
-                hasFood,
-                hasDrink,
+                me.Inventory.Equipped.PhysicalItems.Where(i => i.MaxDurability > 0)
+                    .Select(i => 100.0 * i.Durability / i.MaxDurability).DefaultIfEmpty(double.NaN).Min(),
+                hasFood || foodProvided,
+                hasDrink || drinkProvided,
                 usesMana,
                 CharacterSettings.Instance.FoodAmount,
                 CharacterSettings.Instance.DrinkAmount,
                 needsTrain,
                 hasMail,
                 settings.PreferMageFoodOverVendor,
-                hasActiveMage,
+                false,
                 settings);
         }
 
@@ -190,7 +198,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     if (me.IsMoving) WoWMovement.MoveStop();
                     if (PerformVendorInteraction(vendor, needs))
                     {
-                        _stage1SellRepairBuyDone = true;
+                        var remaining = EvaluateLiveLocalNeeds(settings, leader);
+                        _stage1SellRepairBuyDone = !remaining.NeedsBuy && !remaining.NeedsRepair && !remaining.NeedsSell;
                     }
                     townTasksComplete = false;
                     return true;
@@ -266,8 +275,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     else
                     {
                         if (me.IsMoving) WoWMovement.MoveStop();
-                        PerformTrainerInteraction(me, trainerEntry);
-                        _stage2TrainDone = true;
+                        _stage2TrainDone = PerformTrainerInteraction(me, trainerEntry);
+                        if (!_stage2TrainDone) { townTasksComplete = false; return true; }
                     }
                 }
             }
@@ -298,7 +307,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private static bool PerformVendorInteraction(Vendor? vendor, TownNeedsEvaluation needs)
         {
             var me = StyxWoW.Me;
-            if (me == null) return true;
+            if (me == null) return false;
 
             WoWUnit? npc = ObjectManager.GetObjectsOfType<WoWUnit>(false, false)
                 .Where(u => u != null && u.IsValid && !u.Dead && u.IsAnyVendor &&
@@ -307,7 +316,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 .FirstOrDefault();
 
             if (npc == null)
-                return true;
+                return false;
 
             if (!MerchantFrame.Instance.IsVisible)
             {
@@ -327,6 +336,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 }
             }
 
+            if (!MerchantFrame.Instance.IsVisible) return false;
             if (MerchantFrame.Instance.IsVisible)
             {
                 if (needs.NeedsSell)
@@ -395,7 +405,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             return null;
         }
 
-        private static void PerformTrainerInteraction(LocalPlayer me, int trainerEntry)
+        private static bool PerformTrainerInteraction(LocalPlayer me, int trainerEntry)
         {
             WoWUnit? trainer = ObjectManager.GetObjectsOfType<WoWUnit>(false, false)
                 .Where(u => u != null && u.IsValid && !u.Dead && u.IsAnyTrainer &&
@@ -405,9 +415,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
             if (trainer == null)
             {
-                Vendors.NeedClassTraining = false;
-                Vendors.ForceTrainer = false;
-                return;
+                return false;
             }
 
             if (!TrainerFrame.Instance.IsVisible)
@@ -433,10 +441,11 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 Vendors.TrainSkills();
                 StyxWoW.Sleep(400);
                 TrainerFrame.Instance.Close();
+                Vendors.NeedClassTraining = false;
+                Vendors.ForceTrainer = false;
+                return true;
             }
-
-            Vendors.NeedClassTraining = false;
-            Vendors.ForceTrainer = false;
+            return false;
         }
     }
 }

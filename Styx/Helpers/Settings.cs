@@ -108,18 +108,15 @@ namespace Styx.Helpers
 			if (string.IsNullOrWhiteSpace(instanceName))
 				return null;
 
-			char[] invalid = Path.GetInvalidFileNameChars();
-			var sb = new StringBuilder(instanceName.Length);
-			foreach (char c in instanceName.Trim())
-			{
-				if (c == Path.DirectorySeparatorChar || c == Path.AltDirectorySeparatorChar || Array.IndexOf(invalid, c) >= 0)
-					sb.Append('_');
-				else
-					sb.Append(c);
-			}
-
-			string result = sb.ToString().Trim('.', ' ');
-			return string.IsNullOrEmpty(result) ? null : result;
+            if (instanceName != instanceName.Trim() || instanceName.EndsWith(".") ||
+                instanceName.IndexOfAny("<>:\"/\\|?*".ToCharArray()) >= 0 ||
+                instanceName.Any(c => char.IsControl(c)) || instanceName is "." or "..")
+                throw new ArgumentException("Instance names must be valid Windows directory names.", nameof(instanceName));
+            string stem = instanceName.Split('.')[0].ToUpperInvariant();
+            if (stem is "CON" or "PRN" or "AUX" or "NUL" ||
+                (stem.Length == 4 && (stem.StartsWith("COM") || stem.StartsWith("LPT")) && stem[3] >= '1' && stem[3] <= '9'))
+                throw new ArgumentException("Reserved Windows instance name.", nameof(instanceName));
+            return instanceName;
 		}
 
 		/// <summary>
@@ -378,19 +375,19 @@ namespace Styx.Helpers
 				{
 					if (float.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out float fInv))
 						return fInv;
-					return float.Parse(val, NumberStyles.Float, CultureInfo.CurrentCulture);
+					return Convert.ChangeType(val, t);
 				}
 				if (t == typeof(double))
 				{
 					if (double.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out double dInv))
 						return dInv;
-					return double.Parse(val, NumberStyles.Float, CultureInfo.CurrentCulture);
+					return Convert.ChangeType(val, t);
 				}
 				if (t == typeof(decimal))
 				{
 					if (decimal.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out decimal mInv))
 						return mInv;
-					return decimal.Parse(val, NumberStyles.Float, CultureInfo.CurrentCulture);
+					return Convert.ChangeType(val, t);
 				}
 				return Convert.ChangeType(val, t);
 			}

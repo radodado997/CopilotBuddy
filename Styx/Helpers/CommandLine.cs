@@ -55,43 +55,24 @@ namespace Styx.Helpers
 
         /// <summary>
         /// Parses an explicit process ID from raw command line args supporting both /pid= and -pid=.
-        /// Returns null when omitted or invalid.
+        /// Returns null when omitted and zero when explicitly invalid.
         /// </summary>
         public static int? ParseProcessId(string[]? args = null)
         {
-            if (args == null)
+            var parsedArguments = args == null ? Arguments : new Arguments(args);
+            if (!parsedArguments.Exists("pid")) return null;
+            if (!parsedArguments.HasOperand("pid")) return 0;
+            try
             {
-                try
-                {
-                    if (AutoAttachProcessId > 0)
-                        return AutoAttachProcessId;
-                }
-                catch
-                {
-                    // Fall through to safe raw argument inspection if -pid is malformed.
-                }
+                string raw = parsedArguments.GetString("pid");
+                return int.TryParse(raw, out int pid) && pid > 0 ? pid : 0;
             }
-
-            args ??= Environment.GetCommandLineArgs();
-            foreach (string arg in args)
-            {
-                if (string.IsNullOrEmpty(arg))
-                    continue;
-
-                if (arg.StartsWith("/pid=", StringComparison.OrdinalIgnoreCase)
-                    || arg.StartsWith("-pid=", StringComparison.OrdinalIgnoreCase))
-                {
-                    string raw = arg.Substring(5).Trim();
-                    if (int.TryParse(raw, out int parsed) && parsed > 0)
-                        return parsed;
-                }
-            }
-
-            return null;
+            catch (ArgumentException) { return 0; }
         }
 
         private static string? GetSingleValue(string key)
         {
+            if (!Arguments.HasOperand(key)) return null;
             var values = Arguments[key];
             if (values == null || values.Count == 0)
                 return null;
@@ -101,6 +82,7 @@ namespace Styx.Helpers
 
         private static string? GetJoinedValues(string key)
         {
+            if (!Arguments.HasOperand(key)) return null;
             var values = Arguments[key];
             if (values == null || values.Count == 0)
                 return null;

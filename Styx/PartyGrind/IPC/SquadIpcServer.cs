@@ -119,11 +119,15 @@ namespace Styx.PartyGrind.IPC
             if (IsListening)
                 return;
 
-            _serverCts = new CancellationTokenSource();
-            _listener = new TcpListener(IPAddress.Loopback, _requestedPort);
-            _listener.Start();
-            _actualPort = ((IPEndPoint)_listener.LocalEndpoint).Port;
-            _acceptTask = Task.Run(() => AcceptLoopAsync(_listener, _serverCts.Token));
+            var listener = new TcpListener(IPAddress.Loopback, _requestedPort);
+            try { listener.Start(); }
+            catch { listener.Stop(); throw; }
+            var cts = new CancellationTokenSource();
+            var token = cts.Token;
+            _listener = listener;
+            _serverCts = cts;
+            _actualPort = ((IPEndPoint)listener.LocalEndpoint).Port;
+            _acceptTask = Task.Run(() => AcceptLoopAsync(listener, token));
         }
 
         public void Stop()
@@ -206,7 +210,7 @@ namespace Styx.PartyGrind.IPC
         /// Automatically populates <see cref="SquadLeaderState.MemberAssignments"/> and
         /// <see cref="SquadLeaderState.MemberRoles"/> when empty or stale.
         /// </summary>
-        public void BroadcastLeaderState(SquadLeaderState state)
+        public void BroadcastLeaderState(SquadLeaderState state, bool populateRoster = true)
         {
             if (state == null || !IsListening)
                 return;
@@ -215,10 +219,17 @@ namespace Styx.PartyGrind.IPC
             lock (_sessionsLock)
             {
                 PruneTimedOutLocked(_utcNowMs());
-                foreach (var kv in _namedSessions.OrderBy(k => k.Key, StringComparer.OrdinalIgnoreCase))
+                if (populateRoster)
                 {
-                    state.MemberAssignments[kv.Key] = kv.Value.SlotIndex;
-                    state.MemberRoles[kv.Key] = kv.Value.Handshake.Role;
+                    foreach (var name in state.MemberAssignments.Keys.Where(n => !string.Equals(n, state.LeaderName, StringComparison.OrdinalIgnoreCase)).ToList())
+                        state.MemberAssignments.Remove(name);
+                    foreach (var name in state.MemberRoles.Keys.Where(n => !string.Equals(n, state.LeaderName, StringComparison.OrdinalIgnoreCase)).ToList())
+                        state.MemberRoles.Remove(name);
+                    foreach (var kv in _namedSessions.OrderBy(k => k.Key, StringComparer.OrdinalIgnoreCase))
+                    {
+                        state.MemberAssignments[kv.Key] = kv.Value.SlotIndex;
+                        state.MemberRoles[kv.Key] = kv.Value.Handshake.Role;
+                    }
                 }
                 targets = _namedSessions.Values.Where(s => !s.Closed).ToList();
             }
@@ -263,6 +274,11 @@ namespace Styx.PartyGrind.IPC
                     continue;
                 }
 
+                if (_allSessions.Values.Count(s => string.IsNullOrEmpty(s.CharacterName)) >= 16)
+                {
+                    client.Dispose();
+                    continue;
+                }
                 long sessionId = Interlocked.Increment(ref _nextSessionId);
                 var session = new MemberSession(sessionId, client);
                 _allSessions[sessionId] = session;
@@ -276,19 +292,34 @@ namespace Styx.PartyGrind.IPC
             CancellationToken ct = linkedCts.Token;
 
             Task sendTask = Task.Run(() => SendLoopAsync(session, ct), ct);
+            Task deadline = Task.Run(async () =>
+            {
+                try
+                {
+                    await Task.Delay(DisconnectTimeoutMs, ct).ConfigureAwait(false);
+                    lock (_sessionsLock)
+                        if (string.IsNullOrEmpty(session.CharacterName))
+                        {
+                            linkedCts.Cancel();
+                            session.Tcp.Close();
+                        }
+                }
+                catch (OperationCanceledException) { }
+            });
             try
             {
                 using var reader = new StreamReader(session.Tcp.GetStream(), new UTF8Encoding(false));
                 while (!ct.IsCancellationRequested)
                 {
-                    string? line = await reader.ReadLineAsync(ct).ConfigureAwait(false);
+                    string? line = await SquadJson.ReadFrameAsync(reader, ct).ConfigureAwait(false);
                     if (line == null)
                         break;
 
                     if (string.IsNullOrWhiteSpace(line))
                         continue;
 
-                    HandleIncomingLine(session, line);
+                    try { HandleIncomingLine(session, line); }
+                    catch (System.Text.Json.JsonException) { }
                 }
             }
             catch (OperationCanceledException)
@@ -306,8 +337,11 @@ namespace Styx.PartyGrind.IPC
             }
             finally
             {
+                try { linkedCts.Cancel(); } catch { }
+                try { session.Tcp.Close(); } catch { }
                 RemoveSession(session);
                 try { await sendTask.ConfigureAwait(false); } catch { }
+                try { await deadline.ConfigureAwait(false); } catch { }
                 session.Dispose();
             }
         }
@@ -365,6 +399,8 @@ namespace Styx.PartyGrind.IPC
                 MemberSession? replaced = null;
                 lock (_sessionsLock)
                 {
+                    if (session.CharacterName.Length > 0 && !string.Equals(session.CharacterName, hs.CharacterName.Trim(), StringComparison.OrdinalIgnoreCase))
+                        return;
                     session.CharacterName = hs.CharacterName.Trim();
                     session.Handshake = hs;
                     session.LastReceivedUtcMs = now;
@@ -389,33 +425,20 @@ namespace Styx.PartyGrind.IPC
 
                 lock (_sessionsLock)
                 {
+                    if (string.IsNullOrEmpty(session.CharacterName) ||
+                        !string.Equals(session.CharacterName, state.CharacterName?.Trim(), StringComparison.OrdinalIgnoreCase))
+                        return;
                     session.LastReceivedUtcMs = now;
                     session.LatestState = state;
-                    if (!string.IsNullOrWhiteSpace(state.CharacterName))
+                    session.Handshake = new SquadHandshake
                     {
-                        string name = state.CharacterName.Trim();
-                        if (string.IsNullOrEmpty(session.CharacterName))
-                        {
-                            session.CharacterName = name;
-                            session.Handshake = new SquadHandshake
-                            {
-                                CharacterName = name,
-                                Guid = state.Guid,
-                                Class = state.Class,
-                                Role = state.Role,
-                                Level = state.Level
-                            };
-                            _namedSessions[name] = session;
-                            ReassignSlotsLocked();
-                        }
-                        else
-                        {
-                            session.Handshake.Level = state.Level;
-                            session.Handshake.Role = state.Role;
-                            session.Handshake.Class = state.Class;
-                            session.Handshake.Guid = state.Guid;
-                        }
-                    }
+                        CharacterName = session.CharacterName,
+                        Guid = state.Guid,
+                        Class = state.Class,
+                        Role = state.Role,
+                        Level = state.Level,
+                        ProtocolVersion = session.Handshake.ProtocolVersion
+                    };
                 }
 
                 MemberStateReceived?.Invoke(state);

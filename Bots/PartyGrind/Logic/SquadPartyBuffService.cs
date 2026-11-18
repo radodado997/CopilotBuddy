@@ -133,7 +133,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 !u.HasAura("Arcane Intellect") &&
                 !u.HasAura("Arcane Brilliance") &&
                 !u.HasAura("Dalaran Intellect") &&
-                !u.HasAura("Fel Intelligence"));
+                !u.HasAura("Fel Intelligence") && SpellManager.CanCast("Arcane Intellect", u, true, false));
 
             if (target != null && SpellManager.CanCast("Arcane Intellect", target, true, false))
                 return SpellManager.Cast("Arcane Intellect", target);
@@ -150,8 +150,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (missingFort.Count >= 2 && SpellManager.CanCast("Prayer of Fortitude", me, false, false))
                 return SpellManager.Cast("Prayer of Fortitude", me);
 
-            if (missingFort.Count > 0 && SpellManager.CanCast("Power Word: Fortitude", missingFort[0], true, false))
-                return SpellManager.Cast("Power Word: Fortitude", missingFort[0]);
+            var missingFortTarget = missingFort.FirstOrDefault(u => SpellManager.CanCast("Power Word: Fortitude", u, true, false));
+            if (missingFortTarget != null)
+                return SpellManager.Cast("Power Word: Fortitude", missingFortTarget);
 
             var missingSpirit = allies.Where(u =>
                 (u.PowerType == WoWPowerType.Mana || u.Class == WoWClass.Druid) &&
@@ -162,8 +163,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (missingSpirit.Count >= 2 && SpellManager.CanCast("Prayer of Spirit", me, false, false))
                 return SpellManager.Cast("Prayer of Spirit", me);
 
-            if (missingSpirit.Count > 0 && SpellManager.CanCast("Divine Spirit", missingSpirit[0], true, false))
-                return SpellManager.Cast("Divine Spirit", missingSpirit[0]);
+            var missingSpiritTarget = missingSpirit.FirstOrDefault(u => SpellManager.CanCast("Divine Spirit", u, true, false));
+            if (missingSpiritTarget != null)
+                return SpellManager.Cast("Divine Spirit", missingSpiritTarget);
 
             return false;
         }
@@ -177,12 +179,13 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (missingMotw.Count >= 2 && SpellManager.CanCast("Gift of the Wild", me, false, false))
                 return SpellManager.Cast("Gift of the Wild", me);
 
-            if (missingMotw.Count > 0 && SpellManager.CanCast("Mark of the Wild", missingMotw[0], true, false))
-                return SpellManager.Cast("Mark of the Wild", missingMotw[0]);
+            var missingMotwTarget = missingMotw.FirstOrDefault(u => SpellManager.CanCast("Mark of the Wild", u, true, false));
+            if (missingMotwTarget != null)
+                return SpellManager.Cast("Mark of the Wild", missingMotwTarget);
 
             var tankOrMelee = allies.FirstOrDefault(u =>
                 (SquadContext.IsMemberRole(u.Guid, SquadRole.TankLeader) || SquadContext.IsMemberRole(u.Guid, SquadRole.DpsMelee)) &&
-                !u.HasAura("Thorns"));
+                !u.HasAura("Thorns") && SpellManager.CanCast("Thorns", u, true, false));
             if (tankOrMelee != null && SpellManager.CanCast("Thorns", tankOrMelee, true, false))
                 return SpellManager.Cast("Thorns", tankOrMelee);
 
@@ -238,7 +241,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (paladinIndex == 0)
             {
                 if (role == SquadRole.TankLeader)
-                    return SpellManager.HasSpell("Blessing of Sanctuary") ? "Blessing of Sanctuary" : "Blessing of Kings";
+                    return new[] { "Blessing of Sanctuary", "Blessing of Kings", "Blessing of Might" }.FirstOrDefault(SpellManager.HasSpell) ?? string.Empty;
                 if (role == SquadRole.Healer || targetClass is WoWClass.Mage or WoWClass.Priest or WoWClass.Warlock)
                     return SpellManager.HasSpell("Blessing of Wisdom") ? "Blessing of Wisdom" : "Blessing of Kings";
                 return SpellManager.HasSpell("Blessing of Might") ? "Blessing of Might" : "Blessing of Kings";

@@ -130,12 +130,6 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 return true;
             }
 
-            if (leader != null && !string.IsNullOrWhiteSpace(leader.LeaderName) &&
-                string.Equals(trimmed, leader.LeaderName.Trim(), StringComparison.OrdinalIgnoreCase))
-            {
-                return true;
-            }
-
             return settings.GetExpectedMemberNames()
                 .Any(n => string.Equals(n, trimmed, StringComparison.OrdinalIgnoreCase));
         }

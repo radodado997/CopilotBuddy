@@ -59,7 +59,7 @@ namespace Styx.PartyGrind.IPC
             get
             {
                 var leader = LatestLeaderState;
-                if (leader == null || string.IsNullOrEmpty(_localCharacterName))
+                if (!IsConnected || leader == null || string.IsNullOrEmpty(_localCharacterName))
                     return null;
                 foreach (var kv in leader.MemberAssignments)
                 {
@@ -89,7 +89,10 @@ namespace Styx.PartyGrind.IPC
             _handshakeProvider = handshakeProvider ?? throw new ArgumentNullException(nameof(handshakeProvider));
             _outbound = CreateOutboundChannel();
             _cts = new CancellationTokenSource();
-            _workerTask = Task.Run(() => ConnectionLoopAsync(_cts.Token));
+            var run = _cts;
+            var token = run.Token;
+            var outbound = _outbound;
+            _workerTask = Task.Run(() => ConnectionLoopAsync(run, token, outbound, handshakeProvider));
         }
 
         public void SendMemberState(SquadMemberState state)
@@ -107,9 +110,15 @@ namespace Styx.PartyGrind.IPC
 
         public void Stop()
         {
-            var cts = _cts;
-            _cts = null;
-            _socketConnected = false;
+            CancellationTokenSource? cts;
+            lock (_stateLock)
+            {
+                cts = _cts;
+                _cts = null;
+                _socketConnected = false;
+                _latestLeaderState = null;
+                Interlocked.Exchange(ref _lastReceivedUtcMs, 0);
+            }
             try { cts?.Cancel(); } catch { }
             try { _outbound.Writer.TryComplete(); } catch { }
             try { _workerTask?.Wait(500); } catch { }
@@ -126,7 +135,7 @@ namespace Styx.PartyGrind.IPC
 
         private static Channel<string> CreateOutboundChannel()
         {
-            return Channel.CreateBounded<string>(new BoundedChannelOptions(32)
+            return Channel.CreateBounded<string>(new BoundedChannelOptions(1)
             {
                 FullMode = BoundedChannelFullMode.DropOldest,
                 SingleReader = true,
@@ -134,7 +143,7 @@ namespace Styx.PartyGrind.IPC
             });
         }
 
-        private async Task ConnectionLoopAsync(CancellationToken ct)
+        private async Task ConnectionLoopAsync(CancellationTokenSource run, CancellationToken ct, Channel<string> outbound, Func<SquadHandshake> handshakeProvider)
         {
             int backoffMs = 500;
             while (!ct.IsCancellationRequested)
@@ -146,17 +155,18 @@ namespace Styx.PartyGrind.IPC
                     await tcp.ConnectAsync(IPAddress.Loopback, _port, ct).ConfigureAwait(false);
                     backoffMs = 500; // reset on successful TCP connect
 
-                    SquadHandshake hs = _handshakeProvider!.Invoke();
-                    _localCharacterName = hs.CharacterName?.Trim() ?? string.Empty;
+                    SquadHandshake hs = handshakeProvider.Invoke();
+                    lock (_stateLock)
+                    {
+                        if (!ReferenceEquals(_cts, run)) return;
+                        _localCharacterName = hs.CharacterName?.Trim() ?? string.Empty;
+                    }
 
-                    Interlocked.Exchange(ref _lastReceivedUtcMs, _utcNowMs());
-                    _socketConnected = true;
-
-                    await RunConnectedSessionAsync(tcp, hs, ct).ConfigureAwait(false);
+                    await RunConnectedSessionAsync(tcp, hs, run, outbound, ct).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException)
                 {
-                    break;
+                    if (ct.IsCancellationRequested) break;
                 }
                 catch (Exception ex)
                 {
@@ -164,7 +174,7 @@ namespace Styx.PartyGrind.IPC
                 }
                 finally
                 {
-                    _socketConnected = false;
+                    ClearSession(run);
                     try { tcp?.Dispose(); } catch { }
                 }
 
@@ -183,10 +193,12 @@ namespace Styx.PartyGrind.IPC
             }
         }
 
-        private async Task RunConnectedSessionAsync(TcpClient tcp, SquadHandshake handshake, CancellationToken outerCt)
+        private async Task RunConnectedSessionAsync(TcpClient tcp, SquadHandshake handshake, CancellationTokenSource run, Channel<string> outbound, CancellationToken outerCt)
         {
             using var sessionCts = CancellationTokenSource.CreateLinkedTokenSource(outerCt);
             CancellationToken ct = sessionCts.Token;
+            long connectedUtcMs = _utcNowMs();
+            long sessionLastReceived = connectedUtcMs;
 
             var stream = tcp.GetStream();
             using var writer = new StreamWriter(stream, new UTF8Encoding(false)) { AutoFlush = false, NewLine = "\n" };
@@ -201,8 +213,11 @@ namespace Styx.PartyGrind.IPC
             {
                 try
                 {
-                    await foreach (string line in _outbound.Reader.ReadAllAsync(ct).ConfigureAwait(false))
+                    await foreach (string line in outbound.Reader.ReadAllAsync(ct).ConfigureAwait(false))
                     {
+                        var pending = SquadJson.DeserializeEnvelope(line);
+                        if (pending == null || _utcNowMs() - pending.TimestampUtcMs > DisconnectTimeoutMs)
+                            continue;
                         await writer.WriteLineAsync(line.AsMemory(), ct).ConfigureAwait(false);
                         await writer.FlushAsync(ct).ConfigureAwait(false);
                     }
@@ -219,10 +234,10 @@ namespace Styx.PartyGrind.IPC
                     while (!ct.IsCancellationRequested)
                     {
                         await Task.Delay(250, ct).ConfigureAwait(false);
-                        long last = Interlocked.Read(ref _lastReceivedUtcMs);
+                        long last = Interlocked.Read(ref sessionLastReceived);
                         if (last > 0 && (_utcNowMs() - last) > DisconnectTimeoutMs)
                         {
-                            _socketConnected = false;
+                            ClearSession(run);
                             sessionCts.Cancel();
                             break;
                         }
@@ -235,18 +250,23 @@ namespace Styx.PartyGrind.IPC
             {
                 while (!ct.IsCancellationRequested)
                 {
-                    string? line = await reader.ReadLineAsync(ct).ConfigureAwait(false);
+                    string? line = await SquadJson.ReadFrameAsync(reader, ct).ConfigureAwait(false);
                     if (line == null)
                         break;
                     if (string.IsNullOrWhiteSpace(line))
                         continue;
 
-                    HandleIncomingLine(line);
+                    try
+                    {
+                        if (HandleIncomingLine(line, run))
+                            Interlocked.Exchange(ref sessionLastReceived, _utcNowMs());
+                    }
+                    catch (System.Text.Json.JsonException) { }
                 }
             }
             finally
             {
-                _socketConnected = false;
+                ClearSession(run);
                 try { sessionCts.Cancel(); } catch { }
                 try { tcp.Close(); } catch { }
                 try { await sendTask.ConfigureAwait(false); } catch { }
@@ -254,7 +274,18 @@ namespace Styx.PartyGrind.IPC
             }
         }
 
-        private void HandleIncomingLine(string line)
+        private void ClearSession(CancellationTokenSource run)
+        {
+            lock (_stateLock)
+            {
+                if (!ReferenceEquals(_cts, run)) return;
+                _socketConnected = false;
+                _latestLeaderState = null;
+                Interlocked.Exchange(ref _lastReceivedUtcMs, 0);
+            }
+        }
+
+        private bool HandleIncomingLine(string line, CancellationTokenSource run)
         {
             SquadEnvelope? envelope;
             try
@@ -264,31 +295,37 @@ namespace Styx.PartyGrind.IPC
             catch (Exception ex)
             {
                 Logging.WriteDebug("[PartyGrind IPC] Client ignored malformed JSON: {0}", ex.Message);
-                return;
+                return false;
             }
 
             if (envelope == null)
-                return;
+                return false;
 
             if (!string.IsNullOrEmpty(_teamId) &&
                 !string.Equals(envelope.TeamId, _teamId, StringComparison.OrdinalIgnoreCase))
             {
-                return;
+                return false;
             }
 
             if (string.Equals(envelope.MessageType, SquadMessageTypes.LeaderState, StringComparison.OrdinalIgnoreCase))
             {
                 var leader = SquadJson.DeserializePayload<SquadLeaderState>(envelope);
-                if (leader == null)
-                    return;
+                if (leader == null || leader.Members == null || leader.Breadcrumbs == null ||
+                    leader.MemberAssignments == null || leader.MemberRoles == null ||
+                    leader.Members.Exists(m => m == null) || leader.Breadcrumbs.Exists(b => b == null))
+                    return false;
 
-                Interlocked.Exchange(ref _lastReceivedUtcMs, _utcNowMs());
                 lock (_stateLock)
                 {
+                    if (!ReferenceEquals(_cts, run) || run.IsCancellationRequested) return false;
+                    Interlocked.Exchange(ref _lastReceivedUtcMs, _utcNowMs());
+                    _socketConnected = true;
                     _latestLeaderState = leader;
                 }
                 LeaderStateReceived?.Invoke(leader);
+                return true;
             }
+            return false;
         }
     }
 }

@@ -96,10 +96,10 @@ namespace Styx.PartyGrind
             };
         }
 
-        public override void Update()
+        protected internal override void Update()
         {
             var settings = SquadContext.ActiveSettings;
-            var leader = SquadContext.GetLeaderStateSnapshot();
+            var leader = SquadContext.IsIpcConnected ? SquadContext.GetLeaderStateSnapshot() : null;
             var local = SquadContext.GetLocalMemberStateSnapshot();
 
             string team = settings?.TeamId ?? "Squad";
@@ -208,7 +208,7 @@ namespace Styx.PartyGrind
             AddCell(g, 2, string.Format(CultureInfo.InvariantCulture, "{0} ({1:F0}%)", m.Level, m.XpPercent), WpfColors.White, FontWeights.Normal);
             AddCell(g, 3, FormatXpPerHour(m.XpPerHour), WpfColors.LightGray, FontWeights.Normal);
             AddCell(g, 4, string.Format(CultureInfo.InvariantCulture, "{0:F0}% / {1:F0}%", m.HealthPercent, m.PowerPercent), WpfColors.White, FontWeights.Normal);
-            AddCell(g, 5, string.Format(CultureInfo.InvariantCulture, "{0:F0} yd", m.DistanceToLeader), WpfColors.LightGray, FontWeights.Normal);
+            AddCell(g, 5, m.DistanceToLeader < 0 ? "—" : string.Format(CultureInfo.InvariantCulture, "{0:F0} yd", m.DistanceToLeader), WpfColors.LightGray, FontWeights.Normal);
             AddCell(g, 6, string.IsNullOrEmpty(m.StateLabel) ? "Grinding" : m.StateLabel, stateColor, FontWeights.SemiBold);
             return g;
         }
@@ -255,6 +255,7 @@ namespace Styx.PartyGrind
     {
         private static readonly object _lock = new object();
         private static SquadOverlayComponent? _component;
+        private static CopilotBuddy.Buddy.Overlay.OverlayManager? _manager;
 
         public static void Attach()
         {
@@ -277,6 +278,7 @@ namespace Styx.PartyGrind
 
                         _component = new SquadOverlayComponent();
                         overlay.AddUIComponent(_component);
+                        _manager = overlay;
                     }
                 }));
             }
@@ -303,8 +305,8 @@ namespace Styx.PartyGrind
                     {
                         if (_component == null)
                             return;
-                        if (StyxWoW.IsOverlayActive)
-                            StyxWoW.Overlay.RemoveUIComponent(_component);
+                        _manager?.RemoveUIComponent(_component);
+                        _manager = null;
                         _component = null;
                     }
                 }));

@@ -16,6 +16,23 @@ namespace Styx.PartyGrind.IPC
             WriteIndented = false
         };
 
+        public const int MaxFrameCharacters = 262144;
+
+        public static async System.Threading.Tasks.Task<string?> ReadFrameAsync(
+            System.IO.StreamReader reader, System.Threading.CancellationToken ct)
+        {
+            var buffer = new char[1];
+            var line = new System.Text.StringBuilder();
+            while (await reader.ReadAsync(buffer.AsMemory(), ct).ConfigureAwait(false) != 0)
+            {
+                if (buffer[0] == '\n') return line.ToString().TrimEnd('\r');
+                if (line.Length >= MaxFrameCharacters)
+                    throw new System.IO.IOException("IPC frame exceeds size limit.");
+                line.Append(buffer[0]);
+            }
+            return line.Length == 0 ? null : line.ToString();
+        }
+
         public static string SerializeEnvelope<TPayload>(string messageType, string teamId, long sequenceId, TPayload payload)
         {
             var envelope = new SquadEnvelope
@@ -40,7 +57,23 @@ namespace Styx.PartyGrind.IPC
         {
             if (string.IsNullOrWhiteSpace(envelope.PayloadJson))
                 return default;
-            return JsonSerializer.Deserialize<TPayload>(envelope.PayloadJson, Options);
+            var result = JsonSerializer.Deserialize<TPayload>(envelope.PayloadJson, Options);
+            if (result is SquadLeaderState leader)
+            {
+                if (leader.MemberAssignments != null)
+                {
+                    var assignments = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var kv in leader.MemberAssignments) assignments[kv.Key] = kv.Value;
+                    leader.MemberAssignments = assignments;
+                }
+                if (leader.MemberRoles != null)
+                {
+                    var roles = new Dictionary<string, SquadRole>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var kv in leader.MemberRoles) roles[kv.Key] = kv.Value;
+                    leader.MemberRoles = roles;
+                }
+            }
+            return result;
         }
     }
 
@@ -166,7 +199,7 @@ namespace Styx.PartyGrind.IPC
         public float TownRallyX { get; set; }
         public float TownRallyY { get; set; }
         public float TownRallyZ { get; set; }
-        public uint TownRallyMapId { get; set; }
+        public uint? TownRallyMapId { get; set; }
         public bool AllTownTasksComplete { get; set; }
 
         // Wipe / Corpse Run

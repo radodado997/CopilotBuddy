@@ -807,6 +807,9 @@ namespace Styx.Logic.Relogin
                             client = ReloginClient.FindClientProcessByName();
                         }
 
+                        if (run.StrictProcessBinding && run.ProcessId == 0)
+                            skipRest = true;
+
                         if (!skipRest && client != null && !PublishProcess(run, run.ProcessId, client.Id, ReloginClient.TryGetProcessStartTimeUtcTicks(client)))
                             return;
 

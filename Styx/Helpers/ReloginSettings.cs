@@ -67,7 +67,7 @@ namespace Styx.Helpers
         internal bool IsCredentialUnavailable => _credentialUnavailable;
 
         public ReloginSettings()
-            : base(Path.Combine(SettingsDirectory, "ReloginSettings.xml"), null, autoInitialize: false)
+            : base(Path.Combine(GetSettingsDirectory(Logging.ApplicationPath, ActiveInstanceName), "ReloginSettings.xml"), null, autoInitialize: false)
         {
             string? snapshotRevision = null;
             try

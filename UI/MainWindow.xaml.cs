@@ -413,6 +413,11 @@ namespace CopilotBuddy.UI
 
             // Step 1: Check for /pid= or -pid= command line argument
             int? explicitPid = CommandLine.ParseProcessId();
+            if (explicitPid == 0)
+            {
+                Logging.Write("Invalid -pid option: supply a positive process ID.");
+                return false;
+            }
 
             _selectedWoWProc = null;
             var candidates = new List<Process>();
@@ -986,7 +991,8 @@ namespace CopilotBuddy.UI
             {
                 if (SquadSettings.Instance.ApplyCliOverrides())
                 {
-                    SquadSettings.Instance.Save();
+                    try { SquadSettings.Instance.Save(); }
+                    catch (Exception ex) { Logging.Write("[PartyGrind] CLI overrides could not be saved: {0}", ex.Message); }
                     Logging.Write("[PartyGrind] Applied CLI flags: Role={0}, Coordinator={1}, Team={2}, Port={3}",
                         SquadSettings.Instance.Role,
                         SquadSettings.Instance.IsCoordinator,

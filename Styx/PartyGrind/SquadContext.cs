@@ -39,7 +39,9 @@ namespace Styx.PartyGrind
         {
             lock (_sync)
             {
+                if (ReferenceEquals(LatestLeaderState, state)) return;
                 LatestLeaderState = state;
+                if (state == null) EffectiveLevelOverride = null;
                 if (state != null)
                 {
                     if (state.EffectiveSquadMinLevel > 0)
@@ -67,10 +69,10 @@ namespace Styx.PartyGrind
             lock (_sync) return LocalMemberState;
         }
 
-        public static int GetMySlotIndex(string? myName = null)
+        public static int GetMySlotIndex(string? myName = null, SquadLeaderState? leader = null)
         {
             myName ??= StyxWoW.Me?.Name ?? LocalMemberState?.CharacterName ?? string.Empty;
-            var leader = GetLeaderStateSnapshot();
+            leader ??= GetLeaderStateSnapshot();
             if (leader == null || string.IsNullOrEmpty(myName))
                 return 0;
 
@@ -115,7 +117,7 @@ namespace Styx.PartyGrind
                     set.Add(leader.LeaderGuid);
                 foreach (var m in leader.Members)
                 {
-                    if (m.Guid != 0)
+                    if (m.IsConnected && m.Guid != 0)
                         set.Add(m.Guid);
                 }
             }

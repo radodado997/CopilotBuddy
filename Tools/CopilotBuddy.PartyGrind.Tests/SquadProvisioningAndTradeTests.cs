@@ -90,6 +90,12 @@ namespace CopilotBuddy.PartyGrind.Tests
             Assert.False(blocked.WantsFood);
             Assert.False(blocked.WantsDrink);
             Assert.False(blocked.WantsHealthstone);
+            var combatBlocked = SquadProvisioningService.EvaluateConsumableNeeds(
+                inCombat: true, freeNormalBagSlots: 6, foodCount: 0, drinkCount: 0,
+                usesMana: true, hasHealthstone: false, squadHasWarlock: true, settings: settings);
+            Assert.False(combatBlocked.WantsFood);
+            Assert.False(combatBlocked.WantsDrink);
+            Assert.False(combatBlocked.WantsHealthstone);
         }
 
         [Fact]

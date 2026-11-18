@@ -76,7 +76,8 @@ namespace Styx.Logic.Inventory.Frames.Trade
         /// </summary>
         public bool PutItem(int luaBagIndex, int luaBagSlot, int tradeSlot, int splitCount = 0, int currentStackCount = 0)
         {
-            if (!IsVisible || tradeSlot < 1 || tradeSlot > 6)
+            if (!IsVisible || tradeSlot < 1 || tradeSlot > 6 ||
+                Lua.GetReturnVal<int>("if CursorHasItem() then return 1 else return 0 end", 0U) == 1)
                 return false;
 
             if (splitCount > 0 && (currentStackCount == 0 || splitCount < currentStackCount))

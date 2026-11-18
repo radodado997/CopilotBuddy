@@ -84,6 +84,16 @@ namespace CopilotBuddy.PartyGrind.Tests
         }
 
         [Fact]
+        public void FourMeleeSlots_StayTwoYardsApartAtMinimumRadius()
+        {
+            var slots = Enumerable.Range(0, 4)
+                .Select(i => SquadFormationService.ComputeMeleeFlankPosition(WoWPoint.Zero, 0, 2, i, 4)).ToArray();
+            for (int i = 0; i < slots.Length; i++)
+                for (int j = i + 1; j < slots.Length; j++)
+                    Assert.True(slots[i].Distance(slots[j]) >= 2f);
+        }
+
+        [Fact]
         public void ResolveSubRoleSlot_PlacesHealerInCenterBetweenTwoRanged()
         {
             var leader = new SquadLeaderState
@@ -160,7 +170,8 @@ namespace CopilotBuddy.PartyGrind.Tests
         {
             Assert.Equal(4321, CommandLine.ParseProcessId(new[] { "CopilotBuddy.exe", "-pid=4321" }));
             Assert.Equal(9876, CommandLine.ParseProcessId(new[] { "CopilotBuddy.exe", "/pid=9876" }));
-            Assert.Null(CommandLine.ParseProcessId(new[] { "CopilotBuddy.exe", "-pid=abc" }));
+            Assert.Equal(0, CommandLine.ParseProcessId(new[] { "CopilotBuddy.exe", "-pid=abc" }));
+            Assert.Null(CommandLine.ParseProcessId(new[] { "CopilotBuddy.exe" }));
 
             string defaultDir = Settings.GetSettingsDirectory(@"C:\Bot", null);
             string client2Dir = Settings.GetSettingsDirectory(@"C:\Bot", "Client2");

@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using CopilotBuddy.Bots.PartyGrind.Logic;
+using Styx;
 using Styx.Combat.CombatRoutine;
 using Styx.Logic.Profiles;
 using Styx.PartyGrind;
@@ -13,6 +14,9 @@ namespace CopilotBuddy.PartyGrind.Tests
     public sealed class SquadCoordinatorAndProfileTests : IDisposable
     {
         private readonly string _tempDir;
+        private readonly object? _previousOuter = typeof(ProfileManager).GetField("_currentOuterProfile", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic)!.GetValue(null);
+        private readonly object? _previousCurrent = typeof(ProfileManager).GetField("_currentProfile", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic)!.GetValue(null);
+        private readonly string _previousXml = ProfileManager.XmlLocation;
 
         public SquadCoordinatorAndProfileTests()
         {
@@ -24,6 +28,9 @@ namespace CopilotBuddy.PartyGrind.Tests
 
         public void Dispose()
         {
+            typeof(ProfileManager).GetField("_currentOuterProfile", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic)!.SetValue(null, _previousOuter);
+            typeof(ProfileManager).GetField("_currentProfile", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic)!.SetValue(null, _previousCurrent);
+            typeof(ProfileManager).GetProperty(nameof(ProfileManager.XmlLocation))!.SetValue(null, _previousXml);
             ProfileManager.LevelOverrideSelector = null;
             SquadContext.Reset();
             try
@@ -34,6 +41,32 @@ namespace CopilotBuddy.PartyGrind.Tests
             catch
             {
             }
+        }
+
+        [Fact]
+        public void HandshakeOnlyMember_GatesLevelWithoutRestOrDistance_ThenUsesTelemetry()
+        {
+            var coordinator = new SquadCoordinatorService();
+            var settings = CreateDefaultSettings();
+            var member = new SquadConnectedMemberSnapshot
+            {
+                CharacterName = "Pending", IsConnected = true,
+                Handshake = new SquadHandshake { CharacterName = "Pending", Level = 2 }
+            };
+            var state = coordinator.EvaluateTick(settings, MakeLeaderState(6), new[] { member },
+                new SquadProfileSnapshot(), 0, 0, 0, 0, 1000);
+            Assert.Equal(2, state.EffectiveSquadMinLevel);
+            Assert.Equal(SquadPhase.Grinding, state.Phase);
+            Assert.False(coordinator.IsWaitingForFollower);
+            var real = MakeConnectedClient("Pending", 0, SquadRole.Healer, WoWClass.Priest, 2, 2000, healthPct: 10);
+            state = coordinator.EvaluateTick(settings, MakeLeaderState(6), new[] { real },
+                new SquadProfileSnapshot(), 0, 0, 0, 0, 2000);
+            Assert.Equal(SquadPhase.Resting, state.Phase);
+            coordinator.IsPausedManually = true;
+            coordinator.ManualPauseReason = "test";
+            coordinator.Reset();
+            Assert.False(coordinator.IsPausedManually);
+            Assert.Empty(coordinator.ManualPauseReason);
         }
 
         private SquadSettings CreateDefaultSettings()

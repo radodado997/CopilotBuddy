@@ -84,23 +84,23 @@
                                     <RowDefinition Height="Auto"/>
                                 </Grid.RowDefinitions>
 
-                                <Label Grid.Row="0" Grid.Column="0" Content="Team ID:"/>
-                                <TextBox x:Name="TxtTeamId" Grid.Row="0" Grid.Column="1"/>
+                                <Label x:Name="LblTxtTeamId" Grid.Row="0" Grid.Column="0" Content="Team ID:"/>
+                                <TextBox x:Name="TxtTeamId" AutomationProperties.LabeledBy="{Binding ElementName=LblTxtTeamId}" Grid.Row="0" Grid.Column="1"/>
 
-                                <Label Grid.Row="1" Grid.Column="0" Content="IPC Loopback Port:"/>
-                                <TextBox x:Name="TxtIpcPort" Grid.Row="1" Grid.Column="1"/>
+                                <Label x:Name="LblTxtIpcPort" Grid.Row="1" Grid.Column="0" Content="IPC Loopback Port:"/>
+                                <TextBox x:Name="TxtIpcPort" AutomationProperties.LabeledBy="{Binding ElementName=LblTxtIpcPort}" Grid.Row="1" Grid.Column="1"/>
 
-                                <Label Grid.Row="2" Grid.Column="0" Content="Squad Role:"/>
-                                <ComboBox x:Name="CmbRole" Grid.Row="2" Grid.Column="1" SelectionChanged="CmbRole_SelectionChanged"/>
+                                <Label x:Name="LblCmbRole" Grid.Row="2" Grid.Column="0" Content="Squad Role:"/>
+                                <ComboBox x:Name="CmbRole" AutomationProperties.LabeledBy="{Binding ElementName=LblCmbRole}" Grid.Row="2" Grid.Column="1" SelectionChanged="CmbRole_SelectionChanged"/>
 
                                 <CheckBox x:Name="ChkIsCoordinator" Grid.Row="3" Grid.Column="1"
                                           Content="Is Coordinator (hosts TCP server, leads route &amp; pulls)"/>
 
-                                <Label Grid.Row="4" Grid.Column="0" Content="Coordinator Character Name:"/>
-                                <TextBox x:Name="TxtCoordinatorName" Grid.Row="4" Grid.Column="1"/>
+                                <Label x:Name="LblTxtCoordinatorName" Grid.Row="4" Grid.Column="0" Content="Coordinator Character Name:"/>
+                                <TextBox x:Name="TxtCoordinatorName" AutomationProperties.LabeledBy="{Binding ElementName=LblTxtCoordinatorName}" Grid.Row="4" Grid.Column="1"/>
 
-                                <Label Grid.Row="5" Grid.Column="0" Content="Expected Roster (CSV):"/>
-                                <TextBox x:Name="TxtExpectedRoster" Grid.Row="5" Grid.Column="1"
+                                <Label x:Name="LblTxtExpectedRoster" Grid.Row="5" Grid.Column="0" Content="Expected Roster (CSV):"/>
+                                <TextBox x:Name="TxtExpectedRoster" AutomationProperties.LabeledBy="{Binding ElementName=LblTxtExpectedRoster}" Grid.Row="5" Grid.Column="1"
                                          ToolTip="Comma-separated names of squad characters (3–5 clients)"/>
                             </Grid>
                         </GroupBox>
@@ -123,8 +123,8 @@
 
                                 <CheckBox x:Name="ChkAutoInvite" Grid.Row="0" Grid.ColumnSpan="2"
                                           Content="Coordinator auto-invites roster &amp; connected members"/>
-                                <Label Grid.Row="1" Grid.Column="0" Content="Invite Interval (sec):"/>
-                                <TextBox x:Name="TxtInviteInterval" Grid.Row="1" Grid.Column="1"/>
+                                <Label x:Name="LblTxtInviteInterval" Grid.Row="1" Grid.Column="0" Content="Invite Interval (sec):"/>
+                                <TextBox x:Name="TxtInviteInterval" AutomationProperties.LabeledBy="{Binding ElementName=LblTxtInviteInterval}" Grid.Row="1" Grid.Column="1"/>
 
                                 <CheckBox x:Name="ChkAutoAcceptInvite" Grid.Row="2" Grid.ColumnSpan="2"
                                           Content="Auto-accept party invite from Coordinator"/>
@@ -133,11 +133,11 @@
                                 <CheckBox x:Name="ChkAutoLoadProfile" Grid.Row="4" Grid.ColumnSpan="2"
                                           Content="Auto-load Coordinator profile XML on members"/>
 
-                                <Label Grid.Row="5" Grid.Column="0" Content="Level Advance Mode:"/>
-                                <ComboBox x:Name="CmbLevelAdvanceMode" Grid.Row="5" Grid.Column="1"/>
+                                <Label x:Name="LblCmbLevelAdvanceMode" Grid.Row="5" Grid.Column="0" Content="Level Advance Mode:"/>
+                                <ComboBox x:Name="CmbLevelAdvanceMode" AutomationProperties.LabeledBy="{Binding ElementName=LblCmbLevelAdvanceMode}" Grid.Row="5" Grid.Column="1"/>
 
-                                <Label Grid.Row="6" Grid.Column="0" Content="Disconnect Grace (sec):"/>
-                                <TextBox x:Name="TxtDisconnectGrace" Grid.Row="6" Grid.Column="1"/>
+                                <Label x:Name="LblTxtDisconnectGrace" Grid.Row="6" Grid.Column="0" Content="Disconnect Grace (sec):"/>
+                                <TextBox x:Name="TxtDisconnectGrace" AutomationProperties.LabeledBy="{Binding ElementName=LblTxtDisconnectGrace}" Grid.Row="6" Grid.Column="1"/>
                             </Grid>
                         </GroupBox>
                     </StackPanel>
@@ -162,14 +162,14 @@
                                     <RowDefinition Height="Auto"/>
                                 </Grid.RowDefinitions>
 
-                                <Label Grid.Row="0" Grid.Column="0" Content="DPS Engage Delay (ms):"/>
-                                <TextBox x:Name="TxtDpsDelay" Grid.Row="0" Grid.Column="1"/>
+                                <Label x:Name="LblTxtDpsDelay" Grid.Row="0" Grid.Column="0" Content="DPS Engage Delay (ms):"/>
+                                <TextBox x:Name="TxtDpsDelay" AutomationProperties.LabeledBy="{Binding ElementName=LblTxtDpsDelay}" Grid.Row="0" Grid.Column="1"/>
 
                                 <CheckBox x:Name="ChkHealerAssistDps" Grid.Row="1" Grid.ColumnSpan="2"
                                           Content="Healer casts safe ranged assist DPS when squad is healthy"/>
 
-                                <Label Grid.Row="2" Grid.Column="0" Content="Healer Assist Min Mana (%):"/>
-                                <TextBox x:Name="TxtHealerAssistMana" Grid.Row="2" Grid.Column="1"/>
+                                <Label x:Name="LblTxtHealerAssistMana" Grid.Row="2" Grid.Column="0" Content="Healer Assist Min Mana (%):"/>
+                                <TextBox x:Name="TxtHealerAssistMana" AutomationProperties.LabeledBy="{Binding ElementName=LblTxtHealerAssistMana}" Grid.Row="2" Grid.Column="1"/>
 
                                 <CheckBox x:Name="ChkEmergencySelfHeal" Grid.Row="3" Grid.ColumnSpan="2"
                                           Content="Emergency self-heal (&lt; 35% HP) before healing allies"/>
@@ -195,22 +195,22 @@
                                     <RowDefinition Height="Auto"/>
                                 </Grid.RowDefinitions>
 
-                                <Label Grid.Row="0" Grid.Column="0" Content="Soft Wait Distance:"/>
-                                <TextBox x:Name="TxtSoftWait" Grid.Row="0" Grid.Column="1"/>
-                                <Label Grid.Row="1" Grid.Column="0" Content="Resume Distance:"/>
-                                <TextBox x:Name="TxtResumeDist" Grid.Row="1" Grid.Column="1"/>
-                                <Label Grid.Row="2" Grid.Column="0" Content="Hard Backtrack Distance:"/>
-                                <TextBox x:Name="TxtHardBacktrack" Grid.Row="2" Grid.Column="1"/>
-                                <Label Grid.Row="3" Grid.Column="0" Content="Max Pull Gather Distance:"/>
-                                <TextBox x:Name="TxtMaxPullGather" Grid.Row="3" Grid.Column="1"/>
-                                <Label Grid.Row="4" Grid.Column="0" Content="Ranged Standoff Distance:"/>
-                                <TextBox x:Name="TxtRangedStandoff" Grid.Row="4" Grid.Column="1"/>
-                                <Label Grid.Row="5" Grid.Column="0" Content="Healer Standoff Distance:"/>
-                                <TextBox x:Name="TxtHealerStandoff" Grid.Row="5" Grid.Column="1"/>
-                                <Label Grid.Row="6" Grid.Column="0" Content="Melee Flank Radius:"/>
-                                <TextBox x:Name="TxtMeleeFlank" Grid.Row="6" Grid.Column="1"/>
-                                <Label Grid.Row="7" Grid.Column="0" Content="Mount Policy:"/>
-                                <ComboBox x:Name="CmbMountPolicy" Grid.Row="7" Grid.Column="1"/>
+                                <Label x:Name="LblTxtSoftWait" Grid.Row="0" Grid.Column="0" Content="Soft Wait Distance:"/>
+                                <TextBox x:Name="TxtSoftWait" AutomationProperties.LabeledBy="{Binding ElementName=LblTxtSoftWait}" Grid.Row="0" Grid.Column="1"/>
+                                <Label x:Name="LblTxtResumeDist" Grid.Row="1" Grid.Column="0" Content="Resume Distance:"/>
+                                <TextBox x:Name="TxtResumeDist" AutomationProperties.LabeledBy="{Binding ElementName=LblTxtResumeDist}" Grid.Row="1" Grid.Column="1"/>
+                                <Label x:Name="LblTxtHardBacktrack" Grid.Row="2" Grid.Column="0" Content="Hard Backtrack Distance:"/>
+                                <TextBox x:Name="TxtHardBacktrack" AutomationProperties.LabeledBy="{Binding ElementName=LblTxtHardBacktrack}" Grid.Row="2" Grid.Column="1"/>
+                                <Label x:Name="LblTxtMaxPullGather" Grid.Row="3" Grid.Column="0" Content="Max Pull Gather Distance:"/>
+                                <TextBox x:Name="TxtMaxPullGather" AutomationProperties.LabeledBy="{Binding ElementName=LblTxtMaxPullGather}" Grid.Row="3" Grid.Column="1"/>
+                                <Label x:Name="LblTxtRangedStandoff" Grid.Row="4" Grid.Column="0" Content="Ranged Standoff Distance:"/>
+                                <TextBox x:Name="TxtRangedStandoff" AutomationProperties.LabeledBy="{Binding ElementName=LblTxtRangedStandoff}" Grid.Row="4" Grid.Column="1"/>
+                                <Label x:Name="LblTxtHealerStandoff" Grid.Row="5" Grid.Column="0" Content="Healer Standoff Distance:"/>
+                                <TextBox x:Name="TxtHealerStandoff" AutomationProperties.LabeledBy="{Binding ElementName=LblTxtHealerStandoff}" Grid.Row="5" Grid.Column="1"/>
+                                <Label x:Name="LblTxtMeleeFlank" Grid.Row="6" Grid.Column="0" Content="Melee Flank Radius:"/>
+                                <TextBox x:Name="TxtMeleeFlank" AutomationProperties.LabeledBy="{Binding ElementName=LblTxtMeleeFlank}" Grid.Row="6" Grid.Column="1"/>
+                                <Label x:Name="LblCmbMountPolicy" Grid.Row="7" Grid.Column="0" Content="Mount Policy:"/>
+                                <ComboBox x:Name="CmbMountPolicy" AutomationProperties.LabeledBy="{Binding ElementName=LblCmbMountPolicy}" Grid.Row="7" Grid.Column="1"/>
                             </Grid>
                         </GroupBox>
 
@@ -227,14 +227,14 @@
                                     <RowDefinition Height="Auto"/>
                                 </Grid.RowDefinitions>
 
-                                <Label Grid.Row="0" Grid.Column="0" Content="Trigger Rest HP %:"/>
-                                <TextBox x:Name="TxtRestTriggerHp" Grid.Row="0" Grid.Column="1"/>
-                                <Label Grid.Row="1" Grid.Column="0" Content="Trigger Rest Mana %:"/>
-                                <TextBox x:Name="TxtRestTriggerMp" Grid.Row="1" Grid.Column="1"/>
-                                <Label Grid.Row="2" Grid.Column="0" Content="Resume Fight HP %:"/>
-                                <TextBox x:Name="TxtRestResumeHp" Grid.Row="2" Grid.Column="1"/>
-                                <Label Grid.Row="3" Grid.Column="0" Content="Resume Fight Mana %:"/>
-                                <TextBox x:Name="TxtRestResumeMp" Grid.Row="3" Grid.Column="1"/>
+                                <Label x:Name="LblTxtRestTriggerHp" Grid.Row="0" Grid.Column="0" Content="Trigger Rest HP %:"/>
+                                <TextBox x:Name="TxtRestTriggerHp" AutomationProperties.LabeledBy="{Binding ElementName=LblTxtRestTriggerHp}" Grid.Row="0" Grid.Column="1"/>
+                                <Label x:Name="LblTxtRestTriggerMp" Grid.Row="1" Grid.Column="0" Content="Trigger Rest Mana %:"/>
+                                <TextBox x:Name="TxtRestTriggerMp" AutomationProperties.LabeledBy="{Binding ElementName=LblTxtRestTriggerMp}" Grid.Row="1" Grid.Column="1"/>
+                                <Label x:Name="LblTxtRestResumeHp" Grid.Row="2" Grid.Column="0" Content="Resume Fight HP %:"/>
+                                <TextBox x:Name="TxtRestResumeHp" AutomationProperties.LabeledBy="{Binding ElementName=LblTxtRestResumeHp}" Grid.Row="2" Grid.Column="1"/>
+                                <Label x:Name="LblTxtRestResumeMp" Grid.Row="3" Grid.Column="0" Content="Resume Fight Mana %:"/>
+                                <TextBox x:Name="TxtRestResumeMp" AutomationProperties.LabeledBy="{Binding ElementName=LblTxtRestResumeMp}" Grid.Row="3" Grid.Column="1"/>
                             </Grid>
                         </GroupBox>
                     </StackPanel>
@@ -262,22 +262,22 @@
                                     <RowDefinition Height="Auto"/>
                                 </Grid.RowDefinitions>
 
-                                <Label Grid.Row="0" Grid.Column="0" Content="Loot Method:"/>
-                                <ComboBox x:Name="CmbLootMethod" Grid.Row="0" Grid.Column="1"/>
-                                <Label Grid.Row="1" Grid.Column="0" Content="Group Roll Rule:"/>
-                                <ComboBox x:Name="CmbRollRule" Grid.Row="1" Grid.Column="1"/>
-                                <Label Grid.Row="2" Grid.Column="0" Content="Max Loot Window (sec):"/>
-                                <TextBox x:Name="TxtMaxLootSec" Grid.Row="2" Grid.Column="1"/>
+                                <Label x:Name="LblCmbLootMethod" Grid.Row="0" Grid.Column="0" Content="Loot Method:"/>
+                                <ComboBox x:Name="CmbLootMethod" AutomationProperties.LabeledBy="{Binding ElementName=LblCmbLootMethod}" Grid.Row="0" Grid.Column="1"/>
+                                <Label x:Name="LblCmbRollRule" Grid.Row="1" Grid.Column="0" Content="Group Roll Rule:"/>
+                                <ComboBox x:Name="CmbRollRule" AutomationProperties.LabeledBy="{Binding ElementName=LblCmbRollRule}" Grid.Row="1" Grid.Column="1"/>
+                                <Label x:Name="LblTxtMaxLootSec" Grid.Row="2" Grid.Column="0" Content="Max Loot Window (sec):"/>
+                                <TextBox x:Name="TxtMaxLootSec" AutomationProperties.LabeledBy="{Binding ElementName=LblTxtMaxLootSec}" Grid.Row="2" Grid.Column="1"/>
                                 <CheckBox x:Name="ChkSyncTownRuns" Grid.Row="3" Grid.ColumnSpan="2"
                                           Content="Synchronize TownRuns across all clients"/>
-                                <Label Grid.Row="4" Grid.Column="0" Content="Trigger Free Bag Slots &lt;=:"/>
-                                <TextBox x:Name="TxtTownBagSlots" Grid.Row="4" Grid.Column="1"/>
-                                <Label Grid.Row="5" Grid.Column="0" Content="Trigger Durability % &lt;=:"/>
-                                <TextBox x:Name="TxtTownDurability" Grid.Row="5" Grid.Column="1"/>
+                                <Label x:Name="LblTxtTownBagSlots" Grid.Row="4" Grid.Column="0" Content="Trigger Free Bag Slots &lt;=:"/>
+                                <TextBox x:Name="TxtTownBagSlots" AutomationProperties.LabeledBy="{Binding ElementName=LblTxtTownBagSlots}" Grid.Row="4" Grid.Column="1"/>
+                                <Label x:Name="LblTxtTownDurability" Grid.Row="5" Grid.Column="0" Content="Trigger Durability % &lt;=:"/>
+                                <TextBox x:Name="TxtTownDurability" AutomationProperties.LabeledBy="{Binding ElementName=LblTxtTownDurability}" Grid.Row="5" Grid.Column="1"/>
                                 <CheckBox x:Name="ChkTrainSkills" Grid.Row="6" Grid.ColumnSpan="2"
                                           Content="Visit individual Class Trainers during TownRun"/>
-                                <Label Grid.Row="7" Grid.Column="0" Content="Wait for Party Ress (sec):"/>
-                                <TextBox x:Name="TxtWaitRessSec" Grid.Row="7" Grid.Column="1"/>
+                                <Label x:Name="LblTxtWaitRessSec" Grid.Row="7" Grid.Column="0" Content="Wait for Party Ress (sec):"/>
+                                <TextBox x:Name="TxtWaitRessSec" AutomationProperties.LabeledBy="{Binding ElementName=LblTxtWaitRessSec}" Grid.Row="7" Grid.Column="1"/>
                             </Grid>
                         </GroupBox>
 
@@ -306,18 +306,18 @@
                                           Content="Enable Mage food &amp; water provisioning"/>
                                 <CheckBox x:Name="ChkPreferMageFood" Grid.Row="1" Grid.ColumnSpan="2"
                                           Content="Prefer Mage consumables over buying at vendor"/>
-                                <Label Grid.Row="2" Grid.Column="0" Content="Min Member Food Stack:"/>
-                                <TextBox x:Name="TxtMinFood" Grid.Row="2" Grid.Column="1"/>
-                                <Label Grid.Row="3" Grid.Column="0" Content="Target Member Food Stack:"/>
-                                <TextBox x:Name="TxtTargetFood" Grid.Row="3" Grid.Column="1"/>
-                                <Label Grid.Row="4" Grid.Column="0" Content="Min Member Drink Stack:"/>
-                                <TextBox x:Name="TxtMinDrink" Grid.Row="4" Grid.Column="1"/>
-                                <Label Grid.Row="5" Grid.Column="0" Content="Target Member Drink Stack:"/>
-                                <TextBox x:Name="TxtTargetDrink" Grid.Row="5" Grid.Column="1"/>
-                                <Label Grid.Row="6" Grid.Column="0" Content="Trade Timeout (sec):"/>
-                                <TextBox x:Name="TxtTradeTimeout" Grid.Row="6" Grid.Column="1"/>
-                                <Label Grid.Row="7" Grid.Column="0" Content="Provision Cooldown (sec):"/>
-                                <TextBox x:Name="TxtProvisionCooldown" Grid.Row="7" Grid.Column="1"/>
+                                <Label x:Name="LblTxtMinFood" Grid.Row="2" Grid.Column="0" Content="Min Member Food Stack:"/>
+                                <TextBox x:Name="TxtMinFood" AutomationProperties.LabeledBy="{Binding ElementName=LblTxtMinFood}" Grid.Row="2" Grid.Column="1"/>
+                                <Label x:Name="LblTxtTargetFood" Grid.Row="3" Grid.Column="0" Content="Target Member Food Stack:"/>
+                                <TextBox x:Name="TxtTargetFood" AutomationProperties.LabeledBy="{Binding ElementName=LblTxtTargetFood}" Grid.Row="3" Grid.Column="1"/>
+                                <Label x:Name="LblTxtMinDrink" Grid.Row="4" Grid.Column="0" Content="Min Member Drink Stack:"/>
+                                <TextBox x:Name="TxtMinDrink" AutomationProperties.LabeledBy="{Binding ElementName=LblTxtMinDrink}" Grid.Row="4" Grid.Column="1"/>
+                                <Label x:Name="LblTxtTargetDrink" Grid.Row="5" Grid.Column="0" Content="Target Member Drink Stack:"/>
+                                <TextBox x:Name="TxtTargetDrink" AutomationProperties.LabeledBy="{Binding ElementName=LblTxtTargetDrink}" Grid.Row="5" Grid.Column="1"/>
+                                <Label x:Name="LblTxtTradeTimeout" Grid.Row="6" Grid.Column="0" Content="Trade Timeout (sec):"/>
+                                <TextBox x:Name="TxtTradeTimeout" AutomationProperties.LabeledBy="{Binding ElementName=LblTxtTradeTimeout}" Grid.Row="6" Grid.Column="1"/>
+                                <Label x:Name="LblTxtProvisionCooldown" Grid.Row="7" Grid.Column="0" Content="Provision Cooldown (sec):"/>
+                                <TextBox x:Name="TxtProvisionCooldown" AutomationProperties.LabeledBy="{Binding ElementName=LblTxtProvisionCooldown}" Grid.Row="7" Grid.Column="1"/>
                                 <CheckBox x:Name="ChkEnableWarlockHs" Grid.Row="8" Grid.ColumnSpan="2"
                                           Content="Enable Warlock Healthstones &amp; Soulstone on Healer"/>
                                 <CheckBox x:Name="ChkUseRitualTables" Grid.Row="9" Grid.ColumnSpan="2"
@@ -355,17 +355,17 @@
                                 <RowDefinition Height="Auto"/>
                             </Grid.RowDefinitions>
 
-                            <Label Grid.Row="0" Grid.Column="0" Content="Client Count:"/>
-                            <ComboBox x:Name="CmbClientCount" Grid.Row="0" Grid.Column="1" SelectionChanged="CmbClientCount_SelectionChanged"/>
+                            <Label x:Name="LblCmbClientCount" Grid.Row="0" Grid.Column="0" Content="Client Count:"/>
+                                <ComboBox x:Name="CmbClientCount" AutomationProperties.LabeledBy="{Binding ElementName=LblCmbClientCount}" Grid.Row="0" Grid.Column="1" SelectionChanged="CmbClientCount_SelectionChanged"/>
 
-                            <Label Grid.Row="1" Grid.Column="0" Content="Profile XML Path:"/>
-                            <TextBox x:Name="TxtScriptProfilePath" Grid.Row="1" Grid.Column="1"/>
+                            <Label x:Name="LblTxtScriptProfilePath" Grid.Row="1" Grid.Column="0" Content="Profile XML Path:"/>
+                                <TextBox x:Name="TxtScriptProfilePath" AutomationProperties.LabeledBy="{Binding ElementName=LblTxtScriptProfilePath}" Grid.Row="1" Grid.Column="1"/>
 
-                            <Label Grid.Row="2" Grid.Column="0" Content="Character Names (CSV):"/>
-                            <TextBox x:Name="TxtScriptNames" Grid.Row="2" Grid.Column="1"/>
+                            <Label x:Name="LblTxtScriptNames" Grid.Row="2" Grid.Column="0" Content="Character Names (CSV):"/>
+                                <TextBox x:Name="TxtScriptNames" AutomationProperties.LabeledBy="{Binding ElementName=LblTxtScriptNames}" Grid.Row="2" Grid.Column="1"/>
 
-                            <Label Grid.Row="3" Grid.Column="0" Content="Roles (CSV):"/>
-                            <TextBox x:Name="TxtScriptRoles" Grid.Row="3" Grid.Column="1"/>
+                            <Label x:Name="LblTxtScriptRoles" Grid.Row="3" Grid.Column="0" Content="Roles (CSV):"/>
+                                <TextBox x:Name="TxtScriptRoles" AutomationProperties.LabeledBy="{Binding ElementName=LblTxtScriptRoles}" Grid.Row="3" Grid.Column="1"/>
                         </Grid>
                     </GroupBox>
 
@@ -374,7 +374,7 @@
                         <Button x:Name="BtnCopyScript" Content="Copy Script" Click="BtnCopyScript_Click"/>
                     </StackPanel>
 
-                    <TextBox x:Name="TxtGeneratedScript" Grid.Row="2"
+                    <TextBox IsReadOnly="True" x:Name="TxtGeneratedScript" Grid.Row="2"
                              AcceptsReturn="True" TextWrapping="NoWrap"
                              HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto"
                              FontFamily="Consolas" FontSize="11"/>
