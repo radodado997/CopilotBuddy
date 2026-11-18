@@ -66,7 +66,7 @@ namespace Styx.PartyGrind.IPC
             if (hello == null || hello.Length != 2 || hello[1].Length != 64 || !secrets.TryGetValue(hello[0], out string? secret))
                 throw new IOException("Unconfigured squad member.");
             string nonce = Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
-            string context = JsonSerializer.Serialize(new[] { team, hello[0], hello[1], nonce });
+            string context = JsonSerializer.Serialize(new[] { team.ToUpperInvariant(), hello[0], hello[1], nonce });
             var auth = new SquadPeerAuthentication(hello[0], secret, context, true);
             await Write(writer, JsonSerializer.Serialize(new[] { nonce, auth.Mac(context + "server-proof") }), ct).ConfigureAwait(false);
             if (!auth.Verify(context + "client-proof", await Read(reader, ct).ConfigureAwait(false)))
@@ -81,7 +81,7 @@ namespace Styx.PartyGrind.IPC
             await Write(writer, JsonSerializer.Serialize(new[] { name, nonce }), ct).ConfigureAwait(false);
             var reply = JsonSerializer.Deserialize<string[]>(await Read(reader, ct).ConfigureAwait(false));
             if (reply == null || reply.Length != 2 || reply[0].Length != 64) throw new IOException("Invalid squad challenge.");
-            string context = JsonSerializer.Serialize(new[] { team, name, nonce, reply[0] });
+            string context = JsonSerializer.Serialize(new[] { team.ToUpperInvariant(), name, nonce, reply[0] });
             var auth = new SquadPeerAuthentication(name, secret, context, false);
             if (!auth.Verify(context + "server-proof", reply[1])) throw new IOException("Squad coordinator authentication failed.");
             await Write(writer, auth.Mac(context + "client-proof"), ct).ConfigureAwait(false);

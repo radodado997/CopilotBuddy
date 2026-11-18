@@ -323,9 +323,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     var targetSummary = leader?.Members?.FirstOrDefault(m =>
                         string.Equals(m.CharacterName, _activeTradeTarget, StringComparison.OrdinalIgnoreCase));
                     int receiverLevel = targetSummary?.Level ?? me.Level;
-                    bool wantFood = targetSummary?.WantsFood ?? true;
-                    bool wantDrink = targetSummary?.WantsDrink ?? true;
-                    bool wantHs = targetSummary?.WantsHealthstone ?? false;
+                    bool wantFood = me.Class == WoWClass.Mage && settings.EnableMageProvisioning && SpellManager.HasSpell("Conjure Food") && (targetSummary?.WantsFood ?? false);
+                    bool wantDrink = me.Class == WoWClass.Mage && settings.EnableMageProvisioning && SpellManager.HasSpell("Conjure Water") && (targetSummary?.WantsDrink ?? false);
+                    bool wantHs = me.Class == WoWClass.Warlock && settings.EnableWarlockHealthstones && (targetSummary?.WantsHealthstone ?? false);
 
                     int tradeSlot = 1;
                     bool placed = true;

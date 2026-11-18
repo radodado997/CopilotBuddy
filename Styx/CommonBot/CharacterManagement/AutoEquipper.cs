@@ -77,6 +77,10 @@ namespace Styx.CommonBot.CharacterManagement
                 return 0f;
 
             float score = 0f;
+            if (StatWeights.TryGetValue(StyxWoW.Me.Class, out var weights))
+                foreach (var stat in item.GetItemStats())
+                    if (weights.TryGetValue((WoWItemStatType)(int)stat.Key, out float weight))
+                        score += stat.Value * weight;
 
             // Simple evaluation: bonus for correct armor type
             if (item.ItemClass == WoWItemClass.Armor && item.Armor > 0)

@@ -368,9 +368,9 @@ namespace CopilotBuddy.Bots.PartyGrind
                 if (settings.AutoLoadCoordinatorProfile && !EnsureLeaderProfile(leaderState))
                 {
                     SquadContext.UpdateLeaderState(null);
-                    return;
                 }
-                SquadContext.UpdateLeaderState(leaderState);
+                else
+                    SquadContext.UpdateLeaderState(leaderState);
 
                 if (leaderState.EffectiveSquadMinLevel > 0 && leaderState.EffectiveSquadMinLevel != _lastAppliedEffectiveLevel)
                 {
@@ -544,6 +544,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                 settings);
 
             _townRun.ObservePhase(leader?.Phase);
+            _townRun.RecheckBlocked(settings, leader);
             var townNeeds = SquadTownRunService.EvaluateLiveLocalNeeds(settings, leader);
             if (leader == null || leader.Phase != SquadPhase.TownRun)
                 _townTasksCompleteLocal = false;

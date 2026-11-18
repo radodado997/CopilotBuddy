@@ -150,6 +150,17 @@ namespace CopilotBuddy.PartyGrind.Tests
         }
 
         [Fact]
+        public void LevelFourMage_WaterDoesNotSuppressFoodVendorNeed()
+        {
+            var needs = SquadTownRunService.EvaluateLocalTownNeeds(
+                10, 90, false, false, true, 20, 20, false, false, true,
+                SquadProvisioningService.SelectBestConjureRank(false, 4, 4).HasValue,
+                SquadProvisioningService.SelectBestConjureRank(true, 4, 4).HasValue,
+                MakeSettings());
+            Assert.True(needs.NeedsBuy);
+        }
+
+        [Fact]
         public void EvaluateLocalTownNeeds_SuppressesFoodDrinkVendorRunWhenMageActive()
         {
             var settings = MakeSettings();

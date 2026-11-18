@@ -26,6 +26,32 @@ namespace CopilotBuddy.PartyGrind.Tests
         }
 
         [Fact]
+        public async Task Authentication_RejectsDifferentTeamWithCorrectMemberSecret()
+        {
+            using var server = new SquadIpcServer(0, "SquadBlue", memberSecrets: Secrets);
+            server.Start();
+            using var client = new System.Net.Sockets.TcpClient();
+            await client.ConnectAsync(System.Net.IPAddress.Loopback, server.Port);
+            using var reader = new System.IO.StreamReader(client.GetStream());
+            using var writer = new System.IO.StreamWriter(client.GetStream()) { AutoFlush = true };
+            using var timeout = new System.Threading.CancellationTokenSource(TimeSpan.FromSeconds(4));
+            await Assert.ThrowsAsync<System.IO.IOException>(() => SquadPeerAuthentication.Client(
+                reader, writer, "Follower", Secret("Follower"), "SquadRed", timeout.Token));
+            Assert.Empty(server.GetMemberSnapshots());
+        }
+
+        [Fact]
+        public async Task Authentication_AcceptsTeamCaseDifferences()
+        {
+            using var server = new SquadIpcServer(0, "SquadBlue", memberSecrets: Secrets);
+            server.Start();
+            using var client = new SquadIpcClient(server.Port, "squadblue", memberSecret: Secret("Follower"));
+            client.Start(() => new SquadHandshake { CharacterName = "Follower", Level = 5 });
+            await WaitUntilAsync(() => server.GetMemberSnapshots().Count == 1);
+            Assert.Equal("Follower", Assert.Single(server.GetMemberSnapshots()).CharacterName);
+        }
+
+        [Fact]
         public async Task SameClient_ReconnectsAutomaticallyAfterListenerRestart()
         {
             using var server = new SquadIpcServer(0, "Retry", memberSecrets: Secrets);
@@ -211,7 +237,7 @@ namespace CopilotBuddy.PartyGrind.Tests
         }
 
         [Fact]
-        public async Task Server_RejectsWrongTeamId_AndClientReconnectsAfterRestart()
+        public async Task Server_RejectsMalformedAuthentication_AndClientReconnectsAfterRestart()
         {
             using var server = new SquadIpcServer(0, "SquadBlue", memberSecrets: Secrets);
             server.DisconnectTimeoutMs = 5000;

@@ -61,6 +61,31 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (_wasInTownRun && phase != SquadPhase.TownRun && phase != SquadPhase.Paused) Reset();
         }
 
+        public void RecheckBlocked(SquadSettings settings, SquadLeaderState? leader)
+        {
+            var me = StyxWoW.Me;
+            if (me == null || BlockedReason.Length == 0) return;
+            var needs = EvaluateLiveLocalNeeds(settings, leader);
+            bool resolved = BlockedReason switch
+            {
+                "No eligible vendor found." => ResolveSellOrRepairVendor(needs) != null ||
+                    (!needs.NeedsSell && !needs.NeedsRepair && !needs.NeedsBuy),
+                "No mailbox found." => ProfileManager.CurrentProfile?.MailboxManager?.GetClosestMailbox() != null ||
+                    string.IsNullOrWhiteSpace(CharacterSettings.Instance.MailRecipient) ||
+                    !Styx.Logic.Inventory.InventoryManager.GetItemsToMail().Any(),
+                "Class trainer not found; training remains pending." => !needs.NeedsTrain ||
+                    ResolveClassTrainerLocation(me, out _, out _).HasValue,
+                "Rally is on another map; cross-map town travel is unavailable." => leader != null &&
+                    (!leader.TownRallyMapId.HasValue || leader.TownRallyMapId == me.MapId),
+                _ => false
+            };
+            if (resolved)
+            {
+                BlockedReason = string.Empty;
+                _stageStarted = Environment.TickCount64;
+            }
+        }
+
         public void Reset()
         {
             _stage1SellRepairBuyDone = false;
@@ -197,8 +222,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (leader.TownRallyMapId.HasValue && leader.TownRallyMapId != me.MapId)
                 return Block("Rally is on another map; cross-map town travel is unavailable.", out townTasksComplete);
             var needs = EvaluateLiveLocalNeeds(settings, leader);
-            _mailRequested |= needs.NeedsMail;
-            if (Environment.TickCount64 - _stageStarted > 120000)
+            if (!_stage1MailDone) _mailRequested |= needs.NeedsMail;
+            if (!(_stage1SellRepairBuyDone && _stage1MailDone && _stage2TrainDone) && Environment.TickCount64 - _stageStarted > 120000)
                 return Block("Town task timed out before completion.", out townTasksComplete);
 
             // Stage 1A: Travel to rally vendor & Sell/Repair/Buy.
@@ -224,10 +249,17 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     if (PerformVendorInteraction(vendor, needs))
                     {
                         var remaining = EvaluateLiveLocalNeeds(settings, leader);
-                        _stage1SellRepairBuyDone = !remaining.NeedsBuy && !remaining.NeedsRepair && !remaining.NeedsSell;
+                        _stage1SellRepairBuyDone = !remaining.NeedsBuy && !remaining.NeedsRepair &&
+                            (!remaining.NeedsSell || (_mailRequested && !_stage1MailDone));
                     }
                     if (++_vendorAttempts >= 5 && !_stage1SellRepairBuyDone)
-                        return Block("Vendor tasks remain unmet after five attempts.", out townTasksComplete);
+                    {
+                        var remaining = EvaluateLiveLocalNeeds(settings, leader);
+                        if (_mailRequested && !_stage1MailDone && !remaining.NeedsBuy && !remaining.NeedsRepair)
+                            _stage1SellRepairBuyDone = true;
+                        else
+                            return Block("Vendor tasks remain unmet after five attempts.", out townTasksComplete);
+                    }
                     townTasksComplete = false;
                     return true;
                 }
@@ -281,6 +313,19 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                             return true;
                         }
                     }
+                }
+            }
+
+            if (_stage1MailDone && _mailRequested)
+            {
+                _mailRequested = false;
+                if (EvaluateLiveLocalNeeds(settings, leader).NeedsSell)
+                {
+                    _stage1SellRepairBuyDone = false;
+                    if (_vendorAttempts >= 5)
+                        return Block("Vendor tasks remain unmet after five attempts.", out townTasksComplete);
+                    townTasksComplete = false;
+                    return true;
                 }
             }
 

@@ -8,21 +8,21 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 {
     internal sealed class SquadApproach
     {
-        private readonly Dictionary<ulong, (float Distance, long Progress, long Retry)> _progress = new();
+        private readonly Dictionary<ulong, (float Distance, long Progress, long Retry, long Attempt)> _progress = new();
         public bool TryMove(WoWUnit target, string reason)
         {
             long now = Environment.TickCount64;
             float distance = StyxWoW.Me.Location.Distance(target.Location);
-            if (!_progress.TryGetValue(target.Guid, out var state)) state = (distance, now, 0);
+            if (!_progress.TryGetValue(target.Guid, out var state)) state = (distance, now, 0, now);
             if (now < state.Retry) return false;
-            if (state.Retry != 0 || distance < state.Distance - 1f) state = (distance, now, 0);
+            if (now - state.Attempt > 1000 || state.Retry != 0 || distance < state.Distance - 1f) state = (distance, now, 0, now);
             var result = Navigator.MoveTo(target.Location, reason);
             if (result is MoveResult.Failed or MoveResult.PathGenerationFailed or MoveResult.ReachedDestination || now - state.Progress > 5000)
             {
-                _progress[target.Guid] = (distance, now, now + 15000);
+                _progress[target.Guid] = (distance, now, now + 15000, now);
                 return false;
             }
-            _progress[target.Guid] = state;
+            _progress[target.Guid] = (state.Distance, state.Progress, state.Retry, now);
             return true;
         }
     }

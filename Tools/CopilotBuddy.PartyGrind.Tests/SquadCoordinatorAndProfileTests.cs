@@ -45,6 +45,22 @@ namespace CopilotBuddy.PartyGrind.Tests
         }
 
         [Fact]
+        public void TownBlock_ClearedTelemetryResumesWithoutCoordinatorReset()
+        {
+            var coordinator = new SquadCoordinatorService();
+            var settings = CreateDefaultSettings();
+            var local = MakeLeaderState(10);
+            local.NeedsSell = true;
+            local.TownBlockedReason = "No eligible vendor found.";
+            var profile = new SquadProfileSnapshot();
+            Assert.Equal(SquadPhase.Paused, coordinator.EvaluateTick(settings, local,
+                Array.Empty<SquadConnectedMemberSnapshot>(), profile, 0, 0, 0, 0, 1000).Phase);
+            local.TownBlockedReason = string.Empty;
+            Assert.Equal(SquadPhase.TownRun, coordinator.EvaluateTick(settings, local,
+                Array.Empty<SquadConnectedMemberSnapshot>(), profile, 0, 0, 0, 0, 2000).Phase);
+        }
+
+        [Fact]
         public void UntrainedLivingHealer_DoesNotDelayCorpseRecovery()
         {
             var coord = new SquadCoordinatorService();

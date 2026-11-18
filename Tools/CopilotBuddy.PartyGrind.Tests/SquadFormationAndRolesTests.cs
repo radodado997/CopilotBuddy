@@ -45,6 +45,30 @@ namespace CopilotBuddy.PartyGrind.Tests
             Assert.Equal(20f, next.X);
         }
 
+        [Fact]
+        public void BreadcrumbFollow_RetainsProgressAndResetsForNewRoute()
+        {
+            var progress = new SquadTravelProgress();
+            var leader = new SquadLeaderState { X = 100, MapId = 1, LeaderGuid = 10,
+                Breadcrumbs = new List<SquadBreadcrumb>
+                {
+                    new() { X = 0, MapId = 1, TimestampUtcMs = 1 },
+                    new() { X = 10, MapId = 1, TimestampUtcMs = 2 },
+                    new() { X = 20, MapId = 1, TimestampUtcMs = 3 },
+                    new() { X = 30, MapId = 1, TimestampUtcMs = 4 }
+                } };
+            Assert.Equal(20f, SquadFormationService.ComputeTravelFollowPosition(new WoWPoint(10, 0, 0), leader, 0, progress).X);
+            Assert.Equal(30f, SquadFormationService.ComputeTravelFollowPosition(new WoWPoint(20, 0, 0), leader, 0, progress).X);
+            Assert.Equal(30f, SquadFormationService.ComputeTravelFollowPosition(new WoWPoint(10, 0, 0), leader, 0, progress).X);
+            Assert.Equal(3, progress.LastReachedTimestamp);
+            leader.LeaderGuid = 11;
+            Assert.Equal(20f, SquadFormationService.ComputeTravelFollowPosition(new WoWPoint(10, 0, 0), leader, 0, progress).X);
+            leader.MapId = 2;
+            foreach (var breadcrumb in leader.Breadcrumbs) breadcrumb.MapId = 2;
+            Assert.Equal(10f, SquadFormationService.ComputeTravelFollowPosition(WoWPoint.Zero, leader, 0, progress).X);
+            Assert.Equal(1, progress.LastReachedTimestamp);
+        }
+
         [Theory]
         [InlineData(0f)]
         [InlineData(1.047f)]
