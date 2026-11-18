@@ -45,6 +45,14 @@ namespace Styx.WoWInternals
         private static readonly Dictionary<ulong, WoWObject> _objectsToRemove = new();
         private static ObjectListUpdateFinishedDelegate? _onObjectListUpdateFinished;
         private static readonly object _updateLock = new();
+        private static readonly object _notifyQueueLock = new();
+        private static readonly Queue<(long Epoch, LocalPlayer? Me, ObjectListUpdateFinishedDelegate? Handler, List<WoWObject>? Invalidated)> _pendingNotifications = new();
+        private static bool _drainingNotifications;
+        private static int _drainingThreadId;
+        private static int _activeNotificationCallbacks;
+        private static long _attachmentEpoch;
+        private static bool _attachmentRetired;
+        private static long _cacheRevision;
 
         // caches used by targeting and other systems (400ms window mirrors HB)
         private static readonly TimeCachedValue<List<WoWUnit>> _cachedUnits =
@@ -67,6 +75,7 @@ namespace Styx.WoWInternals
             // a concurrent AcquireFrame/ScanCaches is in progress.
             lock (_cacheLock)
             {
+                Interlocked.Increment(ref _cacheRevision);
                 _distanceCache.Clear();
                 _losCache.Clear();
                 _threatCache.Clear();
@@ -270,7 +279,16 @@ namespace Styx.WoWInternals
             
             // Hook EndScene for code execution
             HookEndscene();
-            
+
+            // Activate a fresh notification epoch for this attachment before the first Update().
+            lock (_notifyQueueLock)
+            {
+                _attachmentEpoch++;
+                _attachmentRetired = false;
+                _pendingNotifications.Clear();
+            }
+            Interlocked.Increment(ref _cacheRevision);
+
             // First Update to populate the object list
             Update();
 
@@ -361,15 +379,32 @@ namespace Styx.WoWInternals
         #region Update - Core of the system
         public static void Update()
         {
+            UpdateAndCheckLocalPlayer();
+        }
+
+        /// <summary>
+        /// Returns whether this pass completed without a walk failure and reached the local
+        /// player. Me is retained across incomplete passes, so it alone is not a readiness signal.
+        /// </summary>
+        internal static bool UpdateAndCheckLocalPlayer()
+        {
             if (Wow == null)
             {
                 throw new InvalidOperationException("Memory not initialized. Call Initialize() first.");
             }
-            
+
+            bool result;
             lock (_updateLock)
             {
+                List<WoWObject>? invalidatedObjects = null;
                 try
                 {
+                    // Retrieve the local GUID before the marker pass so a GUID change
+                    // (switching characters) does not preserve or rebase the old Me wrapper.
+                    ulong localGuid = LocalGuid;
+                    LocalPlayer? previousMe = Me;
+                    ulong previousMeGuid = 0UL;
+
                     // Mark all objects as potentially invalid.  HB originally ran on a single
                     // thread so nobody could read an object while it was being cleared.
                     // In CopilotBuddy the background updater runs concurrently with other
@@ -378,11 +413,16 @@ namespace Styx.WoWInternals
                     // InvalidOperationException like the one seen in the log above.
                     //
                     // To avoid this race we skip the local player during the marker
-                    // pass; its address will be updated later in the enumeration.
+                    // pass when its GUID has not changed; its address will be updated
+                    // later in the enumeration.
                     foreach (var kvp in _objectList)
                     {
-                        if (Me != null && ReferenceEquals(kvp.Value, Me))
-                            continue; // keep our own pointer valid until replaced
+                        if (previousMe != null && ReferenceEquals(kvp.Value, previousMe))
+                        {
+                            previousMeGuid = kvp.Key;
+                            if (localGuid == 0UL || kvp.Key == localGuid)
+                                continue; // keep our own pointer valid until replaced
+                        }
                         kvp.Value.UpdateBaseAddress(0U);
                     }
                     
@@ -402,12 +442,12 @@ namespace Styx.WoWInternals
                     typeOffset -= minOffset;
                     nextOffset -= minOffset;
                     
-                    // Retrieve the local GUID
-                    ulong localGuid = LocalGuid;
+                    bool localPlayerFound = false;
+                    bool walkSucceeded = true;
                     
                     // Retrieve the first object from the list
                     uint curMgr = CurMgr;
-                    if (curMgr == 0U) return;
+                    if (curMgr == 0U) return false;
                     
                     uint currentObject = Wow.Read<uint>(curMgr + FirstObjectOffset);
                     var visited = new HashSet<uint>(64);
@@ -423,6 +463,7 @@ namespace Styx.WoWInternals
                         if (!Wow.TryReadBytes(currentObject + (uint)minOffset, buffer, buffer.Length))
                         {
                             Logging.WriteDebug("ObjectManager: batch read failed at 0x{0:X8}; aborting this update", currentObject);
+                            walkSucceeded = false;
                             break;
                         }
 
@@ -431,22 +472,48 @@ namespace Styx.WoWInternals
                         if (!visited.Add(currentObject))
                         {
                             Logging.WriteDebug("ObjectManager: cyclic object list at 0x{0:X8}; aborting this update", currentObject);
+                            walkSucceeded = false;
                             break;
                         }
 
                         // Extract GUID
                         ulong objGuid = BitConverter.ToUInt64(buffer, guidOffset);
                         
-                        // If it's the local player, update Me
-                        if (objGuid == localGuid && Me != null)
-                        {
-                            Me.UpdateBaseAddress(currentObject);
-                        }
-                        
                         // Update or create the object
                         if (_objectList.TryGetValue(objGuid, out WoWObject? existingObj))
                         {
-                            existingObj.UpdateBaseAddress(currentObject);
+                            // The local GUID may not have been available when this wrapper
+                            // was created (e.g. while entering the world on the glue screen).
+                            if (objGuid != 0 && objGuid == localGuid)
+                            {
+                                WoWObject? replacedObj = null;
+                                LocalPlayer localPlayer;
+                                if (existingObj is LocalPlayer existingLocalPlayer)
+                                {
+                                    localPlayer = existingLocalPlayer;
+                                }
+                                else
+                                {
+                                    replacedObj = existingObj;
+                                    bool canReusePreviousMe = previousMe != null
+                                        && (previousMeGuid == objGuid || (previousMeGuid == 0UL && previousMe.Guid == objGuid));
+                                    localPlayer = canReusePreviousMe
+                                        ? previousMe!
+                                        : new LocalPlayer(currentObject);
+                                }
+                                _objectList[objGuid] = localPlayer;
+                                Me = localPlayer;
+                                localPlayer.UpdateBaseAddress(currentObject);
+                                if (replacedObj != null)
+                                {
+                                    invalidatedObjects ??= new List<WoWObject>();
+                                    invalidatedObjects.Add(replacedObj);
+                                }
+                            }
+                            else
+                            {
+                                existingObj.UpdateBaseAddress(currentObject);
+                            }
                         }
                         else
                         {
@@ -454,16 +521,30 @@ namespace Styx.WoWInternals
                             WoWObjectType objType = (WoWObjectType)BitConverter.ToUInt32(buffer, typeOffset);
                             
                             // Create the correct object type
-                            WoWObject newObj = CreateWoWObject(currentObject, objType, objGuid, localGuid);
+                            bool canReusePreviousMe = previousMe != null
+                                && (previousMeGuid == objGuid || (previousMeGuid == 0UL && previousMe.Guid == objGuid));
+                            WoWObject newObj = CreateWoWObject(currentObject, objType, objGuid, localGuid, canReusePreviousMe);
                             _objectList.Add(objGuid, newObj);
                         }
                         
+                        if (localGuid != 0 && objGuid == localGuid && Me != null && Me.BaseAddress == currentObject)
+                            localPlayerFound = true;
+
                         // Move to the next object
                         uint nextObject = BitConverter.ToUInt32(buffer, nextOffset);
                         if (nextObject == currentObject) break; // End of list
                         currentObject = nextObject;
                     }
                     
+                    // If the previous Me wrapper was not tracked in _objectList and was replaced
+                    // due to a GUID change, invalidate it once _updateLock is released.
+                    if (previousMe != null && previousMeGuid == 0UL && !ReferenceEquals(Me, previousMe))
+                    {
+                        previousMe.UpdateBaseAddress(0U);
+                        invalidatedObjects ??= new List<WoWObject>();
+                        invalidatedObjects.Add(previousMe);
+                    }
+
                     // Clean up invalid objects (BaseAddress = 0)
                     _objectsToRemove.Clear();
                     foreach (var kvp in _objectList)
@@ -474,15 +555,25 @@ namespace Styx.WoWInternals
                         }
                     }
                     
-                    // Remove and notify
+                    // Remove while holding _updateLock; defer subscriber invocation until after release.
                     foreach (var kvp in _objectsToRemove)
                     {
                         _objectList.Remove(kvp.Key);
-                        kvp.Value.OnInvalidated();
+                        invalidatedObjects ??= new List<WoWObject>();
+                        invalidatedObjects.Add(kvp.Value);
                     }
                     
-                    // Trigger the end-of-update event
-                    _onObjectListUpdateFinished?.Invoke(Me);
+                    var updateHandler = _onObjectListUpdateFinished;
+                    if (updateHandler != null || (invalidatedObjects != null && invalidatedObjects.Count > 0))
+                    {
+                        lock (_notifyQueueLock)
+                        {
+                            if (!_attachmentRetired)
+                                _pendingNotifications.Enqueue((_attachmentEpoch, Me, updateHandler, invalidatedObjects));
+                        }
+                    }
+
+                    result = walkSucceeded && localPlayerFound;
                 }
                 catch (Exception ex)
                 {
@@ -495,6 +586,100 @@ namespace Styx.WoWInternals
                     ResetCaches();
                 }
             }
+
+            DrainUpdateNotifications();
+            return result;
+        }
+
+        private static void DrainUpdateNotifications()
+        {
+            lock (_notifyQueueLock)
+            {
+                if (_drainingNotifications || _pendingNotifications.Count == 0)
+                    return;
+                _drainingNotifications = true;
+                _drainingThreadId = Thread.CurrentThread.ManagedThreadId;
+            }
+
+            try
+            {
+                while (true)
+                {
+                    (long Epoch, LocalPlayer? Me, ObjectListUpdateFinishedDelegate? Handler, List<WoWObject>? Invalidated) item;
+                    bool shouldDispatch;
+                    lock (_notifyQueueLock)
+                    {
+                        if (_pendingNotifications.Count == 0)
+                        {
+                            _drainingNotifications = false;
+                            _drainingThreadId = 0;
+                            return;
+                        }
+                        item = _pendingNotifications.Dequeue();
+                        shouldDispatch = !_attachmentRetired && item.Epoch == _attachmentEpoch;
+                        if (shouldDispatch)
+                            _activeNotificationCallbacks++;
+                    }
+
+                    if (!shouldDispatch)
+                        continue;
+
+                    try
+                    {
+                        if (item.Invalidated != null)
+                        {
+                            foreach (var obj in item.Invalidated)
+                            {
+                                if (!IsNotificationEpochCurrent(item.Epoch))
+                                    break;
+                                try { obj.OnInvalidated(); }
+                                catch (Exception ex) { Logging.WriteException(ex); }
+                            }
+                        }
+
+                        if (item.Handler != null && IsNotificationEpochCurrent(item.Epoch))
+                        {
+                            try
+                            {
+                                foreach (Delegate subscriber in item.Handler.GetInvocationList())
+                                {
+                                    if (!IsNotificationEpochCurrent(item.Epoch))
+                                        break;
+                                    ((ObjectListUpdateFinishedDelegate)subscriber).Invoke(item.Me);
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                Logging.WriteException(ex);
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        lock (_notifyQueueLock)
+                        {
+                            _activeNotificationCallbacks--;
+                            if (_activeNotificationCallbacks == 0)
+                                Monitor.PulseAll(_notifyQueueLock);
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                lock (_notifyQueueLock)
+                {
+                    _drainingNotifications = false;
+                    _drainingThreadId = 0;
+                }
+                throw;
+            }
+        }
+
+        private static bool IsNotificationEpochCurrent(long epoch)
+        {
+            lock (_notifyQueueLock)
+                return !_attachmentRetired && epoch == _attachmentEpoch;
         }
 
         /// <summary>
@@ -506,52 +691,90 @@ namespace Styx.WoWInternals
         /// </summary>
         public static void Shutdown()
         {
+            // Retire notifications FIRST, before acquiring AssemblyLock or _updateLock, so any
+            // already-running callback can finish cleanly without deadlocking on those locks,
+            // while queued callbacks that have not started are skipped.
+            lock (_notifyQueueLock)
+            {
+                _attachmentRetired = true;
+                _attachmentEpoch++;
+                _pendingNotifications.Clear();
+                while (_activeNotificationCallbacks > 0 && Thread.CurrentThread.ManagedThreadId != _drainingThreadId)
+                    Monitor.Wait(_notifyQueueLock);
+            }
+
+            // Lua cleanup runs before disposing Executor: removing the event frame goes through
+            // Lua.DoString, which needs the (still initialized) executor.
+            try
+            {
+                Lua.ShutdownEvents();
+            }
+            catch (Exception ex)
+            {
+                Logging.WriteDebug("ObjectManager.Shutdown: failed to remove Lua events: {0}", ex.Message);
+            }
+
+            var executor = Executor;
+            if (executor != null)
+            {
+                // Match AcquireFrame's lock order (AssemblyLock -> _updateLock) so Shutdown
+                // drains in-flight executor/Lua calls before resetting the buffer and disposing.
+                lock (executor.AssemblyLock)
+                {
+                    lock (_updateLock)
+                    {
+                        if (ReferenceEquals(Executor, executor))
+                            Executor = null;
+                        Lua.ResetReturnBuffer(executor);
+                        try
+                        {
+                            executor.Dispose();
+                        }
+                        catch (Exception ex)
+                        {
+                            Logging.WriteDebug("ObjectManager.Shutdown: failed to dispose the EndScene executor: {0}", ex.Message);
+                        }
+                        ClearShutdownStateLocked();
+                    }
+                }
+                return;
+            }
+
             lock (_updateLock)
             {
-                // Lua cleanup runs FIRST: removing the event frame goes through
-                // Lua.DoString, which needs the (still initialized) executor.
-                try
-                {
-                    Lua.ShutdownEvents();
-                }
-                catch (Exception ex)
-                {
-                    Logging.WriteDebug("ObjectManager.Shutdown: failed to remove Lua events: {0}", ex.Message);
-                }
-
-                try
-                {
-                    Executor?.Dispose();
-                }
-                catch (Exception ex)
-                {
-                    Logging.WriteDebug("ObjectManager.Shutdown: failed to dispose the EndScene executor: {0}", ex.Message);
-                }
-                Executor = null;
-
-                lock (_cacheLock)
-                {
-                    _distanceCache.Clear();
-                    _losCache.Clear();
-                    _threatCache.Clear();
-                }
-                _objectList.Clear();
-                _objectsToRemove.Clear();
-                Me = null;
-
-                try
-                {
-                    Wow?.Dispose();
-                }
-                catch (Exception ex)
-                {
-                    Logging.WriteDebug("ObjectManager.Shutdown: failed to close the process handle: {0}", ex.Message);
-                }
-                Wow = null;
+                Lua.ResetReturnBuffer();
+                ClearShutdownStateLocked();
             }
         }
 
-        private static WoWObject CreateWoWObject(uint baseAddress, WoWObjectType? objType, ulong objGuid, ulong myGuid)
+        private static void ClearShutdownStateLocked()
+        {
+            lock (_notifyQueueLock)
+                _pendingNotifications.Clear();
+
+            lock (_cacheLock)
+            {
+                Interlocked.Increment(ref _cacheRevision);
+                _distanceCache.Clear();
+                _losCache.Clear();
+                _threatCache.Clear();
+            }
+            _objectList.Clear();
+            _objectsToRemove.Clear();
+            Me = null;
+
+            try
+            {
+                Wow?.Dispose();
+            }
+            catch (Exception ex)
+            {
+                Logging.WriteDebug("ObjectManager.Shutdown: failed to close the process handle: {0}", ex.Message);
+            }
+            Wow = null;
+        }
+
+        private static WoWObject CreateWoWObject(uint baseAddress, WoWObjectType? objType, ulong objGuid, ulong myGuid, bool canReuseMe = true)
         {
             // If type not provided, read it from memory
             if (objType == null && Wow != null)
@@ -572,9 +795,9 @@ namespace Styx.WoWInternals
                     
                 case WoWObjectType.Player:
                     // If it's us, create/return LocalPlayer
-                    if (objGuid == myGuid)
+                    if (objGuid != 0UL && objGuid == myGuid)
                     {
-                        if (Me == null)
+                        if (Me == null || !canReuseMe)
                         {
                             Me = new LocalPlayer(baseAddress);
                         }
@@ -618,42 +841,93 @@ namespace Styx.WoWInternals
         /// </summary>
         public static void ScanCaches()
         {
-            lock (_cacheLock)
+            Memory? capturedWow;
+            long capturedRevision;
+            WoWPoint myLoc;
+            WoWPoint myTracePos;
+            bool isInsideBg;
+            List<(ulong Guid, WoWPoint Location, WoWPoint TracePos, UnitThreatInfo Threat)> snapshots;
+
+            // Capture all unit wrapper coordinates and threat data while holding _updateLock,
+            // preserving the single lock order (_updateLock -> _cacheLock).
+            lock (_updateLock)
             {
-                _distanceCache.Clear();
-                _losCache.Clear();
-                _threatCache.Clear();
-
-                if (Me == null)
-                    return;
-
-                List<WoWUnit> units;
-                lock (_updateLock)
+                capturedWow = Wow;
+                capturedRevision = Volatile.Read(ref _cacheRevision);
+                var me = Me;
+                if (capturedWow == null || me == null)
                 {
-                    units = _objectList.Values.OfType<WoWUnit>().ToList();
-                }
-                if (units.Count == 0)
+                    lock (_cacheLock)
+                    {
+                        _distanceCache.Clear();
+                        _losCache.Clear();
+                        _threatCache.Clear();
+                    }
                     return;
-
-                Styx.Logic.Pathing.WoWPoint myLoc = Me.Location;
-
-                if (!Battlegrounds.IsInsideBattleground)
-                {
-                    WorldLine[] lines = new WorldLine[units.Count];
-                    Styx.Logic.Pathing.WoWPoint start = Me.GetTraceLinePos();
-                    for (int i = 0; i < units.Count; i++)
-                        lines[i] = new WorldLine(start, units[i].GetTraceLinePos());
-
-                    bool[] los;
-                    GameWorld.MassTraceLine(lines, GameWorld.CGWorldFrameHitFlags.HitTestLOS, out los);
-                    for (int i = 0; i < units.Count; i++)
-                        _losCache[units[i].Guid] = !los[i];
                 }
 
-                foreach (var unit in units)
+                myLoc = me.Location;
+                myTracePos = me.GetTraceLinePos();
+                isInsideBg = Battlegrounds.IsInsideBattleground;
+                snapshots = new List<(ulong, WoWPoint, WoWPoint, UnitThreatInfo)>();
+                foreach (var obj in _objectList.Values)
                 {
-                    _distanceCache[unit.Guid] = myLoc.Distance(unit.Location);
-                    _threatCache[unit.Guid] = unit.ThreatInfo;
+                    if (obj is WoWUnit unit && unit.BaseAddress != 0U)
+                        snapshots.Add((unit.Guid, unit.Location, unit.GetTraceLinePos(), unit.ThreatInfo));
+                }
+
+                if (snapshots.Count == 0)
+                {
+                    lock (_cacheLock)
+                    {
+                        _distanceCache.Clear();
+                        _losCache.Clear();
+                        _threatCache.Clear();
+                    }
+                    return;
+                }
+            }
+
+            var distances = new Dictionary<ulong, float>(snapshots.Count);
+            var losResults = new Dictionary<ulong, bool>(snapshots.Count);
+            var threats = new Dictionary<ulong, UnitThreatInfo>(snapshots.Count);
+
+            if (!isInsideBg)
+            {
+                WorldLine[] lines = new WorldLine[snapshots.Count];
+                for (int i = 0; i < snapshots.Count; i++)
+                    lines[i] = new WorldLine(myTracePos, snapshots[i].TracePos);
+
+                bool[] los;
+                GameWorld.MassTraceLine(lines, GameWorld.CGWorldFrameHitFlags.HitTestLOS, out los);
+                for (int i = 0; i < snapshots.Count; i++)
+                    losResults[snapshots[i].Guid] = !los[i];
+            }
+
+            for (int i = 0; i < snapshots.Count; i++)
+            {
+                var entry = snapshots[i];
+                distances[entry.Guid] = myLoc.Distance(entry.Location);
+                threats[entry.Guid] = entry.Threat;
+            }
+
+            // Publish only if the attachment and cache revision are still current,
+            // maintaining _updateLock -> _cacheLock order.
+            lock (_updateLock)
+            {
+                if (!ReferenceEquals(Wow, capturedWow) || Me == null
+                    || Volatile.Read(ref _cacheRevision) != capturedRevision)
+                    return;
+
+                lock (_cacheLock)
+                {
+                    _distanceCache.Clear();
+                    _losCache.Clear();
+                    _threatCache.Clear();
+
+                    foreach (var kvp in distances) _distanceCache[kvp.Key] = kvp.Value;
+                    foreach (var kvp in losResults) _losCache[kvp.Key] = kvp.Value;
+                    foreach (var kvp in threats) _threatCache[kvp.Key] = kvp.Value;
                 }
             }
         }

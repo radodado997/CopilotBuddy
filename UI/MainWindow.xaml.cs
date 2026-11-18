@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Diagnostics;
@@ -22,6 +22,7 @@ using Styx.CommonBot;
 using Styx.Helpers;
 using Styx.Logic.BehaviorTree;
 using Styx.Logic.Profiles;
+using Styx.Logic.Relogin;
 using Styx.WoWInternals;
 
 using WpfFontFamily = System.Windows.Media.FontFamily;
@@ -42,6 +43,8 @@ namespace CopilotBuddy.UI
         private int _logCount;
         private const int MaxLogLines = 1000;
         private bool _isRunning;
+        // Automatic worker shutdown must preserve this; an explicit Stop cancels it.
+        private bool _resumeBotAfterRelogin;
         private DispatcherTimer? _infoTimer;
 
         /// <summary>
@@ -154,6 +157,14 @@ namespace CopilotBuddy.UI
             }
         }
 
+        private sealed class StartupInitializationException : Exception
+        {
+            public StartupInitializationException(Exception innerException)
+                : base(innerException.Message, innerException)
+            {
+            }
+        }
+
         // Startup (attach + EndScene hook publication) runs on a worker thread.  These
         // let Window_Closing cancel it and wait for it, so an attach can never publish a
         // hook after teardown has already started.
@@ -182,17 +193,31 @@ namespace CopilotBuddy.UI
             {
                 try
                 {
-                    if (!FindAndAttachToWoW(startupToken))
-                        return;
-
-                    if (ObjectManager.IsInitialized)
+                    bool omInitialized = false;
+                    // Hold startup attachment ownership across ObjectManager.Initialize,
+                    // ObjectManager.Me access, LoadSettings(), and RoutineManager.Init()
+                    // so ShutdownForClosing cannot tear down ObjectManager mid-startup.
+                    if (!FindAndAttachToWoW(startupToken, onAttached: () =>
                     {
+                        if (!ObjectManager.IsInitialized)
+                            return;
+
+                        omInitialized = true;
                         Logging.Write("Attached to WoW with ID {0}", _selectedWoWProc!.Value);
 
                         // HB 6.2.3 smethod_3: Start minimize guard thread + event handlers
                         TreeRoot.Initialize();
                         BotEvents.OnBotStarted += BotEvents_OnBotStarted;
                         BotEvents.OnBotStopped += BotEvents_OnBotStopped;
+
+                        // Auto-relogin: the monitor raises this after the in-world state is
+                        // confirmed; resuming the previous routine/profile goes through the
+                        // normal Start path below.
+                        ReloginManager.ResumeBot -= ReloginManager_ResumeBot;
+                        ReloginManager.ResumeBot += ReloginManager_ResumeBot;
+
+                        if (startupToken.IsCancellationRequested || _isClosing)
+                            return;
 
                         // Log character info (HB 4.3.4 pattern after attach)
                         if (ObjectManager.Me != null)
@@ -205,8 +230,14 @@ namespace CopilotBuddy.UI
                             Logging.Write("Current zone is {0}", ObjectManager.Me.RealZoneText);
                         }
 
+                        if (startupToken.IsCancellationRequested || _isClosing)
+                            return;
+
                         // Reinitialize and load settings for this character (HB 4.3.4 pattern)
                         LoadSettings();
+
+                        if (startupToken.IsCancellationRequested || _isClosing)
+                            return;
 
                         // Initialize Combat Routines (compile and load from Routines folder)
                         // This must be done AFTER attachment when ObjectManager.Me is available
@@ -219,7 +250,14 @@ namespace CopilotBuddy.UI
                             Logging.Write(Colors.Red, "Failed to initialize combat routines: {0}", ex.Message);
                             Logging.WriteException(ex);
                         }
+                    }))
+                        return;
 
+                    if (startupToken.IsCancellationRequested || _isClosing)
+                        return;
+
+                    if (omInitialized)
+                    {
                         // Load additional bots from Bots folder (external/custom bots)
                         try
                         {
@@ -233,6 +271,9 @@ namespace CopilotBuddy.UI
                         {
                             Logging.WriteException(ex);
                         }
+
+                        if (startupToken.IsCancellationRequested || _isClosing)
+                            return;
 
                         // Initialize plugins (compile and load from Plugins folder)
                         try
@@ -256,6 +297,9 @@ namespace CopilotBuddy.UI
                             Logging.Write(Colors.Red, "Failed to initialize plugins: {0}", ex.Message);
                             Logging.WriteException(ex);
                         }
+
+                        if (startupToken.IsCancellationRequested || _isClosing)
+                            return;
 
                         Dispatcher.Invoke(() =>
                         {
@@ -290,6 +334,10 @@ namespace CopilotBuddy.UI
                             SetStatus("CopilotBuddy Startup Complete");
                             _infoTimer.Start();
 
+                            // Auto-relogin: start the monitor now that we know which client we
+                            // are attached to. Start() is a no-op when the option is disabled.
+                            ReloginManager.Start(_selectedWoWProc ?? ObjectManager.WoWProcess?.Id ?? 0);
+
                             // AfterInitOnAuthSuccess equivalent for HBRelog integration.
                             // Mirrors Honorbuddy 4.3.4 MainWindow.xaml.cs:419-437 + Start():847-866.
                             // CommandLine.AutoLoadProfile / AutoStartBotName are parsed in
@@ -300,14 +348,33 @@ namespace CopilotBuddy.UI
                     else
                     {
                         Logging.WriteQuiet(Colors.Red, "Failed to initialize ObjectManager");
-                        Dispatcher.Invoke(() => SetStatus("Initialization failed"));
+                        Dispatcher.Invoke(() => { if (!_isClosing) SetStatus("Initialization failed"); });
                     }
+                }
+                catch (StartupInitializationException ex)
+                {
+                    Exception inner = ex.InnerException ?? ex;
+                    Logging.Write(Colors.Red, "Startup initialization failed: {0}", inner.Message);
+                    Logging.WriteException(inner);
+                    Dispatcher.Invoke(() =>
+                    {
+                        if (_isClosing)
+                            return;
+                        SetStatus("Initialization failed");
+                        System.Windows.MessageBox.Show(
+                            $"Startup initialization failed!\n\nError: {inner.Message}",
+                            "CopilotBuddy - Error",
+                            MessageBoxButton.OK,
+                            MessageBoxImage.Error);
+                    });
                 }
                 catch (Exception ex)
                 {
                     Logging.WriteException(ex);
                     Dispatcher.Invoke(() =>
                     {
+                        if (_isClosing)
+                            return;
                         SetStatus("Error");
                         System.Windows.MessageBox.Show(
                             $"Injection failed!\n\nError: {ex.Message}",
@@ -332,7 +399,7 @@ namespace CopilotBuddy.UI
         ///   6. If 2+: show ProcessSelectorWindow
         ///   7. Attach to selected process
         /// </summary>
-        private bool FindAndAttachToWoW(CancellationToken cancellationToken = default)
+        private bool FindAndAttachToWoW(CancellationToken cancellationToken = default, Action? onAttached = null)
         {
             // Cancelled while the user was closing the window: never start an attach.
             if (cancellationToken.IsCancellationRequested || _isClosing)
@@ -489,6 +556,8 @@ namespace CopilotBuddy.UI
             Logging.WriteDebug("Platform: {0}", Environment.Is64BitProcess ? "x64" : "x86");
             Logging.WriteDebug("Executable Path: {0}", AppDomain.CurrentDomain.BaseDirectory);
 
+            Exception? attachedError = null;
+            bool published;
             try
             {
                 var memory = new Memory(wowPid);
@@ -502,34 +571,59 @@ namespace CopilotBuddy.UI
                     return false;
                 }
 
-                // Last checkpoint before publishing the attachment (and installing the
-                // EndScene hook): Window_Closing sets _isClosing and then waits for this
-                // task to finish before it runs ObjectManager.Shutdown().
-                if (cancellationToken.IsCancellationRequested || _isClosing)
-                {
-                    memory.Dispose();
-                    Logging.WriteDebug("Attach aborted: the application is closing.");
-                    return false;
-                }
+                // Coordinate startup ObjectManager.Initialize, _memory/_executor publication,
+                // and attachment-dependent startup work (ObjectManager.Me, LoadSettings,
+                // RoutineManager.Init) under AttachmentSync so Window_Closing teardown cannot
+                // run ObjectManager.Shutdown() while startup still owns the attachment.
+                published = ReloginManager.TryPublishStartupAttachment(
+                    memory,
+                    () => cancellationToken.IsCancellationRequested || _isClosing,
+                    () =>
+                    {
+                        // HB 6.2.3: Initialize hotkeys against the WoW window handle so that
+                        // hotkeys activate when WoW is in the foreground, not CopilotBuddy.
+                        HotkeysManager.Initialize(ObjectManager.WoWProcess!.MainWindowHandle);
+                        HotkeysManager.Register("Core_BringBotToForeground", Keys.F7, Styx.Common.ModifierKeys.Shift, BringBotToForeground);
 
-                ObjectManager.Initialize(memory);
+                        _memory = memory;
+                        _executor = ObjectManager.Executor;
 
-                // HB 6.2.3: Initialize hotkeys against the WoW window handle so that
-                // hotkeys activate when WoW is in the foreground, not CopilotBuddy.
-                HotkeysManager.Initialize(ObjectManager.WoWProcess!.MainWindowHandle);
-                HotkeysManager.Register("Core_BringBotToForeground", Keys.F7, Styx.Common.ModifierKeys.Shift, BringBotToForeground);
+                        if (cancellationToken.IsCancellationRequested || _isClosing)
+                            return;
 
-                _memory = memory;
-                _executor = ObjectManager.Executor;
-                return true;
+                        if (onAttached != null)
+                        {
+                            try
+                            {
+                                onAttached();
+                            }
+                            catch (Exception ex)
+                            {
+                                attachedError = ex;
+                            }
+                        }
+                    });
             }
             catch (Exception ex)
             {
                 Logging.Write(Colors.Red, "Error attaching to WoW! - {0}", ex.Message);
                 Logging.WriteException(ex);
-                Dispatcher.Invoke(() => SetStatus("Attach failed"));
+                Dispatcher.Invoke(() => { if (!_isClosing) SetStatus("Attach failed"); });
                 return false;
             }
+
+            // Route post-publish callback errors to Window_Loaded's startup initialization
+            // failure handler instead of the attach-failure or injection-failure handlers.
+            if (attachedError != null)
+                throw new StartupInitializationException(attachedError);
+
+            if (!published)
+            {
+                Logging.WriteDebug("Attach aborted: the application is closing.");
+                return false;
+            }
+
+            return true;
         }
 
         private void Window_Closing(object sender, System.ComponentModel.CancelEventArgs e)
@@ -545,6 +639,21 @@ namespace CopilotBuddy.UI
             // EndScene hook after teardown has begun.
             _isClosing = true;
             try { _startupCts.Cancel(); } catch { /* already disposed */ }
+
+            // Auto-relogin first: retiring the monitor bumps the generation, so any attach or
+            // relaunch it still has in flight aborts before it can publish a hook or a pid.
+            // Stop() is bounded, and the generation check inside TryAttachAndHook is what
+            // covers work that outlives the join. Doing it here — not after
+            // ObjectManager.Shutdown() — keeps it from touching the client during teardown.
+            try
+            {
+                ReloginManager.Stop();
+                ReloginManager.ResumeBot -= ReloginManager_ResumeBot;
+            }
+            catch (Exception ex)
+            {
+                Logging.WriteDebug("[Relogin] Monitor shutdown failed: {0}", ex.Message);
+            }
 
             // HB 6.2.3/Legion pattern: close all auxiliary windows first.
             foreach (Window window in System.Windows.Application.Current.Windows.Cast<Window>().ToList())
@@ -639,25 +748,39 @@ namespace CopilotBuddy.UI
             SaveSettings();
 
             // Deterministic teardown: restore the EndScene hook and close the game's
-            // process/thread handles here, on this thread.  Previously the only cleanup
-            // lived in finalizers, i.e. it ran on the GC thread (often after the UI had
-            // already gone away) and could freeze or desync the injected detour.
+            // process/thread handles here, serialized with any in-flight attach while
+            // pumping dispatcher messages (and falling back to a foreground teardown owner
+            // thread that holds _processMutex until cleanup completes).
+            bool shutdownCompleted = false;
             try
             {
-                ObjectManager.Shutdown();
+                shutdownCompleted = ReloginManager.ShutdownAttachmentForClosing(
+                    ref _processMutex,
+                    () => Dispatcher.Invoke(() => { }, DispatcherPriority.Background));
             }
             catch (Exception ex)
             {
                 Logging.Write("Shutdown cleanup failed: {0}", ex.Message);
             }
 
-            // Release process mutex so another CopilotBuddy can claim this WoW
-            try
+            if (shutdownCompleted)
             {
-                _processMutex?.Dispose();
-                _processMutex = null;
+                // A failed recovery may still own a replacement claim. Keep it, like the UI's
+                // claim below, until the attachment has been shut down.
+                try
+                {
+                    ReloginManager.ReleaseDetachedClaim();
+                }
+                catch { /* Keep the claim if attachment teardown did not complete. */ }
+
+                // Release process mutex so another CopilotBuddy can claim this WoW
+                try
+                {
+                    _processMutex?.Dispose();
+                    _processMutex = null;
+                }
+                catch { /* Mutex may already be released */ }
             }
-            catch { /* Mutex may already be released */ }
 
             // Cleanup
             Logging.OnLogMessage -= OnLogMessage;
@@ -688,6 +811,35 @@ namespace CopilotBuddy.UI
 
             if (!startup.IsCompleted)
                 Logging.Write("Startup thread did not finish within {0} ms; continuing shutdown.", timeoutMs);
+        }
+
+        /// <summary>How long a relaunched client may take to become usable after the world loads.</summary>
+        private const int ReadyTimeoutSeconds = 30;
+
+        /// <summary>
+        /// Waits until the attached client can actually host the bot: the object manager has a
+        /// valid local player and the world is entered. Yields to the dispatcher between
+        /// polls (this is called on the UI thread) instead of blocking it, and abandons the
+        /// wait as soon as the window closes or the recovery run is retired.
+        /// </summary>
+        private async Task<bool> WaitForClientReadyAsync(ReloginResumeToken token)
+        {
+            var deadline = Stopwatch.StartNew();
+            while (deadline.Elapsed < TimeSpan.FromSeconds(ReadyTimeoutSeconds))
+            {
+                if (_isClosing || !_resumeBotAfterRelogin || !ReloginManager.IsCurrentResume(token))
+                    return false;
+
+                bool localPlayerUpdated = false;
+                try { localPlayerUpdated = ObjectManager.UpdateAndCheckLocalPlayer(); } catch { /* still loading */ }
+
+                if (localPlayerUpdated && ObjectManager.Me != null && ObjectManager.Me.BaseAddress != 0U && StyxWoW.IsInWorld)
+                    return true;
+
+                await Task.Delay(500);
+            }
+
+            return false;
         }
 
         private static bool WaitForTreeRootStop(int timeoutMs)
@@ -911,6 +1063,9 @@ namespace CopilotBuddy.UI
 
             if (_isRunning) return;
 
+            // Auto-relogin: a manual start re-arms the retry budget after a give-up.
+            ReloginManager.OnBotStarted();
+
             if (BotManager.Current == null)
             {
                 Logging.Write(Colors.Red, "No bot selected!");
@@ -920,6 +1075,8 @@ namespace CopilotBuddy.UI
             // Save settings before starting bot (HB 4.3.4 pattern)
             SaveSettings();
 
+            _resumeBotAfterRelogin = true;
+            btnCancelReloginResume.Visibility = Visibility.Collapsed;
             _isRunning = true;
             btnStart.Visibility = Visibility.Hidden;
             btnStopGroup.Visibility = Visibility.Visible;
@@ -967,6 +1124,10 @@ namespace CopilotBuddy.UI
 
         private void StopBot()
         {
+            // Cancel even if an automatic shutdown already marked the bot stopped.
+            // Leave the monitor enabled for subsequent manual starts.
+            _resumeBotAfterRelogin = false;
+            btnCancelReloginResume.Visibility = Visibility.Collapsed;
             if (!_isRunning) return;
 
             _isRunning = false;
@@ -992,6 +1153,13 @@ namespace CopilotBuddy.UI
         private void btnStart_Click(object sender, RoutedEventArgs e)
         {
             StartBot();
+        }
+
+        private void btnCancelReloginResume_Click(object sender, RoutedEventArgs e)
+        {
+            _resumeBotAfterRelogin = false;
+            btnCancelReloginResume.Visibility = Visibility.Collapsed;
+            Logging.Write("[Relogin] Automatic resume cancelled by the user; client monitoring remains enabled.");
         }
 
         private void btnStop_Click(object sender, RoutedEventArgs e)
@@ -1054,7 +1222,14 @@ namespace CopilotBuddy.UI
             btnLoadProfile.IsEnabled = true;
             cmbBotSelector.IsEnabled = true;
             btnSettings.IsEnabled = true;
+            RefreshCancelReloginResumeVisibility();
             SetStatus("CopilotBuddy Stopped");
+        }
+
+        private void RefreshCancelReloginResumeVisibility()
+        {
+            btnCancelReloginResume.Visibility = _resumeBotAfterRelogin && ReloginSettings.Instance.Enabled
+                ? Visibility.Visible : Visibility.Collapsed;
         }
 
         private void BotEvents_OnBotStarted(EventArgs args)
@@ -1127,6 +1302,8 @@ namespace CopilotBuddy.UI
                 Owner = this
             };
             settingsWindow.ShowDialog();
+            if (!_isRunning && TreeRoot.State == TreeRootState.Stopped)
+                RefreshCancelReloginResumeVisibility();
         }
 
         private void btnBotConfig_Click(object sender, RoutedEventArgs e)
@@ -1217,6 +1394,264 @@ namespace CopilotBuddy.UI
             // Save setting
             UISettings.Instance.EnhancedMode = false;
             UISettings.Instance.Save();
+        }
+
+        #endregion
+
+        #region Auto-Relogin
+
+        /// <summary>
+        /// Called by <see cref="ReloginManager"/> once a relogin attempt confirmed the
+        /// in-world state (g_ClientConnectionState + a live LocalPlayer). At that point the
+        /// bot restarts the same BotBase with the same profile — the profile comes from
+        /// LevelbotSettings.LastUsedPath / CharacterSettings.LastUsedPath, which the bot
+        /// remembers in memory whenever a profile is loaded (ProfileManager.LoadNew(path, true)),
+        /// and TreeRoot.Start() reloads it before the worker thread starts.
+        ///
+        /// Runs on a ThreadPool thread (the monitor thread must not block on the dispatcher).
+        /// </summary>
+        private async void ReloginManager_ResumeBot(ReloginResumeToken token)
+        {
+            // The recovery token (generation + confirmed PID + unique recovery id) has to survive
+            // both hops: the ThreadPool -> dispatcher hop below and every await that follows.
+            // Retired or superseded recovery work must not adopt claims or start the bot.
+            if (Dispatcher.Thread != Thread.CurrentThread)
+            {
+                Dispatcher.BeginInvoke(new Action<ReloginResumeToken>(ReloginManager_ResumeBot), token);
+                return;
+            }
+
+            try
+            {
+                if (_isClosing)
+                {
+                    Logging.WriteDebug("[Relogin] Resume skipped: the application is closing.");
+                    return;
+                }
+
+                if (!ReloginManager.IsCurrentResume(token))
+                {
+                    Logging.WriteDebug("[Relogin] Resume skipped: that recovery run was cancelled or superseded.");
+                    return;
+                }
+
+                // Adopt the confirmed (possibly relaunched) client's claim for the UI.
+                // TakeClaimedMutex(token) atomically validates the token before transferring
+                // ownership; ReloginManager already tracks token.ProcessId, so do not overwrite it.
+                int pid = token.ProcessId;
+                if (pid > 0 && pid != _selectedWoWProc)
+                {
+                    Mutex? claimed = ReloginManager.TakeClaimedMutex(token);
+                    if (claimed != null)
+                    {
+                        // Once transferred, the UI owns this claim for the attached client even
+                        // if auto-resume is cancelled immediately afterward; never dispose it
+                        // while the client remains attached.
+                        try { _processMutex?.Dispose(); } catch { /* already released */ }
+                        _processMutex = claimed;
+                        _selectedWoWProc = pid;
+                    }
+                    else if (!ReloginManager.IsCurrentResume(token))
+                    {
+                        Logging.WriteDebug("[Relogin] Resume skipped: that recovery run was cancelled or superseded.");
+                        return;
+                    }
+                    else
+                    {
+                        _selectedWoWProc = pid;
+                    }
+
+                    if (!ReloginManager.IsCurrentResume(token))
+                    {
+                        Logging.WriteDebug("[Relogin] Resume skipped: that recovery run was cancelled or superseded.");
+                        return;
+                    }
+                }
+
+                // A relaunched client has a new window: point the hotkeys at it without
+                // blocking the UI dispatcher behind AttachmentSync during an in-progress attach.
+                bool hotkeysUpdated = await TryUpdateAttachedHotkeysAsync(token);
+                if (_isClosing || !ReloginManager.IsCurrentResume(token))
+                {
+                    Logging.WriteDebug("[Relogin] Resume skipped: that recovery run was cancelled or superseded.");
+                    return;
+                }
+
+                if (!_resumeBotAfterRelogin)
+                {
+                    Logging.WriteDebug("[Relogin] Resume skipped: no automatic resume is pending.");
+                    return;
+                }
+
+                // The client can still be finishing its loading screen when the in-world flag
+                // flips. The bot cannot start from that state ("cannot be started while not
+                // ingame"), so wait for the object manager to be usable first. The wait yields
+                // to the dispatcher (this runs on the UI thread) instead of blocking it.
+                if (!await WaitForClientReadyAsync(token))
+                {
+                    if (_isClosing || !_resumeBotAfterRelogin || !ReloginManager.IsCurrentResume(token))
+                        Logging.WriteDebug("[Relogin] Resume skipped: that recovery run was cancelled or superseded.");
+                    else
+                        Logging.Write(Colors.Red, "[Relogin] Resume failed: the client did not become ready within {0}s; leaving the bot stopped.",
+                            ReadyTimeoutSeconds);
+                    return;
+                }
+
+                if (_isClosing || !_resumeBotAfterRelogin || !ReloginManager.IsCurrentResume(token))
+                {
+                    Logging.WriteDebug("[Relogin] Resume skipped: that recovery run was cancelled or superseded.");
+                    return;
+                }
+
+                // If initial hotkey rebinding did not succeed (e.g. window handle or AttachmentSync
+                // was not yet ready), retry once against the ready attachment; if it still fails,
+                // leave the bot stopped with a specific diagnostic.
+                if (!hotkeysUpdated)
+                {
+                    hotkeysUpdated = await TryUpdateAttachedHotkeysAsync(token);
+                    if (_isClosing || !_resumeBotAfterRelogin || !ReloginManager.IsCurrentResume(token))
+                    {
+                        Logging.WriteDebug("[Relogin] Resume skipped: that recovery run was cancelled or superseded.");
+                        return;
+                    }
+                    if (!hotkeysUpdated)
+                    {
+                        Logging.Write(Colors.Red, "[Relogin] Resume failed: could not rebind hotkeys to the attached client window (pid {0}); leaving the bot stopped.",
+                            token.ProcessId);
+                        return;
+                    }
+                }
+
+                // Validate confirmed character/realm identity BEFORE loading per-character settings
+                // or restoring the profile so a mismatched client cannot mutate settings or profile state.
+                if (!ValidateConfirmedIdentity(token, ObjectManager.Me))
+                    return;
+
+                // LoadNew remembers profile changes in memory, not necessarily on disk.
+                // Capture that path before LoadSettings replaces it with an older saved path.
+                string lastProfile = LevelbotSettings.Instance.LastUsedPath ?? "";
+                if (string.IsNullOrEmpty(lastProfile))
+                    lastProfile = CharacterSettings.Instance.LastUsedPath ?? "";
+
+                LoadSettings();
+                LevelbotSettings.Instance.LastUsedPath = lastProfile;
+
+                // Restore the active profile before TreeRoot.Start reloads the same path.
+                if (!string.IsNullOrEmpty(lastProfile) && File.Exists(lastProfile))
+                {
+                    ProfileManager.LoadNew(lastProfile);
+                    Logging.Write("[Relogin] Resumed profile: {0}", Path.GetFileName(lastProfile));
+                }
+                else
+                {
+                    Logging.WriteDebug("[Relogin] No previous profile to restore ({0}).", lastProfile ?? "none");
+                }
+
+                if (BotManager.Current == null)
+                {
+                    Logging.Write(Colors.Red, "[Relogin] Cannot resume: no botbase is selected.");
+                    return;
+                }
+
+                // In-world state is confirmed; only now does the routine/profile resume.
+                if (TreeRoot.State != TreeRootState.Stopped)
+                {
+                    // The worker was stopped when the client died ("WoW process has exited").
+                    // Wait for that shutdown to finish so a new worker is not started over it.
+                    // Starting a second worker over a live one is exactly the situation
+                    // TreeRoot.Start() guards against, so a timeout means the resume is skipped
+                    // rather than attempted anyway.
+                    if (!WaitForTreeRootStop(5000))
+                    {
+                        Logging.Write(Colors.Red, "[Relogin] Resume skipped: the previous bot thread did not stop within 5s.");
+                        return;
+                    }
+                }
+
+                // Last gate: the profile load above is file I/O, so cancellation, token currency,
+                // in-world state, and character identity are rechecked immediately before StartBot.
+                if (_isClosing || !_resumeBotAfterRelogin || !ReloginManager.IsCurrentResume(token))
+                {
+                    Logging.WriteDebug("[Relogin] Resume cancelled before the bot was started.");
+                    return;
+                }
+
+                bool localPlayerUpdated = false;
+                try { localPlayerUpdated = ObjectManager.UpdateAndCheckLocalPlayer(); } catch { /* client lost */ }
+                if (!localPlayerUpdated)
+                {
+                    Logging.Write(Colors.Red, "[Relogin] Resume failed: the client is no longer in the world; leaving the bot stopped.");
+                    return;
+                }
+
+                if (!ValidateConfirmedIdentity(token, ObjectManager.Me))
+                    return;
+
+                Logging.Write("[Relogin] Resuming botbase: {0}", BotManager.Current.Name);
+                StartBot();
+            }
+            catch (Exception ex)
+            {
+                Logging.Write(Colors.Red, "[Relogin] Resume failed: {0}", ex.Message);
+                Logging.WriteException(ex);
+            }
+        }
+
+        private bool ValidateConfirmedIdentity(ReloginResumeToken token, Styx.WoWInternals.WoWObjects.LocalPlayer? me)
+        {
+            if (_isClosing || !_resumeBotAfterRelogin || !ReloginManager.IsCurrentResume(token))
+            {
+                Logging.WriteDebug("[Relogin] Resume cancelled before the bot was started.");
+                return false;
+            }
+
+            if (!StyxWoW.IsInWorld || me == null || me.BaseAddress == 0U)
+            {
+                Logging.Write(Colors.Red, "[Relogin] Resume failed: the client is no longer in the world; leaving the bot stopped.");
+                return false;
+            }
+
+            if (!ReloginManager.TryGetConfirmedIdentity(token, out string expectedCharacter, out string expectedRealm))
+            {
+                Logging.WriteDebug("[Relogin] Resume cancelled before the bot was started.");
+                return false;
+            }
+
+            string actualCharacter = me.Name ?? "";
+            string actualRealm = string.IsNullOrEmpty(expectedRealm) ? "" : (me.RealmName ?? "");
+            if (string.IsNullOrEmpty(actualCharacter)
+                || !string.Equals(actualCharacter, expectedCharacter, StringComparison.OrdinalIgnoreCase)
+                || (!string.IsNullOrEmpty(expectedRealm)
+                    && (string.IsNullOrEmpty(actualRealm)
+                        || !string.Equals(actualRealm, expectedRealm, StringComparison.OrdinalIgnoreCase))))
+            {
+                Logging.Write(Colors.Red,
+                    "[Relogin] Resume failed: character identity mismatch (expected '{0}' on '{1}', found '{2}' on '{3}'); leaving the bot stopped.",
+                    expectedCharacter, expectedRealm, actualCharacter, actualRealm);
+                return false;
+            }
+
+            return true;
+        }
+
+        private async Task<bool> TryUpdateAttachedHotkeysAsync(ReloginResumeToken token)
+        {
+            var deadline = Stopwatch.StartNew();
+            while (deadline.Elapsed < TimeSpan.FromSeconds(5))
+            {
+                if (_isClosing || !ReloginManager.IsCurrentResume(token))
+                    return false;
+
+                if (ReloginManager.UpdateAttachedHotkeys(token, out bool attachmentBusy))
+                    return true;
+
+                if (!attachmentBusy)
+                    return false;
+
+                await Task.Delay(50);
+            }
+
+            return false;
         }
 
         #endregion

@@ -55,6 +55,23 @@ namespace Styx.Common
             _initialized = true;
         }
 
+        /// <summary>
+        /// Points the hotkeys at a different window. <see cref="Initialize"/> is one-shot, so
+        /// this is what auto-relogin uses after a relaunched client produced a new window —
+        /// otherwise the hotkeys stay bound to the dead client's handle and never fire.
+        /// </summary>
+        public static void UpdateWindowHandle(IntPtr windowHandle)
+        {
+            if (windowHandle == IntPtr.Zero)
+                return;
+
+            lock (_lock)
+            {
+                _windowHandle = windowHandle;
+                _initialized = true;
+            }
+        }
+
         public static Hotkey Register(string name, Keys key, ModifierKeys modifierKeys, Action<Hotkey> callback)
         {
             Hotkey hotkey = new Hotkey(name, key, modifierKeys, Interlocked.Increment(ref _idCounter), callback);

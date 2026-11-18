@@ -18,6 +18,11 @@ namespace Styx.WoWInternals.WoWCache
 
         public WoWCache()
         {
+            BuildCaches();
+        }
+
+        private void BuildCaches()
+        {
             // Base address for cache structures in 3.3.5a (HB uses 12965520 = 0xC5D790)
             uint baseAddr = 12965520U; // Was 0xC5D780, correct is 0xC5D790
             

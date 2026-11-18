@@ -279,6 +279,64 @@
                        Text="{loc:Resx LblLanguageRestart}"/>
           </Grid>
         </GroupBox>
+        <!-- Auto-Relogin GroupBox (ReloginSettings, global settings file) -->
+        <GroupBox x:Name="gbRelogin" Header="{loc:Resx GroupRelogin}"
+                  Foreground="White" Height="219" Width="224" Margin="4">
+          <Grid>
+            <CheckBox x:Name="chkAutoRelogin" Content="{loc:Resx ChkAutoRelogin}" Foreground="White"
+                      HorizontalAlignment="Left" Margin="8,8,0,0" VerticalAlignment="Top"
+                      IsChecked="{Binding Path=ReloginSettings.Enabled, Mode=TwoWay}">
+              <CheckBox.ContentTemplate>
+                <DataTemplate><TextBlock Text="{Binding}" TextWrapping="Wrap" MaxWidth="174"/></DataTemplate>
+              </CheckBox.ContentTemplate>
+            </CheckBox>
+            <Label x:Name="lblReloginAccount" Content="{loc:Resx LblReloginAccount}" Foreground="White"
+                   HorizontalAlignment="Left" Margin="8,48,0,0" Padding="2,0,0,0" Height="16" VerticalAlignment="Top"/>
+            <TextBox x:Name="txtReloginAccount" Margin="8,65,8,0" Height="20" VerticalAlignment="Top"
+                     TextWrapping="NoWrap"
+                     Text="{Binding Path=ReloginSettings.AccountName, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
+            <Label x:Name="lblReloginPassword" Content="{loc:Resx LblReloginPassword}" Foreground="White"
+                   HorizontalAlignment="Left" Margin="8,86,0,0" Padding="2,0,0,0" Height="16" VerticalAlignment="Top"/>
+            <PasswordBox x:Name="pwdReloginPassword" Margin="8,103,8,0" Height="20" VerticalAlignment="Top"/>
+            <Label x:Name="lblReloginRealm" Content="{loc:Resx LblReloginRealm}" Foreground="White"
+                   HorizontalAlignment="Left" Margin="8,124,0,0" Padding="2,0,0,0" Height="16" VerticalAlignment="Top"/>
+            <TextBox x:Name="txtReloginRealm" Margin="8,141,8,0" Height="20" VerticalAlignment="Top"
+                     TextWrapping="NoWrap"
+                     Text="{Binding Path=ReloginSettings.RealmName, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
+            <Label x:Name="lblReloginCharacter" Content="{loc:Resx LblReloginCharacter}" Foreground="White"
+                   HorizontalAlignment="Left" Margin="8,162,0,0" Padding="2,0,0,0" Height="16" VerticalAlignment="Top"/>
+            <TextBox x:Name="txtReloginCharacter" Margin="8,179,8,0" Height="20" VerticalAlignment="Top"
+                     TextWrapping="NoWrap"
+                     Text="{Binding Path=ReloginSettings.CharacterName, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
+          </Grid>
+        </GroupBox>
+
+        <!-- Auto-Relogin, second card: client path, retry policy, warning -->
+        <GroupBox x:Name="gbReloginAdvanced" Header="{loc:Resx GroupRelogin}"
+                  Foreground="White" Height="199" Width="224" Margin="4">
+          <Grid>
+            <Label x:Name="lblReloginWowPath" Content="{loc:Resx LblReloginWowPath}" Foreground="White"
+                   HorizontalAlignment="Left" Margin="8,8,0,0" Padding="2,0,0,0" Height="16" VerticalAlignment="Top"/>
+            <Grid Margin="8,25,8,0" Height="20" VerticalAlignment="Top">
+              <TextBox x:Name="txtReloginWowPath" Margin="0,0,26,0"
+                       TextWrapping="NoWrap"
+                       Text="{Binding Path=ReloginSettings.WowExecutablePath, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
+              <Button x:Name="btnReloginBrowse" Content="..." Width="22" Height="20"
+                      AutomationProperties.Name="{loc:Resx BrowseReloginClient}"
+                      HorizontalAlignment="Right" Click="btnReloginBrowse_Click"/>
+            </Grid>
+            <Label x:Name="lblReloginRetry" Content="{loc:Resx LblReloginRetry}" Foreground="White"
+                   HorizontalAlignment="Left" Margin="8,48,0,0" Padding="2,0,0,0" Height="16" VerticalAlignment="Top"/>
+            <TextBox x:Name="txtReloginRetryDelay" Margin="8,65,60,0" Height="20" HorizontalAlignment="Left"
+                     Width="72" VerticalAlignment="Top" AutomationProperties.Name="{loc:Resx ReloginRetryDelay}"
+                     Text="{Binding Path=ReloginSettings.RetryDelaySeconds, Mode=TwoWay, ValidatesOnExceptions=True, UpdateSourceTrigger=PropertyChanged}"/>
+            <TextBox x:Name="txtReloginMaxRetries" Margin="0,65,8,0" Height="20" HorizontalAlignment="Right"
+                     Width="72" VerticalAlignment="Top" AutomationProperties.Name="{loc:Resx ReloginMaxRetries}"
+                     Text="{Binding Path=ReloginSettings.MaxRetryCount, Mode=TwoWay, ValidatesOnExceptions=True, UpdateSourceTrigger=PropertyChanged}"/>
+            <TextBlock Foreground="LightGray" Margin="8,90,8,8" TextWrapping="Wrap" VerticalAlignment="Top"
+                       Text="{loc:Resx ReloginNote}"/>
+          </Grid>
+        </GroupBox>
       </WrapPanel>
     </ScrollViewer>
   </Grid>
