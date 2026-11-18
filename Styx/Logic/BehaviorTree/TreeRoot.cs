@@ -176,15 +176,16 @@ namespace Styx.Logic.BehaviorTree
 			{
 				Logging.Write(Colors.Red, "WoW cannot be minimized while the bot is running — restoring window.");
 
+				int showCmd = StyxSettings.Instance.RestoreMinimizedWithoutFocus ? 4 : 9; // 4=SW_SHOWNOACTIVATE, 9=SW_RESTORE
 				if (_lastNonMinimizedPlacement != null)
 				{
 					var restore = _lastNonMinimizedPlacement.Value;
-					restore.showCmd = 9; // SW_RESTORE
+					restore.showCmd = showCmd;
 					SetWindowPlacement(hWnd, ref restore);
 				}
 				else
 				{
-					ShowWindow(hWnd, 9); // SW_RESTORE
+					ShowWindow(hWnd, showCmd);
 				}
 
 				Thread.Sleep(500);

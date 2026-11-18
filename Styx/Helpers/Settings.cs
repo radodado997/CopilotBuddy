@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Reflection;
@@ -76,14 +77,60 @@ namespace Styx.Helpers
 		}
 
 		/// <summary>
-		/// Root settings directory: {AppPath}/Settings/
-		/// Pattern from HB 5.4.8.
+		/// Optional programmatic override for instance-isolated settings directory (primarily for tests).
+		/// Defaults to null, which resolves <see cref="CommandLine.InstanceName"/>.
+		/// </summary>
+		public static string? InstanceNameOverride { get; set; }
+
+		/// <summary>
+		/// Effective sanitized instance name from <see cref="InstanceNameOverride"/> or <c>-instance</c>.
+		/// </summary>
+		public static string? ActiveInstanceName => SanitizeInstanceName(InstanceNameOverride ?? CommandLine.InstanceName);
+
+		/// <summary>
+		/// Computes the settings directory for a base application path and optional instance name.
+		/// When <paramref name="instanceName"/> is non-empty, returns
+		/// <c>{baseApplicationPath}/Settings/Instances/{instanceName}</c>; otherwise <c>{baseApplicationPath}/Settings</c>.
+		/// </summary>
+		public static string GetSettingsDirectory(string baseApplicationPath, string? instanceName)
+		{
+			string baseDir = Path.Combine(baseApplicationPath, "Settings");
+			string? sanitized = SanitizeInstanceName(instanceName);
+			if (!string.IsNullOrEmpty(sanitized))
+			{
+				return Path.Combine(baseDir, "Instances", sanitized);
+			}
+			return baseDir;
+		}
+
+		private static string? SanitizeInstanceName(string? instanceName)
+		{
+			if (string.IsNullOrWhiteSpace(instanceName))
+				return null;
+
+			char[] invalid = Path.GetInvalidFileNameChars();
+			var sb = new StringBuilder(instanceName.Length);
+			foreach (char c in instanceName.Trim())
+			{
+				if (c == Path.DirectorySeparatorChar || c == Path.AltDirectorySeparatorChar || Array.IndexOf(invalid, c) >= 0)
+					sb.Append('_');
+				else
+					sb.Append(c);
+			}
+
+			string result = sb.ToString().Trim('.', ' ');
+			return string.IsNullOrEmpty(result) ? null : result;
+		}
+
+		/// <summary>
+		/// Root settings directory: {AppPath}/Settings/ or {AppPath}/Settings/Instances/{Instance}/
+		/// when -instance is active.
 		/// </summary>
 		public static string SettingsDirectory
 		{
 			get
 			{
-				string dir = Path.Combine(Logging.ApplicationPath, "Settings");
+				string dir = GetSettingsDirectory(Logging.ApplicationPath, ActiveInstanceName);
 				if (!Directory.Exists(dir))
 				{
 					Directory.CreateDirectory(dir);
@@ -184,12 +231,19 @@ namespace Styx.Helpers
 						Array array = (Array)value;
 						for (int i = 0; i < array.Length; i++)
 						{
-							element.Add(new XElement("Entry", array.GetValue(i).ToString()));
+							object? item = array.GetValue(i);
+							string? itemText = item is float or double or decimal
+								? Convert.ToString(item, CultureInfo.InvariantCulture)
+								: item?.ToString();
+							element.Add(new XElement("Entry", itemText));
 						}
 					}
 					else
 					{
-						element = new XElement(elementName, value.ToString());
+						string? valueText = value is float or double or decimal
+							? Convert.ToString(value, CultureInfo.InvariantCulture)
+							: value.ToString();
+						element = new XElement(elementName, valueText);
 					}
 					root.Add(element);
 				}
@@ -319,6 +373,24 @@ namespace Styx.Helpers
 				if (t.IsEnum)
 				{
 					return Enum.Parse(t, val);
+				}
+				if (t == typeof(float))
+				{
+					if (float.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out float fInv))
+						return fInv;
+					return float.Parse(val, NumberStyles.Float, CultureInfo.CurrentCulture);
+				}
+				if (t == typeof(double))
+				{
+					if (double.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out double dInv))
+						return dInv;
+					return double.Parse(val, NumberStyles.Float, CultureInfo.CurrentCulture);
+				}
+				if (t == typeof(decimal))
+				{
+					if (decimal.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out decimal mInv))
+						return mInv;
+					return decimal.Parse(val, NumberStyles.Float, CultureInfo.CurrentCulture);
 				}
 				return Convert.ChangeType(val, t);
 			}

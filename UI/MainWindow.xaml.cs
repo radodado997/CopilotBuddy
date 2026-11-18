@@ -23,6 +23,7 @@ using Styx.Helpers;
 using Styx.Logic.BehaviorTree;
 using Styx.Logic.Profiles;
 using Styx.Logic.Relogin;
+using Styx.PartyGrind;
 using Styx.WoWInternals;
 
 using WpfFontFamily = System.Windows.Media.FontFamily;
@@ -410,14 +411,13 @@ namespace CopilotBuddy.UI
 
             Logging.Write("Searching for WoW process...");
 
-            // Step 1: Check for /pid= command line argument
-            string? pidArg = Environment.GetCommandLineArgs()
-                .FirstOrDefault(s => s.StartsWith("/pid=", StringComparison.OrdinalIgnoreCase));
+            // Step 1: Check for /pid= or -pid= command line argument
+            int? explicitPid = CommandLine.ParseProcessId();
 
             _selectedWoWProc = null;
             var candidates = new List<Process>();
 
-            if (pidArg == null)
+            if (!explicitPid.HasValue)
             {
                 // Find ALL Wow processes (covers the standard client, the WoW.exe spelling,
                 // and the Luacct.exe variant used by some private-server clients)
@@ -439,28 +439,25 @@ namespace CopilotBuddy.UI
             }
             else
             {
-                // Explicit PID from command line
-                string pidStr = pidArg.Substring("/pid=".Length).Trim();
-                if (int.TryParse(pidStr, out int pid))
+                // Explicit PID from command line (/pid= or -pid=)
+                int pid = explicitPid.Value;
+                try
                 {
-                    try
+                    var proc = Process.GetProcessById(pid);
+                    if (!proc.HasExited)
                     {
-                        var proc = Process.GetProcessById(pid);
-                        if (!proc.HasExited)
-                        {
-                            int build = proc.MainModule?.FileVersionInfo.FilePrivatePart ?? 0;
-                            // Same rule as the enumeration path above: build == 0 means the
-                            // client has no version resource (private-server Wow.exe), which
-                            // is still a valid 3.3.5a client.  Requiring the exact build here
-                            // made HBRelog-style "/pid=<id>" attach fail on those clients.
-                            if (build == ObjectManager.SupportedBuild || build == 0)
-                                candidates.Add(proc);
-                        }
+                        int build = proc.MainModule?.FileVersionInfo.FilePrivatePart ?? 0;
+                        // Same rule as the enumeration path above: build == 0 means the
+                        // client has no version resource (private-server Wow.exe), which
+                        // is still a valid 3.3.5a client.  Requiring the exact build here
+                        // made HBRelog-style "/pid=<id>" attach fail on those clients.
+                        if (build == ObjectManager.SupportedBuild || build == 0)
+                            candidates.Add(proc);
                     }
-                    catch
-                    {
-                        Logging.Write(Colors.Red, "Process with PID {0} not found or inaccessible.", pid);
-                    }
+                }
+                catch
+                {
+                    Logging.Write(Colors.Red, "Process with PID {0} not found or inaccessible.", pid);
                 }
             }
 
@@ -669,6 +666,8 @@ namespace CopilotBuddy.UI
                 if (!WaitForTreeRootStop(5000))
                     Logging.Write("Bot thread hung during window close");
             }
+
+            try { SquadOverlay.Detach(); } catch { }
 
             // Disable all plugins so overlay/hotkeys and plugin-owned resources are released.
             // IsTearingDown keeps these cleanup-disables from wiping the saved EnabledPlugins list.
@@ -985,6 +984,16 @@ namespace CopilotBuddy.UI
         {
             try
             {
+                if (SquadSettings.Instance.ApplyCliOverrides())
+                {
+                    SquadSettings.Instance.Save();
+                    Logging.Write("[PartyGrind] Applied CLI flags: Role={0}, Coordinator={1}, Team={2}, Port={3}",
+                        SquadSettings.Instance.Role,
+                        SquadSettings.Instance.IsCoordinator,
+                        SquadSettings.Instance.TeamId,
+                        SquadSettings.Instance.IpcPort);
+                }
+
                 string autoLoadProfile = CommandLine.AutoLoadProfile;
                 string autoStartBot = CommandLine.AutoStartBotName;
 
@@ -1016,8 +1025,12 @@ namespace CopilotBuddy.UI
                 if (!string.IsNullOrEmpty(autoStartBot))
                 {
                     string needle = autoStartBot.ToLowerInvariant();
-                    var match = BotManager.Instance.Bots
-                        .FirstOrDefault(b => b.Key != null && b.Key.ToLowerInvariant().Contains(needle));
+                    var exact = BotManager.Instance.Bots
+                        .FirstOrDefault(b => string.Equals(b.Key, autoStartBot, StringComparison.OrdinalIgnoreCase));
+                    var match = exact.Value != null
+                        ? exact
+                        : BotManager.Instance.Bots
+                            .FirstOrDefault(b => b.Key != null && b.Key.ToLowerInvariant().Contains(needle));
                     if (match.Value != null)
                     {
                         Logging.Write("Auto-select botbase from /botname: {0}", match.Key);
@@ -1037,9 +1050,10 @@ namespace CopilotBuddy.UI
                 }
 
                 // Step 3 — auto-start. Mirrors 4.3.4 AfterInitOnAuthSuccess:432-435.
-                // We treat *any* auto-config (loadprofile or botname) as an implicit /autostart,
-                // because HBRelog only forwards those two args together with /autostart.
-                bool shouldAutoStart = !string.IsNullOrEmpty(autoLoadProfile) || !string.IsNullOrEmpty(autoStartBot);
+                // We treat *any* auto-config (loadprofile or botname) or explicit -autostart as auto-start.
+                bool shouldAutoStart = !string.IsNullOrEmpty(autoLoadProfile)
+                    || !string.IsNullOrEmpty(autoStartBot)
+                    || CommandLine.Arguments.IsTrue("autostart");
                 if (shouldAutoStart)
                     StartBot();
             }
@@ -1673,6 +1687,7 @@ namespace CopilotBuddy.UI
                 // Create CharacterSettings instance for the current character
                 // Pattern from HB 5.4.8 smethod_0() — called after game attachment
                 CharacterSettings.Initialize();
+                SquadSettings.Initialize();
 
                 // Load other per-character settings
                 UISettings.Instance.Load();
@@ -1702,6 +1717,7 @@ namespace CopilotBuddy.UI
                 CharacterSettings.Instance.Save();
                 StyxSettings.Instance.Save();
                 LevelbotSettings.Instance.Save();
+                SquadSettings.Instance?.Save();
                 
                 Logging.WriteDebug("[Settings] Saved all settings");
             }

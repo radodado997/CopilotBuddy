@@ -89,6 +89,21 @@ namespace Styx.Logic.Profiles
 			}
 		}
 
+		/// <summary>
+		/// Optional level selector override (e.g. PartyGrindBot uses EffectiveSquadMinLevel
+		/// so all clients stay on the same sub-profile until the lowest member levels up).
+		/// </summary>
+		public static Func<int>? LevelOverrideSelector { get; set; }
+
+		/// <summary>
+		/// Re-evaluates the active sub-profile against the current effective level
+		/// (<see cref="LevelOverrideSelector"/> or <c>ObjectManager.Me?.Level</c>).
+		/// </summary>
+		public static void RefreshProfileForLevel()
+		{
+			LoadProfileForLevel();
+		}
+
 		private static void OnLevelUp(BotEvents.Player.LevelUpEventArgs args)
 		{
 			if (Battlegrounds.IsInsideBattleground)
@@ -99,7 +114,8 @@ namespace Styx.Logic.Profiles
 
 		private static void LoadProfileForLevel()
 		{
-			var profile = GetProfileForLevel(ObjectManager.Me?.Level ?? 1);
+			int effectiveLevel = LevelOverrideSelector?.Invoke() ?? ObjectManager.Me?.Level ?? 1;
+			var profile = GetProfileForLevel(effectiveLevel);
 			CurrentProfile = profile;
 			if (profile != null)
 				Logging.WriteDebug("Selected sub-profile: {0} (L{1}-{2})", profile.Name, profile.MinLevel, profile.MaxLevel);
@@ -113,7 +129,8 @@ namespace Styx.Logic.Profiles
 			}
 
 			var sortedProfiles = CurrentOuterProfile.GetScopeSortedProfiles();
-			uint mapId = ObjectManager.Me?.MapId ?? 0;
+			var me = ObjectManager.Me;
+			uint mapId = me?.MapId ?? 0;
 			for (int i = 0; i < sortedProfiles.Count; i++)
 			{
 				// BUG-10: Check ContinentId matches current map (HB 4.3.4)
@@ -126,6 +143,20 @@ namespace Styx.Logic.Profiles
 					sortedProfiles[i].Name, sortedProfiles[i].MinLevel, sortedProfiles[i].MaxLevel,
 					sortedProfiles[i].ContinentId, level, mapId);
 			}
+
+			// When running offline without an attached WoW client (e.g. unit tests),
+			// allow matching by level range if no ContinentId==0/-1 sub-profile matched.
+			if (me == null)
+			{
+				for (int i = 0; i < sortedProfiles.Count; i++)
+				{
+					if (level >= sortedProfiles[i].MinLevel && level < sortedProfiles[i].MaxLevel)
+					{
+						return sortedProfiles[i];
+					}
+				}
+			}
+
 			return null;
 		}
 
