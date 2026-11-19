@@ -24,6 +24,22 @@ namespace Styx.Logic.Inventory.Frames.Trainer
 		public int NumTrainerServices => Lua.GetReturnVal<int>("return GetNumTrainerServices()", 0);
 
 		/// <summary>
+		/// Returns true when at least one trainer row is still marked available (trainable).
+		/// Rows are inspected by their reported category, not by their display position.
+		/// </summary>
+		public bool HasPurchasableService()
+		{
+			const string script =
+				"local count = GetNumTrainerServices() or 0; " +
+				"for i = 1, count do " +
+				"  local _, _, category = GetTrainerServiceInfo(i); " +
+				"  if category == 'available' then return true end " +
+				"end " +
+				"return false";
+			return Lua.GetReturnVal<bool>(script, 0);
+		}
+
+		/// <summary>
 		/// Gets whether this is a tradeskill trainer.
 		/// </summary>
 		public bool IsTradeskillTrainer => Lua.GetReturnVal<bool>("return IsTradeskillTrainer()", 0);

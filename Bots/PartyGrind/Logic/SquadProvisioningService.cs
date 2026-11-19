@@ -125,24 +125,27 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         }
 
         /// <summary>
-        /// Collects the spell IDs of ranked spells the provider actually knows, keyed by rank.
-        /// The generic base spell name alone does not prove that a specific rank is known.
+        /// Collects each learned spell record (ID plus rank metadata) for a base spell name.
+        /// Uses the individual spell book entries so duplicate names and every learned rank
+        /// are preserved, rather than the name-deduplicated SpellManager dictionary.
         /// </summary>
-        private static Dictionary<int, int> GetKnownRankSpellIds(string baseSpellName)
+        private static List<(int Rank, int SpellId)> GetKnownRankSpells(string baseSpellName)
         {
-            var known = new Dictionary<int, int>();
-            string rankMarker = "(Rank ";
-            foreach (var pair in SpellManager.Spells)
+            var known = new List<(int Rank, int SpellId)>();
+            var me = StyxWoW.Me;
+            if (me == null)
+                return known;
+
+            foreach (var spell in me.KnownSpells)
             {
-                int rankStart = pair.Key.IndexOf(rankMarker, StringComparison.OrdinalIgnoreCase);
-                if (rankStart <= 0 ||
-                    !pair.Key.Substring(0, rankStart).Trim().Equals(baseSpellName, StringComparison.OrdinalIgnoreCase))
+                if (spell == null || !string.Equals(spell.Name, baseSpellName, StringComparison.OrdinalIgnoreCase))
                     continue;
-                int digitsStart = rankStart + rankMarker.Length;
-                int close = pair.Key.IndexOf(')', digitsStart);
-                if (close > digitsStart &&
-                    int.TryParse(pair.Key.Substring(digitsStart, close - digitsStart), out int rank))
-                    known[rank] = pair.Value.Id;
+
+                string rankText = spell.Rank ?? string.Empty;
+                int space = rankText.LastIndexOf(' ');
+                string digits = space >= 0 ? rankText.Substring(space + 1) : rankText;
+                if (int.TryParse(digits.Trim(), out int rank))
+                    known.Add((rank, spell.Id));
             }
             return known;
         }
@@ -150,20 +153,20 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         /// <summary>
         /// Selects the highest WotLK rank for Conjure Water / Conjure Food / Create Healthstone
         /// whose created item RequiredLevel &lt;= <paramref name="receiverLevel"/>.
-        /// When supplied, <paramref name="knownRankSpellIds"/> restricts candidates to ranks
-        /// the provider actually knows (rank -&gt; known spell ID).
+        /// When supplied, <paramref name="knownRankSpells"/> restricts candidates to ranks
+        /// the provider actually knows (learned spell ID plus rank metadata).
         /// </summary>
         public static int? SelectBestConjureRank(
             bool isWater,
             int receiverLevel,
             int casterLevel,
-            IReadOnlyDictionary<int, int>? knownRankSpellIds = null)
+            IReadOnlyList<(int Rank, int SpellId)>? knownRankSpells = null)
         {
             var table = isWater ? ConjureWaterRanks : ConjureFoodRanks;
             int? best = null;
             foreach (var row in table)
             {
-                if (knownRankSpellIds != null && !knownRankSpellIds.ContainsKey(row.Rank))
+                if (knownRankSpells != null && !knownRankSpells.Any(k => k.Rank == row.Rank))
                     continue;
                 if (casterLevel >= row.CasterLevel && receiverLevel >= row.ItemReqLevel)
                     best = row.Rank;
@@ -174,12 +177,12 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         public static int? SelectBestHealthstoneRank(
             int receiverLevel,
             int casterLevel,
-            IReadOnlyDictionary<int, int>? knownRankSpellIds = null)
+            IReadOnlyList<(int Rank, int SpellId)>? knownRankSpells = null)
         {
             int? best = null;
             foreach (var row in CreateHealthstoneRanks)
             {
-                if (knownRankSpellIds != null && !knownRankSpellIds.ContainsKey(row.Rank))
+                if (knownRankSpells != null && !knownRankSpells.Any(k => k.Rank == row.Rank))
                     continue;
                 if (casterLevel >= row.CasterLevel && receiverLevel >= row.ItemReqLevel)
                     best = row.Rank;
@@ -511,7 +514,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     return SpellManager.Cast("Conjure Refreshment", me);
                 }
 
-                var foodRanks = GetKnownRankSpellIds("Conjure Food");
+                var foodRanks = GetKnownRankSpells("Conjure Food");
                 int? foodRank = SelectBestConjureRank(isWater: false, receiverLevel, me.Level, foodRanks);
                 if (foodRank.HasValue)
                 {
@@ -530,7 +533,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     return SpellManager.Cast("Conjure Refreshment", me);
                 }
 
-                var waterRanks = GetKnownRankSpellIds("Conjure Water");
+                var waterRanks = GetKnownRankSpells("Conjure Water");
                 int? waterRank = SelectBestConjureRank(isWater: true, receiverLevel, me.Level, waterRanks);
                 if (waterRank.HasValue)
                 {
@@ -571,7 +574,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
             if (FindTradableBagItem(me, targetSummary.Level, false, false, true) == null)
             {
-                var hsRanks = GetKnownRankSpellIds("Create Healthstone");
+                var hsRanks = GetKnownRankSpells("Create Healthstone");
                 int? hsRank = SelectBestHealthstoneRank(targetSummary.Level, me.Level, hsRanks);
                 if (hsRank.HasValue)
                 {

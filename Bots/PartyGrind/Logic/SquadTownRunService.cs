@@ -584,19 +584,26 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             {
                 bool forceTrainer = Vendors.ForceTrainer;
                 int spellsBefore = SpellManager.NumKnownSpells;
+                // Normalize filters so BuyAll and the purchasability check see every row,
+                // regardless of how the trainer window was left configured.
+                TrainerFrame.Instance.SetServiceFilter(TrainerServiceFilter.Available, true);
+                TrainerFrame.Instance.SetServiceFilter(TrainerServiceFilter.Unavailable, true);
+                TrainerFrame.Instance.SetServiceFilter(TrainerServiceFilter.Used, true);
                 TrainerFrame.Instance.BuyAll();
 
                 // BuyTrainerService is answered by the server asynchronously. Wait briefly
                 // for the spellbook/trainer list to settle before declaring training done.
-                int remainingServices = TrainerFrame.Instance.NumTrainerServices;
-                for (int attempt = 0; attempt < 3 && remainingServices > 0; attempt++)
+                // Count only rows the client still reports as trainable; unrelated rows
+                // (already used or unavailable) must not block completion.
+                bool hasPurchasableService = TrainerFrame.Instance.HasPurchasableService();
+                for (int attempt = 0; attempt < 3 && hasPurchasableService; attempt++)
                 {
                     StyxWoW.Sleep(300);
                     SpellManager.Refresh();
-                    remainingServices = TrainerFrame.Instance.NumTrainerServices;
+                    hasPurchasableService = TrainerFrame.Instance.HasPurchasableService();
                 }
                 bool learnedSpell = SpellManager.NumKnownSpells > spellsBefore;
-                bool trained = remainingServices == 0 || learnedSpell;
+                bool trained = !hasPurchasableService || learnedSpell;
                 TrainerFrame.Instance.Close();
 
                 if (!trained)
