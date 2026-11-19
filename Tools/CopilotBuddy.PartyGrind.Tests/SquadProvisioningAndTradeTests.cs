@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using CopilotBuddy.Bots.PartyGrind.Logic;
 using Styx.Logic.Inventory.Frames.Trade;
@@ -138,6 +139,12 @@ namespace CopilotBuddy.PartyGrind.Tests
 
             int? rankFor20 = SquadProvisioningService.SelectBestConjureRank(isWater: true, receiverLevel: 20, casterLevel: 25);
             Assert.Equal(3, rankFor20);
+
+            // Only ranks the provider actually knows are eligible.
+            var knownRanks = new Dictionary<int, int> { { 1, 100 }, { 2, 101 } };
+            Assert.Equal(2, SquadProvisioningService.SelectBestConjureRank(true, 20, 25, knownRanks));
+            Assert.Null(SquadProvisioningService.SelectBestConjureRank(
+                true, 20, 25, new Dictionary<int, int>()));
         }
 
         [Fact]

@@ -66,7 +66,7 @@ namespace CopilotBuddy.Bots.PartyGrind
         private bool _lootFilterAttached;
         private SquadTravelProgress _travelProgress = new();
         private static Composite? _activeCombatRoutine, _activeRestRoutine;
-        private static bool _combatTicked, _restTicked;
+        private static bool _combatTicked, _restTicked, _healTicked;
 
         private sealed class RoutineAwareRoot : PrioritySelector
         {
@@ -74,12 +74,14 @@ namespace CopilotBuddy.Bots.PartyGrind
             public override RunStatus Tick(object context)
             {
                 if (IsRunning) { base.Stop(context); base.Start(context); }
-                _combatTicked = _restTicked = false;
+                _combatTicked = _restTicked = _healTicked = false;
                 try { return base.Tick(context); }
                 finally
                 {
                     if (!_combatTicked) StopRoutine(ref _activeCombatRoutine);
-                    if (!_combatTicked) SquadHealBridge.StopActiveHealBehavior();
+                    // Healing has its own ownership flag: a healer tick that is actively
+                    // handling a target must not be mistaken for a finished combat branch.
+                    if (!_healTicked) SquadHealBridge.StopActiveHealBehavior();
                     if (!_restTicked) StopRoutine(ref _activeRestRoutine);
                 }
             }
@@ -887,7 +889,10 @@ namespace CopilotBuddy.Bots.PartyGrind
 
                 case SquadRole.Healer:
                     if (SquadHealBridge.RunHealerTick(emergencyOnly: false, settings, leader))
+                    {
+                        _healTicked = true;
                         return RunStatus.Success;
+                    }
                     if (PositionBackline(settings.HealerStandoffDistance, leader, me))
                         return RunStatus.Success;
                     if (SquadHealBridge.TryHealerAssistDps(settings, leader))
@@ -896,7 +901,10 @@ namespace CopilotBuddy.Bots.PartyGrind
 
                 case SquadRole.HybridOffHeal:
                     if (SquadHealBridge.RunHealerTick(emergencyOnly: true, settings, leader))
+                    {
+                        _healTicked = true;
                         return RunStatus.Success;
+                    }
                     return RunDpsBehavior(settings, leader, isMelee: false);
 
                 case SquadRole.DpsMelee:

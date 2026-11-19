@@ -82,6 +82,8 @@
                                     <RowDefinition Height="Auto"/>
                                     <RowDefinition Height="Auto"/>
                                     <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="Auto"/>
                                 </Grid.RowDefinitions>
 
                                 <Label x:Name="LblTxtTeamId" Grid.Row="0" Grid.Column="0" Content="Team ID:"/>
@@ -102,6 +104,16 @@
                                 <Label x:Name="LblTxtExpectedRoster" Grid.Row="5" Grid.Column="0" Content="Expected Roster (CSV):"/>
                                 <TextBox x:Name="TxtExpectedRoster" AutomationProperties.LabeledBy="{Binding ElementName=LblTxtExpectedRoster}" Grid.Row="5" Grid.Column="1"
                                          ToolTip="Comma-separated names of squad characters (3–5 clients)"/>
+
+                                <Label x:Name="LblTxtIpcMemberSecretsPath" Grid.Row="6" Grid.Column="0" Content="IPC Secrets File:"/>
+                                <StackPanel Grid.Row="6" Grid.Column="1" Orientation="Horizontal">
+                                    <TextBox x:Name="TxtIpcMemberSecretsPath" AutomationProperties.LabeledBy="{Binding ElementName=LblTxtIpcMemberSecretsPath}" Width="330"
+                                             ToolTip="JSON file of random per-character IPC secrets. Configure each instance before launch; secret values are never written to the launcher script."/>
+                                    <Button x:Name="BtnBrowseSecrets" Content="Browse..." Click="BtnBrowseSecrets_Click"/>
+                                </StackPanel>
+                                <TextBlock Grid.Row="7" Grid.ColumnSpan="2" TextWrapping="Wrap"
+                                           Text="Each WoW client/instance must have its own secrets file configured here before launch. Secret values stay out of the generated .bat file."
+                                           Margin="0,2,0,0"/>
                             </Grid>
                         </GroupBox>
 

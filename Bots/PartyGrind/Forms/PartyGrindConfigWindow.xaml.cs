@@ -5,6 +5,7 @@ using System.Linq;
 using System.Text;
 using System.Windows;
 using System.Windows.Controls;
+using Microsoft.Win32;
 using Styx.Logic.Profiles;
 using Styx.PartyGrind;
 
@@ -49,6 +50,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Forms
                 ChkIsCoordinator.IsChecked = s.IsCoordinator;
                 TxtCoordinatorName.Text = s.CoordinatorName;
                 TxtExpectedRoster.Text = s.ExpectedMemberNamesCsv;
+                TxtIpcMemberSecretsPath.Text = s.IpcMemberSecretsPath;
 
                 ChkAutoInvite.IsChecked = s.AutoInviteMembers;
                 TxtInviteInterval.Text = s.InviteIntervalSeconds.ToString(CultureInfo.InvariantCulture);
@@ -132,6 +134,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Forms
             s.IsCoordinator = ChkIsCoordinator.IsChecked == true;
             s.CoordinatorName = TxtCoordinatorName.Text?.Trim() ?? string.Empty;
             s.ExpectedMemberNamesCsv = TxtExpectedRoster.Text?.Trim() ?? string.Empty;
+            s.IpcMemberSecretsPath = TxtIpcMemberSecretsPath.Text?.Trim() ?? string.Empty;
 
             s.AutoInviteMembers = ChkAutoInvite.IsChecked == true;
             s.InviteIntervalSeconds = ParseInt(TxtInviteInterval.Text, s.InviteIntervalSeconds, 3, 300);
@@ -190,6 +193,19 @@ namespace CopilotBuddy.Bots.PartyGrind.Forms
             if (s.ResumeRestHealthPct < s.TriggerRestHealthPct || s.ResumeRestManaPct < s.TriggerRestManaPct)
                 throw new ArgumentException("Rest resume thresholds must be at least their trigger thresholds.");
             s.GetXML().Save(s.SettingsPath);
+        }
+
+        private void BtnBrowseSecrets_Click(object sender, RoutedEventArgs e)
+        {
+            var dialog = new OpenFileDialog
+            {
+                Title = "Select per-instance IPC member secrets file",
+                Filter = "Secrets files (*.json;*.txt)|*.json;*.txt|All files (*.*)|*.*",
+                CheckFileExists = true,
+                FileName = TxtIpcMemberSecretsPath.Text ?? string.Empty
+            };
+            if (dialog.ShowDialog(this) == true)
+                TxtIpcMemberSecretsPath.Text = dialog.FileName;
         }
 
         private void CmbRole_SelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -335,8 +351,12 @@ namespace CopilotBuddy.Bots.PartyGrind.Forms
             for (int i = 0; i < count; i++)
             {
                 bool isCoord = i == 0;
+                // Bind each launch to its WoW process explicitly. The window title is
+                // only a label; -pid is the supported attach selector.
+                sb.AppendLine($"set /p PID{i + 1}=WoW PID for {finalNames[i]} (Client{i + 1}): ");
                 sb.AppendLine(
                     $"start \"Client{i + 1} - {finalNames[i]}\" CopilotBuddy.exe " +
+                    $"-pid=%PID{i + 1}% " +
                     $"-instance=Client{i + 1} " +
                     $"-botname=\"Party Grind\" " +
                     $"-loadprofile=%PROFILE% " +

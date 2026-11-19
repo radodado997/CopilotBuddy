@@ -125,26 +125,62 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         }
 
         /// <summary>
+        /// Collects the spell IDs of ranked spells the provider actually knows, keyed by rank.
+        /// The generic base spell name alone does not prove that a specific rank is known.
+        /// </summary>
+        private static Dictionary<int, int> GetKnownRankSpellIds(string baseSpellName)
+        {
+            var known = new Dictionary<int, int>();
+            string rankMarker = "(Rank ";
+            foreach (var pair in SpellManager.Spells)
+            {
+                int rankStart = pair.Key.IndexOf(rankMarker, StringComparison.OrdinalIgnoreCase);
+                if (rankStart <= 0 ||
+                    !pair.Key.Substring(0, rankStart).Trim().Equals(baseSpellName, StringComparison.OrdinalIgnoreCase))
+                    continue;
+                int digitsStart = rankStart + rankMarker.Length;
+                int close = pair.Key.IndexOf(')', digitsStart);
+                if (close > digitsStart &&
+                    int.TryParse(pair.Key.Substring(digitsStart, close - digitsStart), out int rank))
+                    known[rank] = pair.Value.Id;
+            }
+            return known;
+        }
+
+        /// <summary>
         /// Selects the highest WotLK rank for Conjure Water / Conjure Food / Create Healthstone
         /// whose created item RequiredLevel &lt;= <paramref name="receiverLevel"/>.
+        /// When supplied, <paramref name="knownRankSpellIds"/> restricts candidates to ranks
+        /// the provider actually knows (rank -&gt; known spell ID).
         /// </summary>
-        public static int? SelectBestConjureRank(bool isWater, int receiverLevel, int casterLevel)
+        public static int? SelectBestConjureRank(
+            bool isWater,
+            int receiverLevel,
+            int casterLevel,
+            IReadOnlyDictionary<int, int>? knownRankSpellIds = null)
         {
             var table = isWater ? ConjureWaterRanks : ConjureFoodRanks;
             int? best = null;
             foreach (var row in table)
             {
+                if (knownRankSpellIds != null && !knownRankSpellIds.ContainsKey(row.Rank))
+                    continue;
                 if (casterLevel >= row.CasterLevel && receiverLevel >= row.ItemReqLevel)
                     best = row.Rank;
             }
             return best;
         }
 
-        public static int? SelectBestHealthstoneRank(int receiverLevel, int casterLevel)
+        public static int? SelectBestHealthstoneRank(
+            int receiverLevel,
+            int casterLevel,
+            IReadOnlyDictionary<int, int>? knownRankSpellIds = null)
         {
             int? best = null;
             foreach (var row in CreateHealthstoneRanks)
             {
+                if (knownRankSpellIds != null && !knownRankSpellIds.ContainsKey(row.Rank))
+                    continue;
                 if (casterLevel >= row.CasterLevel && receiverLevel >= row.ItemReqLevel)
                     best = row.Rank;
             }
@@ -475,8 +511,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     return SpellManager.Cast("Conjure Refreshment", me);
                 }
 
-                int? foodRank = SelectBestConjureRank(isWater: false, receiverLevel, me.Level);
-                if (foodRank.HasValue && SpellManager.HasSpell("Conjure Food"))
+                var foodRanks = GetKnownRankSpellIds("Conjure Food");
+                int? foodRank = SelectBestConjureRank(isWater: false, receiverLevel, me.Level, foodRanks);
+                if (foodRank.HasValue)
                 {
                     if (me.IsMoving) WoWMovement.MoveStop();
                     Lua.DoString($"CastSpellByName('Conjure Food(Rank {foodRank.Value})')");
@@ -493,8 +530,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     return SpellManager.Cast("Conjure Refreshment", me);
                 }
 
-                int? waterRank = SelectBestConjureRank(isWater: true, receiverLevel, me.Level);
-                if (waterRank.HasValue && SpellManager.HasSpell("Conjure Water"))
+                var waterRanks = GetKnownRankSpellIds("Conjure Water");
+                int? waterRank = SelectBestConjureRank(isWater: true, receiverLevel, me.Level, waterRanks);
+                if (waterRank.HasValue)
                 {
                     if (me.IsMoving) WoWMovement.MoveStop();
                     Lua.DoString($"CastSpellByName('Conjure Water(Rank {waterRank.Value})')");
@@ -533,8 +571,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
             if (FindTradableBagItem(me, targetSummary.Level, false, false, true) == null)
             {
-                int? hsRank = SelectBestHealthstoneRank(targetSummary.Level, me.Level);
-                if (hsRank.HasValue && SpellManager.HasSpell("Create Healthstone"))
+                var hsRanks = GetKnownRankSpellIds("Create Healthstone");
+                int? hsRank = SelectBestHealthstoneRank(targetSummary.Level, me.Level, hsRanks);
+                if (hsRank.HasValue)
                 {
                     if (me.IsMoving) WoWMovement.MoveStop();
                     Lua.DoString($"CastSpellByName('Create Healthstone(Rank {hsRank.Value})')");

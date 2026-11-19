@@ -229,6 +229,8 @@ namespace CopilotBuddy.PartyGrind.Tests
 
             Assert.Contains("-instance=Client1", script);
             Assert.Contains("-instance=Client5", script);
+            Assert.Contains("-pid=%PID1%", script);
+            Assert.Contains("-pid=%PID5%", script);
             Assert.Contains("-botname=\"Party Grind\"", script);
             Assert.Contains("-squadcoordinator=true", script);
             Assert.Contains("-squadcoordinator=false", script);

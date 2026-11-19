@@ -7,6 +7,7 @@ using Styx.Combat.CombatRoutine;
 using Styx.Database;
 using Styx.Helpers;
 using Styx.Logic;
+using Styx.Logic.Combat;
 using Styx.Logic.Inventory.Frames.Gossip;
 using Styx.Logic.Inventory.Frames.MailBox;
 using Styx.Logic.Inventory.Frames.Merchant;
@@ -581,9 +582,30 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
             if (TrainerFrame.Instance.IsVisible)
             {
-                Vendors.TrainSkills();
-                StyxWoW.Sleep(400);
+                bool forceTrainer = Vendors.ForceTrainer;
+                int spellsBefore = SpellManager.NumKnownSpells;
+                TrainerFrame.Instance.BuyAll();
+
+                // BuyTrainerService is answered by the server asynchronously. Wait briefly
+                // for the spellbook/trainer list to settle before declaring training done.
+                int remainingServices = TrainerFrame.Instance.NumTrainerServices;
+                for (int attempt = 0; attempt < 3 && remainingServices > 0; attempt++)
+                {
+                    StyxWoW.Sleep(300);
+                    SpellManager.Refresh();
+                    remainingServices = TrainerFrame.Instance.NumTrainerServices;
+                }
+                bool learnedSpell = SpellManager.NumKnownSpells > spellsBefore;
+                bool trained = remainingServices == 0 || learnedSpell;
                 TrainerFrame.Instance.Close();
+
+                if (!trained)
+                {
+                    // Keep the request pending so a later town run retries training.
+                    if (forceTrainer) Vendors.ForceTrainer = true;
+                    return false;
+                }
+
                 Vendors.NeedClassTraining = false;
                 Vendors.ForceTrainer = false;
                 return true;
