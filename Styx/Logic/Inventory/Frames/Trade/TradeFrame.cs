@@ -68,13 +68,13 @@ namespace Styx.Logic.Inventory.Frames.Trade
             if (luaBag < 0 || luaSlot <= 0)
                 return false;
 
-            return PutItem(luaBag, luaSlot, tradeSlot, splitCount, (int)item.StackCount);
+            return PutItem(luaBag, luaSlot, tradeSlot, splitCount, (int)item.StackCount, item.Entry);
         }
 
         /// <summary>
         /// Places an item from Lua bag (0-4) and slot (1-based) into trade slot (1-6).
         /// </summary>
-        public bool PutItem(int luaBagIndex, int luaBagSlot, int tradeSlot, int splitCount = 0, int currentStackCount = 0)
+        public bool PutItem(int luaBagIndex, int luaBagSlot, int tradeSlot, int splitCount = 0, int currentStackCount = 0, uint expectedEntry = 0)
         {
             if (!IsVisible || tradeSlot < 1 || tradeSlot > 6 ||
                 Lua.GetReturnVal<int>("if CursorHasItem() then return 1 else return 0 end", 0U) == 1)
@@ -89,9 +89,16 @@ namespace Styx.Logic.Inventory.Frames.Trade
                 Lua.DoString($"PickupContainerItem({luaBagIndex}, {luaBagSlot}) ClickTradeButton({tradeSlot})");
             }
 
-            if (Lua.GetReturnVal<int>("if CursorHasItem() then return 1 else return 0 end", 0U) == 1)
+            bool cursorEmpty = Lua.GetReturnVal<int>("if CursorHasItem() then return 1 else return 0 end", 0U) != 1;
+            int expectedCount = splitCount > 0 ? splitCount : currentStackCount;
+            // An empty cursor alone is not success: verify the intended item landed in
+            // the intended trade slot with the expected quantity.
+            bool slotVerified = expectedEntry == 0 || expectedCount <= 0 ||
+                ContainsPlayerItem(tradeSlot, expectedEntry, expectedCount);
+            if (!cursorEmpty || !slotVerified)
             {
-                Lua.DoString("ClearCursor()");
+                if (!cursorEmpty)
+                    Lua.DoString("ClearCursor()");
                 return false;
             }
 
@@ -104,7 +111,18 @@ namespace Styx.Logic.Inventory.Frames.Trade
         public bool HasEmptyPlayerOffer => Lua.GetReturnVal<int>(
             "if GetPlayerTradeMoney() ~= 0 then return 0 end for i=1,7 do if GetTradePlayerItemLink(i) then return 0 end end return 1", 0U) == 1;
 
-        public int PlayerTradeMoney => Lua.GetReturnVal<int>("return GetPlayerTradeMoney() or 0", 0U);
+        // Returns -1 when the value cannot be read (including when the frame is gone),
+        // so callers never mistake a failed read for a valid offer of zero copper.
+        public int PlayerTradeMoney
+        {
+            get
+            {
+                string raw = Lua.GetReturnVal<string>(
+                    "if TradeFrame and TradeFrame:IsVisible() then local m = GetPlayerTradeMoney() if m ~= nil then return tostring(m) end end return 'unreadable'",
+                    0U);
+                return int.TryParse(raw, out int money) ? money : -1;
+            }
+        }
 
         /// <summary>
         /// Compact signature of the local offer: slot:entry:count for trade slots 1-6.

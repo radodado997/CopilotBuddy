@@ -71,6 +71,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private bool _migratingZone;
         private string _lastSubProfileKey = string.Empty;
         private uint _lastBreadcrumbMapId;
+        private int _breadcrumbGeneration;
+        private long _breadcrumbSequence;
         private string _activeProvisioner = string.Empty;
         private string _activeTradeTarget = string.Empty;
         private long _provisionStartedUtcMs;
@@ -87,7 +89,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             ManualPauseReason = string.Empty;
             _history.Clear();
             _provisionCooldownUntilMs.Clear();
-            _breadcrumbs.Clear();
+            ClearBreadcrumbs();
             _isWaitingForFollower = false;
             _isHardBacktracking = false;
             _inTownRun = false;
@@ -224,7 +226,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     !string.Equals(_lastSubProfileKey, subProfileKey, StringComparison.Ordinal))
                 {
                     _migratingZone = true;
-                    _breadcrumbs.Clear();
+                    ClearBreadcrumbs();
                 }
                 _lastSubProfileKey = subProfileKey;
             }
@@ -263,6 +265,10 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             bool hasLivingResCapable = rosterStates.Any(m =>
                 !m.IsDead && !m.IsGhost &&
                 m.CanResurrect);
+            // A connected member that has not reported telemetry is unknown, not dead and
+            // not proof that nobody can resurrect. Do not act on an incomplete roster.
+            bool rosterIncomplete = connectedClients.Any(s => s.IsConnected &&
+                s.LatestState == null && !string.IsNullOrWhiteSpace(s.CharacterName));
 
             if (_wasAnyInCombat && !anyInCombat && !allDead)
             {
@@ -307,7 +313,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             bool resTimeoutExceeded = _resWaitStartedUtcMs > 0 &&
                 (nowUtcMs - _resWaitStartedUtcMs) >= Math.Max(5, settings.WaitForPartyRessSeconds) * 1000L;
 
-            if (allDead || (anyDead && !hasLivingResCapable && !anyInCombat) || resTimeoutExceeded)
+            if (!rosterIncomplete &&
+                (allDead || (anyDead && !hasLivingResCapable && !anyInCombat) || resTimeoutExceeded))
             {
                 _inCorpseRun = true;
             }
@@ -379,7 +386,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     (!profile.TownRallyMapId.HasValue || m.MapId == profile.TownRallyMapId.Value) &&
                     new WoWPoint(m.X, m.Y, m.Z).Distance2D(townRally) <= 20.0f);
 
-                if (allDoneAndAtRally && !anyStillHasNeed)
+                if (!anyInCombat && !anyDead && allDoneAndAtRally && !anyStillHasNeed)
                 {
                     _allTownTasksComplete = true;
                     _inTownRun = false;
@@ -499,7 +506,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     X = b.X,
                     Y = b.Y,
                     Z = b.Z,
-                    TimestampUtcMs = b.TimestampUtcMs
+                    TimestampUtcMs = b.TimestampUtcMs,
+                    RouteGeneration = b.RouteGeneration,
+                    Sequence = b.Sequence
                 }).ToList(),
                 TownRallyX = profile.TownRallyX,
                 TownRallyY = profile.TownRallyY,
@@ -510,7 +519,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 SquadCorpseRallyX = profile.SafeCorpseRallyX,
                 SquadCorpseRallyY = profile.SafeCorpseRallyY,
                 SquadCorpseRallyZ = profile.SafeCorpseRallyZ,
-                ReleaseCorpseOrder = _inCorpseRun && anyDead,
+                ReleaseCorpseOrder = !rosterIncomplete && _inCorpseRun && anyDead,
                 ActiveProvisionerName = _activeProvisioner,
                 ActiveTradeTargetName = _activeTradeTarget,
                 MemberAssignments = assignments,
@@ -586,25 +595,39 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             rec.LastState = state;
         }
 
+        private void ClearBreadcrumbs()
+        {
+            _breadcrumbs.Clear();
+            _breadcrumbGeneration++;
+        }
+
         private void UpdateBreadcrumbs(uint mapId, float x, float y, float z, long nowUtcMs)
         {
             if (_lastBreadcrumbMapId != mapId)
             {
-                _breadcrumbs.Clear();
+                ClearBreadcrumbs();
                 _lastBreadcrumbMapId = mapId;
             }
 
             var current = new WoWPoint(x, y, z);
             if (_breadcrumbs.Count == 0)
             {
-                _breadcrumbs.Add(new SquadBreadcrumb { MapId = mapId, X = x, Y = y, Z = z, TimestampUtcMs = nowUtcMs });
+                _breadcrumbs.Add(new SquadBreadcrumb
+                {
+                    MapId = mapId, X = x, Y = y, Z = z, TimestampUtcMs = nowUtcMs,
+                    RouteGeneration = _breadcrumbGeneration, Sequence = ++_breadcrumbSequence
+                });
                 return;
             }
 
             var last = _breadcrumbs[^1];
             if (current.Distance(new WoWPoint(last.X, last.Y, last.Z)) >= 5.0f)
             {
-                _breadcrumbs.Add(new SquadBreadcrumb { MapId = mapId, X = x, Y = y, Z = z, TimestampUtcMs = nowUtcMs });
+                _breadcrumbs.Add(new SquadBreadcrumb
+                {
+                    MapId = mapId, X = x, Y = y, Z = z, TimestampUtcMs = nowUtcMs,
+                    RouteGeneration = _breadcrumbGeneration, Sequence = ++_breadcrumbSequence
+                });
                 while (_breadcrumbs.Count > 30)
                     _breadcrumbs.RemoveAt(0);
             }

@@ -86,8 +86,9 @@ namespace Styx.Logic.Relogin
         /// launched replacement clients) and never falls back to <see cref="ReloginClient.FindClientProcessByName"/>.
         /// Defaults to true when -pid or -instance is supplied on the command line.
         /// </summary>
+        // ParseProcessId is nonthrowing: a malformed -pid must not crash static initialization.
         public static bool StrictProcessBinding { get; set; } =
-            ShouldDefaultStrictProcessBinding(CommandLine.AutoAttachProcessId, CommandLine.InstanceName);
+            ShouldDefaultStrictProcessBinding(CommandLine.ParseProcessId() ?? 0, CommandLine.InstanceName);
 
         /// <summary>
         /// Current client process ID pinned to this relogin manager (alias of <see cref="AttachedProcessId"/>).

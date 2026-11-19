@@ -266,6 +266,21 @@ namespace CopilotBuddy.Bots.PartyGrind
                 File.ReadAllText(settings.IpcMemberSecretsPath)) ?? throw new InvalidOperationException("Invalid member secrets file."), StringComparer.OrdinalIgnoreCase);
         }
 
+        private static void ValidateIpcSecret(string secret)
+        {
+            byte[] decoded;
+            try
+            {
+                decoded = Convert.FromBase64String(secret);
+            }
+            catch (FormatException ex)
+            {
+                throw new InvalidOperationException("IPC secret for this character is not valid Base64.", ex);
+            }
+            if (decoded.Length < 32)
+                throw new InvalidOperationException("IPC secret for this character must decode to at least 32 bytes.");
+        }
+
         private void StartIpc(SquadSettings settings)
         {
             StopIpc();
@@ -284,6 +299,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                 {
                     var secrets = LoadMemberSecrets(settings);
                     if (!secrets.TryGetValue(StyxWoW.Me!.Name, out string? secret)) throw new InvalidOperationException("No IPC secret configured for this character.");
+                    ValidateIpcSecret(secret);
                     _ipcClient = new SquadIpcClient(settings.IpcPort, settings.TeamId, memberSecret: secret);
                     _ipcClient.Start(BuildLocalHandshake);
                     SquadContext.IsIpcConnected = false;
@@ -830,9 +846,12 @@ namespace CopilotBuddy.Bots.PartyGrind
                     targetPoint = rally;
             }
 
-            if (me.Location.Distance(targetPoint) > 30f && me.Location.Distance(corpsePoint) > 30f)
+            // Navigate to within 30 yards of the actual corpse. The rally waypoint is
+            // only an intermediate target when it leads toward the corpse area.
+            if (me.Location.Distance(corpsePoint) > 30f)
             {
-                Navigator.MoveTo(targetPoint, "CorpseRun: returning to squad corpse");
+                WoWPoint moveTarget = me.Location.Distance(targetPoint) <= 30f ? corpsePoint : targetPoint;
+                Navigator.MoveTo(moveTarget, "CorpseRun: returning to squad corpse");
                 return RunStatus.Success;
             }
 
@@ -962,7 +981,18 @@ namespace CopilotBuddy.Bots.PartyGrind
                     }
                 }
             }
-            focus ??= Targeting.Instance.FirstUnit;
+            if (focus == null)
+            {
+                // Only fall back to an unit that is already hostile toward the squad;
+                // an idle target must not trigger a pull or a pet attack.
+                var fallback = Targeting.Instance.FirstUnit;
+                if (fallback != null && fallback.IsValid && !fallback.Dead && fallback.Attackable && !fallback.IsFriendly)
+                {
+                    ulong targetGuid = fallback.CurrentTargetGuid;
+                    if (targetGuid == me.Guid || SquadContext.GetKnownMemberGuids().Contains(targetGuid))
+                        focus = fallback;
+                }
+            }
 
             if (focus != null && focus.IsValid && !focus.Dead && focus.Attackable && !focus.IsFriendly)
             {

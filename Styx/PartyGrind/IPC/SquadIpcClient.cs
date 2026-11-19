@@ -200,7 +200,23 @@ namespace Styx.PartyGrind.IPC
             using var sessionCts = CancellationTokenSource.CreateLinkedTokenSource(outerCt);
             CancellationToken ct = sessionCts.Token;
             long connectedUtcMs = _utcNowMs();
-            long sessionLastReceived = connectedUtcMs;
+            int sessionClosed = 0;
+
+            // Once closed, no further receive timestamp or leader state may be published.
+            bool TryCloseSession()
+            {
+                if (Interlocked.Exchange(ref sessionClosed, 1) != 0)
+                    return false;
+                ClearSession(run);
+                try { sessionCts.Cancel(); } catch { }
+                return true;
+            }
+
+            lock (_stateLock)
+            {
+                if (!ReferenceEquals(_cts, run)) return;
+                Interlocked.Exchange(ref _lastReceivedUtcMs, connectedUtcMs);
+            }
 
             var stream = tcp.GetStream();
             using var writer = new StreamWriter(stream, new UTF8Encoding(false)) { AutoFlush = false, NewLine = "\n" };
@@ -239,11 +255,16 @@ namespace Styx.PartyGrind.IPC
                     while (!ct.IsCancellationRequested)
                     {
                         await Task.Delay(250, ct).ConfigureAwait(false);
-                        long last = Interlocked.Read(ref sessionLastReceived);
+                        long last;
+                        lock (_stateLock)
+                        {
+                            if (Volatile.Read(ref sessionClosed) != 0 || !ReferenceEquals(_cts, run))
+                                break;
+                            last = Interlocked.Read(ref _lastReceivedUtcMs);
+                        }
                         if (last > 0 && (_utcNowMs() - last) > DisconnectTimeoutMs)
                         {
-                            ClearSession(run);
-                            sessionCts.Cancel();
+                            TryCloseSession();
                             break;
                         }
                     }
@@ -263,16 +284,24 @@ namespace Styx.PartyGrind.IPC
 
                     try
                     {
-                        if (HandleIncomingLine(auth.Unprotect(line), run))
-                            Interlocked.Exchange(ref sessionLastReceived, _utcNowMs());
+                        if (Volatile.Read(ref sessionClosed) != 0)
+                            break;
+                        string plaintext = auth.Unprotect(line);
+                        lock (_stateLock)
+                        {
+                            if (Volatile.Read(ref sessionClosed) != 0 || !ReferenceEquals(_cts, run) ||
+                                ct.IsCancellationRequested)
+                                break;
+                            Interlocked.Exchange(ref _lastReceivedUtcMs, _utcNowMs());
+                        }
+                        HandleIncomingLine(plaintext, run, () => Volatile.Read(ref sessionClosed) == 0);
                     }
                     catch (System.Text.Json.JsonException) { }
                 }
             }
             finally
             {
-                ClearSession(run);
-                try { sessionCts.Cancel(); } catch { }
+                TryCloseSession();
                 try { tcp.Close(); } catch { }
                 try { await sendTask.ConfigureAwait(false); } catch { }
                 try { await watchdogTask.ConfigureAwait(false); } catch { }
@@ -290,7 +319,7 @@ namespace Styx.PartyGrind.IPC
             }
         }
 
-        private bool HandleIncomingLine(string line, CancellationTokenSource run)
+        private bool HandleIncomingLine(string line, CancellationTokenSource run, Func<bool> isSessionOpen)
         {
             SquadEnvelope? envelope;
             try
@@ -322,7 +351,7 @@ namespace Styx.PartyGrind.IPC
 
                 lock (_stateLock)
                 {
-                    if (!ReferenceEquals(_cts, run) || run.IsCancellationRequested) return false;
+                    if (!ReferenceEquals(_cts, run) || run.IsCancellationRequested || !isSessionOpen()) return false;
                     Interlocked.Exchange(ref _lastReceivedUtcMs, _utcNowMs());
                     _socketConnected = true;
                     _latestLeaderState = leader;

@@ -60,11 +60,11 @@ namespace Styx.Helpers
         /// </summary>
         public static int? ParseProcessId(string[]? args = null)
         {
-            var parsedArguments = args == null ? Arguments : new Arguments(args);
-            if (!parsedArguments.Exists("pid")) return null;
-            if (!parsedArguments.HasOperand("pid")) return 0;
             try
             {
+                var parsedArguments = args == null ? Arguments : new Arguments(args);
+                if (!parsedArguments.Exists("pid")) return null;
+                if (!parsedArguments.HasOperand("pid")) return 0;
                 string raw = parsedArguments.GetString("pid");
                 return int.TryParse(raw, out int pid) && pid > 0 ? pid : 0;
             }
@@ -97,20 +97,27 @@ namespace Styx.Helpers
                 return null;
             string? raw = GetSingleValue(key);
             if (raw == null)
-                return Arguments.IsTrue(key) ? true : null;
+                return Arguments.IsTrue(key)
+                    ? true
+                    : throw new ArgumentException($"{key} requires true, false, 1 or 0.");
             if (bool.TryParse(raw, out bool b))
                 return b;
             if (raw == "1") return true;
             if (raw == "0") return false;
-            return null;
+            throw new ArgumentException($"{key} has invalid value '{raw}'; expected true, false, 1 or 0.");
         }
 
         private static int? GetNullableInt(string key)
         {
+            if (!Arguments.Exists(key))
+                return null;
             string? raw = GetSingleValue(key);
-            if (raw != null && int.TryParse(raw, out int value))
+            if (raw != null && int.TryParse(raw, out int value) && value > 0 && value <= 65535)
                 return value;
-            return null;
+            throw new ArgumentException(
+                raw == null
+                    ? $"{key} requires a port number."
+                    : $"{key} has invalid value '{raw}'; expected a port number from 1 to 65535.");
         }
     }
 }

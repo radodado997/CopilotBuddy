@@ -323,7 +323,7 @@ namespace Styx.PartyGrind.IPC
                     if (string.IsNullOrWhiteSpace(line))
                         continue;
 
-                    try { HandleIncomingLine(session, session.Authentication.Unprotect(line)); }
+                    try { HandleIncomingLine(session, session.Authentication.Unprotect(line), ct); }
                     catch (System.Text.Json.JsonException) { }
                 }
             }
@@ -372,7 +372,15 @@ namespace Styx.PartyGrind.IPC
             }
         }
 
-        private void HandleIncomingLine(MemberSession session, string line)
+        private static bool HasValidCoordinates(SquadMemberState state) =>
+            float.IsFinite(state.X) && Math.Abs(state.X) <= 1000000f &&
+            float.IsFinite(state.Y) && Math.Abs(state.Y) <= 1000000f &&
+            float.IsFinite(state.Z) && Math.Abs(state.Z) <= 1000000f &&
+            float.IsFinite(state.CorpseX) && Math.Abs(state.CorpseX) <= 1000000f &&
+            float.IsFinite(state.CorpseY) && Math.Abs(state.CorpseY) <= 1000000f &&
+            float.IsFinite(state.CorpseZ) && Math.Abs(state.CorpseZ) <= 1000000f;
+
+        private void HandleIncomingLine(MemberSession session, string line, CancellationToken linkedToken)
         {
             SquadEnvelope? envelope;
             try
@@ -404,7 +412,10 @@ namespace Styx.PartyGrind.IPC
                 MemberSession? replaced = null;
                 lock (_sessionsLock)
                 {
-                    if (session.CharacterName.Length > 0)
+                    // The linked token can be canceled by the deadline task or server
+                    // shutdown while this line is being processed. Re-check under the
+                    // session lock so a stale handshake never replaces an active member.
+                    if (linkedToken.IsCancellationRequested || session.Closed || session.CharacterName.Length > 0)
                         return;
                     session.CharacterName = hs.CharacterName.Trim();
                     session.Handshake = hs;
@@ -427,10 +438,14 @@ namespace Styx.PartyGrind.IPC
                 var state = SquadJson.DeserializePayload<SquadMemberState>(envelope);
                 if (state == null)
                     return;
+                // Reject malformed coordinates before overwriting the last valid sample.
+                if (!HasValidCoordinates(state))
+                    return;
 
                 lock (_sessionsLock)
                 {
-                    if (string.IsNullOrEmpty(session.CharacterName) ||
+                    if (linkedToken.IsCancellationRequested || session.Closed ||
+                        string.IsNullOrEmpty(session.CharacterName) ||
                         !string.Equals(session.CharacterName, state.CharacterName?.Trim(), StringComparison.OrdinalIgnoreCase) ||
                         state.Guid != session.Handshake.Guid || state.Class != session.Handshake.Class || state.Role != session.Handshake.Role ||
                         !_namedSessions.TryGetValue(session.CharacterName, out var current) || !ReferenceEquals(current, session))

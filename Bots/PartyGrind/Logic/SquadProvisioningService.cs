@@ -71,6 +71,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private bool _tradeItemsPlaced;
         private bool _tradeCompletionPending;
         private readonly List<(int Slot, uint Entry, int Count)> _offeredItems = new();
+        private ulong _assistedRitualGuid;
+        private byte _assistedRitualProgress;
 
         public bool IsTradeBusy => !string.IsNullOrEmpty(_activeTradeTarget) || TradeFrame.Instance.IsVisible;
 
@@ -619,7 +621,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             return true;
         }
 
-        private static bool TryUseNearbyRitualOrTable(LocalPlayer me, SquadSettings settings)
+        private bool TryUseNearbyRitualOrTable(LocalPlayer me, SquadSettings settings)
         {
             if (me.FreeNormalBagSlots < 2)
                 return false;
@@ -634,13 +636,30 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 g.SubType == WoWGameObjectType.Ritual &&
                 g.CreatedByGuid != me.Guid &&
                 memberGuids.Contains(g.CreatedByGuid));
+            if (ritual == null && _assistedRitualGuid != 0)
+            {
+                // The previous ritual finished or disappeared; a new one is eligible again.
+                _assistedRitualGuid = 0;
+                _assistedRitualProgress = 0;
+            }
+
             if (ritual != null)
             {
-                if (ritual.Location.Distance(me.Location) > 4.5f)
-                    Navigator.MoveTo(ritual.Location, "Assisting party ritual");
-                else
+                byte progress = ritual.AnimationProgress;
+                bool alreadyAssisted = _assistedRitualGuid == ritual.Guid;
+                if (!alreadyAssisted || progress != _assistedRitualProgress)
+                {
+                    if (ritual.Location.Distance(me.Location) > 4.5f)
+                    {
+                        Navigator.MoveTo(ritual.Location, "Assisting party ritual");
+                        return true;
+                    }
                     ritual.Interact();
-                return true;
+                    _assistedRitualGuid = ritual.Guid;
+                    _assistedRitualProgress = progress;
+                    return true;
+                }
+                // Already assisted and the ritual has not advanced: let later tick steps run.
             }
 
             // 2. Click Refreshment Table when needing food or drink.

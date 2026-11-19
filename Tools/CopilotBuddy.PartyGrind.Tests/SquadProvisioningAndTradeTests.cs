@@ -51,6 +51,8 @@ namespace CopilotBuddy.PartyGrind.Tests
         {
             var need = SquadTownRunService.EvaluateLocalTownNeeds(10, 90, false, false, true,
                 20, 20, false, false, true, false, true, MakeSettings());
+            Assert.True(need.NeedsFood);
+            Assert.False(need.NeedsDrink);
             Assert.True(need.NeedsBuy);
         }
 
@@ -161,11 +163,15 @@ namespace CopilotBuddy.PartyGrind.Tests
         [Fact]
         public void LevelFourMage_WaterDoesNotSuppressFoodVendorNeed()
         {
+            bool mageCanProvideFood = SquadProvisioningService.SelectBestConjureRank(false, 4, 4).HasValue;
+            bool mageCanProvideDrink = SquadProvisioningService.SelectBestConjureRank(true, 4, 4).HasValue;
+            Assert.False(mageCanProvideFood);
+            Assert.True(mageCanProvideDrink);
             var needs = SquadTownRunService.EvaluateLocalTownNeeds(
                 10, 90, false, false, true, 20, 20, false, false, true,
-                SquadProvisioningService.SelectBestConjureRank(false, 4, 4).HasValue,
-                SquadProvisioningService.SelectBestConjureRank(true, 4, 4).HasValue,
-                MakeSettings());
+                mageCanProvideFood, mageCanProvideDrink, MakeSettings());
+            Assert.True(needs.NeedsFood);
+            Assert.False(needs.NeedsDrink);
             Assert.True(needs.NeedsBuy);
         }
 
@@ -189,8 +195,29 @@ namespace CopilotBuddy.PartyGrind.Tests
                 mageCanProvideDrink: true,
                 settings: settings);
 
+            Assert.False(withMage.NeedsFood);
+            Assert.False(withMage.NeedsDrink);
             Assert.False(withMage.NeedsBuy);
             Assert.False(withMage.Any);
+
+            // A drink-only shortage is also covered when the mage can provide water.
+            var drinkOnly = SquadTownRunService.EvaluateLocalTownNeeds(
+                freeNormalBagSlots: 10,
+                lowestDurabilityPct: 90.0,
+                hasFood: true,
+                hasDrink: false,
+                usesMana: true,
+                desiredFoodAmount: 20,
+                desiredDrinkAmount: 20,
+                needClassTraining: false,
+                hasMailRecipient: false,
+                preferMageFoodOverVendor: true,
+                mageCanProvideFood: false,
+                mageCanProvideDrink: true,
+                settings: settings);
+            Assert.False(drinkOnly.NeedsFood);
+            Assert.False(drinkOnly.NeedsDrink);
+            Assert.False(drinkOnly.NeedsBuy);
 
             // Without Mage, missing food/drink triggers NeedsBuy
             var withoutMage = SquadTownRunService.EvaluateLocalTownNeeds(

@@ -27,6 +27,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         public bool NeedsSell { get; init; }
         public bool NeedsRepair { get; init; }
         public bool NeedsBuy { get; init; }
+        public bool NeedsFood { get; init; }
+        public bool NeedsDrink { get; init; }
         public bool NeedsTrain { get; init; }
         public bool NeedsMail { get; init; }
         public bool Any => NeedsSell || NeedsRepair || NeedsBuy || NeedsTrain || NeedsMail;
@@ -156,8 +158,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             bool foodProvided = preferMageFoodOverVendor && mageCanProvideFood;
             bool drinkProvided = preferMageFoodOverVendor && mageCanProvideDrink;
 
-            bool needsBuy = (desiredFoodAmount > 0 && !hasFood && !foodProvided) ||
-                 (usesMana && desiredDrinkAmount > 0 && !hasDrink && !drinkProvided);
+            bool needsFood = desiredFoodAmount > 0 && !hasFood && !foodProvided;
+            bool needsDrink = usesMana && desiredDrinkAmount > 0 && !hasDrink && !drinkProvided;
+            bool needsBuy = needsFood || needsDrink;
 
             bool needsTrain = settings.TrainSkillsInGroupTownRun && needClassTraining;
             bool needsMail = hasMailRecipient && needsSell;
@@ -167,6 +170,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 NeedsSell = needsSell,
                 NeedsRepair = needsRepair,
                 NeedsBuy = needsBuy,
+                NeedsFood = needsFood,
+                NeedsDrink = needsDrink,
                 NeedsTrain = needsTrain,
                 NeedsMail = needsMail
             };
@@ -260,9 +265,10 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             var needs = EvaluateLiveLocalNeeds(settings, leader);
             // A renewed requirement (e.g. NeedsBuy after bag space frees up) reopens
             // the vendor stage instead of publishing completion with unmet needs.
-            bool sellDeferredForMail = _mailRequested && !_stage1MailDone && !needs.NeedsBuy && !needs.NeedsRepair;
-            if (_stage1SellRepairBuyDone &&
-                (needs.NeedsBuy || needs.NeedsRepair || (needs.NeedsSell && !sellDeferredForMail)))
+            // When bags are full, mail first so a needed purchase can succeed afterward.
+            bool mailBeforeVendor = _mailRequested && !_stage1MailDone && needs.NeedsSell;
+            if (_stage1SellRepairBuyDone && !mailBeforeVendor &&
+                (needs.NeedsBuy || needs.NeedsRepair || needs.NeedsSell))
             {
                 _stage1SellRepairBuyDone = false;
                 _vendorAttempts = 0;
@@ -274,7 +280,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 return Block("Town task timed out before completion.", out townTasksComplete);
 
             // Stage 1A: Travel to rally vendor & Sell/Repair/Buy.
-            if (!_stage1SellRepairBuyDone)
+            if (!_stage1SellRepairBuyDone && !mailBeforeVendor)
             {
                 if (!needs.NeedsSell && !needs.NeedsRepair && !needs.NeedsBuy)
                 {
@@ -302,7 +308,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     if (++_vendorAttempts >= 5 && !_stage1SellRepairBuyDone)
                     {
                         var remaining = EvaluateLiveLocalNeeds(settings, leader);
-                        if (_mailRequested && !_stage1MailDone && !remaining.NeedsBuy && !remaining.NeedsRepair)
+                        if (_mailRequested && !_stage1MailDone && remaining.NeedsSell)
                             _stage1SellRepairBuyDone = true;
                         else
                             return Block("Vendor tasks remain unmet after five attempts.", out townTasksComplete);
@@ -366,17 +372,28 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (_stage1MailDone && _mailRequested)
             {
                 _mailRequested = false;
-                if (EvaluateLiveLocalNeeds(settings, leader).NeedsSell)
+                var remaining = EvaluateLiveLocalNeeds(settings, leader);
+                if (remaining.NeedsSell || remaining.NeedsBuy || remaining.NeedsRepair)
                 {
+                    // Mail freed space or left other needs pending: retry the vendor stage
+                    // with a fresh bounded attempt window.
                     _stage1SellRepairBuyDone = false;
-                    if (_vendorAttempts >= 5)
-                        return Block("Vendor tasks remain unmet after five attempts.", out townTasksComplete);
+                    _vendorAttempts = 0;
+                    _stageStarted = Environment.TickCount64;
+                    _regroupStarted = 0;
                     townTasksComplete = false;
                     return true;
                 }
             }
 
-            // Stage 2: Diverge individually to own Class Trainer if needed.
+            // Stage 2: Diverge individually to own Class Trainer if needed. A live
+            // training request reopens this stage even if it had already completed.
+            if (settings.TrainSkillsInGroupTownRun && needs.NeedsTrain && _stage2TrainDone)
+            {
+                _stage2TrainDone = false;
+                _stageStarted = Environment.TickCount64;
+                _regroupStarted = 0;
+            }
             if (!_stage2TrainDone)
             {
                 if (!settings.TrainSkillsInGroupTownRun || !needs.NeedsTrain)
@@ -490,11 +507,11 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     if (vendor != null && (vendor.Type == Vendor.VendorType.Food || vendor.Type == Vendor.VendorType.Restock))
                     {
                         BotPoi.Current = new BotPoi(vendor, PoiType.Buy);
-                        Vendors.BuyItems();
+                        Vendors.BuyItems(needs.NeedsFood, needs.NeedsDrink);
                     }
                     else
                     {
-                        BuyFoodAndDrinkDirectly(me);
+                        BuyFoodAndDrinkDirectly(needs.NeedsFood, needs.NeedsDrink);
                     }
                 }
                 if (MerchantFrame.Instance.IsVisible)
@@ -504,23 +521,16 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             return true;
         }
 
-        private static void BuyFoodAndDrinkDirectly(LocalPlayer me)
+        private static void BuyFoodAndDrinkDirectly(bool needsFood, bool needsDrink)
         {
-            bool usesMana = me.PowerType == WoWPowerType.Mana || me.Class == WoWClass.Druid;
             int bestDrinkIndex = MerchantFrame.Instance.GetBestDrinkFromVendor();
             int bestFoodIndex = MerchantFrame.Instance.GetBestFoodFromVendor();
 
-            if (bestDrinkIndex != -1 && usesMana && CharacterSettings.Instance.DrinkAmount > 0 &&
-                SquadProvisioningService.CountDrinksInBags() == 0)
-            {
+            if (needsDrink && bestDrinkIndex != -1 && CharacterSettings.Instance.DrinkAmount > 0)
                 MerchantFrame.Instance.BuyItem(bestDrinkIndex, CharacterSettings.Instance.DrinkAmount);
-            }
 
-            if (bestFoodIndex != -1 && CharacterSettings.Instance.FoodAmount > 0 &&
-                SquadProvisioningService.CountFoodInBags() == 0)
-            {
+            if (needsFood && bestFoodIndex != -1 && CharacterSettings.Instance.FoodAmount > 0)
                 MerchantFrame.Instance.BuyItem(bestFoodIndex, CharacterSettings.Instance.FoodAmount);
-            }
         }
 
         private static WoWPoint? ResolveClassTrainerLocation(LocalPlayer me, out int entry, out string name)
@@ -562,8 +572,14 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 return false;
             }
 
-            if (!TrainerFrame.Instance.IsVisible)
+            bool frameMatchesTrainer = TrainerFrame.Instance.IsVisible &&
+                !TrainerFrame.Instance.IsTradeskillTrainer &&
+                me.CurrentTargetGuid == trainer.Guid;
+            if (!frameMatchesTrainer)
             {
+                if (TrainerFrame.Instance.IsVisible)
+                    TrainerFrame.Instance.Close();
+                trainer.Target();
                 trainer.Interact();
                 StyxWoW.Sleep(600);
                 if (GossipFrame.Instance.IsVisible && GossipFrame.Instance.GossipOptionEntries != null)
@@ -580,7 +596,10 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 }
             }
 
-            if (TrainerFrame.Instance.IsVisible)
+            frameMatchesTrainer = TrainerFrame.Instance.IsVisible &&
+                !TrainerFrame.Instance.IsTradeskillTrainer &&
+                me.CurrentTargetGuid == trainer.Guid;
+            if (frameMatchesTrainer)
             {
                 bool forceTrainer = Vendors.ForceTrainer;
                 int spellsBefore = SpellManager.NumKnownSpells;

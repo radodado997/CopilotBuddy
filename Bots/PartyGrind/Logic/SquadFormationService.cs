@@ -16,7 +16,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
     /// </summary>
     public sealed class SquadTravelProgress
     {
-        public long LastReachedTimestamp { get; set; }
+        public long LastReachedSequence { get; set; }
+        public int RouteGeneration { get; set; }
         public uint MapId { get; set; }
         public ulong LeaderGuid { get; set; }
     }
@@ -129,18 +130,22 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 // so a follower that later falls behind resumes after the last breadcrumb
                 // it actually reached.
                 var route = leader.Breadcrumbs.Where(b => b.MapId == leader.MapId).ToList();
-                if (progress != null && (progress.MapId != leader.MapId || progress.LeaderGuid != leader.LeaderGuid))
+                int routeGeneration = route.Count > 0 ? route[^1].RouteGeneration : 0;
+                if (progress != null && (progress.MapId != leader.MapId || progress.LeaderGuid != leader.LeaderGuid ||
+                                         progress.RouteGeneration != routeGeneration))
                 {
-                    progress.LastReachedTimestamp = 0;
+                    progress.LastReachedSequence = 0;
                     progress.MapId = leader.MapId;
                     progress.LeaderGuid = leader.LeaderGuid;
+                    progress.RouteGeneration = routeGeneration;
                 }
                 int nearest = -1;
                 float bestDist = float.MaxValue;
                 for (int i = 0; i < route.Count; i++)
                 {
                     var bc = route[i];
-                    if (progress != null && bc.TimestampUtcMs <= progress.LastReachedTimestamp) continue;
+                    if (bc.RouteGeneration != routeGeneration) continue;
+                    if (progress != null && bc.Sequence <= progress.LastReachedSequence) continue;
                     float d = memberPos.Distance(new WoWPoint(bc.X, bc.Y, bc.Z));
                     if (d <= bestDist)
                     {
@@ -149,7 +154,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     }
                 }
                 if (progress != null && nearest >= 0 && bestDist < 5f)
-                    progress.LastReachedTimestamp = route[nearest].TimestampUtcMs;
+                    progress.LastReachedSequence = route[nearest].Sequence;
 
                 float distToLeader = memberPos.Distance(leaderPos);
                 if (distToLeader > 22f)

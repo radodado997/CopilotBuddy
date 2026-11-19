@@ -67,7 +67,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 return null;
 
             var eligible = candidates
-                .Where(c => c.Distance <= 40.0 && c.HealthPercent < healthThresholdPct)
+                .Where(c => c.Distance <= 45.0 && c.HealthPercent < healthThresholdPct)
                 .ToList();
 
             if (eligible.Count == 0)

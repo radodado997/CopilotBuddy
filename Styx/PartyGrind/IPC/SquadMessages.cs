@@ -110,6 +110,8 @@ namespace Styx.PartyGrind.IPC
         public float Y { get; set; }
         public float Z { get; set; }
         public long TimestampUtcMs { get; set; }
+        public int RouteGeneration { get; set; }
+        public long Sequence { get; set; }
     }
 
     /// <summary>

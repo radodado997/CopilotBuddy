@@ -52,21 +52,26 @@ namespace CopilotBuddy.PartyGrind.Tests
             var leader = new SquadLeaderState { X = 100, MapId = 1, LeaderGuid = 10,
                 Breadcrumbs = new List<SquadBreadcrumb>
                 {
-                    new() { X = 0, MapId = 1, TimestampUtcMs = 1 },
-                    new() { X = 10, MapId = 1, TimestampUtcMs = 2 },
-                    new() { X = 20, MapId = 1, TimestampUtcMs = 3 },
-                    new() { X = 30, MapId = 1, TimestampUtcMs = 4 }
+                    new() { X = 0, MapId = 1, TimestampUtcMs = 1, RouteGeneration = 7, Sequence = 1 },
+                    new() { X = 10, MapId = 1, TimestampUtcMs = 2, RouteGeneration = 7, Sequence = 2 },
+                    new() { X = 20, MapId = 1, TimestampUtcMs = 3, RouteGeneration = 7, Sequence = 3 },
+                    new() { X = 30, MapId = 1, TimestampUtcMs = 4, RouteGeneration = 7, Sequence = 4 }
                 } };
             Assert.Equal(20f, SquadFormationService.ComputeTravelFollowPosition(new WoWPoint(10, 0, 0), leader, 0, progress).X);
             Assert.Equal(30f, SquadFormationService.ComputeTravelFollowPosition(new WoWPoint(20, 0, 0), leader, 0, progress).X);
             Assert.Equal(30f, SquadFormationService.ComputeTravelFollowPosition(new WoWPoint(10, 0, 0), leader, 0, progress).X);
-            Assert.Equal(3, progress.LastReachedTimestamp);
+            Assert.Equal(3, progress.LastReachedSequence);
             leader.LeaderGuid = 11;
             Assert.Equal(20f, SquadFormationService.ComputeTravelFollowPosition(new WoWPoint(10, 0, 0), leader, 0, progress).X);
             leader.MapId = 2;
-            foreach (var breadcrumb in leader.Breadcrumbs) breadcrumb.MapId = 2;
+            foreach (var breadcrumb in leader.Breadcrumbs)
+            {
+                breadcrumb.MapId = 2;
+                breadcrumb.RouteGeneration = 8;
+            }
             Assert.Equal(10f, SquadFormationService.ComputeTravelFollowPosition(WoWPoint.Zero, leader, 0, progress).X);
-            Assert.Equal(1, progress.LastReachedTimestamp);
+            Assert.Equal(1, progress.LastReachedSequence);
+            Assert.Equal(8, progress.RouteGeneration);
         }
 
         [Theory]
@@ -206,6 +211,7 @@ namespace CopilotBuddy.PartyGrind.Tests
             Assert.Equal(4321, CommandLine.ParseProcessId(new[] { "CopilotBuddy.exe", "-pid=4321" }));
             Assert.Equal(9876, CommandLine.ParseProcessId(new[] { "CopilotBuddy.exe", "/pid=9876" }));
             Assert.Equal(0, CommandLine.ParseProcessId(new[] { "CopilotBuddy.exe", "-pid=abc" }));
+            Assert.Equal(0, CommandLine.ParseProcessId(new[] { "CopilotBuddy.exe", "-pid=123", "-pid" }));
             Assert.Null(CommandLine.ParseProcessId(new[] { "CopilotBuddy.exe" }));
 
             string defaultDir = Settings.GetSettingsDirectory(@"C:\Bot", null);
