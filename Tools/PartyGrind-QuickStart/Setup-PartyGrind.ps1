@@ -147,6 +147,7 @@ for ($i = 0; $i -lt $ClientCount; $i++) {
     }
 
     $isCoordinator = if ($i -eq 0) { 'true' } else { 'false' }
+    [void] $launchLines.AppendLine(('echo Launching Client{0} ({1}, {2}) with WoW PID %PID{0}%' -f $n, $names[$i], $roles[$i]))
     $launch = 'start "Client{0} - {1}" "%BOT_DIR%\CopilotBuddy.exe" -pid=%PID{0}% -instance=Client{0} -botname="Party Grind" -loadprofile="%PROFILE%" -squadrole=%ROLE{0}% -squadcoordinator={2} -squadteam=%TEAM_ID% -squadport=%IPC_PORT% -squadleader="%NAME1%" -squadroster="%ROSTER%"'
     [void] $launchLines.AppendLine(($launch -f $n, $names[$i], $isCoordinator))
     if ($i -eq 0) {
@@ -198,18 +199,23 @@ echo.
 {{LAUNCH_LINES}}
 echo.
 echo All clients launched. Watch the bot log for IPC connection messages.
+echo If no bot window appeared, check BOT_DIR\Logs and run CopilotBuddy.exe manually.
+pause
 exit /b 0
 
 :missing_pid
 echo [ERROR] Enter the WoW PID for every client. Do not leave any PID blank.
+pause
 exit /b 1
 
 :bad_pid
 echo [ERROR] One of the entered PIDs is not a positive integer.
+pause
 exit /b 1
 
 :duplicate_pid
 echo [ERROR] Every client must have a different WoW PID.
+pause
 exit /b 1
 '@
 

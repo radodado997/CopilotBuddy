@@ -58,7 +58,9 @@ Uwaga: `-Force` nadpisuje istniejący `PartyGrindSecrets.json` i ustawienia inst
 3. Skrypt pokaże tabelę procesów `Wow` z `Id`, `StartTime` i `MainWindowTitle`.
    Wpisz PID odpowiadający każdej postaci. Tytuł okna służy tylko do rozpoznania —
    bot wiąże się z wpisanym PID-em (`-pid=%PID1%` itd.).
-4. Launcher odpala najpierw koordynatora, potem (po 3 s) followerów.
+4. Launcher odpala najpierw koordynatora, potem (po 3 s) followerów. Przed zakończeniem
+   pokazuje listę użytych PID-ów i czeka na naciśnięcie klawisza (`pause`) — dzięki temu
+   widać ewentualny błąd, zamiast natychmiast zamykanego okna.
 5. Po starcie sprawdź logi:
    - `[PartyGrind] Started as ... (Coordinator=..., Team=..., Port=...)`,
    - komunikaty `[PartyGrind IPC]` o połączeniu,
