@@ -602,8 +602,12 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     SpellManager.Refresh();
                     hasPurchasableService = TrainerFrame.Instance.HasPurchasableService();
                 }
+                // The spell-count delta is progress evidence only: an available service
+                // must still block completion even if another spell was learned.
                 bool learnedSpell = SpellManager.NumKnownSpells > spellsBefore;
-                bool trained = !hasPurchasableService || learnedSpell;
+                bool trained = !hasPurchasableService;
+                Logging.WriteDebug("[PartyGrind Town] Trainer visit: available={0}, learnedSpell={1}",
+                    hasPurchasableService, learnedSpell);
                 TrainerFrame.Instance.Close();
 
                 if (!trained)
