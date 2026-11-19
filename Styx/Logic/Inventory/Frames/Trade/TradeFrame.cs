@@ -104,6 +104,17 @@ namespace Styx.Logic.Inventory.Frames.Trade
         public bool HasEmptyPlayerOffer => Lua.GetReturnVal<int>(
             "if GetPlayerTradeMoney() ~= 0 then return 0 end for i=1,7 do if GetTradePlayerItemLink(i) then return 0 end end return 1", 0U) == 1;
 
+        public int PlayerTradeMoney => Lua.GetReturnVal<int>("return GetPlayerTradeMoney() or 0", 0U);
+
+        /// <summary>
+        /// Compact signature of the local offer: slot:entry:count for trade slots 1-6.
+        /// Empty slots have entry 0 and count 0.
+        /// </summary>
+        public string PlayerOfferSignature => Lua.GetReturnVal<string>(
+            "local p={} for i=1,6 do local link=GetTradePlayerItemLink(i); local _,_,n=GetTradePlayerItemInfo(i); " +
+            "local e=0; if link then e=tonumber(string.match(link,'item:(%d+)')) or 0 end " +
+            "p[#p+1]=i..':'..e..':'..(n or 0) end return table.concat(p,';')", 0U) ?? string.Empty;
+
         public void AcceptTrade()
         {
             Lua.DoString("AcceptTrade()");

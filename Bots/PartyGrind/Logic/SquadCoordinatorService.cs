@@ -66,6 +66,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private long _lootWindowEndsUtcMs;
         private bool _wasAnyInCombat;
         private long _resWaitStartedUtcMs;
+        private string _resWaitMemberKey = string.Empty;
         private bool _inCorpseRun;
         private bool _migratingZone;
         private string _lastSubProfileKey = string.Empty;
@@ -95,6 +96,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             _lootWindowEndsUtcMs = 0;
             _wasAnyInCombat = false;
             _resWaitStartedUtcMs = 0;
+            _resWaitMemberKey = string.Empty;
             _inCorpseRun = false;
             _migratingZone = false;
             _lastSubProfileKey = string.Empty;
@@ -278,14 +280,27 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 }
             }
 
-            if (anyDead && !anyInCombat)
+            string? deadMemberKey = !anyInCombat
+                ? rosterStates.Where(m => m.IsDead || m.IsGhost)
+                    .OrderBy(m => m.CharacterName, StringComparer.OrdinalIgnoreCase)
+                    .Select(m => $"{m.CharacterName?.Trim()}|{m.Guid}")
+                    .FirstOrDefault()
+                : null;
+
+            if (deadMemberKey != null)
             {
-                if (_resWaitStartedUtcMs == 0)
+                // Associate the wait with the member who died: keep the timer while the
+                // same corpse is being waited on, restart it when the dead member changes.
+                if (!string.Equals(_resWaitMemberKey, deadMemberKey, StringComparison.Ordinal))
+                {
                     _resWaitStartedUtcMs = nowUtcMs;
+                    _resWaitMemberKey = deadMemberKey;
+                }
             }
             else if (!anyDead)
             {
                 _resWaitStartedUtcMs = 0;
+                _resWaitMemberKey = string.Empty;
                 _inCorpseRun = false;
             }
 
@@ -341,10 +356,25 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             }
             else if (_inTownRun)
             {
-                var living = rosterStates;
-                bool anyStillHasNeed = living.Any(m =>
+                // Completion must account for every connected participant, including a
+                // reconnecting member that has not yet sent a telemetry sample.
+                var townParticipants = new List<SquadMemberState>(1 + connectedClients.Count) { leaderLocal };
+                foreach (var snap in connectedClients.Where(s => s.IsConnected && !string.IsNullOrWhiteSpace(s.CharacterName)))
+                {
+                    townParticipants.Add(snap.LatestState ?? new SquadMemberState
+                    {
+                        CharacterName = snap.CharacterName.Trim(),
+                        Guid = snap.Handshake.Guid,
+                        Class = snap.Handshake.Class,
+                        Role = snap.Handshake.Role,
+                        Level = Math.Max(1, snap.Handshake.Level)
+                    });
+                }
+                bool pendingTelemetry = connectedClients.Any(s => s.IsConnected && s.LatestState == null &&
+                    !string.IsNullOrWhiteSpace(s.CharacterName));
+                bool anyStillHasNeed = townParticipants.Any(m =>
                     !m.TownTasksComplete && (m.NeedsSell || m.NeedsRepair || m.NeedsBuy || m.NeedsTrain || m.NeedsMail));
-                bool allDoneAndAtRally = living.Count > 0 && living.All(m =>
+                bool allDoneAndAtRally = !pendingTelemetry && townParticipants.Count > 0 && townParticipants.All(m =>
                     m.TownTasksComplete &&
                     (!profile.TownRallyMapId.HasValue || m.MapId == profile.TownRallyMapId.Value) &&
                     new WoWPoint(m.X, m.Y, m.Z).Distance2D(townRally) <= 20.0f);
@@ -378,8 +408,10 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 phase = SquadPhase.Paused;
                 pauseReason = ManualPauseReason;
             }
-            else if (rosterStates.Any(m => !string.IsNullOrEmpty(m.TownBlockedReason)))
+            else if (!anyInCombat && !anyDead && rosterStates.Any(m => !string.IsNullOrEmpty(m.TownBlockedReason)))
             {
+                // Keep the town block pending, but never let it suppress combat or
+                // death recovery that must be resolved first.
                 phase = SquadPhase.Paused;
                 pauseReason = rosterStates.First(m => !string.IsNullOrEmpty(m.TownBlockedReason)).TownBlockedReason;
             }
@@ -403,8 +435,10 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             {
                 phase = SquadPhase.MigratingZone;
             }
-            else if (_inLootWindow || rosterStates.Any(m => m.IsLooting))
+            else if (_inLootWindow)
             {
+                // Only the bounded loot window drives this phase; a stale follower
+                // IsLooting flag must not keep the squad in Looting after its hard cap.
                 phase = SquadPhase.Looting;
             }
             else if (anyNeedsRest)

@@ -53,6 +53,8 @@ namespace CopilotBuddy.Bots.PartyGrind
         private string _cachedProfilePath = string.Empty;
         private string _cachedProfileHash = string.Empty;
         private string _lastAttemptedLeaderProfilePath = string.Empty;
+        private string _missingLeaderProfileHash = string.Empty;
+        private long _nextLeaderProfileLookupUtcMs;
         private int _lastAppliedEffectiveLevel;
         private ulong _currentFocusGuid;
         private ulong _currentSecondaryGuid;
@@ -149,6 +151,7 @@ namespace CopilotBuddy.Bots.PartyGrind
             SquadContext.EffectiveLevelOverride = StyxWoW.Me?.Level ?? 1;
 
             ProfileManager.LevelOverrideSelector = () => _lastAppliedEffectiveLevel > 0 ? _lastAppliedEffectiveLevel : SquadContext.GetEffectiveProfileLevel();
+            BotEvents.Profile.OnNewProfileLoaded += OnProfileRevisionLoaded;
 
             SquadTankBridge.AttachTargetingFilters();
             if (!_lootFilterAttached)
@@ -172,6 +175,7 @@ namespace CopilotBuddy.Bots.PartyGrind
 
         public override void Stop()
         {
+            BotEvents.Profile.OnNewProfileLoaded -= OnProfileRevisionLoaded;
             ProfileManager.LevelOverrideSelector = null;
             ProfileManager.RefreshProfileForLevel();
             Mount.OnMountUp -= SquadFormationService.HandleMountUpEvent;
@@ -285,7 +289,21 @@ namespace CopilotBuddy.Bots.PartyGrind
                 StopIpc();
                 Stop();
                 Logging.Write("[PartyGrind IPC] Startup failed: {0}", ex.Message);
+                // TreeRoot.Start() handles HonorbuddyUnableToStartException by restoring
+                // the stopped state and letting the UI recover; do not swallow the failure.
+                throw new HonorbuddyUnableToStartException("[PartyGrind IPC] Startup failed: " + ex.Message, ex);
             }
+        }
+
+        private void OnProfileRevisionLoaded(BotEvents.Profile.NewProfileLoadedEventArgs args)
+        {
+            // A sub-profile revision can load without changing XmlLocation; record
+            // the digest of the revision that is actually active.
+            string path = ProfileManager.XmlLocation ?? string.Empty;
+            if (string.IsNullOrEmpty(path))
+                return;
+            _cachedProfilePath = path;
+            _cachedProfileHash = ComputeFileHash(path);
         }
 
         private void StopIpc()
@@ -391,9 +409,28 @@ namespace CopilotBuddy.Bots.PartyGrind
         private bool EnsureLeaderProfile(SquadLeaderState leader)
         {
             if (string.IsNullOrWhiteSpace(leader.ProfileXmlHash)) return false;
-            if (!string.IsNullOrEmpty(ProfileManager.XmlLocation) &&
-                string.Equals(ComputeFileHash(ProfileManager.XmlLocation), leader.ProfileXmlHash, StringComparison.OrdinalIgnoreCase))
+
+            long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            if (!string.IsNullOrEmpty(_missingLeaderProfileHash) &&
+                string.Equals(_missingLeaderProfileHash, leader.ProfileXmlHash, StringComparison.OrdinalIgnoreCase) &&
+                now < _nextLeaderProfileLookupUtcMs)
+                return false; // cached miss; retry periodically for a newly installed profile
+
+            string loadedHash = string.Empty;
+            if (!string.IsNullOrEmpty(ProfileManager.XmlLocation))
+            {
+                // Compare against the digest of the loaded revision, not bytes that may
+                // have changed on disk after the profile was loaded.
+                loadedHash = string.Equals(ProfileManager.XmlLocation, _cachedProfilePath, StringComparison.OrdinalIgnoreCase)
+                    ? _cachedProfileHash
+                    : ComputeFileHash(ProfileManager.XmlLocation);
+            }
+            if (!string.IsNullOrEmpty(loadedHash) &&
+                string.Equals(loadedHash, leader.ProfileXmlHash, StringComparison.OrdinalIgnoreCase))
+            {
+                _missingLeaderProfileHash = string.Empty;
                 return true;
+            }
             string root = Path.Combine(AppContext.BaseDirectory, "Profiles");
             var candidates = Directory.Exists(root) ? Directory.EnumerateFiles(root, "*.xml", new EnumerationOptions
             {
@@ -405,8 +442,11 @@ namespace CopilotBuddy.Bots.PartyGrind
                 if (_lastAttemptedLeaderProfilePath != leader.ProfileXmlPath)
                     Logging.Write("[PartyGrind] Missing trusted local profile: {0}. Place the matching XML under Profiles.", leader.ProfileXmlPath);
                 _lastAttemptedLeaderProfilePath = leader.ProfileXmlPath;
+                _missingLeaderProfileHash = leader.ProfileXmlHash;
+                _nextLeaderProfileLookupUtcMs = now + 10000L;
                 return false;
             }
+            _missingLeaderProfileHash = string.Empty;
             ProfileManager.LoadNew(local, rememberMe: false);
             _lastAppliedEffectiveLevel = leader.EffectiveSquadMinLevel;
             ProfileManager.RefreshProfileForLevel();
@@ -426,8 +466,14 @@ namespace CopilotBuddy.Bots.PartyGrind
             }
 
             ulong newFocusGuid = (focus != null && focus.IsValid && !focus.Dead && !focus.IsFriendly) ? focus.Guid : 0UL;
+            // An idle focus is only publishable when our just-captured telemetry says we
+            // are free to pull; active combat threats keep their separate selection path.
+            var local = SquadContext.GetLocalMemberStateSnapshot();
+            bool localCannotPull = local == null || local.IsDead || local.IsGhost || local.IsInCombat ||
+                                   local.NeedsRest || local.IsLooting;
             if (newFocusGuid != 0 && focus != null && !focus.Combat && !focus.IsTargetingMyPartyMember &&
-                (_coordinator.IsWaitingForFollower || !SquadTankBridge.CanInitiatePull(SquadContext.GetLeaderStateSnapshot(),
+                (localCannotPull || _coordinator.IsWaitingForFollower ||
+                 !SquadTankBridge.CanInitiatePull(SquadContext.GetLeaderStateSnapshot(),
                     (SquadContext.ActiveSettings ?? SquadSettings.Instance).MaxPullGatherDistance)))
                 newFocusGuid = 0;
             if (newFocusGuid != 0 && newFocusGuid != _currentFocusGuid)
@@ -504,6 +550,9 @@ namespace CopilotBuddy.Bots.PartyGrind
             bool isGhost = me.IsGhost;
             if (!isDead && !isGhost) _deathStartedUtcMs = 0;
             bool usesMana = me.PowerType == WoWPowerType.Mana;
+            // Druids need water even while shapeshifted into a non-mana form; use the
+            // same class-aware predicate as the town-run need evaluation for requests.
+            bool usesManaForDrinks = usesMana || me.Class == WoWClass.Druid;
 
             _localWasNeedingRest = !me.Combat && !isDead && !isGhost &&
                 SquadCoordinatorService.EvaluateRestHysteresis(
@@ -538,7 +587,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                 (int)me.FreeNormalBagSlots,
                 foodCount,
                 drinkCount,
-                usesMana,
+                usesManaForDrinks,
                 hasHs,
                 squadHasWarlock,
                 settings);
@@ -644,7 +693,8 @@ namespace CopilotBuddy.Bots.PartyGrind
 
                 // 3. Synchronized TownRun
                 new Decorator(
-                    ctx => SquadContext.GetLeaderStateSnapshot()?.Phase == SquadPhase.TownRun,
+                    ctx => SquadContext.GetLeaderStateSnapshot()?.Phase == SquadPhase.TownRun &&
+                           SquadContext.GetLocalMemberStateSnapshot()?.IsInCombat != true,
                     new Action(ctx =>
                     {
                         var settings = SquadContext.ActiveSettings ?? SquadSettings.Instance;
@@ -882,13 +932,26 @@ namespace CopilotBuddy.Bots.PartyGrind
                 }
             }
 
-            ulong targetGuid = leader?.FocusTargetGuid ?? 0UL;
-            if (targetGuid == 0 && leader != null)
-                targetGuid = leader.SecondaryTargetGuid;
-
-            WoWUnit? focus = targetGuid != 0
-                ? ObjectManager.GetObjectByGuid<WoWUnit>(targetGuid)
-                : Targeting.Instance.FirstUnit;
+            // Resolve the leader's focus first, then the secondary target when the
+            // focus unit is missing, dead, unattackable or friendly; fall back to
+            // ordinary targeting only when neither leader target is usable.
+            WoWUnit? focus = null;
+            if (leader != null)
+            {
+                foreach (ulong guid in new[] { leader.FocusTargetGuid, leader.SecondaryTargetGuid })
+                {
+                    if (guid == 0)
+                        continue;
+                    var candidate = ObjectManager.GetObjectByGuid<WoWUnit>(guid);
+                    if (candidate != null && candidate.IsValid && !candidate.Dead &&
+                        candidate.Attackable && !candidate.IsFriendly)
+                    {
+                        focus = candidate;
+                        break;
+                    }
+                }
+            }
+            focus ??= Targeting.Instance.FirstUnit;
 
             if (focus != null && focus.IsValid && !focus.Dead && focus.Attackable && !focus.IsFriendly)
             {

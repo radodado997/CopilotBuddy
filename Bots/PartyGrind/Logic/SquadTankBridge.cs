@@ -352,7 +352,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 switch (me.Class)
                 {
                     case WoWClass.Warrior:
-                        if (looseMobs.Count >= 2 && loose.Distance <= 9f && SpellManager.CanCast("Challenging Shout", me, false, false))
+                        if (looseMobs.Count(u => u.Distance <= 9f) >= 2 && SpellManager.CanCast("Challenging Shout", me, false, false))
                             return SpellManager.Cast("Challenging Shout", me);
                         if (SpellManager.CanCast("Taunt", loose, true, false))
                             return SpellManager.Cast("Taunt", loose);
@@ -361,7 +361,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                         break;
 
                     case WoWClass.Druid:
-                        if (looseMobs.Count >= 2 && loose.Distance <= 9f && SpellManager.CanCast("Challenging Roar", me, false, false))
+                        if (looseMobs.Count(u => u.Distance <= 9f) >= 2 && SpellManager.CanCast("Challenging Roar", me, false, false))
                             return SpellManager.Cast("Challenging Roar", me);
                         if (SpellManager.CanCast("Growl", loose, true, false))
                             return SpellManager.Cast("Growl", loose);

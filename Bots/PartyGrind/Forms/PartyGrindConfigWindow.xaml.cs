@@ -315,6 +315,12 @@ namespace CopilotBuddy.Bots.PartyGrind.Forms
                     : defaultRoles[i]);
             }
 
+            for (int i = 0; i < finalRoles.Count; i++)
+            {
+                if (!Enum.TryParse(finalRoles[i], ignoreCase: true, out SquadRole parsedRole) || !Enum.IsDefined(parsedRole))
+                    throw new ArgumentException($"Invalid squad role at slot {i + 1}: {finalRoles[i]}.");
+            }
+
             string rosterCsv = string.Join(",", finalNames);
             string leaderName = finalNames[0];
 

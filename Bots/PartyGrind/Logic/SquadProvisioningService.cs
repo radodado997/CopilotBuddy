@@ -69,6 +69,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private string _activeTradeTarget = string.Empty;
         private long _tradeStartedUtcMs;
         private bool _tradeItemsPlaced;
+        private bool _tradeCompletionPending;
         private readonly List<(int Slot, uint Entry, int Count)> _offeredItems = new();
 
         public bool IsTradeBusy => !string.IsNullOrEmpty(_activeTradeTarget) || TradeFrame.Instance.IsVisible;
@@ -209,11 +210,43 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         }
 
 
+        /// <summary>
+        /// Verifies the entire outgoing offer against the provisioning plan: no gold,
+        /// no untracked or extra items, and every planned consumable in its slot.
+        /// </summary>
+        private bool IsExactPlayerOffer()
+        {
+            if (_offeredItems.Count == 0 || TradeFrame.Instance.PlayerTradeMoney != 0)
+                return false;
+
+            var actual = new Dictionary<int, (uint Entry, int Count)>();
+            foreach (string part in TradeFrame.Instance.PlayerOfferSignature.Split(';', StringSplitOptions.RemoveEmptyEntries))
+            {
+                string[] fields = part.Split(':');
+                if (fields.Length != 3 || !int.TryParse(fields[0], out int slot) ||
+                    !uint.TryParse(fields[1], out uint entry) || !int.TryParse(fields[2], out int count))
+                    return false;
+                if (entry != 0 && count > 0)
+                    actual[slot] = (entry, count);
+            }
+
+            if (actual.Count != _offeredItems.Count)
+                return false;
+            foreach (var planned in _offeredItems)
+            {
+                if (!actual.TryGetValue(planned.Slot, out var offered) ||
+                    offered.Entry != planned.Entry || offered.Count != planned.Count)
+                    return false;
+            }
+            return true;
+        }
+
         private void ResetActiveTradeState()
         {
             _activeTradeTarget = string.Empty;
             _tradeStartedUtcMs = 0;
             _tradeItemsPlaced = false;
+            _tradeCompletionPending = false;
             _offeredItems.Clear();
         }
 
@@ -248,6 +281,13 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             // 2. Clean up stale initiated trade timeout if frame never opened.
             if (!string.IsNullOrEmpty(_activeTradeTarget))
             {
+                // A confirmed mutual acceptance closes the frame on success; do not
+                // misclassify that as a timeout and penalize the recipient.
+                if (_tradeCompletionPending)
+                {
+                    ResetActiveTradeState();
+                    return false;
+                }
                 long elapsed = now - _tradeStartedUtcMs;
                 if (elapsed > Math.Max(4, settings.TradeOfferTimeoutSeconds) * 1000L)
                 {
@@ -353,14 +393,19 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     _tradeItemsPlaced = true;
                 }
 
-                if (_offeredItems.Count == 0 || _offeredItems.Any(i => !TradeFrame.Instance.ContainsPlayerItem(i.Slot, i.Entry, i.Count)))
+                if (!IsExactPlayerOffer())
                 {
                     TradeFrame.Instance.CancelTrade();
                     OnTradeCancelledOrTimeout(_activeTradeTarget, settings.ProvisionCooldownSeconds);
                     return true;
                 }
                 if (!TradeFrame.Instance.PlayerAccepted)
+                {
+                    // Only treat a frame close as success when the recipient had
+                    // already accepted before we confirmed our own acceptance.
+                    _tradeCompletionPending = TradeFrame.Instance.TargetAccepted;
                     TradeFrame.Instance.AcceptTrade();
+                }
 
                 return true;
             }
@@ -640,13 +685,27 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             else
                 return null;
 
-            return candidates
+            // Route live bag offers through the same selector the tests exercise, so
+            // level, binding and stack rules have a single implementation.
+            var eligible = candidates
                 .Where(i => i != null && i.IsValid && i.StackCount > 0 &&
                             (i.Flags & ItemFlagSoulbound) == 0 &&
                             i.RequiredLevel <= receiverLevel)
-                .OrderByDescending(i => i.RequiredLevel)
-                .ThenByDescending(i => i.StackCount)
-                .FirstOrDefault();
+                .ToList();
+            var snapshots = eligible.Select(i => new TradableConsumableCandidate
+            {
+                Entry = i.Entry,
+                Name = i.Name ?? string.Empty,
+                RequiredLevel = i.RequiredLevel,
+                StackCount = (int)i.StackCount,
+                IsSoulbound = (i.Flags & ItemFlagSoulbound) != 0,
+                IsFood = isFood,
+                IsDrink = isDrink,
+                IsHealthstone = isHealthstone
+            }).ToList();
+
+            var best = SelectBestTradableItem(snapshots, receiverLevel, isFood, isDrink, isHealthstone);
+            return best == null ? null : eligible.FirstOrDefault(i => i.Entry == best.Entry);
         }
     }
 }

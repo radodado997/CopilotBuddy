@@ -19,6 +19,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             var result = Navigator.MoveTo(target.Location, reason);
             if (result is MoveResult.Failed or MoveResult.PathGenerationFailed or MoveResult.ReachedDestination || now - state.Progress > 5000)
             {
+                // Release any partial navigation order before abandoning this target;
+                // the retry bookkeeping below is unchanged.
+                Navigator.Clear();
                 _progress[target.Guid] = (distance, now, now + 15000, now);
                 return false;
             }

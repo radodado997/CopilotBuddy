@@ -253,6 +253,15 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (leader.TownRallyMapId.HasValue && leader.TownRallyMapId != me.MapId)
                 return Block("Rally is on another map; cross-map town travel is unavailable.", out townTasksComplete);
             var needs = EvaluateLiveLocalNeeds(settings, leader);
+            // A renewed requirement (e.g. NeedsBuy after bag space frees up) reopens
+            // the vendor stage instead of publishing completion with unmet needs.
+            bool sellDeferredForMail = _mailRequested && !_stage1MailDone && !needs.NeedsBuy && !needs.NeedsRepair;
+            if (_stage1SellRepairBuyDone &&
+                (needs.NeedsBuy || needs.NeedsRepair || (needs.NeedsSell && !sellDeferredForMail)))
+            {
+                _stage1SellRepairBuyDone = false;
+                _vendorAttempts = 0;
+            }
             if (!_stage1MailDone) _mailRequested |= needs.NeedsMail;
             if (!(_stage1SellRepairBuyDone && _stage1MailDone && _stage2TrainDone) && Environment.TickCount64 - _stageStarted > 120000)
                 return Block("Town task timed out before completion.", out townTasksComplete);
@@ -425,9 +434,11 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             var me = StyxWoW.Me;
             if (me == null) return false;
 
+            // Prefer the configured vendor entry; an unrelated nearby merchant must not
+            // be used to satisfy a configured vendor's Sell/Repair/Buy stage.
             WoWUnit? npc = ObjectManager.GetObjectsOfType<WoWUnit>(false, false)
                 .Where(u => u != null && u.IsValid && !u.Dead && u.IsAnyVendor &&
-                            (vendor == null || u.Entry == (uint)vendor.Entry || u.Location.Distance(me.Location) <= 10f))
+                            (vendor == null || u.Entry == (uint)vendor.Entry))
                 .OrderBy(u => u.Location.Distance(me.Location))
                 .FirstOrDefault();
 
@@ -453,6 +464,14 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             }
 
             if (!MerchantFrame.Instance.IsVisible) return false;
+            var openMerchant = MerchantFrame.Instance.Merchant;
+            if (openMerchant != null && openMerchant.IsValid && openMerchant.Entry != npc.Entry)
+            {
+                // The frame belongs to a different merchant — do not buy or blacklist
+                // anything against the selected vendor.
+                MerchantFrame.Instance.Close();
+                return false;
+            }
             if (MerchantFrame.Instance.IsVisible)
             {
                 if (needs.NeedsSell)

@@ -236,7 +236,7 @@ namespace Styx.CommonBot.CharacterManagement
         /// <summary>
         /// Gets the inventory slot for an item
         /// </summary>
-        private WoWInventorySlot GetItemSlot(ItemInfo item)
+        private static WoWInventorySlot GetItemSlot(ItemInfo item)
         {
             switch (item.InventoryType)
             {

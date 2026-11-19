@@ -125,40 +125,41 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
             if (leader.Breadcrumbs != null && leader.Breadcrumbs.Count > 0)
             {
-                // Pick the earliest breadcrumb ahead of the member that is still at least 6 yd away,
-                // or fall back to leader position when close.
+                // Track route progress on every pulse, even while in close formation,
+                // so a follower that later falls behind resumes after the last breadcrumb
+                // it actually reached.
+                var route = leader.Breadcrumbs.Where(b => b.MapId == leader.MapId).ToList();
+                if (progress != null && (progress.MapId != leader.MapId || progress.LeaderGuid != leader.LeaderGuid))
+                {
+                    progress.LastReachedTimestamp = 0;
+                    progress.MapId = leader.MapId;
+                    progress.LeaderGuid = leader.LeaderGuid;
+                }
+                int nearest = -1;
+                float bestDist = float.MaxValue;
+                for (int i = 0; i < route.Count; i++)
+                {
+                    var bc = route[i];
+                    if (progress != null && bc.TimestampUtcMs <= progress.LastReachedTimestamp) continue;
+                    float d = memberPos.Distance(new WoWPoint(bc.X, bc.Y, bc.Z));
+                    if (d <= bestDist)
+                    {
+                        nearest = i;
+                        bestDist = d;
+                    }
+                }
+                if (progress != null && nearest >= 0 && bestDist < 5f)
+                    progress.LastReachedTimestamp = route[nearest].TimestampUtcMs;
+
                 float distToLeader = memberPos.Distance(leaderPos);
                 if (distToLeader > 22f)
                 {
-                    var route = leader.Breadcrumbs.Where(b => b.MapId == leader.MapId).ToList();
-                    if (progress != null && (progress.MapId != leader.MapId || progress.LeaderGuid != leader.LeaderGuid))
-                    {
-                        progress.LastReachedTimestamp = 0;
-                        progress.MapId = leader.MapId;
-                        progress.LeaderGuid = leader.LeaderGuid;
-                    }
-                    int nearest = -1;
-                    float bestDist = float.MaxValue;
-                    for (int i = 0; i < route.Count; i++)
-                    {
-                        var bc = route[i];
-                        if (progress != null && bc.TimestampUtcMs <= progress.LastReachedTimestamp) continue;
-                        float d = memberPos.Distance(new WoWPoint(bc.X, bc.Y, bc.Z));
-                        if (d <= bestDist)
-                        {
-                            nearest = i;
-                            bestDist = d;
-                        }
-                    }
-                    if (progress != null && nearest >= 0 && bestDist < 5f)
-                        progress.LastReachedTimestamp = route[nearest].TimestampUtcMs;
                     int next = bestDist < 5f ? nearest + 1 : nearest;
                     if (next >= 0 && next < route.Count)
                     {
                         var chosen = route[next];
                         return new WoWPoint(chosen.X, chosen.Y, chosen.Z);
                     }
-
                 }
             }
 

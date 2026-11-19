@@ -201,7 +201,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         {
             // Determine Paladin index among party Paladins so multiple Paladins pick distinct auras & blessings.
             var paladinNames = (leader?.Members ?? new List<SquadMemberSummary>())
-                .Where(m => m.Class == WoWClass.Paladin)
+                .Where(m => m.Class == WoWClass.Paladin && m.IsConnected && !m.IsDead && !m.IsGhost)
                 .Select(m => m.CharacterName)
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .OrderBy(n => n, StringComparer.OrdinalIgnoreCase)
@@ -251,18 +251,49 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
         public static string SelectTankBlessing(int index, IReadOnlyList<IReadOnlyList<string>> known)
         {
-            var assigned = new HashSet<string>();
-            for (int i = 0; i <= index && i < known.Count; i++)
-            {
-                string[] preference = i == 0
+            if (known == null || known.Count == 0 || index < 0 || index >= known.Count)
+                return string.Empty;
+
+            // Choose an assignment for every participating Paladin at once: maximize
+            // the number of distinct blessings first, then honor each paladin's
+            // preference order (deterministically, in paladin index order).
+            var preferences = Enumerable.Range(0, known.Count)
+                .Select(i => (i == 0
                     ? new[] { "Blessing of Sanctuary", "Blessing of Might", "Blessing of Kings", "Blessing of Wisdom" }
-                    : new[] { "Blessing of Kings", "Blessing of Might", "Blessing of Sanctuary", "Blessing of Wisdom" };
-                var available = preference.Where(s => known[i].Contains(s) && !assigned.Contains(s)).ToList();
-                string choice = available.OrderByDescending(s => i + 1 >= known.Count || known[i + 1].Any(other => other != s && !assigned.Contains(other))).FirstOrDefault() ?? string.Empty;
-                if (i == index) return choice;
-                assigned.Add(choice);
+                    : new[] { "Blessing of Kings", "Blessing of Might", "Blessing of Sanctuary", "Blessing of Wisdom" })
+                    .Where(s => known[i].Contains(s)).ToArray())
+                .ToArray();
+
+            var best = new string[known.Count];
+            var current = new string[known.Count];
+            int bestDistinct = -1, bestPenalty = int.MaxValue;
+
+            void Search(int i, HashSet<string> used, int penalty)
+            {
+                if (i == preferences.Length)
+                {
+                    int distinct = used.Count;
+                    if (distinct > bestDistinct || (distinct == bestDistinct && penalty < bestPenalty))
+                    {
+                        bestDistinct = distinct;
+                        bestPenalty = penalty;
+                        Array.Copy(current, best, current.Length);
+                    }
+                    return;
+                }
+
+                for (int rank = 0; rank <= preferences[i].Length; rank++)
+                {
+                    string choice = rank < preferences[i].Length ? preferences[i][rank] : string.Empty;
+                    bool added = !string.IsNullOrEmpty(choice) && used.Add(choice);
+                    current[i] = choice;
+                    Search(i + 1, used, penalty + (string.IsNullOrEmpty(choice) ? 100 : rank));
+                    if (added) used.Remove(choice);
+                }
             }
-            return string.Empty;
+
+            Search(0, new HashSet<string>(), 0);
+            return best[index] ?? string.Empty;
         }
 
         public static string SelectBlessingForRole(SquadRole role, WoWClass targetClass, int paladinIndex)

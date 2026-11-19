@@ -416,6 +416,7 @@ namespace CopilotBuddy.UI
             if (explicitPid == 0)
             {
                 Logging.Write("Invalid -pid option: supply a positive process ID.");
+                Dispatcher.Invoke(() => { if (!_isClosing) SetStatus("Invalid process ID"); });
                 return false;
             }
 

@@ -18,6 +18,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
     {
         private readonly SquadProvisioningService _provisioning;
         private bool _eventsAttached;
+        private Styx.WoWInternals.LuaEvents? _eventsDispatcher;
         private long _lastInviteUtcMs;
         private long _lastLootMethodUtcMs;
 
@@ -28,29 +29,34 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
         public void AttachEvents()
         {
-            if (_eventsAttached)
+            var dispatcher = Lua.Events;
+            if (_eventsAttached && ReferenceEquals(_eventsDispatcher, dispatcher))
                 return;
+            if (_eventsAttached)
+                DetachEvents(); // handlers belong to a dispatcher that was replaced
 
-            Lua.Events.AttachEvent("PARTY_INVITE_REQUEST", OnPartyInviteRequest);
-            Lua.Events.AttachEvent("RESURRECT_REQUEST", OnResurrectRequest);
-            Lua.Events.AttachEvent("START_LOOT_ROLL", OnStartLootRoll);
-            Lua.Events.AttachEvent("CONFIRM_SUMMON", OnConfirmSummon);
-            Lua.Events.AttachEvent("QUEST_ACCEPT_CONFIRM", OnQuestAcceptConfirm);
+            _eventsDispatcher = dispatcher;
+            dispatcher.AttachEvent("PARTY_INVITE_REQUEST", OnPartyInviteRequest);
+            dispatcher.AttachEvent("RESURRECT_REQUEST", OnResurrectRequest);
+            dispatcher.AttachEvent("START_LOOT_ROLL", OnStartLootRoll);
+            dispatcher.AttachEvent("CONFIRM_SUMMON", OnConfirmSummon);
+            dispatcher.AttachEvent("QUEST_ACCEPT_CONFIRM", OnQuestAcceptConfirm);
             _eventsAttached = true;
         }
 
         public void DetachEvents()
         {
-            if (!_eventsAttached)
+            var dispatcher = _eventsDispatcher;
+            if (!_eventsAttached || dispatcher == null)
                 return;
 
             try
             {
-                Lua.Events.DetachEvent("PARTY_INVITE_REQUEST", OnPartyInviteRequest);
-                Lua.Events.DetachEvent("RESURRECT_REQUEST", OnResurrectRequest);
-                Lua.Events.DetachEvent("START_LOOT_ROLL", OnStartLootRoll);
-                Lua.Events.DetachEvent("CONFIRM_SUMMON", OnConfirmSummon);
-                Lua.Events.DetachEvent("QUEST_ACCEPT_CONFIRM", OnQuestAcceptConfirm);
+                dispatcher.DetachEvent("PARTY_INVITE_REQUEST", OnPartyInviteRequest);
+                dispatcher.DetachEvent("RESURRECT_REQUEST", OnResurrectRequest);
+                dispatcher.DetachEvent("START_LOOT_ROLL", OnStartLootRoll);
+                dispatcher.DetachEvent("CONFIRM_SUMMON", OnConfirmSummon);
+                dispatcher.DetachEvent("QUEST_ACCEPT_CONFIRM", OnQuestAcceptConfirm);
             }
             catch (Exception ex)
             {
@@ -59,6 +65,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             finally
             {
                 _eventsAttached = false;
+                _eventsDispatcher = null;
             }
         }
 

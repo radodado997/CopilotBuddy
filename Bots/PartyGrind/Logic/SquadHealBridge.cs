@@ -35,6 +35,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
     public static class SquadHealBridge
     {
         private static readonly SquadApproach HealApproach = new();
+        private static readonly Dictionary<ulong, (int Failures, long RetryUntil)> _resApproaches = new();
+        private static Composite? _activeHealBehavior;
         private static readonly string[] RangedAssistSpells =
         {
             "Smite", "Holy Fire", "Shadow Word: Pain",
@@ -136,14 +138,29 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                         try
                         {
                             HealTargeting.Instance.Pulse();
-                            healBehavior.Start(null);
+                            if (!ReferenceEquals(_activeHealBehavior, healBehavior))
+                            {
+                                _activeHealBehavior?.Stop(null);
+                                _activeHealBehavior = null;
+                                healBehavior.Start(null);
+                                _activeHealBehavior = healBehavior;
+                            }
                             RunStatus status = healBehavior.Tick(null);
-                            healBehavior.Stop(null);
-                            if (status == RunStatus.Success || me.IsCasting || me.ChanneledCastingSpellId != 0)
-                                return true;
+                            // A Running routine stays active across ticks; only finish it
+                            // when it completes, reports Failure, or actually starts a cast.
+                            if (status != RunStatus.Running || me.IsCasting || me.ChanneledCastingSpellId != 0)
+                            {
+                                healBehavior.Stop(null);
+                                _activeHealBehavior = null;
+                                if (status == RunStatus.Success || me.IsCasting || me.ChanneledCastingSpellId != 0)
+                                    return true;
+                            }
                         }
                         catch (Exception ex)
                         {
+                            // Start may have succeeded before Tick threw — clean up either way.
+                            try { healBehavior.Stop(null); } catch { }
+                            _activeHealBehavior = null;
                             Logging.WriteDebug("[PartyGrind Heal] Routine HealBehavior fallback: {0}", ex.Message);
                         }
                     }
@@ -205,28 +222,44 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 return false;
 
             var memberGuids = SquadContext.GetKnownMemberGuids();
-            var deadAlly = ObjectManager.GetObjectsOfType<WoWPlayer>(false, false)
+            long now = Environment.TickCount64;
+            foreach (ulong stale in _resApproaches.Keys.Where(g => !memberGuids.Contains(g)).ToList())
+                _resApproaches.Remove(stale);
+
+            var deadAllies = ObjectManager.GetObjectsOfType<WoWPlayer>(false, false)
                 .Where(p => p != null && p.IsValid && p.Dead && !p.IsGhost &&
                             memberGuids.Contains(p.Guid) && p.Location.Distance(me.Location) <= 45f)
+                .Where(p => !_resApproaches.TryGetValue(p.Guid, out var attempt) ||
+                            (attempt.Failures < 3 && now >= attempt.RetryUntil))
                 .OrderBy(p => p.Location.Distance(me.Location))
-                .FirstOrDefault();
+                .ToList();
 
-            if (deadAlly == null)
-                return false;
-
-            if (deadAlly.Distance > 28f || !deadAlly.InLineOfSpellSight)
+            foreach (var deadAlly in deadAllies)
             {
-                Navigator.MoveTo(deadAlly.Location, "Moving to resurrect " + deadAlly.Name);
-                return true;
-            }
+                if (deadAlly.Distance > 28f || !deadAlly.InLineOfSpellSight)
+                {
+                    var result = Navigator.MoveTo(deadAlly.Location, "Moving to resurrect " + deadAlly.Name);
+                    // Path failures and arrival without line of sight count against this
+                    // corpse; try the next one instead of retrying it forever.
+                    if (result is MoveResult.Failed or MoveResult.PathGenerationFailed or MoveResult.ReachedDestination)
+                    {
+                        int failures = _resApproaches.TryGetValue(deadAlly.Guid, out var previous) ? previous.Failures + 1 : 1;
+                        _resApproaches[deadAlly.Guid] = (failures, now + 15000);
+                        Navigator.Clear();
+                        continue;
+                    }
+                    return true;
+                }
 
-            if (me.IsMoving)
-                WoWMovement.MoveStop();
+                if (me.IsMoving)
+                    WoWMovement.MoveStop();
 
-            if (SpellManager.CanCast(resSpell, deadAlly, true, false))
-            {
-                Logging.Write("[PartyGrind] Resurrecting {0} with {1}", deadAlly.Name, resSpell);
-                return SpellManager.Cast(resSpell, deadAlly);
+                if (SpellManager.CanCast(resSpell, deadAlly, true, false))
+                {
+                    Logging.Write("[PartyGrind] Resurrecting {0} with {1}", deadAlly.Name, resSpell);
+                    _resApproaches.Remove(deadAlly.Guid);
+                    return SpellManager.Cast(resSpell, deadAlly);
+                }
             }
 
             return false;
