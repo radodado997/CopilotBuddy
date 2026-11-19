@@ -57,6 +57,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 _progress[target.Guid] = (distance, now, now + 15000, now);
                 return false;
             }
+            SquadPartySyncService.LogAction(reason);
             _progress[target.Guid] = (state.Distance, state.Progress, state.Retry, now);
             return true;
         }

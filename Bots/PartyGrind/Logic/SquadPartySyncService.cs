@@ -21,7 +21,31 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private Styx.WoWInternals.LuaEvents? _eventsDispatcher;
         private readonly List<(string Name, LuaEventHandlerDelegate Handler)> _attachedHandlers = new();
         private long _lastInviteUtcMs;
+        private readonly object _invitePulseLock = new();
+        private readonly SquadInviteTracker _inviteTracker = new();
         private long _lastLootMethodUtcMs;
+
+        private static readonly object ActionLogLock = new();
+        private static string _lastAction = string.Empty;
+        private static string _lastActionCharacter = string.Empty;
+
+        internal static void ResetActionLog()
+        {
+            lock (ActionLogLock) { _lastAction = _lastActionCharacter = string.Empty; }
+        }
+
+        internal static void LogAction(string action)
+        {
+            string name = StyxWoW.Me?.Name ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(name)) return;
+            lock (ActionLogLock)
+            {
+                if (_lastAction == action && _lastActionCharacter == name) return;
+                _lastAction = action;
+                _lastActionCharacter = name;
+                Logging.WriteDebug("[PartyGrind Sync {0}] {1}", name, action);
+            }
+        }
 
         public SquadPartySyncService(SquadProvisioningService provisioning)
         {
@@ -101,42 +125,51 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
             long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
-            // 1. Invite missing members on interval.
-            if (settings.AutoInviteMembers &&
-                (now - _lastInviteUtcMs) >= Math.Max(3, settings.InviteIntervalSeconds) * 1000L)
+            // Serialize overlapping pulses as well as each player's pending-invite window.
+            lock (_invitePulseLock)
             {
-                _lastInviteUtcMs = now;
-
-                var currentPartyNames = new HashSet<string>(
-                    me.PartyMemberInfos.Select(p => p.Name ?? string.Empty),
-                    StringComparer.OrdinalIgnoreCase);
-
-                var desiredNames = new HashSet<string>(settings.GetExpectedMemberNames(), StringComparer.OrdinalIgnoreCase);
-                foreach (var snap in connected)
+                if (settings.AutoInviteMembers &&
+                    (now - _lastInviteUtcMs) >= Math.Max(3, settings.InviteIntervalSeconds) * 1000L)
                 {
-                    if (!string.IsNullOrWhiteSpace(snap.CharacterName))
-                        desiredNames.Add(snap.CharacterName.Trim());
-                }
-
-                desiredNames.Remove(me.Name ?? string.Empty);
-
-                foreach (string name in desiredNames)
-                {
-                    if (!currentPartyNames.Contains(name))
+                    _lastInviteUtcMs = now;
+                    var desiredNames = new HashSet<string>(
+                        settings.GetExpectedMemberNames().Where(n => !string.IsNullOrWhiteSpace(n)).Select(n => n.Trim()),
+                        StringComparer.OrdinalIgnoreCase);
+                    foreach (var snap in connected)
                     {
-                        Logging.WriteDebug("[PartyGrind Sync] Inviting squadmate: {0}", name);
-                        Lua.DoString($"InviteUnit('{Lua.Escape(name)}')");
+                        if (!string.IsNullOrWhiteSpace(snap.CharacterName))
+                            desiredNames.Add(snap.CharacterName.Trim());
+                    }
+                    desiredNames.Remove((me.Name ?? string.Empty).Trim());
+
+                    foreach (string name in desiredNames)
+                    {
+                        _inviteTracker.Check(name, Environment.TickCount64, mayInvite =>
+                        {
+                            // Name is a valid UnitId for a party member in 3.3.5a.
+                            // Check and invite in the same Lua execution so a roster update
+                            // cannot occur between the membership test and InviteUnit.
+                            return Lua.GetReturnVal<string>(BuildInviteScript(name, mayInvite), 0U)
+                                ?? string.Empty;
+                        });
                     }
                 }
             }
 
             // 2. Enforce configured party loot method (freeforall / group).
-            if (me.PartyMemberInfos.Count > 0 && (now - _lastLootMethodUtcMs) >= 15000L)
+            if ((now - _lastLootMethodUtcMs) >= 15000L)
             {
                 _lastLootMethodUtcMs = now;
                 string method = settings.LootMethod == SquadLootMethod.FreeForAll ? "freeforall" : "group";
-                Lua.DoString($"if GetLootMethod() ~= '{method}' then SetLootMethod('{method}') end");
+                Lua.DoString($"if GetPartyMember(1) and GetLootMethod() ~= '{method}' then SetLootMethod('{method}') end");
             }
+        }
+
+        internal static string BuildInviteScript(string name, bool mayInvite)
+        {
+            string escaped = Lua.Escape(name);
+            return $"if UnitInParty('{escaped}') then return 'member' end; " +
+                   (mayInvite ? $"InviteUnit('{escaped}'); return 'invited'" : "return 'waiting'");
         }
 
         public static bool IsInviterAuthorized(string inviterName, SquadSettings settings, SquadLeaderState? leader)
@@ -250,4 +283,26 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         }
 
     }
+    /// <summary>Suppress duplicate in-flight invitations without treating them as party membership.</summary>
+    internal sealed class SquadInviteTracker
+    {
+        private const long InviteCooldownMs = 10000;
+        private readonly object _gate = new();
+        private readonly Dictionary<string, long> _lastAttempts = new(StringComparer.OrdinalIgnoreCase);
+
+        internal void Check(string name, long now, Func<bool, string> checkAndInvite)
+        {
+            lock (_gate)
+            {
+                bool mayInvite = !_lastAttempts.TryGetValue(name, out long last) || now - last >= InviteCooldownMs;
+                // Reserve before executing Lua, including when execution fails or returns no result.
+                if (mayInvite)
+                    _lastAttempts[name] = now;
+                string result = checkAndInvite(mayInvite);
+                if (result == "member")
+                    _lastAttempts.Remove(name); // A later departure can be invited again.
+            }
+        }
+    }
+
 }
