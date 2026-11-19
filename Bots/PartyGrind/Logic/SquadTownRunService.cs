@@ -46,11 +46,14 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private bool _mailRequested;
         private int _mailAttempts, _vendorAttempts;
         private long _stageStarted;
+        private long _blockedAt;
+        private long _regroupStarted;
         public string BlockedReason { get; private set; } = string.Empty;
 
         private bool Block(string reason, out bool complete)
         {
             BlockedReason = reason;
+            _blockedAt = Environment.TickCount64;
             Logging.Write("[PartyGrind Town] Blocked: {0}", reason);
             complete = false;
             return true;
@@ -66,22 +69,47 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             var me = StyxWoW.Me;
             if (me == null || BlockedReason.Length == 0) return;
             var needs = EvaluateLiveLocalNeeds(settings, leader);
+
+            // Failure-based blocks are retried on a cooldown so a resolved configuration
+            // problem (vendor/mailbox/trainer appearing later) unblocks the squad without
+            // depending on RunTownTick, which is skipped while the phase is Paused.
+            bool retryAllowed = Environment.TickCount64 - _blockedAt >= 15000;
+            bool mailboxAvailable = ProfileManager.CurrentProfile?.MailboxManager?.GetClosestMailbox() != null ||
+                string.IsNullOrWhiteSpace(CharacterSettings.Instance.MailRecipient) ||
+                !Styx.Logic.Inventory.InventoryManager.GetItemsToMail().Any();
+            bool vendorAvailable = !needs.NeedsSell && !needs.NeedsRepair && !needs.NeedsBuy ||
+                ResolveSellOrRepairVendor(needs) != null;
+            bool trainerAvailable = !needs.NeedsTrain || ResolveClassTrainerLocation(me, out _, out _).HasValue;
+            WoWPoint rally = leader != null && (leader.TownRallyX != 0f || leader.TownRallyY != 0f)
+                ? new WoWPoint(leader.TownRallyX, leader.TownRallyY, leader.TownRallyZ)
+                : ResolveTownRallyPoint().Location;
+            bool atRally = (leader == null || !leader.TownRallyMapId.HasValue || leader.TownRallyMapId == me.MapId) &&
+                me.Location.Distance2D(rally) <= 15.0f;
+
             bool resolved = BlockedReason switch
             {
-                "No eligible vendor found." => ResolveSellOrRepairVendor(needs) != null ||
-                    (!needs.NeedsSell && !needs.NeedsRepair && !needs.NeedsBuy),
-                "No mailbox found." => ProfileManager.CurrentProfile?.MailboxManager?.GetClosestMailbox() != null ||
-                    string.IsNullOrWhiteSpace(CharacterSettings.Instance.MailRecipient) ||
-                    !Styx.Logic.Inventory.InventoryManager.GetItemsToMail().Any(),
-                "Class trainer not found; training remains pending." => !needs.NeedsTrain ||
-                    ResolveClassTrainerLocation(me, out _, out _).HasValue,
-                "Rally is on another map; cross-map town travel is unavailable." => leader != null &&
-                    (!leader.TownRallyMapId.HasValue || leader.TownRallyMapId == me.MapId),
+                "No eligible vendor found." => vendorAvailable,
+                "No mailbox found." => mailboxAvailable,
+                "Class trainer not found; training remains pending." => trainerAvailable,
+                "Rally is on another map; cross-map town travel is unavailable." =>
+                    leader != null && (!leader.TownRallyMapId.HasValue || leader.TownRallyMapId == me.MapId),
+                "Town task timed out before completion." => !needs.Any ||
+                    (retryAllowed && vendorAvailable && mailboxAvailable && trainerAvailable),
+                "Vendor tasks remain unmet after five attempts." =>
+                    (!needs.NeedsSell && !needs.NeedsRepair && !needs.NeedsBuy) ||
+                    (retryAllowed && vendorAvailable),
+                "Mailbox failed to open or finish mailing after three attempts." => mailboxAvailable &&
+                    (!Styx.Logic.Inventory.InventoryManager.GetItemsToMail().Any() || retryAllowed),
+                "Unable to reach town rally point before timeout." => atRally ||
+                    (retryAllowed && (leader == null || !leader.TownRallyMapId.HasValue || leader.TownRallyMapId == me.MapId)),
                 _ => false
             };
             if (resolved)
             {
                 BlockedReason = string.Empty;
+                _blockedAt = 0;
+                _mailAttempts = _vendorAttempts = 0;
+                _regroupStarted = 0;
                 _stageStarted = Environment.TickCount64;
             }
         }
@@ -95,6 +123,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             _mailRequested = false;
             _mailAttempts = _vendorAttempts = 0;
             _stageStarted = Environment.TickCount64;
+            _blockedAt = 0;
+            _regroupStarted = 0;
             BlockedReason = string.Empty;
         }
 
@@ -218,6 +248,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (rallyPoint == WoWPoint.Zero)
                 rallyPoint = ResolveTownRallyPoint().Location;
 
+            RecheckBlocked(settings, leader);
             if (BlockedReason.Length > 0) { townTasksComplete = false; return true; }
             if (leader.TownRallyMapId.HasValue && leader.TownRallyMapId != me.MapId)
                 return Block("Rally is on another map; cross-map town travel is unavailable.", out townTasksComplete);
@@ -358,9 +389,17 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 }
             }
 
-            // Stage 3: Return to TownRallyPoint (<= 20 yd) before marking TownTasksComplete = true.
+            // Stage 3: Return to TownRallyPoint (<= 15 yd) before marking TownTasksComplete = true.
+            // Once every task flag is set the regroup itself is time-bounded, so a member
+            // that cannot reach the rally transitions to a bounded blocked state instead of
+            // reporting an incomplete task forever.
+            if (_stage1SellRepairBuyDone && _stage1MailDone && _stage2TrainDone && _regroupStarted == 0)
+                _regroupStarted = Environment.TickCount64;
+
             if (me.Location.Distance2D(rallyPoint) > 15.0f)
             {
+                if (_regroupStarted > 0 && Environment.TickCount64 - _regroupStarted > 120000)
+                    return Block("Unable to reach town rally point before timeout.", out townTasksComplete);
                 Navigator.MoveTo(rallyPoint, "TownRun: returning to squad rally point");
                 townTasksComplete = false;
                 return true;
