@@ -112,7 +112,7 @@
                                     <Button x:Name="BtnBrowseSecrets" Content="Browse..." Click="BtnBrowseSecrets_Click"/>
                                 </StackPanel>
                                 <TextBlock Grid.Row="7" Grid.ColumnSpan="2" TextWrapping="Wrap"
-                                           Text="Each WoW client/instance must have its own secrets file configured here before launch. Secret values stay out of the generated .bat file."
+                                           Text="Run each fresh Client instance once without auto-start flags, configure its secrets file here, and save before using the launcher. Secret values stay out of the generated .bat file."
                                            Margin="0,2,0,0"/>
                             </Grid>
                         </GroupBox>

@@ -26,6 +26,19 @@ namespace CopilotBuddy.PartyGrind.Tests
         }
 
         [Fact]
+        public void ProtectedFrames_RejectOversizeWithoutConsumingSequence()
+        {
+            var constructor = typeof(SquadPeerAuthentication).GetConstructors(
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance).Single();
+            var sender = (SquadPeerAuthentication)constructor.Invoke(new object[] { "Follower", Secret("Follower"), "test", false });
+            var receiver = (SquadPeerAuthentication)constructor.Invoke(new object[] { "Follower", Secret("Follower"), "test", true });
+            Assert.Throws<ArgumentException>(() => sender.Protect(new string('x', SquadJson.MaxFrameCharacters)));
+            Assert.Equal("valid", receiver.Unprotect(sender.Protect("valid")));
+            Assert.Throws<ArgumentException>(() => sender.Protect(new string('界', SquadJson.MaxFrameCharacters / 3)));
+            Assert.Equal("next", receiver.Unprotect(sender.Protect("next")));
+        }
+
+        [Fact]
         public async Task Authentication_RejectsDifferentTeamWithCorrectMemberSecret()
         {
             using var server = new SquadIpcServer(0, "SquadBlue", memberSecrets: Secrets);
@@ -223,7 +236,7 @@ namespace CopilotBuddy.PartyGrind.Tests
                     foreach (var hs in handshakes.Values)
                         Assert.Equal(hs.Role, client.LatestLeaderState!.MemberRoles[hs.CharacterName]);
                     Assert.True(client.IsConnected);
-                    Assert.NotNull(client.AssignedSlotIndex);
+                    Assert.Equal(assignments[expectedNames[clients.IndexOf(client)]], client.AssignedSlotIndex);
                     Assert.Equal(5, client.LatestLeaderState!.EffectiveSquadMinLevel);
                     Assert.Equal(SquadPhase.Grinding, client.LatestLeaderState.Phase);
                     Assert.Equal("Zone 1-6", client.LatestLeaderState.ActiveSubProfileName);

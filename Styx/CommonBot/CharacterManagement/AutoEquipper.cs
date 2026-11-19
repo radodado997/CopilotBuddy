@@ -101,7 +101,8 @@ namespace Styx.CommonBot.CharacterManagement
             int emptySlots = 0;
             foreach (WoWInventorySlot slot in slots)
             {
-                WoWItem equipped = inventory.GetItemBySlot((uint)slot);
+                if (!inventory.TryGetItemBySlot((uint)slot, out WoWItem equipped))
+                    return false;
                 if (equipped == null)
                 {
                     emptySlots++;
@@ -181,7 +182,8 @@ namespace Styx.CommonBot.CharacterManagement
                 bool unknownEquipped = false;
                 foreach (WoWInventorySlot checkSlot in slotsToCheck)
                 {
-                    WoWItem equipped = inventory.GetItemBySlot((uint)checkSlot);
+                    if (!inventory.TryGetItemBySlot((uint)checkSlot, out WoWItem equipped))
+                        return 0f;
                     if (equipped == null)
                     {
                         emptySlots++;

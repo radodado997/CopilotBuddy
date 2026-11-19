@@ -174,7 +174,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             float perpX = -dirY;
             float perpY = dirX;
 
-            float trailDist = 3.5f + (Math.Max(0, memberSlotIndex) * 1.4f);
+            float trailDist = 3.5f + (Math.Max(0, memberSlotIndex) * 4.5f);
             float lateral = (memberSlotIndex % 2 == 0 ? 1f : -1f) * (1.8f + (memberSlotIndex / 2) * 1.5f);
 
             return new WoWPoint(

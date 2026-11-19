@@ -185,7 +185,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
             bool usesMana = me.PowerType == WoWPowerType.Mana || me.Class == WoWClass.Druid;
             var mages = (leader?.Members ?? new List<SquadMemberSummary>())
-                .Where(m => m.IsConnected && !m.IsDead && !m.IsGhost && m.Class == WoWClass.Mage);
+                .Where(m => m.IsConnected && !m.IsDead && !m.IsGhost && m.Class == WoWClass.Mage && m.MapId == me.MapId);
             bool foodProvided = settings.PreferMageFoodOverVendor && mages.Any(m => m.CanProvideMageFood);
             bool drinkProvided = settings.PreferMageFoodOverVendor && mages.Any(m => m.CanProvideMageDrink);
 
@@ -438,7 +438,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 return true;
             }
 
-            townTasksComplete = true;
+            var remainingNeeds = EvaluateLiveLocalNeeds(settings, leader);
+            townTasksComplete = !remainingNeeds.NeedsSell && !remainingNeeds.NeedsRepair &&
+                !remainingNeeds.NeedsBuy && !remainingNeeds.NeedsTrain && !remainingNeeds.NeedsMail;
             return true;
         }
 

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using Styx;
 using Styx.Logic.Pathing;
 using Styx.WoWInternals.WoWObjects;
@@ -12,6 +13,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         public bool TryMove(WoWUnit target, string reason)
         {
             long now = Environment.TickCount64;
+            foreach (var stale in _progress.Where(p => p.Key != target.Guid && now >= p.Value.Retry && now - p.Value.Attempt > 15000).Select(p => p.Key).ToList())
+                _progress.Remove(stale);
             float distance = StyxWoW.Me.Location.Distance(target.Location);
             if (!_progress.TryGetValue(target.Guid, out var state)) state = (distance, now, 0, now);
             if (now < state.Retry) return false;
@@ -27,16 +30,21 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 float dx = meLocation.X - target.Location.X;
                 float dy = meLocation.Y - target.Location.Y;
                 float length = (float)Math.Sqrt(dx * dx + dy * dy);
-                if (length > 0.01f)
+                if (length <= 0.01f) { dx = 1f; dy = 0f; length = 1f; }
+                float offset = Navigator.PathPrecision + 1.5f;
+                foreach (float direction in new[] { 1f, -1f })
                 {
-                    float offset = Navigator.PathPrecision + 1.5f;
                     var candidate = new WoWPoint(
-                        target.Location.X + dx / length * offset,
-                        target.Location.Y + dy / length * offset,
+                        target.Location.X + direction * dx / length * offset,
+                        target.Location.Y + direction * dy / length * offset,
                         target.Location.Z);
                     var castingPoint = Navigator.FindNearestPoint(candidate);
-                    if (castingPoint.Distance(target.Location) > Navigator.PathPrecision)
+                    if (castingPoint.Distance(target.Location) > Navigator.PathPrecision &&
+                        castingPoint.Distance(meLocation) > Navigator.PathPrecision)
+                    {
                         destination = castingPoint;
+                        break;
+                    }
                 }
             }
 

@@ -295,9 +295,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
             if (deadMemberKey != null)
             {
-                // Associate the wait with the member who died: keep the timer while the
-                // same corpse is being waited on, restart it when the dead member changes.
-                if (!string.Equals(_resWaitMemberKey, deadMemberKey, StringComparison.Ordinal))
+                if (string.IsNullOrEmpty(_resWaitMemberKey))
                 {
                     _resWaitStartedUtcMs = nowUtcMs;
                     _resWaitMemberKey = deadMemberKey;
@@ -380,7 +378,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 bool pendingTelemetry = connectedClients.Any(s => s.IsConnected && s.LatestState == null &&
                     !string.IsNullOrWhiteSpace(s.CharacterName));
                 bool anyStillHasNeed = townParticipants.Any(m =>
-                    !m.TownTasksComplete && (m.NeedsSell || m.NeedsRepair || m.NeedsBuy || m.NeedsTrain || m.NeedsMail));
+                    m.NeedsSell || m.NeedsRepair || m.NeedsBuy || m.NeedsTrain || m.NeedsMail);
                 bool allDoneAndAtRally = !pendingTelemetry && townParticipants.Count > 0 && townParticipants.All(m =>
                     m.TownTasksComplete &&
                     (!profile.TownRallyMapId.HasValue || m.MapId == profile.TownRallyMapId.Value) &&

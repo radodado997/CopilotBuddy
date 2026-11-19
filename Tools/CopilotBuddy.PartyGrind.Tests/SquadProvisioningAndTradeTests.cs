@@ -163,8 +163,12 @@ namespace CopilotBuddy.PartyGrind.Tests
         [Fact]
         public void LevelFourMage_WaterDoesNotSuppressFoodVendorNeed()
         {
-            bool mageCanProvideFood = SquadProvisioningService.SelectBestConjureRank(false, 4, 4).HasValue;
-            bool mageCanProvideDrink = SquadProvisioningService.SelectBestConjureRank(true, 4, 4).HasValue;
+            int? foodRank = SquadProvisioningService.SelectBestConjureRank(false, 4, 4);
+            int? waterRank = SquadProvisioningService.SelectBestConjureRank(true, 4, 4);
+            Assert.Null(foodRank);
+            Assert.NotNull(waterRank);
+            bool mageCanProvideFood = foodRank.HasValue;
+            bool mageCanProvideDrink = waterRank.HasValue;
             Assert.False(mageCanProvideFood);
             Assert.True(mageCanProvideDrink);
             var needs = SquadTownRunService.EvaluateLocalTownNeeds(
@@ -173,6 +177,10 @@ namespace CopilotBuddy.PartyGrind.Tests
             Assert.True(needs.NeedsFood);
             Assert.False(needs.NeedsDrink);
             Assert.True(needs.NeedsBuy);
+            var drinkOnly = SquadTownRunService.EvaluateLocalTownNeeds(
+                10, 90, true, false, true, 20, 20, false, false, true,
+                mageCanProvideFood, mageCanProvideDrink, MakeSettings());
+            Assert.False(drinkOnly.NeedsBuy);
         }
 
         [Fact]

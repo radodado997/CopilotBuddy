@@ -282,6 +282,25 @@ namespace Styx.WoWInternals
         /// <summary>
         /// Gets the item at a specific slot
         /// </summary>
+        public bool TryGetItemBySlot(uint slot, out WoWItem item)
+        {
+            item = null;
+            try
+            {
+                if (slot >= Slots || ObjectManager.Wow == null)
+                    return false;
+                ulong guid = ObjectManager.Wow.Read<ulong>(new uint[] { _bagStructure.ItemsBaseAddress + (FirstSlotIndex + slot) * 8U });
+                if (guid == 0)
+                    return true;
+                item = ObjectManager.GetObjectByGuid<WoWItem>(guid);
+                return item != null;
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+
         public WoWItem GetItemBySlot(uint slot)
         {
             try

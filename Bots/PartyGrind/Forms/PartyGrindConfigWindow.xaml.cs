@@ -180,9 +180,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Forms
             s.EnableMageProvisioning = ChkEnableMageProv.IsChecked == true;
             s.PreferMageFoodOverVendor = ChkPreferMageFood.IsChecked == true;
             s.MinMemberFoodStack = ParseInt(TxtMinFood.Text, s.MinMemberFoodStack, 0, 80);
-            s.TargetMemberFoodStack = ParseInt(TxtTargetFood.Text, s.TargetMemberFoodStack, 1, 80);
+            s.TargetMemberFoodStack = Math.Max(s.MinMemberFoodStack, ParseInt(TxtTargetFood.Text, s.TargetMemberFoodStack, 1, 80));
             s.MinMemberDrinkStack = ParseInt(TxtMinDrink.Text, s.MinMemberDrinkStack, 0, 80);
-            s.TargetMemberDrinkStack = ParseInt(TxtTargetDrink.Text, s.TargetMemberDrinkStack, 1, 80);
+            s.TargetMemberDrinkStack = Math.Max(s.MinMemberDrinkStack, ParseInt(TxtTargetDrink.Text, s.TargetMemberDrinkStack, 1, 80));
             s.TradeOfferTimeoutSeconds = ParseInt(TxtTradeTimeout.Text, s.TradeOfferTimeoutSeconds, 4, 60);
             s.ProvisionCooldownSeconds = ParseInt(TxtProvisionCooldown.Text, s.ProvisionCooldownSeconds, 5, 300);
             s.EnableWarlockHealthstones = ChkEnableWarlockHs.IsChecked == true;
@@ -197,7 +197,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Forms
 
         private void BtnBrowseSecrets_Click(object sender, RoutedEventArgs e)
         {
-            var dialog = new OpenFileDialog
+            var dialog = new Microsoft.Win32.OpenFileDialog
             {
                 Title = "Select per-instance IPC member secrets file",
                 Filter = "Secrets files (*.json;*.txt)|*.json;*.txt|All files (*.*)|*.*",
@@ -337,6 +337,11 @@ namespace CopilotBuddy.Bots.PartyGrind.Forms
                     throw new ArgumentException($"Invalid squad role at slot {i + 1}: {finalRoles[i]}.");
             }
 
+            var conflicts = finalNames.Select((name, index) => new { Name = name, Slot = index + 1 })
+                .GroupBy(x => x.Name, StringComparer.OrdinalIgnoreCase).Where(g => g.Count() > 1).ToList();
+            if (conflicts.Count > 0)
+                throw new ArgumentException("Duplicate character names: " + string.Join("; ", conflicts.Select(g =>
+                    g.Key + " (slots " + string.Join(", ", g.Select(x => x.Slot)) + ")")));
             string rosterCsv = string.Join(",", finalNames);
             string leaderName = finalNames[0];
 
@@ -350,10 +355,21 @@ namespace CopilotBuddy.Bots.PartyGrind.Forms
 
             for (int i = 0; i < count; i++)
             {
+                sb.AppendLine($":PID_SLOT_{i + 1}");
+                sb.AppendLine($"set \"PID{i + 1}=\"");
+                sb.AppendLine($"set /p PID{i + 1}=WoW PID for {finalNames[i]} (Client{i + 1}): ");
+                sb.AppendLine($"powershell -NoProfile -Command \"$p=0; if ([int]::TryParse($env:PID{i + 1},[ref]$p) -and $p -gt 0) {{ exit 0 }}; exit 1\"");
+                sb.AppendLine($"if errorlevel 1 goto PID_SLOT_{i + 1}");
+                sb.AppendLine($"for /f %%P in ('powershell -NoProfile -Command \"[int]$env:PID{i + 1}\"') do set \"PID{i + 1}=%%P\"");
+                for (int j = 0; j < i; j++)
+                    sb.AppendLine($"if \"%PID{i + 1}%\"==\"%PID{j + 1}%\" goto PID_SLOT_{i + 1}");
+            }
+
+            for (int i = 0; i < count; i++)
+            {
                 bool isCoord = i == 0;
                 // Bind each launch to its WoW process explicitly. The window title is
                 // only a label; -pid is the supported attach selector.
-                sb.AppendLine($"set /p PID{i + 1}=WoW PID for {finalNames[i]} (Client{i + 1}): ");
                 sb.AppendLine(
                     $"start \"Client{i + 1} - {finalNames[i]}\" CopilotBuddy.exe " +
                     $"-pid=%PID{i + 1}% " +

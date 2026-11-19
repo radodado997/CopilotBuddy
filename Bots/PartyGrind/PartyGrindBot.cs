@@ -89,8 +89,10 @@ namespace CopilotBuddy.Bots.PartyGrind
 
         private static void StopRoutine(ref Composite? active)
         {
-            active?.Stop(null);
+            var routine = active;
             active = null;
+            try { routine?.Stop(null); }
+            catch (Exception ex) { Logging.WriteException(ex); }
         }
 
         private static RunStatus TickRoutine(ref Composite? active, Composite behavior)
@@ -148,58 +150,72 @@ namespace CopilotBuddy.Bots.PartyGrind
             _deathStartedUtcMs = 0;
             _localWasNeedingRest = false;
 
-            SquadContext.Reset();
-            SquadContext.IsActive = true;
-            SquadContext.ActiveSettings = settings;
-            SquadContext.EffectiveLevelOverride = StyxWoW.Me?.Level ?? 1;
-
-            ProfileManager.LevelOverrideSelector = () => _lastAppliedEffectiveLevel > 0 ? _lastAppliedEffectiveLevel : SquadContext.GetEffectiveProfileLevel();
-            BotEvents.Profile.OnNewProfileLoaded += OnProfileRevisionLoaded;
-
-            SquadTankBridge.AttachTargetingFilters();
-            if (!_lootFilterAttached)
+            try
             {
-                LootTargeting.Instance.IncludeTargetsFilter += LevelBot.LevelbotIncludeLootsFilter;
-                _lootFilterAttached = true;
+                SquadContext.Reset();
+                SquadContext.IsActive = true;
+                SquadContext.ActiveSettings = settings;
+                SquadContext.EffectiveLevelOverride = StyxWoW.Me?.Level ?? 1;
+
+                ProfileManager.LevelOverrideSelector = () => _lastAppliedEffectiveLevel > 0 ? _lastAppliedEffectiveLevel : SquadContext.GetEffectiveProfileLevel();
+                BotEvents.Profile.OnNewProfileLoaded += OnProfileRevisionLoaded;
+
+                SquadTankBridge.AttachTargetingFilters();
+                if (!_lootFilterAttached)
+                {
+                    LootTargeting.Instance.IncludeTargetsFilter += LevelBot.LevelbotIncludeLootsFilter;
+                    _lootFilterAttached = true;
+                }
+
+                Mount.OnMountUp += SquadFormationService.HandleMountUpEvent;
+                _partySync.AttachEvents();
+
+                StartIpc(settings);
+                if (!SquadContext.IsActive) return;
+                if (ProfileManager.CurrentOuterProfile != null)
+                    ProfileManager.RefreshProfileForLevel();
+                SquadOverlay.Attach();
+
+                Logging.Write("[PartyGrind] Started as {0} (Coordinator={1}, Team={2}, Port={3}).",
+                    settings.Role, settings.IsCoordinator, settings.TeamId, settings.IpcPort);
             }
+            catch
+            {
+                Stop();
+                throw;
+            }
+        }
 
-            Mount.OnMountUp += SquadFormationService.HandleMountUpEvent;
-            _partySync.AttachEvents();
-
-            StartIpc(settings);
-            if (!SquadContext.IsActive) return;
-            if (ProfileManager.CurrentOuterProfile != null)
-                ProfileManager.RefreshProfileForLevel();
-            SquadOverlay.Attach();
-
-            Logging.Write("[PartyGrind] Started as {0} (Coordinator={1}, Team={2}, Port={3}).",
-                settings.Role, settings.IsCoordinator, settings.TeamId, settings.IpcPort);
+        private static void Cleanup(System.Action action)
+        {
+            try { action(); }
+            catch (Exception ex) { Logging.WriteException(ex); }
         }
 
         public override void Stop()
         {
-            BotEvents.Profile.OnNewProfileLoaded -= OnProfileRevisionLoaded;
-            ProfileManager.LevelOverrideSelector = null;
-            ProfileManager.RefreshProfileForLevel();
-            Mount.OnMountUp -= SquadFormationService.HandleMountUpEvent;
-            SquadTankBridge.DetachTargetingFilters();
+            Cleanup(() => { BotEvents.Profile.OnNewProfileLoaded -= OnProfileRevisionLoaded; });
+            Cleanup(() => { ProfileManager.LevelOverrideSelector = null; });
+            Cleanup(() => { ProfileManager.RefreshProfileForLevel(); });
+            Cleanup(() => { Mount.OnMountUp -= SquadFormationService.HandleMountUpEvent; });
+            Cleanup(() => { SquadTankBridge.DetachTargetingFilters(); });
 
             if (_lootFilterAttached)
             {
-                LootTargeting.Instance.IncludeTargetsFilter -= LevelBot.LevelbotIncludeLootsFilter;
+                Cleanup(() => { LootTargeting.Instance.IncludeTargetsFilter -= LevelBot.LevelbotIncludeLootsFilter; });
                 _lootFilterAttached = false;
             }
 
-            StopRoutine(ref _activeCombatRoutine);
-            StopRoutine(ref _activeRestRoutine);
-            SquadHealBridge.StopActiveHealBehavior();
-            _provisioning.Stop();
-            _partySync.DetachEvents();
-            StopIpc();
-            SquadOverlay.Detach();
-            SquadContext.Reset();
-            _coordinator.Reset();
-            _townRun.Reset();
+            Cleanup(() => { StopRoutine(ref _activeCombatRoutine); });
+            Cleanup(() => { StopRoutine(ref _activeRestRoutine); });
+            Cleanup(() => { SquadHealBridge.StopActiveHealBehavior(); });
+            Cleanup(() => { _provisioning.Stop(); });
+            Cleanup(() => { _partySync.DetachEvents(); });
+            Cleanup(() => { StopIpc(); });
+            Cleanup(() => { SquadOverlay.Detach(); });
+            Cleanup(() => { SquadContext.Reset(); });
+            Cleanup(() => { _coordinator.Reset(); });
+            Cleanup(() => { _townRun.Reset(); });
         }
 
         public override void OnPaused()
@@ -354,7 +370,6 @@ namespace CopilotBuddy.Bots.PartyGrind
             var snapshots = _ipcServer?.GetMemberSnapshots() ?? new List<SquadConnectedMemberSnapshot>();
             _partySync.PulseCoordinatorPartySync(settings, snapshots);
 
-            UpdateCoordinatorTargets(now);
             SquadProfileSnapshot profileSnap = CaptureProfileSnapshot(now);
 
             SquadLeaderState leaderState = _coordinator.EvaluateTick(
@@ -376,6 +391,10 @@ namespace CopilotBuddy.Bots.PartyGrind
                     return CaptureProfileSnapshot(now);
                 });
 
+            UpdateCoordinatorTargets(now, leaderState);
+            leaderState.FocusTargetGuid = _currentFocusGuid;
+            leaderState.SecondaryTargetGuid = _currentSecondaryGuid;
+            leaderState.PullStartedUtcMs = _pullStartedUtcMs;
             SquadContext.IsIpcConnected = _ipcServer?.IsListening == true;
             SquadContext.UpdateLeaderState(leaderState);
 
@@ -468,13 +487,19 @@ namespace CopilotBuddy.Bots.PartyGrind
                 return false;
             }
             _missingLeaderProfileHash = string.Empty;
-            ProfileManager.LoadNew(local, rememberMe: false);
+            try { ProfileManager.LoadNew(local, rememberMe: false); }
+            catch (FileNotFoundException)
+            {
+                _missingLeaderProfileHash = leader.ProfileXmlHash;
+                _nextLeaderProfileLookupUtcMs = now + 10000L;
+                return false;
+            }
             _lastAppliedEffectiveLevel = leader.EffectiveSquadMinLevel;
             ProfileManager.RefreshProfileForLevel();
             return true;
         }
 
-        private void UpdateCoordinatorTargets(long now)
+        private void UpdateCoordinatorTargets(long now, SquadLeaderState decision)
         {
             var me = StyxWoW.Me;
             if (me == null)
@@ -493,8 +518,8 @@ namespace CopilotBuddy.Bots.PartyGrind
             bool localCannotPull = local == null || local.IsDead || local.IsGhost || local.IsInCombat ||
                                    local.NeedsRest || local.IsLooting;
             if (newFocusGuid != 0 && focus != null && !focus.Combat && !focus.IsTargetingMyPartyMember &&
-                (localCannotPull || _coordinator.IsWaitingForFollower ||
-                 !SquadTankBridge.CanInitiatePull(SquadContext.GetLeaderStateSnapshot(),
+                (localCannotPull || decision.Phase != SquadPhase.Grinding || _coordinator.IsWaitingForFollower ||
+                 !SquadTankBridge.CanInitiatePull(decision,
                     (SquadContext.ActiveSettings ?? SquadSettings.Instance).MaxPullGatherDistance)))
                 newFocusGuid = 0;
             if (newFocusGuid != 0 && newFocusGuid != _currentFocusGuid)
@@ -616,7 +641,8 @@ namespace CopilotBuddy.Bots.PartyGrind
             _townRun.ObservePhase(leader?.Phase, leader?.TownRunInterrupted == true);
             _townRun.RecheckBlocked(settings, leader);
             var townNeeds = SquadTownRunService.EvaluateLiveLocalNeeds(settings, leader);
-            if (leader == null || leader.Phase != SquadPhase.TownRun)
+            if (leader == null || leader.Phase != SquadPhase.TownRun ||
+                townNeeds.NeedsSell || townNeeds.NeedsRepair || townNeeds.NeedsBuy || townNeeds.NeedsTrain || townNeeds.NeedsMail)
                 _townTasksCompleteLocal = false;
 
             string xmlPath = ProfileManager.XmlLocation ?? string.Empty;
@@ -875,11 +901,11 @@ namespace CopilotBuddy.Bots.PartyGrind
             if (leader != null && (leader.InCombat || leader.FocusTargetGuid != 0))
                 return true;
 
-            if (settings.Role is SquadRole.Healer or SquadRole.HybridOffHeal)
-            {
-                if (leader?.Members?.Any(m => m.IsConnected && !m.IsDead && m.HealthPercent < 88f) == true)
-                    return true;
-            }
+            if (settings.Role == SquadRole.Healer && SquadHealBridge.HasHealCandidate(leader))
+                return true;
+            if (settings.Role == SquadRole.HybridOffHeal &&
+                leader?.Members?.Any(m => m.IsConnected && !m.IsDead && m.HealthPercent < 88f) == true)
+                return true;
 
             return false;
         }
@@ -941,7 +967,7 @@ namespace CopilotBuddy.Bots.PartyGrind
             var local = SquadContext.GetLocalMemberStateSnapshot();
 
             // 1. Aggro Peel Rule: if a non-tank pulled aggro and tank is alive nearby, run within 12 yd of Tank.
-            if (local != null && local.NeedsPeel && leader != null && !leader.IsDead && !leader.IsGhost)
+            if (local != null && local.NeedsPeel && leader != null && leader.MapId == me.MapId && !leader.IsDead && !leader.IsGhost)
             {
                 var tankPos = new WoWPoint(leader.X, leader.Y, leader.Z);
                 if (me.Location.Distance(tankPos) > 12f)
@@ -1033,7 +1059,7 @@ namespace CopilotBuddy.Bots.PartyGrind
 
         private static bool PositionBackline(float standoffDistance, SquadLeaderState? leader, LocalPlayer me, WoWUnit? selectedTarget = null)
         {
-            if (leader == null || leader.IsDead || leader.IsGhost)
+            if (leader == null || leader.MapId != me.MapId || leader.IsDead || leader.IsGhost)
                 return false;
 
             var tankPos = new WoWPoint(leader.X, leader.Y, leader.Z);
@@ -1158,10 +1184,15 @@ namespace CopilotBuddy.Bots.PartyGrind
             return FindEligibleLoot() != null;
         }
 
+        private static readonly Dictionary<ulong, long> LootRetry = new();
+
         private static WoWObject? FindEligibleLoot()
         {
             var leader = SquadContext.GetLeaderStateSnapshot();
-            return LootTargeting.Instance.LootingList.FirstOrDefault(o => o != null && o.IsValid &&
+            long now = Environment.TickCount64;
+            foreach (var guid in LootRetry.Where(p => p.Value <= now).Select(p => p.Key).ToList())
+                LootRetry.Remove(guid);
+            return LootTargeting.Instance.LootingList.FirstOrDefault(o => o != null && o.IsValid && !LootRetry.ContainsKey(o.Guid) &&
                 (leader == null || o.Location.Distance(new WoWPoint(leader.X, leader.Y, leader.Z)) <= 25f));
         }
 
@@ -1186,7 +1217,12 @@ namespace CopilotBuddy.Bots.PartyGrind
 
             if (lootObj.Location.Distance(me.Location) > 4.5f)
             {
-                Navigator.MoveTo(lootObj.Location, "Looting " + lootObj.Name);
+                if (Navigator.MoveTo(lootObj.Location, "Looting " + lootObj.Name) == MoveResult.PathGenerationFailed)
+                {
+                    LootRetry[lootObj.Guid] = Environment.TickCount64 + 15000;
+                    Navigator.Clear();
+                    return FindEligibleLoot() == null ? RunStatus.Failure : RunStatus.Success;
+                }
                 return RunStatus.Success;
             }
 
@@ -1281,7 +1317,13 @@ namespace CopilotBuddy.Bots.PartyGrind
                     WoWPetControl.Follow();
                 }
 
-                if (leader == null || leader.MapId != me.MapId)
+                if (leader == null)
+                {
+                    Navigator.Clear();
+                    WoWMovement.MoveStop();
+                    return RunStatus.Success;
+                }
+                if (leader.MapId != me.MapId)
                     return RunStatus.Success;
 
                 int slotIdx = SquadContext.GetMySlotIndex(me.Name, leader);

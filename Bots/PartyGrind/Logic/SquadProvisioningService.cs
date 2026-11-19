@@ -444,14 +444,16 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 {
                     // Only treat a frame close as success when the recipient had
                     // already accepted before we confirmed our own acceptance.
-                    _tradeCompletionPending = TradeFrame.Instance.TargetAccepted;
-                    TradeFrame.Instance.AcceptTrade();
+                    bool targetAccepted = TradeFrame.Instance.TargetAccepted;
+                    _tradeCompletionPending = TradeFrame.Instance.AcceptExactPlayerOffer(_activeTradeTarget, _offeredItems) && targetAccepted;
                 }
 
                 return true;
             }
 
             // Otherwise we are the RECEIVER: enforce strict partner check against ActiveProvisionerName.
+            if (!TradeFrame.IsPartnerAuthorized(me.Name, leader?.ActiveTradeTargetName))
+                return false;
             string expectedProvisioner = leader?.ActiveProvisionerName ?? string.Empty;
             if (!TradeFrame.IsPartnerAuthorized(partner, expectedProvisioner) ||
                 !TradeFrame.IsPartnerAuthorized(me.Name, leader?.ActiveTradeTargetName))
@@ -464,7 +466,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
             if (TradeFrame.Instance.HasEmptyPlayerOffer && TradeFrame.Instance.TargetAccepted && !TradeFrame.Instance.PlayerAccepted)
             {
-                TradeFrame.Instance.AcceptTrade();
+                TradeFrame.Instance.AcceptExactPlayerOffer(expectedProvisioner, Array.Empty<(int Slot, uint Entry, int Count)>());
             }
             return true;
         }
@@ -580,6 +582,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 int? hsRank = SelectBestHealthstoneRank(targetSummary.Level, me.Level, hsRanks);
                 if (hsRank.HasValue)
                 {
+                    var selectedSpell = me.KnownSpells.FirstOrDefault(s => s.Id == hsRanks.First(r => r.Rank == hsRank.Value).SpellId);
+                    if (selectedSpell == null || !SpellManager.CanCast(selectedSpell, me, false, false))
+                        return false;
                     if (me.IsMoving) WoWMovement.MoveStop();
                     Lua.DoString($"CastSpellByName('Create Healthstone(Rank {hsRank.Value})')");
                     return true;

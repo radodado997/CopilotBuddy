@@ -36,6 +36,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
     {
         private static readonly SquadApproach HealApproach = new();
         private static readonly Dictionary<ulong, (int Failures, long RetryUntil)> _resApproaches = new();
+        private static readonly Dictionary<ulong, (double Distance, long Progress)> _resProgress = new();
+        private static readonly Dictionary<ulong, long> _resPending = new();
+        private static readonly Dictionary<ulong, long> _resCastRetry = new();
         private static Composite? _activeHealBehavior;
 
         /// <summary>Stops a retained routine when healing is no longer being ticked.</summary>
@@ -97,6 +100,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         /// <summary>
         /// Runs one healing tick. Returns true if healing/positioning/resurrection work was handled this tick.
         /// </summary>
+        public static bool HasHealCandidate(SquadLeaderState? leader) =>
+            CollectLiveHealCandidates(leader).Any(c => c.HealthPercent < 92.0);
+
         public static bool RunHealerTick(bool emergencyOnly, SquadSettings settings, SquadLeaderState? leader)
         {
             var me = StyxWoW.Me;
@@ -224,7 +230,14 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 return false;
 
             if (me.IsCasting || me.ChanneledCastingSpellId != 0)
+            {
+                foreach (ulong guid in _resPending.Keys.ToList())
+                {
+                    _resCastRetry[guid] = Environment.TickCount64 + 15000;
+                    _resPending.Remove(guid);
+                }
                 return true;
+            }
 
             string? resSpell = GetResurrectionSpell(me.Class);
 
@@ -246,8 +259,24 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 .OrderBy(p => p.Location.Distance(me.Location))
                 .ToList();
 
+            var active = deadAllies.Select(p => p.Guid).ToHashSet();
+            foreach (ulong guid in _resProgress.Keys.Concat(_resPending.Keys).Concat(_resCastRetry.Keys).Distinct().Where(g => !active.Contains(g)).ToList())
+            {
+                _resProgress.Remove(guid);
+                _resPending.Remove(guid);
+                _resCastRetry.Remove(guid);
+            }
             foreach (var deadAlly in deadAllies)
             {
+                if (_resPending.TryGetValue(deadAlly.Guid, out long dispatched))
+                {
+                    if (now - dispatched < 2000) return true;
+                    _resPending.Remove(deadAlly.Guid);
+                    _resCastRetry[deadAlly.Guid] = now + 15000;
+                    continue;
+                }
+                if (_resCastRetry.TryGetValue(deadAlly.Guid, out long retry) && now < retry)
+                    continue;
                 _resApproaches.TryGetValue(deadAlly.Guid, out var attempt);
                 if (deadAlly.Distance > 28f || !deadAlly.InLineOfSpellSight)
                 {
@@ -255,13 +284,16 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     // remains eligible for a direct cast if it comes into range/LoS.
                     if (attempt.Failures >= 3 || now < attempt.RetryUntil)
                         continue;
+                    if (!_resProgress.TryGetValue(deadAlly.Guid, out var progress) || deadAlly.Distance < progress.Distance - 1f)
+                        _resProgress[deadAlly.Guid] = progress = (deadAlly.Distance, now);
                     var result = Navigator.MoveTo(deadAlly.Location, "Moving to resurrect " + deadAlly.Name);
                     // Path failures and arrival without line of sight count against this
                     // corpse; try the next one instead of retrying it forever.
-                    if (result is MoveResult.Failed or MoveResult.PathGenerationFailed or MoveResult.ReachedDestination)
+                    if (result is MoveResult.Failed or MoveResult.PathGenerationFailed or MoveResult.ReachedDestination || now - progress.Progress >= 5000)
                     {
                         int failures = _resApproaches.TryGetValue(deadAlly.Guid, out var previous) ? previous.Failures + 1 : 1;
                         _resApproaches[deadAlly.Guid] = (failures, now + 15000);
+                        _resProgress.Remove(deadAlly.Guid);
                         Navigator.Clear();
                         continue;
                     }
@@ -278,7 +310,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     // actually lands, otherwise try the next eligible corpse.
                     if (SpellManager.Cast(resSpell, deadAlly))
                     {
-                        _resApproaches.Remove(deadAlly.Guid);
+                        _resPending[deadAlly.Guid] = now;
                         return true;
                     }
                 }

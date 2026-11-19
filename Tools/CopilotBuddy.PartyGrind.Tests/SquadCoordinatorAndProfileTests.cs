@@ -82,7 +82,9 @@ namespace CopilotBuddy.PartyGrind.Tests
                 CharacterName = "Pending", IsConnected = true,
                 Handshake = new SquadHandshake { CharacterName = "Pending", Level = 2 }
             };
-            var state = coordinator.EvaluateTick(settings, MakeLeaderState(6), new[] { member },
+            var leader = MakeLeaderState(6);
+            leader.CanMount = true;
+            var state = coordinator.EvaluateTick(settings, leader, new[] { member },
                 new SquadProfileSnapshot(), 0, 0, 0, 0, 1000);
             Assert.Equal(2, state.EffectiveSquadMinLevel);
             Assert.Equal(SquadPhase.Grinding, state.Phase);
@@ -91,9 +93,11 @@ namespace CopilotBuddy.PartyGrind.Tests
             Assert.False(SquadTankBridge.CanInitiatePull(state, 30));
             Assert.False(SquadFormationService.CanSquadMount(SquadMountPolicy.SyncWithSlowestMember, true, state));
             var real = MakeConnectedClient("Pending", 0, SquadRole.Healer, WoWClass.Priest, 2, 2000, healthPct: 10);
-            state = coordinator.EvaluateTick(settings, MakeLeaderState(6), new[] { real },
+            real.LatestState!.CanMount = true;
+            state = coordinator.EvaluateTick(settings, leader, new[] { real },
                 new SquadProfileSnapshot(), 0, 0, 0, 0, 2000);
             Assert.Equal(SquadPhase.Resting, state.Phase);
+            Assert.True(SquadFormationService.CanSquadMount(SquadMountPolicy.SyncWithSlowestMember, true, state));
             coordinator.IsPausedManually = true;
             coordinator.ManualPauseReason = "test";
             coordinator.Reset();

@@ -36,8 +36,13 @@ namespace Styx.PartyGrind.IPC
 
         public string Protect(string line)
         {
-            string payload = (++_sent).ToString(System.Globalization.CultureInfo.InvariantCulture) + ":" + Convert.ToBase64String(Encoding.UTF8.GetBytes(line));
-            return payload + ":" + Mac(_context + _sendDirection + payload);
+            long next = checked(_sent + 1);
+            string payload = next.ToString(System.Globalization.CultureInfo.InvariantCulture) + ":" + Convert.ToBase64String(Encoding.UTF8.GetBytes(line));
+            string frame = payload + ":" + Mac(_context + _sendDirection + payload);
+            if (frame.Length > SquadJson.MaxFrameCharacters)
+                throw new ArgumentException("IPC frame exceeds size limit.", nameof(line));
+            _sent = next;
+            return frame;
         }
 
         public string Unprotect(string line)

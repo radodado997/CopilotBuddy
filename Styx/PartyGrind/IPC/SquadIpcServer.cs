@@ -234,7 +234,7 @@ namespace Styx.PartyGrind.IPC
                         state.MemberRoles[kv.Key] = kv.Value.Handshake.Role;
                     }
                 }
-                targets = _namedSessions.Values.Where(s => !s.Closed).ToList();
+                targets = _namedSessions.Values.Where(s => !s.Closed && (populateRoster || state.MemberAssignments.ContainsKey(s.CharacterName))).ToList();
             }
 
             if (targets.Count == 0)
@@ -357,7 +357,10 @@ namespace Styx.PartyGrind.IPC
             {
                 await foreach (string line in session.Outbound.Reader.ReadAllAsync(ct).ConfigureAwait(false))
                 {
-                    await session.Writer.WriteLineAsync(session.Authentication!.Protect(line).AsMemory(), ct).ConfigureAwait(false);
+                    string frame;
+                    try { frame = session.Authentication!.Protect(line); }
+                    catch (ArgumentException) { continue; }
+                    await session.Writer.WriteLineAsync(frame.AsMemory(), ct).ConfigureAwait(false);
                     await session.Writer.FlushAsync(ct).ConfigureAwait(false);
                 }
             }
@@ -373,12 +376,12 @@ namespace Styx.PartyGrind.IPC
         }
 
         private static bool HasValidCoordinates(SquadMemberState state) =>
-            float.IsFinite(state.X) && Math.Abs(state.X) <= 1000000f &&
-            float.IsFinite(state.Y) && Math.Abs(state.Y) <= 1000000f &&
-            float.IsFinite(state.Z) && Math.Abs(state.Z) <= 1000000f &&
-            float.IsFinite(state.CorpseX) && Math.Abs(state.CorpseX) <= 1000000f &&
-            float.IsFinite(state.CorpseY) && Math.Abs(state.CorpseY) <= 1000000f &&
-            float.IsFinite(state.CorpseZ) && Math.Abs(state.CorpseZ) <= 1000000f;
+            float.IsFinite(state.X) && Math.Abs(state.X) <= 17066.666f &&
+            float.IsFinite(state.Y) && Math.Abs(state.Y) <= 17066.666f &&
+            float.IsFinite(state.Z) && Math.Abs(state.Z) <= 17066.666f &&
+            float.IsFinite(state.CorpseX) && Math.Abs(state.CorpseX) <= 17066.666f &&
+            float.IsFinite(state.CorpseY) && Math.Abs(state.CorpseY) <= 17066.666f &&
+            float.IsFinite(state.CorpseZ) && Math.Abs(state.CorpseZ) <= 17066.666f;
 
         private void HandleIncomingLine(MemberSession session, string line, CancellationToken linkedToken)
         {

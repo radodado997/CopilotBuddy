@@ -239,7 +239,10 @@ namespace Styx.PartyGrind.IPC
                         var pending = SquadJson.DeserializeEnvelope(line);
                         if (pending == null || _utcNowMs() - pending.TimestampUtcMs > DisconnectTimeoutMs)
                             continue;
-                        await writer.WriteLineAsync(auth.Protect(line).AsMemory(), ct).ConfigureAwait(false);
+                        string frame;
+                        try { frame = auth.Protect(line); }
+                        catch (ArgumentException) { continue; }
+                        await writer.WriteLineAsync(frame.AsMemory(), ct).ConfigureAwait(false);
                         await writer.FlushAsync(ct).ConfigureAwait(false);
                     }
                 }

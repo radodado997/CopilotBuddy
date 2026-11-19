@@ -220,7 +220,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             {
                 if (!me.HasAura(aura) && SpellManager.CanCast(aura, me, false, false))
                     return SpellManager.Cast(aura, me);
-                if (me.HasAura(aura))
+                if (me.GetAllAuras().Any(a => a.Name == aura && a.CreatorGuid == me.Guid))
                     break;
             }
 

@@ -80,7 +80,18 @@ namespace Styx.Logic.Inventory.Frames.Trade
                 Lua.GetReturnVal<int>("if CursorHasItem() then return 1 else return 0 end", 0U) == 1)
                 return false;
 
-            if (splitCount > 0 && (currentStackCount == 0 || splitCount < currentStackCount))
+            if (expectedEntry == 0 || currentStackCount <= 0)
+            {
+                string source = Lua.GetReturnVal<string>($"local link=GetContainerItemLink({luaBagIndex},{luaBagSlot}); local _,n=GetContainerItemInfo({luaBagIndex},{luaBagSlot}); if link and n then return (string.match(link,'item:(%d+)') or '')..':'..n end return ''", 0U);
+                string[] fields = (source ?? string.Empty).Split(':');
+                if (fields.Length != 2 || !uint.TryParse(fields[0], out expectedEntry) ||
+                    !int.TryParse(fields[1], out currentStackCount) || expectedEntry == 0 || currentStackCount <= 0)
+                    return false;
+            }
+            if (splitCount < 0 || splitCount > currentStackCount)
+                return false;
+
+            if (splitCount > 0 && splitCount < currentStackCount)
             {
                 Lua.DoString($"SplitContainerItem({luaBagIndex}, {luaBagSlot}, {splitCount}) ClickTradeButton({tradeSlot})");
             }
@@ -93,7 +104,7 @@ namespace Styx.Logic.Inventory.Frames.Trade
             int expectedCount = splitCount > 0 ? splitCount : currentStackCount;
             // An empty cursor alone is not success: verify the intended item landed in
             // the intended trade slot with the expected quantity.
-            bool slotVerified = expectedEntry == 0 || expectedCount <= 0 ||
+            bool slotVerified = expectedEntry != 0 && expectedCount > 0 &&
                 ContainsPlayerItem(tradeSlot, expectedEntry, expectedCount);
             if (!cursorEmpty || !slotVerified)
             {
@@ -132,6 +143,21 @@ namespace Styx.Logic.Inventory.Frames.Trade
             "local p={} for i=1,6 do local link=GetTradePlayerItemLink(i); local _,_,n=GetTradePlayerItemInfo(i); " +
             "local e=0; if link then e=tonumber(string.match(link,'item:(%d+)')) or 0 end " +
             "p[#p+1]=i..':'..e..':'..(n or 0) end return table.concat(p,';')", 0U) ?? string.Empty;
+
+        public bool AcceptExactPlayerOffer(string partner, System.Collections.Generic.IReadOnlyList<(int Slot, uint Entry, int Count)> items)
+        {
+            string expected = string.Join(";", System.Linq.Enumerable.Select(System.Linq.Enumerable.Range(1, 6), slot =>
+            {
+                var item = System.Linq.Enumerable.FirstOrDefault(items, i => i.Slot == slot);
+                return $"{slot}:{item.Entry}:{item.Count}";
+            }));
+            return Lua.GetReturnVal<int>(
+                "if not TradeFrame or not TradeFrame:IsVisible() then return 0 end " +
+                $"local partner=UnitName('NPC') or (TradeFrameRecipientNameText and TradeFrameRecipientNameText:GetText()); if not partner or string.lower(partner) ~= string.lower('{Lua.Escape(partner)}') then return 0 end " +
+                "if GetPlayerTradeMoney() ~= 0 or GetTradePlayerItemLink(7) then return 0 end " +
+                "local p={} for i=1,6 do local link=GetTradePlayerItemLink(i); local _,_,n=GetTradePlayerItemInfo(i); local e=0; if link then e=tonumber(string.match(link,'item:(%d+)')); if not e or not n or n<=0 then return 0 end elseif n and n~=0 then return 0 end p[#p+1]=i..':'..e..':'..(n or 0) end " +
+                $"if table.concat(p,';') ~= '{expected}' then return 0 end AcceptTrade() return 1", 0U) == 1;
+        }
 
         public void AcceptTrade()
         {
