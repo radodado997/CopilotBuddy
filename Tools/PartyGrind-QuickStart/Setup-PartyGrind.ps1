@@ -142,6 +142,10 @@ for ($i = 0; $i -lt $ClientCount; $i++) {
     [void] $setLines.AppendLine(('set "ROLE{0}={1}"' -f $n, $roles[$i]))
     [void] $pidPromptLines.AppendLine(('set /p PID{0}=WoW PID for {1} (Client{0}, {2}): ' -f $n, $names[$i], $roles[$i]))
     [void] $pidCheckLines.AppendLine(('if "%PID{0}%"=="" goto :missing_pid' -f $n))
+    # Pass the value through an environment variable: this avoids for-variable
+    # substitution issues and is the same validation pattern the UI generates.
+    [void] $pidCheckLines.AppendLine(('powershell -NoProfile -Command "$p=0; if ([int]::TryParse($env:PID{0},[ref]$p) -and $p -gt 0) {{ exit 0 }}; exit 1"' -f $n))
+    [void] $pidCheckLines.AppendLine('if errorlevel 1 goto :bad_pid')
     for ($j = 0; $j -lt $i; $j++) {
         [void] $duplicateCheckLines.AppendLine(('if "%PID{0}%"=="%PID{1}%" goto :duplicate_pid' -f $n, ($j + 1)))
     }
@@ -189,10 +193,6 @@ echo Validating PIDs...
 
 {{DUP_CHECKS}}
 
-for %%P in (%PID1%{{EXTRA_PIDS}}) do (
-    powershell -NoProfile -Command "$v='%%P'; $n=0; if (-not [int]::TryParse($v, [ref]$n) -or $n -le 0) { exit 1 }"
-    if errorlevel 1 goto :bad_pid
-)
 echo PID validation OK.
 
 echo.
@@ -221,10 +221,6 @@ pause
 exit /b 1
 '@
 
-$extraPids = ''
-for ($i = 1; $i -lt $ClientCount; $i++) {
-    $extraPids += (',%PID{0}' -f ($i + 1))
-}
 $bat = $batTemplate.Replace('{{BOT_DIR}}', $botDirFull)
 $bat = $bat.Replace('{{PROFILE}}', $profileFull)
 $bat = $bat.Replace('{{TEAM_ID}}', $TeamId)
@@ -235,7 +231,6 @@ $bat = $bat.Replace('{{ROSTER}}', $roster)
 $bat = $bat.Replace('{{PID_PROMPTS}}', $pidPromptLines.ToString().TrimEnd())
 $bat = $bat.Replace('{{PID_CHECKS}}', $pidCheckLines.ToString().TrimEnd())
 $bat = $bat.Replace('{{DUP_CHECKS}}', $duplicateCheckLines.ToString().TrimEnd())
-$bat = $bat.Replace('{{EXTRA_PIDS}}', $extraPids)
 $bat = $bat.Replace('{{LAUNCH_LINES}}', $launchLines.ToString().TrimEnd())
 
 $launcherPath = Join-Path $botDirFull 'Start-PartyGrind.bat'
