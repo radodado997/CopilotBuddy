@@ -184,6 +184,7 @@ echo.
 
 {{PID_PROMPTS}}
 
+echo Validating PIDs...
 {{PID_CHECKS}}
 
 {{DUP_CHECKS}}
@@ -192,6 +193,7 @@ for %%P in (%PID1%{{EXTRA_PIDS}}) do (
     powershell -NoProfile -Command "$v='%%P'; $n=0; if (-not [int]::TryParse($v, [ref]$n) -or $n -le 0) { exit 1 }"
     if errorlevel 1 goto :bad_pid
 )
+echo PID validation OK.
 
 echo.
 echo Starting coordinator, then followers. Leave each bot window open.
