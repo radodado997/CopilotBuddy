@@ -48,15 +48,33 @@ $profileFull = (Resolve-Path -LiteralPath $ProfilePath).Path
 
 Assert-SafeToken -Value $TeamId -Label 'TeamId'
 
-if ($CharacterNames.Count -lt $ClientCount) {
-    throw "Expected at least $ClientCount character names, got $($CharacterNames.Count)."
-}
-if ($Roles.Count -lt $ClientCount) {
-    throw "Expected at least $ClientCount roles, got $($Roles.Count)."
+# Accept both PowerShell forms: -CharacterNames A,B,C and -CharacterNames "A,B,C".
+function Convert-ToNameList {
+    param([string[]] $Values)
+    $list = New-Object System.Collections.Generic.List[string]
+    foreach ($value in $Values) {
+        if ([string]::IsNullOrWhiteSpace($value)) { continue }
+        foreach ($part in ($value -split '[,;]')) {
+            $trimmed = $part.Trim()
+            if (-not [string]::IsNullOrWhiteSpace($trimmed)) {
+                [void] $list.Add($trimmed)
+            }
+        }
+    }
+    return $list.ToArray()
 }
 
-$names = @($CharacterNames | Select-Object -First $ClientCount)
-$roles = @($Roles | Select-Object -First $ClientCount)
+$names = @(Convert-ToNameList -Values $CharacterNames)
+$roles = @(Convert-ToNameList -Values $Roles)
+if ($names.Count -lt $ClientCount) {
+    throw "Expected at least $ClientCount character names, got $($names.Count)."
+}
+if ($roles.Count -lt $ClientCount) {
+    throw "Expected at least $ClientCount roles, got $($roles.Count)."
+}
+
+$names = @($names | Select-Object -First $ClientCount)
+$roles = @($roles | Select-Object -First $ClientCount)
 $validRoles = @('TankLeader', 'Healer', 'DpsMelee', 'DpsRanged', 'HybridOffHeal')
 $seen = @{}
 

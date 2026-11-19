@@ -31,6 +31,9 @@ powershell -NoProfile -ExecutionPolicy Bypass `
   -IpcPort 1339
 ```
 
+Możesz też zamknąć całą listę w cudzysłów — skrypt sam rozdziela przecinki:
+`-CharacterNames "TankChar,HealerChar,DpsChar" -Roles "TankLeader,Healer,DpsMelee"`.
+
 Dla 4 lub 5 klientów dodaj kolejne nazwy i role, np.
 `-ClientCount 4 -CharacterNames A,B,C,D -Roles TankLeader,Healer,DpsMelee,DpsRanged`.
 
