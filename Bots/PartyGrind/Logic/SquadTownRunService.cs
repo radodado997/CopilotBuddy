@@ -59,9 +59,13 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             return true;
         }
 
-        public void ObservePhase(SquadPhase? phase)
+        public void ObservePhase(SquadPhase? phase, bool townRunInterrupted = false)
         {
-            if (_wasInTownRun && phase != SquadPhase.TownRun && phase != SquadPhase.Paused) Reset();
+            // Combat/death recovery can temporarily take priority while the town run is
+            // still active; that is an interruption, not the end of the run.
+            if (_wasInTownRun && phase != SquadPhase.TownRun && phase != SquadPhase.Paused &&
+                !townRunInterrupted)
+                Reset();
         }
 
         public void RecheckBlocked(SquadSettings settings, SquadLeaderState? leader)
@@ -261,6 +265,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             {
                 _stage1SellRepairBuyDone = false;
                 _vendorAttempts = 0;
+                _stageStarted = Environment.TickCount64;
+                _regroupStarted = 0;
             }
             if (!_stage1MailDone) _mailRequested |= needs.NeedsMail;
             if (!(_stage1SellRepairBuyDone && _stage1MailDone && _stage2TrainDone) && Environment.TickCount64 - _stageStarted > 120000)

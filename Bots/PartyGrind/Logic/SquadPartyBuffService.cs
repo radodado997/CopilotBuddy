@@ -201,7 +201,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         {
             // Determine Paladin index among party Paladins so multiple Paladins pick distinct auras & blessings.
             var paladinNames = (leader?.Members ?? new List<SquadMemberSummary>())
-                .Where(m => m.Class == WoWClass.Paladin && m.IsConnected && !m.IsDead && !m.IsGhost)
+                .Where(m => m.Class == WoWClass.Paladin && m.IsConnected && !m.IsDead && !m.IsGhost && m.MapId == me.MapId)
                 .Select(m => m.CharacterName)
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .OrderBy(n => n, StringComparer.OrdinalIgnoreCase)

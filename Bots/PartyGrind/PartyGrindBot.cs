@@ -79,6 +79,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                 finally
                 {
                     if (!_combatTicked) StopRoutine(ref _activeCombatRoutine);
+                    if (!_combatTicked) SquadHealBridge.StopActiveHealBehavior();
                     if (!_restTicked) StopRoutine(ref _activeRestRoutine);
                 }
             }
@@ -189,6 +190,7 @@ namespace CopilotBuddy.Bots.PartyGrind
 
             StopRoutine(ref _activeCombatRoutine);
             StopRoutine(ref _activeRestRoutine);
+            SquadHealBridge.StopActiveHealBehavior();
             _provisioning.Stop();
             _partySync.DetachEvents();
             StopIpc();
@@ -202,6 +204,7 @@ namespace CopilotBuddy.Bots.PartyGrind
         {
             StopRoutine(ref _activeCombatRoutine);
             StopRoutine(ref _activeRestRoutine);
+            SquadHealBridge.StopActiveHealBehavior();
             _coordinator.IsPausedManually = true;
             _coordinator.ManualPauseReason = "Bot paused";
             var settings = SquadContext.ActiveSettings ?? SquadSettings.Instance;
@@ -592,7 +595,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                 squadHasWarlock,
                 settings);
 
-            _townRun.ObservePhase(leader?.Phase);
+            _townRun.ObservePhase(leader?.Phase, leader?.TownRunInterrupted == true);
             _townRun.RecheckBlocked(settings, leader);
             var townNeeds = SquadTownRunService.EvaluateLiveLocalNeeds(settings, leader);
             if (leader == null || leader.Phase != SquadPhase.TownRun)
@@ -980,7 +983,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                 }
                 else
                 {
-                    if (PositionBackline(settings.RangedStandoffDistance, leader, me))
+                    if (PositionBackline(settings.RangedStandoffDistance, leader, me, focus))
                         return RunStatus.Success;
                 }
 
@@ -990,7 +993,7 @@ namespace CopilotBuddy.Bots.PartyGrind
             return RunStatus.Failure;
         }
 
-        private static bool PositionBackline(float standoffDistance, SquadLeaderState? leader, LocalPlayer me)
+        private static bool PositionBackline(float standoffDistance, SquadLeaderState? leader, LocalPlayer me, WoWUnit? selectedTarget = null)
         {
             if (leader == null || leader.IsDead || leader.IsGhost)
                 return false;
@@ -998,10 +1001,14 @@ namespace CopilotBuddy.Bots.PartyGrind
             var tankPos = new WoWPoint(leader.X, leader.Y, leader.Z);
 
             WoWPoint? focusPos = null;
-            if (leader.FocusTargetGuid != 0)
+            if (selectedTarget != null && selectedTarget.IsValid && !selectedTarget.Dead)
+            {
+                focusPos = selectedTarget.Location;
+            }
+            else if (leader.FocusTargetGuid != 0)
             {
                 var focusUnit = ObjectManager.GetObjectByGuid<WoWUnit>(leader.FocusTargetGuid);
-                if (focusUnit != null && focusUnit.IsValid)
+                if (focusUnit != null && focusUnit.IsValid && !focusUnit.Dead)
                     focusPos = focusUnit.Location;
             }
 

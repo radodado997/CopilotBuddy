@@ -81,9 +81,8 @@ namespace Styx.CommonBot.CharacterManagement
         }
 
         /// <summary>
-        /// Checks only the slots that are actually vacated when this item is equipped.
-        /// A two-hander's off-hand is deliberately excluded: leaving that slot empty
-        /// displaces nothing and must not short-circuit the score comparison.
+        /// Checks the slots actually vacated when this item is equipped. A two-hander
+        /// vacates both hands, so it only qualifies when both are empty.
         /// </summary>
         private static bool HasEmptyReplacementSlot(ItemInfo item)
         {
@@ -95,12 +94,27 @@ namespace Styx.CommonBot.CharacterManagement
             WoWInventorySlot secondary = GetSecondaryItemSlot(item);
             if (secondary != WoWInventorySlot.None)
                 slots.Add(secondary);
+            bool isTwoHand = item.InventoryType == InventoryType.TwoHandWeapon;
+            if (isTwoHand && !slots.Contains(WoWInventorySlot.OffHand))
+                slots.Add(WoWInventorySlot.OffHand);
 
-            return slots.Any(slot =>
+            int emptySlots = 0;
+            foreach (WoWInventorySlot slot in slots)
             {
                 WoWItem equipped = inventory.GetItemBySlot((uint)slot);
-                return equipped == null || equipped.ItemInfo == null;
-            });
+                if (equipped == null)
+                {
+                    emptySlots++;
+                    continue;
+                }
+                // An unreadable ItemInfo is an unknown state, not a vacancy.
+                if (equipped.ItemInfo == null)
+                    return false;
+            }
+
+            // A two-hander displaces both hands, so it only gets the free-slot shortcut
+            // when neither hand holds an item.
+            return isTwoHand ? emptySlots == slots.Count : emptySlots > 0;
         }
 
         private float EvaluateItem(ItemInfo item, int count, bool compareEquipped = true)
@@ -163,16 +177,20 @@ namespace Styx.CommonBot.CharacterManagement
 
                 float weakestEquippedScore = float.MaxValue;
                 float totalDisplacedScore = 0f;
-                bool anySlotEmpty = false;
+                int emptySlots = 0;
+                bool unknownEquipped = false;
                 foreach (WoWInventorySlot checkSlot in slotsToCheck)
                 {
                     WoWItem equipped = inventory.GetItemBySlot((uint)checkSlot);
-                    if (equipped == null || equipped.ItemInfo == null)
+                    if (equipped == null)
                     {
-                        // An empty off-hand beside a two-hander displaces nothing: do not
-                        // treat it as a free upgrade, and compare MainHand alone below.
-                        if (!isTwoHand || checkSlot != WoWInventorySlot.OffHand)
-                            anySlotEmpty = true;
+                        emptySlots++;
+                        continue;
+                    }
+                    if (equipped.ItemInfo == null)
+                    {
+                        // Cannot score what is being replaced: do not claim an upgrade.
+                        unknownEquipped = true;
                         continue;
                     }
                     float equippedScore = EvaluateItem(equipped.ItemInfo, 1, false);
@@ -181,10 +199,14 @@ namespace Styx.CommonBot.CharacterManagement
                     totalDisplacedScore += equippedScore;
                 }
 
+                if (unknownEquipped)
+                    return 0f;
+
                 // Aggregation rule: dual-slot items (rings/trinkets) replace only the
                 // weaker equipped item, while a two-hander displaces every occupied slot
                 // so their scores are summed before applying the +5% upgrade threshold.
                 float baseline = isTwoHand ? totalDisplacedScore : weakestEquippedScore;
+                bool anySlotEmpty = isTwoHand ? emptySlots == slotsToCheck.Count : emptySlots > 0;
                 if (!anySlotEmpty && score <= baseline * 1.05f)
                     return 0f;
             }

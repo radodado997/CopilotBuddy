@@ -19,6 +19,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private readonly SquadProvisioningService _provisioning;
         private bool _eventsAttached;
         private Styx.WoWInternals.LuaEvents? _eventsDispatcher;
+        private readonly List<(string Name, LuaEventHandlerDelegate Handler)> _attachedHandlers = new();
         private long _lastInviteUtcMs;
         private long _lastLootMethodUtcMs;
 
@@ -35,12 +36,35 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (_eventsAttached)
                 DetachEvents(); // handlers belong to a dispatcher that was replaced
 
+            var registrations = new (string Name, LuaEventHandlerDelegate Handler)[]
+            {
+                ("PARTY_INVITE_REQUEST", OnPartyInviteRequest),
+                ("RESURRECT_REQUEST", OnResurrectRequest),
+                ("START_LOOT_ROLL", OnStartLootRoll),
+                ("CONFIRM_SUMMON", OnConfirmSummon),
+                ("QUEST_ACCEPT_CONFIRM", OnQuestAcceptConfirm)
+            };
+            var registered = new List<(string Name, LuaEventHandlerDelegate Handler)>();
+            try
+            {
+                foreach (var registration in registrations)
+                {
+                    dispatcher.AttachEvent(registration.Name, registration.Handler);
+                    registered.Add(registration);
+                }
+            }
+            catch
+            {
+                // Roll back every handler that was registered before the failure so a
+                // retry on the same dispatcher cannot leave duplicate subscriptions.
+                for (int i = registered.Count - 1; i >= 0; i--)
+                    try { dispatcher.DetachEvent(registered[i].Name, registered[i].Handler); } catch { }
+                throw;
+            }
+
             _eventsDispatcher = dispatcher;
-            dispatcher.AttachEvent("PARTY_INVITE_REQUEST", OnPartyInviteRequest);
-            dispatcher.AttachEvent("RESURRECT_REQUEST", OnResurrectRequest);
-            dispatcher.AttachEvent("START_LOOT_ROLL", OnStartLootRoll);
-            dispatcher.AttachEvent("CONFIRM_SUMMON", OnConfirmSummon);
-            dispatcher.AttachEvent("QUEST_ACCEPT_CONFIRM", OnQuestAcceptConfirm);
+            _attachedHandlers.Clear();
+            _attachedHandlers.AddRange(registered);
             _eventsAttached = true;
         }
 
@@ -52,20 +76,17 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
             try
             {
-                dispatcher.DetachEvent("PARTY_INVITE_REQUEST", OnPartyInviteRequest);
-                dispatcher.DetachEvent("RESURRECT_REQUEST", OnResurrectRequest);
-                dispatcher.DetachEvent("START_LOOT_ROLL", OnStartLootRoll);
-                dispatcher.DetachEvent("CONFIRM_SUMMON", OnConfirmSummon);
-                dispatcher.DetachEvent("QUEST_ACCEPT_CONFIRM", OnQuestAcceptConfirm);
-            }
-            catch (Exception ex)
-            {
-                Logging.WriteDebug("[PartyGrind Sync] DetachEvents warning: {0}", ex.Message);
+                for (int i = _attachedHandlers.Count - 1; i >= 0; i--)
+                {
+                    try { dispatcher.DetachEvent(_attachedHandlers[i].Name, _attachedHandlers[i].Handler); }
+                    catch (Exception ex) { Logging.WriteDebug("[PartyGrind Sync] DetachEvents warning: {0}", ex.Message); }
+                }
             }
             finally
             {
                 _eventsAttached = false;
                 _eventsDispatcher = null;
+                _attachedHandlers.Clear();
             }
         }
 

@@ -37,6 +37,15 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private static readonly SquadApproach HealApproach = new();
         private static readonly Dictionary<ulong, (int Failures, long RetryUntil)> _resApproaches = new();
         private static Composite? _activeHealBehavior;
+
+        /// <summary>Stops a retained routine when healing is no longer being ticked.</summary>
+        public static void StopActiveHealBehavior()
+        {
+            if (_activeHealBehavior == null)
+                return;
+            try { _activeHealBehavior.Stop(null); } catch { }
+            _activeHealBehavior = null;
+        }
         private static readonly string[] RangedAssistSpells =
         {
             "Smite", "Holy Fire", "Shadow Word: Pain",
@@ -98,6 +107,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 return true;
 
             var candidates = CollectLiveHealCandidates(leader);
+            if (candidates.Count == 0 || (!emergencyOnly && me.Level < 10))
+                StopActiveHealBehavior();
             double threshold = emergencyOnly ? 55.0 : 92.0;
 
             // Check if a HybridOffHeal should step in aggressively because main healer is dead or < 20% mana.
@@ -146,15 +157,14 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                                 _activeHealBehavior = healBehavior;
                             }
                             RunStatus status = healBehavior.Tick(null);
-                            // A Running routine stays active across ticks; only finish it
-                            // when it completes, reports Failure, or actually starts a cast.
-                            if (status != RunStatus.Running || me.IsCasting || me.ChanneledCastingSpellId != 0)
-                            {
-                                healBehavior.Stop(null);
-                                _activeHealBehavior = null;
-                                if (status == RunStatus.Success || me.IsCasting || me.ChanneledCastingSpellId != 0)
-                                    return true;
-                            }
+                            // Running keeps the composite active and handled this tick;
+                            // a cast also wins. Only Failure falls through to explicit healing.
+                            if (status == RunStatus.Running || me.IsCasting || me.ChanneledCastingSpellId != 0)
+                                return true;
+                            healBehavior.Stop(null);
+                            _activeHealBehavior = null;
+                            if (status == RunStatus.Success)
+                                return true;
                         }
                         catch (Exception ex)
                         {
@@ -225,19 +235,26 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             long now = Environment.TickCount64;
             foreach (ulong stale in _resApproaches.Keys.Where(g => !memberGuids.Contains(g)).ToList())
                 _resApproaches.Remove(stale);
+            // A new death episode starts with a clean slate.
+            foreach (var player in ObjectManager.GetObjectsOfType<WoWPlayer>(false, false))
+                if (player != null && _resApproaches.ContainsKey(player.Guid) && (!player.Dead || player.IsGhost))
+                    _resApproaches.Remove(player.Guid);
 
             var deadAllies = ObjectManager.GetObjectsOfType<WoWPlayer>(false, false)
                 .Where(p => p != null && p.IsValid && p.Dead && !p.IsGhost &&
                             memberGuids.Contains(p.Guid) && p.Location.Distance(me.Location) <= 45f)
-                .Where(p => !_resApproaches.TryGetValue(p.Guid, out var attempt) ||
-                            (attempt.Failures < 3 && now >= attempt.RetryUntil))
                 .OrderBy(p => p.Location.Distance(me.Location))
                 .ToList();
 
             foreach (var deadAlly in deadAllies)
             {
+                _resApproaches.TryGetValue(deadAlly.Guid, out var attempt);
                 if (deadAlly.Distance > 28f || !deadAlly.InLineOfSpellSight)
                 {
+                    // Exhausted approaches suppress further movement, but the corpse
+                    // remains eligible for a direct cast if it comes into range/LoS.
+                    if (attempt.Failures >= 3 || now < attempt.RetryUntil)
+                        continue;
                     var result = Navigator.MoveTo(deadAlly.Location, "Moving to resurrect " + deadAlly.Name);
                     // Path failures and arrival without line of sight count against this
                     // corpse; try the next one instead of retrying it forever.
@@ -257,8 +274,13 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 if (SpellManager.CanCast(resSpell, deadAlly, true, false))
                 {
                     Logging.Write("[PartyGrind] Resurrecting {0} with {1}", deadAlly.Name, resSpell);
-                    _resApproaches.Remove(deadAlly.Guid);
-                    return SpellManager.Cast(resSpell, deadAlly);
+                    // A failed cast is not success: drop this corpse only when the cast
+                    // actually lands, otherwise try the next eligible corpse.
+                    if (SpellManager.Cast(resSpell, deadAlly))
+                    {
+                        _resApproaches.Remove(deadAlly.Guid);
+                        return true;
+                    }
                 }
             }
 

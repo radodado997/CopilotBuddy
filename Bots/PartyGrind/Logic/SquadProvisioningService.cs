@@ -692,7 +692,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                             (i.Flags & ItemFlagSoulbound) == 0 &&
                             i.RequiredLevel <= receiverLevel)
                 .ToList();
-            var snapshots = eligible.Select(i => new TradableConsumableCandidate
+            // Keep each snapshot paired with its live item so the chosen stack is the
+            // exact one evaluated (entry alone can match a different stack).
+            var offers = eligible.Select(i => (Item: i, Snapshot: new TradableConsumableCandidate
             {
                 Entry = i.Entry,
                 Name = i.Name ?? string.Empty,
@@ -702,10 +704,14 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 IsFood = isFood,
                 IsDrink = isDrink,
                 IsHealthstone = isHealthstone
-            }).ToList();
+            })).ToList();
 
-            var best = SelectBestTradableItem(snapshots, receiverLevel, isFood, isDrink, isHealthstone);
-            return best == null ? null : eligible.FirstOrDefault(i => i.Entry == best.Entry);
+            var best = SelectBestTradableItem(offers.Select(o => o.Snapshot).ToList(),
+                receiverLevel, isFood, isDrink, isHealthstone);
+            if (best == null)
+                return null;
+            var selected = offers.FirstOrDefault(o => ReferenceEquals(o.Snapshot, best));
+            return selected.Item;
         }
     }
 }

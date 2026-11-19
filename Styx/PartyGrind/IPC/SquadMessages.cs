@@ -187,6 +187,8 @@ namespace Styx.PartyGrind.IPC
         public bool IsMounted { get; set; }
         public bool IsFlying { get; set; }
         public bool InCombat { get; set; }
+        /// <summary>Authoritative bounded loot-window state from the coordinator.</summary>
+        public bool IsLootWindowActive { get; set; }
         public bool IsDead { get; set; }
         public bool IsGhost { get; set; }
         public ulong FocusTargetGuid { get; set; }
@@ -203,6 +205,8 @@ namespace Styx.PartyGrind.IPC
         public float TownRallyZ { get; set; }
         public uint? TownRallyMapId { get; set; }
         public bool AllTownTasksComplete { get; set; }
+        /// <summary>True while combat/death recovery temporarily takes priority over an active town run.</summary>
+        public bool TownRunInterrupted { get; set; }
 
         // Wipe / Corpse Run
         public float SquadCorpseRallyX { get; set; }

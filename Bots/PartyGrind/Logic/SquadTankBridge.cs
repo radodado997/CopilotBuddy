@@ -57,6 +57,11 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (leader.Phase != SquadPhase.Grinding)
                 return false;
 
+            // Use the coordinator's authoritative loot window instead of a possibly
+            // stale follower IsLooting flag; an expired window must not veto pulls.
+            if (leader.IsLootWindowActive)
+                return false;
+
             if (leader.Members == null || leader.Members.Count == 0)
                 return true;
 
@@ -65,7 +70,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             {
                 if (!m.IsConnected)
                     continue;
-                if (!m.HasTelemetry || m.IsDead || m.IsGhost || m.NeedsRest || m.IsLooting || m.NeedsTown && !m.TownTasksComplete)
+                if (!m.HasTelemetry || m.IsDead || m.IsGhost || m.NeedsRest || m.NeedsTown && !m.TownTasksComplete)
                     return false;
                 if (m.MapId != leader.MapId)
                     return false;
