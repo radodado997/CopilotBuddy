@@ -48,6 +48,22 @@ namespace CopilotBuddy.PartyGrind.Tests
         }
 
         [Fact]
+        public void MailFirstWaitsForPendingVendorConfirmationWithoutResettingAttempts()
+        {
+            var retry = new SquadVendorAttempts();
+            Assert.False(SquadTownRunService.ShouldWaitForVendorBeforeMail(true, retry, 0));
+            retry.Record(1000, Sell, 0, true);
+            Assert.False(SquadTownRunService.ShouldWaitForVendorBeforeMail(false, retry, 1001));
+            Assert.True(SquadTownRunService.ShouldWaitForVendorBeforeMail(true, retry, 1001));
+            Assert.Equal(1, retry.Count);
+            Assert.Equal(SquadVendorAttemptDecision.Wait, retry.Evaluate(2499, Sell, 0));
+            Assert.True(SquadTownRunService.ShouldWaitForVendorBeforeMail(true, retry, 2499));
+            Assert.False(SquadTownRunService.ShouldWaitForVendorBeforeMail(true, retry, 2500));
+            Assert.Equal(1, retry.Count);
+            Assert.Equal(SquadVendorAttemptDecision.Try, retry.Evaluate(2500, Sell, 0));
+        }
+
+        [Fact]
         public void CompletedRepairOrConsumableNeedIsRecognizedAsProgress()
         {
             var retry = new SquadVendorAttempts();

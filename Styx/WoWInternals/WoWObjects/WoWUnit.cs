@@ -104,7 +104,10 @@ namespace Styx.WoWInternals.WoWObjects
         public bool IsClassTrainer => HasNpcFlag(UnitNPCFlags.ClassTrainer);
         public bool IsProfessionTrainer => HasNpcFlag(UnitNPCFlags.ProfessionTrainer);
         public bool IsAnyTrainer => HasNpcFlag(UnitNPCFlags.AnyTrainer);
-        public bool IsAnyVendor => HasNpcFlag(UnitNPCFlags.AnyVendor);
+        // AnyVendor is a mask of several alternative vendor flags, not a flag
+        // that requires every vendor subtype to be present at once.
+        public bool IsAnyVendor => HasAnyVendorFlag(NpcFlags);
+        internal static bool HasAnyVendorFlag(uint flags) => (flags & (uint)UnitNPCFlags.AnyVendor) != 0;
         public bool IsVendor => HasNpcFlag(UnitNPCFlags.Vendor);
         public bool IsAmmoVendor => HasNpcFlag(UnitNPCFlags.AmmoVendor);
         public bool IsFoodVendor => HasNpcFlag(UnitNPCFlags.FoodVendor);

@@ -266,10 +266,18 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (leader.TownRallyMapId.HasValue && leader.TownRallyMapId != me.MapId)
                 return Block("Rally is on another map; cross-map town travel is unavailable.", out townTasksComplete);
             var needs = EvaluateLiveLocalNeeds(settings, leader);
+            // When bags are full, mail first if requested, but never abandon an
+            // in-flight vendor confirmation or clear its attempt count.
+            if (!_stage1MailDone) _mailRequested |= needs.NeedsMail;
+            bool mailBeforeVendor = _mailRequested && !_stage1MailDone && needs.NeedsSell;
+            if (ShouldWaitForVendorBeforeMail(mailBeforeVendor, _vendorAttempts, Environment.TickCount64))
+            {
+                townTasksComplete = false;
+                return true;
+            }
+
             // A renewed requirement (e.g. NeedsBuy after bag space frees up) reopens
             // the vendor stage instead of publishing completion with unmet needs.
-            // When bags are full, mail first so a needed purchase can succeed afterward.
-            bool mailBeforeVendor = _mailRequested && !_stage1MailDone && needs.NeedsSell;
             if (_stage1SellRepairBuyDone && !mailBeforeVendor &&
                 (needs.NeedsBuy || needs.NeedsRepair || needs.NeedsSell))
             {
@@ -278,7 +286,6 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 _stageStarted = Environment.TickCount64;
                 _regroupStarted = 0;
             }
-            if (!_stage1MailDone) _mailRequested |= needs.NeedsMail;
             if (!(_stage1SellRepairBuyDone && _stage1MailDone && _stage2TrainDone) && Environment.TickCount64 - _stageStarted > 120000)
                 return Block("Town task timed out before completion.", out townTasksComplete);
 
@@ -464,6 +471,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 !remainingNeeds.NeedsBuy && !remainingNeeds.NeedsTrain && !remainingNeeds.NeedsMail;
             return true;
         }
+
+        internal static bool ShouldWaitForVendorBeforeMail(bool mailBeforeVendor, SquadVendorAttempts attempts, long now)
+            => mailBeforeVendor && attempts.IsConfirmationPending(now);
 
         private static Vendor? ResolveSellOrRepairVendor(TownNeedsEvaluation needs)
         {
@@ -696,9 +706,11 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             LastInteractionSucceeded = false;
         }
 
+        internal bool IsConfirmationPending(long now) => Count > 0 && now < _nextAttempt;
+
         public SquadVendorAttemptDecision Evaluate(long now, TownNeedsEvaluation needs, int freeSlots)
         {
-            if (Count > 0 && now < _nextAttempt)
+            if (IsConfirmationPending(now))
                 return SquadVendorAttemptDecision.Wait;
 
             if (Count > 0 && LastInteractionSucceeded &&
