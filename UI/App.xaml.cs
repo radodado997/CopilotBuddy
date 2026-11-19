@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
@@ -15,6 +15,17 @@ namespace CopilotBuddy.UI
     /// </summary>
     public partial class App : System.Windows.Application
     {
+        /// <summary>
+        /// Application Entry Point.
+        /// </summary>
+        [STAThread]
+        public static void Main()
+        {
+            var app = new App();
+            app.InitializeComponent();
+            app.Run();
+        }
+
         protected override void OnStartup(StartupEventArgs e)
         {
             Globalization.ApplyLanguage(StyxSettings.Instance?.Language);
@@ -26,6 +37,10 @@ namespace CopilotBuddy.UI
 
             // Task exceptions that were never observed
             TaskScheduler.UnobservedTaskException += OnUnobservedTaskException;
+
+            var mainWindow = new MainWindow();
+            MainWindow = mainWindow;
+            mainWindow.Show();
         }
 
         /// <summary>

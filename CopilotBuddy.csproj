@@ -59,13 +59,6 @@
     <Content Remove="output\**" />
   </ItemGroup>
 
-  <ItemGroup>
-    <Page Remove="UI\App.xaml" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <ApplicationDefinition Include="UI\App.xaml" />
-  </ItemGroup>
 
   <!-- PostBuild: move satellite culture folders into Languages/ subdir (HB pattern) -->
   <Target Name="MoveSatelliteAssemblies" AfterTargets="Build">
