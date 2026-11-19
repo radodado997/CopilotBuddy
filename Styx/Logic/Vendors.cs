@@ -254,7 +254,13 @@ namespace Styx.Logic
 		/// Buys items from vendor based on OnBuyItems event handlers and food/drink settings.
 		/// Ported from HB 4.3.4.
 		/// </summary>
-		public static void BuyItems()
+		public static void BuyItems() => BuyItems(null, null);
+
+		/// <summary>
+		/// Buys vendor items. When food/drink needs are supplied by the caller they take
+		/// precedence over the local bag check (e.g. squad-provided water must not be bought).
+		/// </summary>
+		public static void BuyItems(bool? needsFood, bool? needsDrink)
 		{
 			var itemsToBuy = new Dictionary<uint, int>();
 
@@ -310,9 +316,11 @@ namespace Styx.Logic
 				return;
 			}
 
-			// Buy drinks if needed
-			if (Consumable.GetBestDrink(false) == null && bestDrinkIndex != -1 && usesMana && 
-			    CharacterSettings.Instance.DrinkAmount > 0)
+		// Buy drinks if needed
+		bool wantsDrink = needsDrink ?? Consumable.GetBestDrink(false) == null;
+		bool wantsFood = needsFood ?? Consumable.GetBestFood(false) == null;
+		if (wantsDrink && bestDrinkIndex != -1 && usesMana &&
+		    CharacterSettings.Instance.DrinkAmount > 0)
 			{
 				var drinkItem = _merchantFrame.GetMerchantItemByIndex(bestDrinkIndex);
 				if (drinkItem != null)
@@ -323,8 +331,8 @@ namespace Styx.Logic
 			}
 
 			// Buy food if needed
-			if (Consumable.GetBestFood(false) == null && bestFoodIndex != -1 &&
-			    CharacterSettings.Instance.FoodAmount > 0)
+		if (wantsFood && bestFoodIndex != -1 &&
+		    CharacterSettings.Instance.FoodAmount > 0)
 			{
 				var foodItem = _merchantFrame.GetMerchantItemByIndex(bestFoodIndex);
 				if (foodItem != null)

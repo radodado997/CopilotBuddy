@@ -64,7 +64,61 @@ namespace Styx.CommonBot.CharacterManagement
         /// <summary>
         /// Evaluates an item based on character class and basic stats
         /// </summary>
-        private float EvaluateItem(ItemInfo item, int count)
+        public bool IsUpgrade(ItemInfo item)
+        {
+            if (item == null || ObjectManager.Me?.Inventory == null)
+                return false;
+            if (GetItemSlot(item) == WoWInventorySlot.None || !ObjectManager.Me.CanEquipItem(item))
+                return false;
+
+            // An equippable item that fills a genuinely vacant slot is an upgrade even when
+            // its weighted stat score is zero (e.g. a stat-only ring on a class with no
+            // weights for those stats). Items that displace gear still need a positive score.
+            if (HasEmptyReplacementSlot(item))
+                return true;
+
+            return EvaluateItem(item, 1) > 0;
+        }
+
+        /// <summary>
+        /// Checks the slots actually vacated when this item is equipped. A two-hander
+        /// vacates both hands, so it only qualifies when both are empty.
+        /// </summary>
+        private static bool HasEmptyReplacementSlot(ItemInfo item)
+        {
+            var inventory = ObjectManager.Me?.Inventory;
+            if (inventory == null)
+                return false;
+
+            var slots = new List<WoWInventorySlot> { GetItemSlot(item) };
+            WoWInventorySlot secondary = GetSecondaryItemSlot(item);
+            if (secondary != WoWInventorySlot.None)
+                slots.Add(secondary);
+            bool isTwoHand = item.InventoryType == InventoryType.TwoHandWeapon;
+            if (isTwoHand && !slots.Contains(WoWInventorySlot.OffHand))
+                slots.Add(WoWInventorySlot.OffHand);
+
+            int emptySlots = 0;
+            foreach (WoWInventorySlot slot in slots)
+            {
+                if (!inventory.TryGetItemBySlot((uint)slot, out WoWItem equipped))
+                    return false;
+                if (equipped == null)
+                {
+                    emptySlots++;
+                    continue;
+                }
+                // An unreadable ItemInfo is an unknown state, not a vacancy.
+                if (equipped.ItemInfo == null)
+                    return false;
+            }
+
+            // A two-hander displaces both hands, so it only gets the free-slot shortcut
+            // when neither hand holds an item.
+            return isTwoHand ? emptySlots == slots.Count : emptySlots > 0;
+        }
+
+        private float EvaluateItem(ItemInfo item, int count, bool compareEquipped = true)
         {
             if (item == null)
                 return 0f;
@@ -74,6 +128,10 @@ namespace Styx.CommonBot.CharacterManagement
                 return 0f;
 
             float score = 0f;
+            if (StatWeights.TryGetValue(StyxWoW.Me.Class, out var weights))
+                foreach (var stat in item.GetItemStats())
+                    if (weights.TryGetValue((WoWItemStatType)(int)stat.Key, out float weight))
+                        score += stat.Value * weight;
 
             // Simple evaluation: bonus for correct armor type
             if (item.ItemClass == WoWItemClass.Armor && item.Armor > 0)
@@ -107,32 +165,51 @@ namespace Styx.CommonBot.CharacterManagement
             // HB 6.2.3 yields Finger1+Finger2 and Trinket1+Trinket2 for dual-slot types.
             // Previously only Finger1/Trinket1 was checked, meaning Finger2/Trinket2 was never replaced.
             WoWInventorySlot slot1 = GetItemSlot(item);
-            if (slot1 != WoWInventorySlot.None)
+            if (compareEquipped && slot1 != WoWInventorySlot.None)
             {
+                bool isTwoHand = item.InventoryType == InventoryType.TwoHandWeapon;
+                var slotsToCheck = new List<WoWInventorySlot> { slot1 };
                 WoWInventorySlot slot2 = GetSecondaryItemSlot(item);
-                WoWInventorySlot[] slotsToCheck = slot2 != WoWInventorySlot.None
-                    ? new[] { slot1, slot2 }
-                    : new[] { slot1 };
+                if (slot2 != WoWInventorySlot.None)
+                    slotsToCheck.Add(slot2);
+                // Equipping a two-hander also displaces the off-hand item.
+                if (isTwoHand && !slotsToCheck.Contains(WoWInventorySlot.OffHand))
+                    slotsToCheck.Add(WoWInventorySlot.OffHand);
 
-                // Find the weakest equipped item across all valid slots for this item type
                 float weakestEquippedScore = float.MaxValue;
-                bool anySlotEmpty = false;
+                float totalDisplacedScore = 0f;
+                int emptySlots = 0;
+                bool unknownEquipped = false;
                 foreach (WoWInventorySlot checkSlot in slotsToCheck)
                 {
-                    WoWItem equipped = inventory.GetItemBySlot((uint)checkSlot);
-                    if (equipped == null || equipped.ItemInfo == null)
+                    if (!inventory.TryGetItemBySlot((uint)checkSlot, out WoWItem equipped))
+                        return 0f;
+                    if (equipped == null)
                     {
-                        // Empty slot — item is automatically an upgrade
-                        anySlotEmpty = true;
-                        break;
+                        emptySlots++;
+                        continue;
                     }
-                    float equippedScore = EvaluateItem(equipped.ItemInfo, 1);
+                    if (equipped.ItemInfo == null)
+                    {
+                        // Cannot score what is being replaced: do not claim an upgrade.
+                        unknownEquipped = true;
+                        continue;
+                    }
+                    float equippedScore = EvaluateItem(equipped.ItemInfo, 1, false);
                     if (equippedScore < weakestEquippedScore)
                         weakestEquippedScore = equippedScore;
+                    totalDisplacedScore += equippedScore;
                 }
 
-                // Only consider it if it's at least 5% better than the weakest slot
-                if (!anySlotEmpty && score <= weakestEquippedScore * 1.05f)
+                if (unknownEquipped)
+                    return 0f;
+
+                // Aggregation rule: dual-slot items (rings/trinkets) replace only the
+                // weaker equipped item, while a two-hander displaces every occupied slot
+                // so their scores are summed before applying the +5% upgrade threshold.
+                float baseline = isTwoHand ? totalDisplacedScore : weakestEquippedScore;
+                bool anySlotEmpty = isTwoHand ? emptySlots == slotsToCheck.Count : emptySlots > 0;
+                if (!anySlotEmpty && score <= baseline * 1.05f)
                     return 0f;
             }
 
@@ -183,7 +260,7 @@ namespace Styx.CommonBot.CharacterManagement
         /// <summary>
         /// Gets the inventory slot for an item
         /// </summary>
-        private WoWInventorySlot GetItemSlot(ItemInfo item)
+        private static WoWInventorySlot GetItemSlot(ItemInfo item)
         {
             switch (item.InventoryType)
             {

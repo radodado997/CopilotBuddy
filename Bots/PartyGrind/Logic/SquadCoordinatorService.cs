@@ -1,0 +1,847 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Styx;
+using Styx.Combat.CombatRoutine;
+using Styx.Logic.Pathing;
+using Styx.PartyGrind;
+using Styx.PartyGrind.IPC;
+
+namespace CopilotBuddy.Bots.PartyGrind.Logic
+{
+    /// <summary>
+    /// Snapshot of active profile metadata used by <see cref="SquadCoordinatorService"/>.
+    /// Kept decoupled from WoW memory so coordinator logic is fully unit-testable.
+    /// </summary>
+    public sealed class SquadProfileSnapshot
+    {
+        public string ProfileXmlPath { get; set; } = string.Empty;
+        public string ProfileXmlHash { get; set; } = string.Empty;
+        public string SubProfileName { get; set; } = string.Empty;
+        public int SubProfileMinLevel { get; set; } = 1;
+        public int SubProfileMaxLevel { get; set; } = 85;
+        public uint MapId { get; set; }
+        public float HotspotX { get; set; }
+        public float HotspotY { get; set; }
+        public float HotspotZ { get; set; }
+        public uint? TownRallyMapId { get; set; }
+        public float TownRallyX { get; set; }
+        public float TownRallyY { get; set; }
+        public float TownRallyZ { get; set; }
+        public float SafeCorpseRallyX { get; set; }
+        public float SafeCorpseRallyY { get; set; }
+        public float SafeCorpseRallyZ { get; set; }
+        public bool HasProfile { get; set; } = true;
+    }
+
+    /// <summary>
+    /// Authoritative coordinator state machine for PartyGrindBot.
+    /// Computes EffectiveSquadMinLevel, synchronized SquadPhase, breadcrumbs, distance hysteresis,
+    /// TownRun completion gate, wipe/corpse recovery, and provisioning arbitration.
+    /// </summary>
+    public sealed class SquadCoordinatorService
+    {
+        private sealed class MemberHistoryRecord
+        {
+            public string Name = string.Empty;
+            public ulong Guid;
+            public SquadRole Role;
+            public WoWClass Class;
+            public int Level = 1;
+            public float XpPercent;
+            public long LastSeenUtcMs;
+            public bool NeedsRest;
+            public SquadMemberState? LastState;
+        }
+
+        private readonly Dictionary<string, MemberHistoryRecord> _history = new Dictionary<string, MemberHistoryRecord>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, long> _provisionCooldownUntilMs = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+        private readonly List<SquadBreadcrumb> _breadcrumbs = new List<SquadBreadcrumb>();
+
+        private bool _isWaitingForFollower;
+        private bool _isHardBacktracking;
+        private bool _inTownRun;
+        private bool _allTownTasksComplete;
+        private bool _inLootWindow;
+        private long _lootWindowEndsUtcMs;
+        private bool _wasAnyInCombat;
+        private long _resWaitStartedUtcMs;
+        private string _resWaitMemberKey = string.Empty;
+        private bool _inCorpseRun;
+        private bool _migratingZone;
+        private string _lastSubProfileKey = string.Empty;
+        private uint _lastBreadcrumbMapId;
+        private int _breadcrumbGeneration;
+        private long _breadcrumbSequence;
+        private string _activeProvisioner = string.Empty;
+        private string _activeTradeTarget = string.Empty;
+        private long _provisionStartedUtcMs;
+        private bool _assignedFood, _assignedDrink, _assignedHealthstone;
+
+        public bool IsPausedManually { get; set; }
+        public string ManualPauseReason { get; set; } = string.Empty;
+        public bool IsWaitingForFollower => _isWaitingForFollower;
+        public bool IsHardBacktracking => _isHardBacktracking;
+
+        public void Reset()
+        {
+            IsPausedManually = false;
+            ManualPauseReason = string.Empty;
+            _history.Clear();
+            _provisionCooldownUntilMs.Clear();
+            ClearBreadcrumbs();
+            _isWaitingForFollower = false;
+            _isHardBacktracking = false;
+            _inTownRun = false;
+            _allTownTasksComplete = false;
+            _inLootWindow = false;
+            _lootWindowEndsUtcMs = 0;
+            _wasAnyInCombat = false;
+            _resWaitStartedUtcMs = 0;
+            _resWaitMemberKey = string.Empty;
+            _inCorpseRun = false;
+            _migratingZone = false;
+            _lastSubProfileKey = string.Empty;
+            _lastBreadcrumbMapId = 0;
+            _activeProvisioner = string.Empty;
+            _activeTradeTarget = string.Empty;
+            _provisionStartedUtcMs = 0;
+        }
+
+        /// <summary>
+        /// Evaluates one coordinator tick using purely provided inputs and returns the broadcastable
+        /// <see cref="SquadLeaderState"/>.
+        /// </summary>
+        public SquadLeaderState EvaluateTick(
+            SquadSettings settings,
+            SquadMemberState leaderLocal,
+            IReadOnlyList<SquadConnectedMemberSnapshot> connectedClients,
+            SquadProfileSnapshot profile,
+            ulong focusTargetGuid,
+            ulong secondaryTargetGuid,
+            long pullStartedUtcMs,
+            float leaderFacing,
+            long nowUtcMs,
+            float? effectiveProfileLevelHint = null,
+            Func<int, SquadProfileSnapshot>? resolveProfile = null)
+        {
+            if (settings == null) throw new ArgumentNullException(nameof(settings));
+            if (leaderLocal == null) throw new ArgumentNullException(nameof(leaderLocal));
+            profile ??= new SquadProfileSnapshot { HasProfile = false };
+
+            // 1. Merge coordinator + connected clients into roster and update level history.
+            var rosterStates = new List<SquadMemberState>(1 + connectedClients.Count) { leaderLocal };
+            var connectedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (!string.IsNullOrWhiteSpace(leaderLocal.CharacterName))
+            {
+                connectedNames.Add(leaderLocal.CharacterName.Trim());
+                UpsertHistory(leaderLocal, settings, nowUtcMs);
+            }
+
+            var assignments = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            var roles = new Dictionary<string, SquadRole>(StringComparer.OrdinalIgnoreCase);
+            if (!string.IsNullOrWhiteSpace(leaderLocal.CharacterName))
+                roles[leaderLocal.CharacterName.Trim()] = leaderLocal.Role;
+
+            foreach (var snap in connectedClients)
+            {
+                if (string.IsNullOrWhiteSpace(snap.CharacterName))
+                    continue;
+                string name = snap.CharacterName.Trim();
+                assignments[name] = snap.SlotIndex;
+
+                var state = snap.LatestState ?? new SquadMemberState
+                {
+                    CharacterName = name,
+                    Guid = snap.Handshake.Guid,
+                    Class = snap.Handshake.Class,
+                    Role = snap.Handshake.Role,
+                    Level = Math.Max(1, snap.Handshake.Level)
+                };
+
+                roles[name] = state.Role;
+                if (snap.IsConnected)
+                {
+                    connectedNames.Add(name);
+                    rosterStates.Add(state);
+                    UpsertHistory(state, settings, nowUtcMs);
+                    if (snap.LatestState == null) _history[name].LastState = null;
+                }
+            }
+
+            // 2. Compute EffectiveSquadMinLevel (including recently disconnected members within DisconnectGraceSeconds).
+            long graceMs = Math.Max(0, settings.DisconnectGraceSeconds) * 1000L;
+            var levelCandidates = new List<(string Name, int Level, float XpPct)>();
+
+            foreach (var m in rosterStates)
+            {
+                string name = m.CharacterName?.Trim() ?? string.Empty;
+                if (string.IsNullOrEmpty(name)) continue;
+                levelCandidates.Add((name, Math.Max(1, m.Level), ComputeXpPercent(m)));
+            }
+
+            foreach (var kv in _history)
+            {
+                if (connectedNames.Contains(kv.Key))
+                    continue;
+                if ((nowUtcMs - kv.Value.LastSeenUtcMs) <= graceMs)
+                {
+                    levelCandidates.Add((kv.Value.Name, Math.Max(1, kv.Value.Level), kv.Value.XpPercent));
+                }
+            }
+
+            int effectiveMinLevel = Math.Max(1, leaderLocal.Level);
+            string lowestName = leaderLocal.CharacterName ?? string.Empty;
+            float lowestXpPct = ComputeXpPercent(leaderLocal);
+
+            if (levelCandidates.Count > 0)
+            {
+                var lowest = levelCandidates
+                    .OrderBy(c => c.Level)
+                    .ThenBy(c => c.XpPct)
+                    .ThenBy(c => c.Name, StringComparer.OrdinalIgnoreCase)
+                    .First();
+
+                effectiveMinLevel = lowest.Level;
+                lowestName = lowest.Name;
+                lowestXpPct = lowest.XpPct;
+            }
+
+            var telemetryNames = new HashSet<string>(
+                connectedClients.Where(s => s.IsConnected && s.LatestState != null).Select(s => s.CharacterName.Trim()),
+                StringComparer.OrdinalIgnoreCase);
+            telemetryNames.Add(leaderLocal.CharacterName.Trim());
+            rosterStates.RemoveAll(m => !telemetryNames.Contains(m.CharacterName.Trim()));
+            foreach (var name in _history.Where(kv => !connectedNames.Contains(kv.Key) &&
+                nowUtcMs - kv.Value.LastSeenUtcMs > graceMs).Select(kv => kv.Key).ToList())
+                _history.Remove(name);
+
+            if (resolveProfile != null) profile = resolveProfile(effectiveMinLevel);
+
+            // Detect sub-profile transition -> MigratingZone.
+            string subProfileKey = $"{profile.ProfileXmlPath}|{profile.ProfileXmlHash}|{profile.SubProfileName}|{profile.SubProfileMinLevel}|{profile.SubProfileMaxLevel}|{profile.MapId}";
+            if (profile.HasProfile)
+            {
+                if (!string.IsNullOrEmpty(_lastSubProfileKey) &&
+                    !string.Equals(_lastSubProfileKey, subProfileKey, StringComparison.Ordinal))
+                {
+                    _migratingZone = true;
+                    ClearBreadcrumbs();
+                }
+                _lastSubProfileKey = subProfileKey;
+            }
+
+            // 3. Record movement breadcrumbs (every >= 5 yd, max 30 entries).
+            UpdateBreadcrumbs(leaderLocal.MapId, leaderLocal.X, leaderLocal.Y, leaderLocal.Z, nowUtcMs);
+
+            // 4. Evaluate distance hysteresis to living connected members on the same map.
+            var leaderPoint = new WoWPoint(leaderLocal.X, leaderLocal.Y, leaderLocal.Z);
+            float maxFollowerDist = 0f;
+            foreach (var m in rosterStates)
+            {
+                if (string.Equals(m.CharacterName, leaderLocal.CharacterName, StringComparison.OrdinalIgnoreCase))
+                    continue;
+                if (m.IsDead || m.IsGhost || m.MapId != leaderLocal.MapId)
+                    continue;
+                float d = leaderPoint.Distance(new WoWPoint(m.X, m.Y, m.Z));
+                if (d > maxFollowerDist)
+                    maxFollowerDist = d;
+            }
+
+            if (!_isWaitingForFollower && maxFollowerDist > settings.SoftWaitDistance)
+                _isWaitingForFollower = true;
+            else if (_isWaitingForFollower && maxFollowerDist <= settings.ResumeDistance)
+                _isWaitingForFollower = false;
+
+            if (!_isHardBacktracking && maxFollowerDist > settings.HardBacktrackDistance)
+                _isHardBacktracking = true;
+            else if (_isHardBacktracking && maxFollowerDist <= settings.ResumeDistance)
+                _isHardBacktracking = false;
+
+            // 5. Evaluate combat, death/resurrection, looting, resting, provisioning, town run.
+            bool anyInCombat = rosterStates.Any(m => m.IsInCombat);
+            bool anyDead = rosterStates.Any(m => m.IsDead || m.IsGhost);
+            bool allDead = rosterStates.Count > 0 && rosterStates.All(m => m.IsDead || m.IsGhost);
+            bool hasLivingResCapable = rosterStates.Any(m =>
+                !m.IsDead && !m.IsGhost &&
+                m.CanResurrect);
+            // A connected member that has not reported telemetry is unknown, not dead and
+            // not proof that nobody can resurrect. Do not act on an incomplete roster.
+            bool rosterIncomplete = connectedClients.Any(s => s.IsConnected &&
+                s.LatestState == null && !string.IsNullOrWhiteSpace(s.CharacterName));
+
+            if (_wasAnyInCombat && !anyInCombat && !allDead)
+            {
+                _inLootWindow = true;
+                _lootWindowEndsUtcMs = nowUtcMs + Math.Max(1, settings.MaxLootWindowSeconds) * 1000L;
+            }
+            _wasAnyInCombat = anyInCombat;
+
+            if (_inLootWindow)
+            {
+                bool anyLooting = rosterStates.Any(m => m.IsLooting);
+                if (anyInCombat || (!anyLooting && nowUtcMs >= _lootWindowEndsUtcMs) || nowUtcMs >= (_lootWindowEndsUtcMs + 4000L))
+                {
+                    _inLootWindow = false;
+                }
+            }
+
+            string? deadMemberKey = !anyInCombat
+                ? rosterStates.Where(m => m.IsDead || m.IsGhost)
+                    .OrderBy(m => m.CharacterName, StringComparer.OrdinalIgnoreCase)
+                    .Select(m => $"{m.CharacterName?.Trim()}|{m.Guid}")
+                    .FirstOrDefault()
+                : null;
+
+            if (deadMemberKey != null)
+            {
+                if (string.IsNullOrEmpty(_resWaitMemberKey))
+                {
+                    _resWaitStartedUtcMs = nowUtcMs;
+                    _resWaitMemberKey = deadMemberKey;
+                }
+            }
+            else if (!anyDead)
+            {
+                _resWaitStartedUtcMs = 0;
+                _resWaitMemberKey = string.Empty;
+                _inCorpseRun = false;
+            }
+
+            bool resTimeoutExceeded = _resWaitStartedUtcMs > 0 &&
+                (nowUtcMs - _resWaitStartedUtcMs) >= Math.Max(5, settings.WaitForPartyRessSeconds) * 1000L;
+
+            if (!rosterIncomplete &&
+                (allDead || (anyDead && !hasLivingResCapable && !anyInCombat) || resTimeoutExceeded))
+            {
+                _inCorpseRun = true;
+            }
+
+            // Check migration completion
+            if (_migratingZone)
+            {
+                var hotspot = new WoWPoint(profile.HotspotX, profile.HotspotY, profile.HotspotZ);
+                bool allArrived = rosterStates.Where(m => !m.IsDead && !m.IsGhost).All(m =>
+                    m.MapId == profile.MapId &&
+                    new WoWPoint(m.X, m.Y, m.Z).Distance(hotspot) <= settings.SoftWaitDistance);
+
+                if (allArrived)
+                    _migratingZone = false;
+            }
+
+            // Evaluate per-member rest hysteresis.
+            bool anyNeedsRest = false;
+            foreach (var m in rosterStates)
+            {
+                if (m.IsDead || m.IsGhost)
+                    continue;
+                string key = m.CharacterName?.Trim() ?? string.Empty;
+                bool wasResting = !string.IsNullOrEmpty(key) && _history.TryGetValue(key, out var rec) && rec.NeedsRest;
+                bool usesMana = m.PowerType == WoWPowerType.Mana;
+                bool evaluated = EvaluateRestHysteresis(wasResting, m.HealthPercent, m.PowerPercent, usesMana, settings);
+                bool combinedRest = evaluated || m.NeedsRest;
+                if (!string.IsNullOrEmpty(key) && _history.TryGetValue(key, out var histRec))
+                    histRec.NeedsRest = combinedRest;
+                if (combinedRest)
+                    anyNeedsRest = true;
+            }
+
+            // Evaluate TownRun trigger & completion gate.
+            var townRally = new WoWPoint(profile.TownRallyX, profile.TownRallyY, profile.TownRallyZ);
+            if (!_inTownRun && settings.SyncTownRuns && !anyInCombat && !anyDead)
+            {
+                bool anyNeedsTown = rosterStates.Any(m =>
+                    !m.IsDead && !m.IsGhost &&
+                    (m.NeedsSell || m.NeedsRepair || m.NeedsBuy || m.NeedsTrain || m.NeedsMail));
+                if (anyNeedsTown)
+                {
+                    _inTownRun = true;
+                    _allTownTasksComplete = false;
+                }
+            }
+            else if (_inTownRun)
+            {
+                // Completion must account for every connected participant, including a
+                // reconnecting member that has not yet sent a telemetry sample.
+                var townParticipants = new List<SquadMemberState>(1 + connectedClients.Count) { leaderLocal };
+                foreach (var snap in connectedClients.Where(s => s.IsConnected && !string.IsNullOrWhiteSpace(s.CharacterName)))
+                {
+                    townParticipants.Add(snap.LatestState ?? new SquadMemberState
+                    {
+                        CharacterName = snap.CharacterName.Trim(),
+                        Guid = snap.Handshake.Guid,
+                        Class = snap.Handshake.Class,
+                        Role = snap.Handshake.Role,
+                        Level = Math.Max(1, snap.Handshake.Level)
+                    });
+                }
+                bool pendingTelemetry = connectedClients.Any(s => s.IsConnected && s.LatestState == null &&
+                    !string.IsNullOrWhiteSpace(s.CharacterName));
+                bool anyStillHasNeed = townParticipants.Any(m =>
+                    m.NeedsSell || m.NeedsRepair || m.NeedsBuy || m.NeedsTrain || m.NeedsMail);
+                bool allDoneAndAtRally = !pendingTelemetry && townParticipants.Count > 0 && townParticipants.All(m =>
+                    m.TownTasksComplete &&
+                    (!profile.TownRallyMapId.HasValue || m.MapId == profile.TownRallyMapId.Value) &&
+                    new WoWPoint(m.X, m.Y, m.Z).Distance2D(townRally) <= 20.0f);
+
+                if (!anyInCombat && !anyDead && allDoneAndAtRally && !anyStillHasNeed)
+                {
+                    _allTownTasksComplete = true;
+                    _inTownRun = false;
+                }
+                else
+                {
+                    _allTownTasksComplete = false;
+                }
+            }
+
+            // Provisioning arbitration.
+            if (anyInCombat || anyDead || _inTownRun || anyNeedsRest || _migratingZone)
+            {
+                ClearProvisioning();
+            }
+            else
+            {
+                EvaluateProvisioningArbitration(settings, rosterStates, nowUtcMs);
+            }
+
+            // 6. Determine authoritative SquadPhase.
+            SquadPhase phase;
+            string pauseReason = string.Empty;
+            if (IsPausedManually)
+            {
+                phase = SquadPhase.Paused;
+                pauseReason = ManualPauseReason;
+            }
+            else if (!anyInCombat && !anyDead && rosterStates.Any(m => !string.IsNullOrEmpty(m.TownBlockedReason)))
+            {
+                // Keep the town block pending, but never let it suppress combat or
+                // death recovery that must be resolved first.
+                phase = SquadPhase.Paused;
+                pauseReason = rosterStates.First(m => !string.IsNullOrEmpty(m.TownBlockedReason)).TownBlockedReason;
+            }
+            else if (!profile.HasProfile)
+            {
+                phase = SquadPhase.Initializing;
+            }
+            else if (_inCorpseRun && anyDead)
+            {
+                phase = SquadPhase.CorpseRun;
+            }
+            else if (anyDead && !anyInCombat)
+            {
+                phase = SquadPhase.WaitingResurrection;
+            }
+            else if (anyInCombat)
+            {
+                phase = _migratingZone ? SquadPhase.MigratingZone : SquadPhase.Grinding;
+            }
+            else if (_migratingZone)
+            {
+                phase = SquadPhase.MigratingZone;
+            }
+            else if (_inLootWindow)
+            {
+                // Only the bounded loot window drives this phase; a stale follower
+                // IsLooting flag must not keep the squad in Looting after its hard cap.
+                phase = SquadPhase.Looting;
+            }
+            else if (anyNeedsRest)
+            {
+                phase = SquadPhase.Resting;
+            }
+            else if (!string.IsNullOrEmpty(_activeProvisioner))
+            {
+                phase = SquadPhase.Provisioning;
+            }
+            else if (_inTownRun)
+            {
+                phase = SquadPhase.TownRun;
+            }
+            else
+            {
+                phase = SquadPhase.Grinding;
+            }
+
+            // 7. Build member summaries for HUD & peer services.
+            var summaries = BuildMemberSummaries(rosterStates, connectedNames, leaderPoint, leaderLocal.MapId, nowUtcMs);
+
+            return new SquadLeaderState
+            {
+                LeaderGuid = leaderLocal.Guid,
+                LeaderName = leaderLocal.CharacterName ?? string.Empty,
+                Phase = phase,
+                PauseReason = pauseReason,
+                ProfileXmlPath = profile.ProfileXmlPath,
+                ProfileXmlHash = profile.ProfileXmlHash,
+                ActiveSubProfileName = profile.SubProfileName,
+                ActiveSubProfileMinLevel = profile.SubProfileMinLevel,
+                ActiveSubProfileMaxLevel = profile.SubProfileMaxLevel,
+                EffectiveSquadMinLevel = effectiveMinLevel,
+                LowestMemberName = lowestName,
+                LowestMemberXpPercent = lowestXpPct,
+                MapId = leaderLocal.MapId,
+                ZoneId = leaderLocal.ZoneId,
+                X = leaderLocal.X,
+                Y = leaderLocal.Y,
+                Z = leaderLocal.Z,
+                Facing = leaderFacing,
+                IsMounted = leaderLocal.IsMounted,
+                IsFlying = false,
+                InCombat = anyInCombat,
+                IsLootWindowActive = _inLootWindow,
+                IsDead = leaderLocal.IsDead,
+                IsGhost = leaderLocal.IsGhost,
+                FocusTargetGuid = focusTargetGuid,
+                SecondaryTargetGuid = secondaryTargetGuid,
+                PullStartedUtcMs = pullStartedUtcMs,
+                ActiveHotspotX = profile.HotspotX,
+                ActiveHotspotY = profile.HotspotY,
+                ActiveHotspotZ = profile.HotspotZ,
+                Breadcrumbs = _breadcrumbs.Select(b => new SquadBreadcrumb
+                {
+                    MapId = b.MapId,
+                    X = b.X,
+                    Y = b.Y,
+                    Z = b.Z,
+                    TimestampUtcMs = b.TimestampUtcMs,
+                    RouteGeneration = b.RouteGeneration,
+                    Sequence = b.Sequence
+                }).ToList(),
+                TownRallyX = profile.TownRallyX,
+                TownRallyY = profile.TownRallyY,
+                TownRallyZ = profile.TownRallyZ,
+                TownRallyMapId = profile.TownRallyMapId,
+                AllTownTasksComplete = _allTownTasksComplete,
+                TownRunInterrupted = _inTownRun && (anyInCombat || anyDead),
+                SquadCorpseRallyX = profile.SafeCorpseRallyX,
+                SquadCorpseRallyY = profile.SafeCorpseRallyY,
+                SquadCorpseRallyZ = profile.SafeCorpseRallyZ,
+                ReleaseCorpseOrder = !rosterIncomplete && _inCorpseRun && anyDead,
+                ActiveProvisionerName = _activeProvisioner,
+                ActiveTradeTargetName = _activeTradeTarget,
+                MemberAssignments = assignments,
+                MemberRoles = roles,
+                Members = summaries
+            };
+        }
+
+        /// <summary>
+        /// Rest hysteresis check shared between Coordinator and Members.
+        /// </summary>
+        public static bool EvaluateRestHysteresis(
+            bool wasNeedingRest,
+            float healthPct,
+            float powerPct,
+            bool usesMana,
+            SquadSettings settings)
+        {
+            if (wasNeedingRest)
+            {
+                bool hpOk = healthPct >= settings.ResumeRestHealthPct;
+                bool mpOk = !usesMana || powerPct >= settings.ResumeRestManaPct;
+                return !(hpOk && mpOk);
+            }
+
+            bool lowHp = healthPct < settings.TriggerRestHealthPct;
+            bool lowMp = usesMana && powerPct < settings.TriggerRestManaPct;
+            return lowHp || lowMp;
+        }
+
+        public WoWPoint? GetBacktrackTarget(WoWPoint currentLeaderPos, WoWPoint trailingMemberPos)
+        {
+            if (_breadcrumbs.Count == 0)
+                return trailingMemberPos;
+
+            // Walk reversed breadcrumbs to find the point roughly halfway back toward the trailing member.
+            for (int i = _breadcrumbs.Count - 1; i >= 0; i--)
+            {
+                var bc = _breadcrumbs[i];
+                var pt = new WoWPoint(bc.X, bc.Y, bc.Z);
+                if (pt.Distance(currentLeaderPos) >= 10f &&
+                    pt.Distance(trailingMemberPos) < currentLeaderPos.Distance(trailingMemberPos))
+                    return pt;
+            }
+            return trailingMemberPos;
+        }
+
+        public void RecordProvisionCooldown(string characterName, int cooldownSeconds, long nowUtcMs)
+        {
+            if (string.IsNullOrWhiteSpace(characterName))
+                return;
+            _provisionCooldownUntilMs[characterName.Trim()] = nowUtcMs + Math.Max(1, cooldownSeconds) * 1000L;
+        }
+
+        private void UpsertHistory(SquadMemberState state, SquadSettings settings, long nowUtcMs)
+        {
+            string name = state.CharacterName?.Trim() ?? string.Empty;
+            if (string.IsNullOrEmpty(name))
+                return;
+
+            if (!_history.TryGetValue(name, out var rec))
+            {
+                rec = new MemberHistoryRecord { Name = name };
+                _history[name] = rec;
+            }
+
+            rec.Guid = state.Guid;
+            rec.Role = state.Role;
+            rec.Class = state.Class;
+            rec.Level = Math.Max(1, state.Level);
+            rec.XpPercent = ComputeXpPercent(state);
+            rec.LastSeenUtcMs = nowUtcMs;
+            rec.LastState = state;
+        }
+
+        private void ClearBreadcrumbs()
+        {
+            _breadcrumbs.Clear();
+            _breadcrumbGeneration++;
+        }
+
+        private void UpdateBreadcrumbs(uint mapId, float x, float y, float z, long nowUtcMs)
+        {
+            if (_lastBreadcrumbMapId != mapId)
+            {
+                ClearBreadcrumbs();
+                _lastBreadcrumbMapId = mapId;
+            }
+
+            var current = new WoWPoint(x, y, z);
+            if (_breadcrumbs.Count == 0)
+            {
+                _breadcrumbs.Add(new SquadBreadcrumb
+                {
+                    MapId = mapId, X = x, Y = y, Z = z, TimestampUtcMs = nowUtcMs,
+                    RouteGeneration = _breadcrumbGeneration, Sequence = ++_breadcrumbSequence
+                });
+                return;
+            }
+
+            var last = _breadcrumbs[^1];
+            if (current.Distance(new WoWPoint(last.X, last.Y, last.Z)) >= 5.0f)
+            {
+                _breadcrumbs.Add(new SquadBreadcrumb
+                {
+                    MapId = mapId, X = x, Y = y, Z = z, TimestampUtcMs = nowUtcMs,
+                    RouteGeneration = _breadcrumbGeneration, Sequence = ++_breadcrumbSequence
+                });
+                while (_breadcrumbs.Count > 30)
+                    _breadcrumbs.RemoveAt(0);
+            }
+        }
+
+        private void EvaluateProvisioningArbitration(
+            SquadSettings settings,
+            List<SquadMemberState> rosterStates,
+            long nowUtcMs)
+        {
+            long timeoutMs = Math.Max(4, settings.TradeOfferTimeoutSeconds + 3) * 1000L;
+
+            if (!string.IsNullOrEmpty(_activeProvisioner))
+            {
+                bool timedOut = (nowUtcMs - _provisionStartedUtcMs) > timeoutMs;
+                var prov = rosterStates.FirstOrDefault(m => string.Equals(m.CharacterName, _activeProvisioner, StringComparison.OrdinalIgnoreCase));
+                var recv = string.IsNullOrEmpty(_activeTradeTarget)
+                    ? null
+                    : rosterStates.FirstOrDefault(m => string.Equals(m.CharacterName, _activeTradeTarget, StringComparison.OrdinalIgnoreCase));
+
+                bool stillNeeded = prov != null && (prov.IsProvisioningBusy ||
+                    (recv != null && ((_assignedFood && recv.WantsFood) ||
+                        (_assignedDrink && recv.WantsDrink) || (_assignedHealthstone && recv.WantsHealthstone))));
+
+                if (timedOut)
+                {
+                    if (!string.IsNullOrEmpty(_activeTradeTarget))
+                        RecordProvisionCooldown(_activeTradeTarget, settings.ProvisionCooldownSeconds, nowUtcMs);
+                    ClearProvisioning();
+                }
+                else if (stillNeeded)
+                {
+                    return;
+                }
+                else
+                {
+                    ClearProvisioning();
+                }
+            }
+
+            // Pick next provisioner -> target pair (Mage first, then Warlock).
+            if (settings.EnableMageProvisioning)
+            {
+                foreach (var mage in rosterStates.Where(m => !m.IsDead && !m.IsGhost && (m.CanProvideMageFood || m.CanProvideMageDrink)))
+                {
+                    var magePos = new WoWPoint(mage.X, mage.Y, mage.Z);
+                    var target = rosterStates.FirstOrDefault(m =>
+                        !m.IsDead && !m.IsGhost &&
+                        !string.Equals(m.CharacterName, mage.CharacterName, StringComparison.OrdinalIgnoreCase) &&
+                        m.MapId == mage.MapId &&
+                        magePos.Distance(new WoWPoint(m.X, m.Y, m.Z)) <= 40f &&
+                        m.FreeBagSlots >= 2 &&
+                        ((mage.CanProvideMageFood && m.WantsFood) || (mage.CanProvideMageDrink && m.WantsDrink)) &&
+                        !IsOnProvisionCooldown(m.CharacterName, nowUtcMs));
+
+                    if (target != null)
+                    {
+                        _assignedFood = mage.CanProvideMageFood && target.WantsFood;
+                        _assignedDrink = mage.CanProvideMageDrink && target.WantsDrink;
+                        _assignedHealthstone = false;
+                        _activeProvisioner = mage.CharacterName;
+                        _activeTradeTarget = target.CharacterName;
+                        _provisionStartedUtcMs = nowUtcMs;
+                        return;
+                    }
+                }
+            }
+
+            if (settings.EnableWarlockHealthstones)
+            {
+                foreach (var warlock in rosterStates.Where(m => !m.IsDead && !m.IsGhost && m.CanProvideHealthstone))
+                {
+                    var lockPos = new WoWPoint(warlock.X, warlock.Y, warlock.Z);
+                    var target = rosterStates.FirstOrDefault(m =>
+                        !m.IsDead && !m.IsGhost &&
+                        !string.Equals(m.CharacterName, warlock.CharacterName, StringComparison.OrdinalIgnoreCase) &&
+                        m.MapId == warlock.MapId &&
+                        lockPos.Distance(new WoWPoint(m.X, m.Y, m.Z)) <= 40f &&
+                        m.FreeBagSlots >= 2 &&
+                        m.WantsHealthstone &&
+                        !IsOnProvisionCooldown(m.CharacterName, nowUtcMs));
+
+                    if (target != null)
+                    {
+                        _assignedFood = _assignedDrink = false;
+                        _assignedHealthstone = true;
+                        _activeProvisioner = warlock.CharacterName;
+                        _activeTradeTarget = target.CharacterName;
+                        _provisionStartedUtcMs = nowUtcMs;
+                        return;
+                    }
+                }
+            }
+        }
+
+        private bool IsOnProvisionCooldown(string name, long nowUtcMs)
+        {
+            return !string.IsNullOrWhiteSpace(name) &&
+                _provisionCooldownUntilMs.TryGetValue(name.Trim(), out long until) &&
+                nowUtcMs < until;
+        }
+
+        private void ClearProvisioning()
+        {
+            _activeProvisioner = string.Empty;
+            _activeTradeTarget = string.Empty;
+            _provisionStartedUtcMs = 0;
+        }
+
+        private List<SquadMemberSummary> BuildMemberSummaries(
+            List<SquadMemberState> activeRoster,
+            HashSet<string> connectedNames,
+            WoWPoint leaderPoint,
+            uint leaderMapId,
+            long nowUtcMs)
+        {
+            var result = new List<SquadMemberSummary>();
+            var activeByName = new Dictionary<string, SquadMemberState>(StringComparer.OrdinalIgnoreCase);
+            foreach (var m in activeRoster)
+            {
+                if (!string.IsNullOrWhiteSpace(m.CharacterName))
+                    activeByName[m.CharacterName.Trim()] = m;
+            }
+
+            foreach (var m in activeRoster)
+            {
+                result.Add(ToSummary(m, isConnected: true, leaderPoint, leaderMapId));
+            }
+
+            foreach (var kv in _history)
+            {
+                if (activeByName.ContainsKey(kv.Key))
+                    continue;
+                if (kv.Value.LastState == null)
+                {
+                    result.Add(new SquadMemberSummary
+                    {
+                        CharacterName = kv.Value.Name, Guid = kv.Value.Guid,
+                        Role = kv.Value.Role, Class = kv.Value.Class, Level = kv.Value.Level,
+                        HasTelemetry = false, IsConnected = connectedNames.Contains(kv.Key),
+                        DistanceToLeader = -1f, StateLabel = "Awaiting telemetry"
+                    });
+                }
+                else
+                {
+                    var summary = ToSummary(kv.Value.LastState, isConnected: connectedNames.Contains(kv.Key), leaderPoint, leaderMapId);
+                    summary.StateLabel = connectedNames.Contains(kv.Key) ? "Awaiting telemetry" : "Disconnected";
+                    result.Add(summary);
+                }
+            }
+
+            return result
+                .OrderBy(s => s.Role == SquadRole.TankLeader ? 0 : 1)
+                .ThenBy(s => s.CharacterName, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+
+        private SquadMemberSummary ToSummary(SquadMemberState m, bool isConnected, WoWPoint leaderPoint, uint leaderMapId)
+        {
+            string label = m.IsDead || m.IsGhost ? "Dead"
+                : m.IsInCombat ? "Combat"
+                : !m.TownTasksComplete && (m.NeedsSell || m.NeedsRepair || m.NeedsBuy || m.NeedsTrain || m.NeedsMail) && _inTownRun ? "TownRun"
+                : m.IsResting || m.NeedsRest ? "Resting"
+                : m.IsLooting ? "Looting"
+                : m.IsProvisioningBusy ? "Provisioning"
+                : "Grinding";
+
+            float dist = m.MapId == leaderMapId ? leaderPoint.Distance(new WoWPoint(m.X, m.Y, m.Z)) : -1f;
+            return new SquadMemberSummary
+            {
+                CharacterName = m.CharacterName,
+                Guid = m.Guid,
+                Role = m.Role,
+                Class = m.Class,
+                Level = m.Level,
+                XpPercent = ComputeXpPercent(m),
+                XpPerHour = m.XpPerHour,
+                HealthPercent = m.HealthPercent,
+                PowerPercent = m.PowerPercent,
+                PowerType = m.PowerType,
+                MapId = m.MapId,
+                X = m.X,
+                Y = m.Y,
+                Z = m.Z,
+                DistanceToLeader = dist,
+                IsDead = m.IsDead,
+                IsGhost = m.IsGhost,
+                IsInCombat = m.IsInCombat,
+                NeedsRest = m.NeedsRest,
+                IsResting = m.IsResting,
+                IsLooting = m.IsLooting,
+                NeedsTown = m.NeedsSell || m.NeedsRepair || m.NeedsBuy || m.NeedsTrain || m.NeedsMail,
+                TownTasksComplete = m.TownTasksComplete,
+                KnownBlessings = m.KnownBlessings,
+                CanMount = m.CanMount,
+                CanFly = m.CanFly,
+                IsMounted = m.IsMounted,
+                FreeBagSlots = m.FreeBagSlots,
+                WantsFood = m.WantsFood,
+                WantsDrink = m.WantsDrink,
+                WantsHealthstone = m.WantsHealthstone,
+                CanProvideMageFood = m.CanProvideMageFood,
+                CanProvideMageDrink = m.CanProvideMageDrink,
+                CanProvideHealthstone = m.CanProvideHealthstone,
+                IsProvisioningBusy = m.IsProvisioningBusy,
+                IsConnected = isConnected,
+                StateLabel = label
+            };
+        }
+
+        private static float ComputeXpPercent(SquadMemberState m)
+        {
+            if (m.NextLevelXp == 0)
+                return 0f;
+            float pct = (m.CurrentXp * 100f) / m.NextLevelXp;
+            return Math.Clamp(pct, 0f, 100f);
+        }
+    }
+}

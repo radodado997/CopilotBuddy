@@ -35,6 +35,7 @@ namespace Styx.Helpers
         private bool _logoutInactivityUseForceQuit = false;
         private bool _profileDebuggingMode = false;
         private bool _useFrameLock = false;
+        private bool _restoreMinimizedWithoutFocus = true;
 
         /// <summary>
         /// <summary>
@@ -157,6 +158,18 @@ namespace Styx.Helpers
         {
             get { return _useFrameLock; }
             set { _useFrameLock = value; }
+        }
+
+        /// <summary>
+        /// Restore minimized WoW windows without stealing foreground focus (SW_SHOWNOACTIVATE = 4).
+        /// Prevents 3-5 running clients from fighting each other for focus.
+        /// </summary>
+        [Setting(Explanation = "Restore minimized WoW windows without stealing focus (SW_SHOWNOACTIVATE).")]
+        [DefaultValue(true)]
+        public bool RestoreMinimizedWithoutFocus
+        {
+            get { return _restoreMinimizedWithoutFocus; }
+            set { _restoreMinimizedWithoutFocus = value; }
         }
 
         private LogLevel _loggingLevel = LogLevel.Normal;

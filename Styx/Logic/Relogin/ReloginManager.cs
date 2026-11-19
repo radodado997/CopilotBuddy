@@ -81,6 +81,30 @@ namespace Styx.Logic.Relogin
     /// </summary>
     public static class ReloginManager
     {
+        /// <summary>
+        /// When true, the monitor strictly tracks its bound <see cref="PinnedProcessId"/> (or newly
+        /// launched replacement clients) and never falls back to <see cref="ReloginClient.FindClientProcessByName"/>.
+        /// Defaults to true when -pid or -instance is supplied on the command line.
+        /// </summary>
+        // ParseProcessId is nonthrowing: a malformed -pid must not crash static initialization.
+        public static bool StrictProcessBinding { get; set; } =
+            ShouldDefaultStrictProcessBinding(CommandLine.ParseProcessId() ?? 0, CommandLine.InstanceName);
+
+        /// <summary>
+        /// Current client process ID pinned to this relogin manager (alias of <see cref="AttachedProcessId"/>).
+        /// </summary>
+        public static int PinnedProcessId => AttachedProcessId;
+
+        internal static bool ShouldDefaultStrictProcessBinding(int pidArg, string? instanceName)
+        {
+            return pidArg > 0 || !string.IsNullOrWhiteSpace(instanceName);
+        }
+
+        internal static bool ShouldAllowNameFallback(bool strictProcessBinding, int trackedPid)
+        {
+            return !strictProcessBinding && trackedPid <= 0;
+        }
+
         #region Configuration snapshot
 
         /// <summary>
@@ -163,6 +187,7 @@ namespace Styx.Logic.Relogin
         {
             public readonly int Generation;
             public readonly Config Config;
+            public readonly bool StrictProcessBinding;
             public int ProcessId, Attempt, HungProcessId, ConfirmedProcessId;
             public long? ProcessStartTimeUtcTicks, HungProcessStartTimeUtcTicks;
             public long ActiveRecoveryId, ConfirmedRecoveryId;
@@ -174,12 +199,13 @@ namespace Styx.Logic.Relogin
             public Func<int, (Mutex? Mutex, string Error)>? ClaimProcess;
             public Func<Mutex, bool>? ReleaseClaim;
 
-            public MonitorRun(int generation, Config config, int processId, long? processStartTimeUtcTicks = null)
+            public MonitorRun(int generation, Config config, int processId, long? processStartTimeUtcTicks = null, bool strictProcessBinding = false)
             {
                 Generation = generation;
                 Config = config;
                 ProcessId = processId;
                 ProcessStartTimeUtcTicks = processStartTimeUtcTicks;
+                StrictProcessBinding = strictProcessBinding;
             }
         }
 
@@ -288,7 +314,7 @@ namespace Styx.Logic.Relogin
                     trackedStartTicks = _processStartTimeUtcTicks;
                 }
 
-                var run = new MonitorRun(generation, Config.FromSettings(settings), trackedPid, trackedStartTicks);
+                var run = new MonitorRun(generation, Config.FromSettings(settings), trackedPid, trackedStartTicks, StrictProcessBinding);
                 lock (_stateSync) Volatile.Write(ref _run, run);
                 if (!run.Config.Enabled)
                 {
@@ -723,7 +749,7 @@ namespace Styx.Logic.Relogin
 
             try
             {
-                if (run.ProcessId <= 0)
+                if (ShouldAllowNameFallback(run.StrictProcessBinding, run.ProcessId))
                 {
                     using Process? initialClient = ReloginClient.FindClientProcessByName();
                     if (initialClient != null && !PublishProcess(run, run.ProcessId, initialClient.Id, ReloginClient.TryGetProcessStartTimeUtcTicks(initialClient)))
@@ -777,10 +803,13 @@ namespace Styx.Logic.Relogin
                                 }
                             }
                         }
-                        else
+                        else if (ShouldAllowNameFallback(run.StrictProcessBinding, run.ProcessId))
                         {
                             client = ReloginClient.FindClientProcessByName();
                         }
+
+                        if (run.StrictProcessBinding && run.ProcessId == 0)
+                            skipRest = true;
 
                         if (!skipRest && client != null && !PublishProcess(run, run.ProcessId, client.Id, ReloginClient.TryGetProcessStartTimeUtcTicks(client)))
                             return;

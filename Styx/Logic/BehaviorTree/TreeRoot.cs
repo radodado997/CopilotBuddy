@@ -27,6 +27,7 @@ namespace Styx.Logic.BehaviorTree
 		private static string _goalText = "";
 		private static readonly object _stateLock = new object();
 		private static WindowPlacement? _lastNonMinimizedPlacement;
+        private static IntPtr _lastPlacementHandle;
 		private static EventHandler<ShutdownRequestedEventArgs>? _onShutdownRequested;
 
 		// HB 6.2.3: Coroutine pre-tick checks (ns47.Class678 → HookCoroutineTask)
@@ -176,15 +177,16 @@ namespace Styx.Logic.BehaviorTree
 			{
 				Logging.Write(Colors.Red, "WoW cannot be minimized while the bot is running — restoring window.");
 
-				if (_lastNonMinimizedPlacement != null)
+				int showCmd = StyxSettings.Instance.RestoreMinimizedWithoutFocus ? 4 : 9; // 4=SW_SHOWNOACTIVATE, 9=SW_RESTORE
+				if (_lastNonMinimizedPlacement != null && _lastPlacementHandle == hWnd)
 				{
 					var restore = _lastNonMinimizedPlacement.Value;
-					restore.showCmd = 9; // SW_RESTORE
+					restore.showCmd = showCmd;
 					SetWindowPlacement(hWnd, ref restore);
 				}
 				else
 				{
-					ShowWindow(hWnd, 9); // SW_RESTORE
+					ShowWindow(hWnd, showCmd);
 				}
 
 				Thread.Sleep(500);
@@ -194,6 +196,7 @@ namespace Styx.Logic.BehaviorTree
 			if (!isMinimized)
 			{
 				_lastNonMinimizedPlacement = placement;
+                _lastPlacementHandle = hWnd;
 			}
 		}
 
