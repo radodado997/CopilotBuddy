@@ -136,6 +136,7 @@ namespace CopilotBuddy.Bots.PartyGrind
             SquadSettings settings = SquadSettings.Instance;
             settings.ApplyCliOverrides();
             _travelProgress = new SquadTravelProgress();
+            SquadPartySyncService.ResetActionLog();
 
             _coordinator.Reset();
             _townRun.Reset();
@@ -726,6 +727,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                     ctx => ShouldPauseMovement(),
                     new Action(ctx =>
                     {
+                        SquadPartySyncService.LogAction("Waiting: squad paused or disconnected");
                         if (StyxWoW.Me?.IsMoving == true)
                             WoWMovement.MoveStop();
                         return RunStatus.Success;
@@ -749,6 +751,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                         if (_townRun.RunTownTick(settings, leader, out bool complete))
                         {
                             _townTasksCompleteLocal = complete;
+                            SquadPartySyncService.LogAction(complete ? "Town tasks complete" : "Performing town tasks");
                             return RunStatus.Success;
                         }
                         _townTasksCompleteLocal = false;
@@ -853,10 +856,12 @@ namespace CopilotBuddy.Bots.PartyGrind
 
                 if (releaseOrdered || waitExpired)
                 {
+                    SquadPartySyncService.LogAction("Releasing spirit");
                     Lua.DoString("RepopMe()");
                 }
                 else
                 {
+                    SquadPartySyncService.LogAction("Waiting for resurrection");
                     if (me.IsMoving) WoWMovement.MoveStop();
                 }
                 return RunStatus.Success;
@@ -877,11 +882,13 @@ namespace CopilotBuddy.Bots.PartyGrind
             if (me.Location.Distance(corpsePoint) > 30f)
             {
                 WoWPoint moveTarget = me.Location.Distance(targetPoint) <= 30f ? corpsePoint : targetPoint;
+                SquadPartySyncService.LogAction("Moving to corpse");
                 Navigator.MoveTo(moveTarget, "CorpseRun: returning to squad corpse");
                 return RunStatus.Success;
             }
 
             // Wait briefly for squadmate ghosts before retrieving corpse if others are also ghosts nearby.
+            SquadPartySyncService.LogAction("Retrieving corpse");
             Lua.DoString("RetrieveCorpse()");
             return RunStatus.Success;
         }
@@ -941,7 +948,10 @@ namespace CopilotBuddy.Bots.PartyGrind
                     if (PositionBackline(settings.HealerStandoffDistance, leader, me))
                         return RunStatus.Success;
                     if (SquadHealBridge.TryHealerAssistDps(settings, leader))
+                    {
+                        SquadPartySyncService.LogAction("Healer assisting attack");
                         return RunStatus.Success;
+                    }
                     return RunStatus.Success;
 
                 case SquadRole.HybridOffHeal:
@@ -972,6 +982,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                 var tankPos = new WoWPoint(leader.X, leader.Y, leader.Z);
                 if (me.Location.Distance(tankPos) > 12f)
                 {
+                    SquadPartySyncService.LogAction("Moving to tank with aggro");
                     Navigator.MoveTo(tankPos, "Bringing aggro to Tank");
                     return RunStatus.Success;
                 }
@@ -1040,6 +1051,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                             focus.Location, focus.Rotation, settings.MeleeFlankRadius, slotIdx, slotCount);
                         if (me.Location.Distance2D(flankPos) > 1.8f && focus.Distance > 4.5f)
                         {
+                            SquadPartySyncService.LogAction("Moving to flank " + focus.Name);
                             Navigator.MoveTo(flankPos, "Flanking " + focus.Name);
                             return RunStatus.Success;
                         }
@@ -1083,6 +1095,7 @@ namespace CopilotBuddy.Bots.PartyGrind
 
             if (me.Location.Distance2D(slotPos) > 3.0f)
             {
+                SquadPartySyncService.LogAction("Moving to backline position");
                 Navigator.MoveTo(slotPos, "Holding backline standoff");
                 return true;
             }
@@ -1110,6 +1123,8 @@ namespace CopilotBuddy.Bots.PartyGrind
             if (behavior == null)
                 return RunStatus.Failure;
 
+            SquadPartySyncService.LogAction((me.Combat ? "Combat routine" : "Pull routine") +
+                (me.CurrentTarget != null ? ": " + me.CurrentTarget.Name : string.Empty));
             _combatTicked = true;
             RunStatus status = TickRoutine(ref _activeCombatRoutine, behavior);
             return status == RunStatus.Failure ? RunStatus.Success : status;
@@ -1130,6 +1145,7 @@ namespace CopilotBuddy.Bots.PartyGrind
 
         private static RunStatus RunRestBehavior()
         {
+            SquadPartySyncService.LogAction("Resting");
             var me = StyxWoW.Me!;
             if (me.IsMoving)
                 WoWMovement.MoveStop();
@@ -1201,6 +1217,7 @@ namespace CopilotBuddy.Bots.PartyGrind
             var me = StyxWoW.Me!;
             if (LootFrame.Instance.IsVisible)
             {
+                SquadPartySyncService.LogAction("Looting");
                 LootFrame.Instance.LootAll();
                 StyxWoW.Sleep(200);
                 LootFrame.Instance.Close();
@@ -1217,6 +1234,7 @@ namespace CopilotBuddy.Bots.PartyGrind
 
             if (lootObj.Location.Distance(me.Location) > 4.5f)
             {
+                SquadPartySyncService.LogAction("Moving to loot " + lootObj.Name);
                 if (Navigator.MoveTo(lootObj.Location, "Looting " + lootObj.Name) == MoveResult.PathGenerationFailed)
                 {
                     LootRetry[lootObj.Guid] = Environment.TickCount64 + 15000;
@@ -1227,6 +1245,7 @@ namespace CopilotBuddy.Bots.PartyGrind
             }
 
             if (me.IsMoving) WoWMovement.MoveStop();
+            SquadPartySyncService.LogAction("Looting " + lootObj.Name);
             lootObj.Interact();
             return RunStatus.Success;
         }
@@ -1257,6 +1276,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                         var backPt = _coordinator.GetBacktrackTarget(me.Location, new WoWPoint(trailing.X, trailing.Y, trailing.Z));
                         if (backPt.HasValue)
                         {
+                            SquadPartySyncService.LogAction("Moving back for " + trailing.CharacterName);
                             Navigator.MoveTo(backPt.Value, "Backtracking for lagging squadmate");
                             return RunStatus.Success;
                         }
@@ -1266,6 +1286,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                 // 2. Soft wait when follower > SoftWaitDistance.
                 if (_coordinator.IsWaitingForFollower)
                 {
+                    SquadPartySyncService.LogAction("Waiting for squadmate");
                     if (me.IsMoving) WoWMovement.MoveStop();
                     return RunStatus.Success;
                 }
@@ -1277,6 +1298,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                     WoWPoint hs = grindArea.CurrentHotSpot.Position;
                     if (me.Location.Distance(hs) > 10f)
                     {
+                        SquadPartySyncService.LogAction("Moving to new zone hotspot");
                         Navigator.MoveTo(hs, "Migrating to new sub-profile hotspot");
                         return RunStatus.Success;
                     }
@@ -1302,6 +1324,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                     WoWPoint hotspot = grindArea.CurrentHotSpot.Position;
                     if (hotspot != WoWPoint.Zero && me.Location.Distance2D(hotspot) > 12f)
                     {
+                        SquadPartySyncService.LogAction("Moving to grind hotspot");
                         Navigator.MoveTo(hotspot, "Roaming hotspot");
                         return RunStatus.Success;
                     }
@@ -1330,6 +1353,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                 WoWPoint followPos = SquadFormationService.ComputeTravelFollowPosition(me.Location, leader, slotIdx, _travelProgress);
                 if (me.Location.Distance(followPos) > 4.0f)
                 {
+                    SquadPartySyncService.LogAction("Following " + leader.LeaderName);
                     Navigator.MoveTo(followPos, "Following " + leader.LeaderName);
                 }
                 else if (me.IsMoving)

@@ -374,15 +374,6 @@ namespace Styx.Logic.Pathing
 			Clear();
 		}
 
-		/// <summary>
-		/// Logs tile loading events from Navigation.dll.
-		/// Mirrors HB 6.2.3 WorldMeshManager.TileLoaded → log pattern.
-		/// </summary>
-		private static void OnTileLoaded(object? sender, TripperNav.TileLoadedEventArgs e)
-		{
-			Logging.Write("Loading {0}_{1}_{2}", e.MapId, e.TileX, e.TileY);
-		}
-
 		private static void OnBotStart(EventArgs args)
 		{
 			Clear();
@@ -396,10 +387,7 @@ namespace Styx.Logic.Pathing
 			{
 				try
 				{
-					if (_navigator.LoadMeshes())
-					{
-						_navigator.TileLoaded += OnTileLoaded;
-					}
+					_navigator.LoadMeshes();
 				}
 				catch (Exception ex) { _ = ex; }
 			}
@@ -433,8 +421,6 @@ namespace Styx.Logic.Pathing
 
 		private static void OnBotStop(EventArgs args)
 		{
-			if (_navigator != null)
-				_navigator.TileLoaded -= OnTileLoaded;
 			Clear();
 		}
 

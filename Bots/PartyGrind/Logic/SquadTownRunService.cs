@@ -47,7 +47,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private bool _stage2TrainDone;
         private bool _wasInTownRun;
         private bool _mailRequested;
-        private int _mailAttempts, _vendorAttempts;
+        private int _mailAttempts;
+        private readonly SquadVendorAttempts _vendorAttempts = new();
         private long _stageStarted;
         private long _blockedAt;
         private long _regroupStarted;
@@ -115,7 +116,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             {
                 BlockedReason = string.Empty;
                 _blockedAt = 0;
-                _mailAttempts = _vendorAttempts = 0;
+                _mailAttempts = 0;
+                _vendorAttempts.Reset();
                 _regroupStarted = 0;
                 _stageStarted = Environment.TickCount64;
             }
@@ -128,7 +130,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             _stage2TrainDone = false;
             _wasInTownRun = false;
             _mailRequested = false;
-            _mailAttempts = _vendorAttempts = 0;
+            _mailAttempts = 0;
+            _vendorAttempts.Reset();
             _stageStarted = Environment.TickCount64;
             _blockedAt = 0;
             _regroupStarted = 0;
@@ -263,28 +266,62 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (leader.TownRallyMapId.HasValue && leader.TownRallyMapId != me.MapId)
                 return Block("Rally is on another map; cross-map town travel is unavailable.", out townTasksComplete);
             var needs = EvaluateLiveLocalNeeds(settings, leader);
+            // When bags are full, mail first if requested, but never abandon an
+            // in-flight vendor confirmation or clear its attempt count.
+            if (!_stage1MailDone) _mailRequested |= needs.NeedsMail;
+            bool mailBeforeVendor = _mailRequested && !_stage1MailDone && needs.NeedsSell;
+            if (ShouldWaitForVendorBeforeMail(mailBeforeVendor, _vendorAttempts, Environment.TickCount64))
+            {
+                townTasksComplete = false;
+                return true;
+            }
+
             // A renewed requirement (e.g. NeedsBuy after bag space frees up) reopens
             // the vendor stage instead of publishing completion with unmet needs.
-            // When bags are full, mail first so a needed purchase can succeed afterward.
-            bool mailBeforeVendor = _mailRequested && !_stage1MailDone && needs.NeedsSell;
             if (_stage1SellRepairBuyDone && !mailBeforeVendor &&
                 (needs.NeedsBuy || needs.NeedsRepair || needs.NeedsSell))
             {
                 _stage1SellRepairBuyDone = false;
-                _vendorAttempts = 0;
+                _vendorAttempts.Reset();
                 _stageStarted = Environment.TickCount64;
                 _regroupStarted = 0;
             }
-            if (!_stage1MailDone) _mailRequested |= needs.NeedsMail;
             if (!(_stage1SellRepairBuyDone && _stage1MailDone && _stage2TrainDone) && Environment.TickCount64 - _stageStarted > 120000)
                 return Block("Town task timed out before completion.", out townTasksComplete);
 
             // Stage 1A: Travel to rally vendor & Sell/Repair/Buy.
             if (!_stage1SellRepairBuyDone && !mailBeforeVendor)
             {
+                int freeSlots = (int)me.FreeNormalBagSlots;
+                var decision = _vendorAttempts.Evaluate(Environment.TickCount64, needs, freeSlots);
+                if (decision == SquadVendorAttemptDecision.Wait)
+                {
+                    townTasksComplete = false;
+                    return true;
+                }
+
                 if (!needs.NeedsSell && !needs.NeedsRepair && !needs.NeedsBuy)
                 {
                     _stage1SellRepairBuyDone = true;
+                }
+                else if (_vendorAttempts.LastInteractionSucceeded && _mailRequested && !_stage1MailDone &&
+                         needs.NeedsSell && !needs.NeedsBuy && !needs.NeedsRepair)
+                {
+                    _stage1SellRepairBuyDone = true;
+                }
+                else if (decision == SquadVendorAttemptDecision.Exhausted)
+                {
+                    if (_mailRequested && !_stage1MailDone && needs.NeedsSell)
+                        _stage1SellRepairBuyDone = true;
+                    else
+                    {
+                        var profile = ProfileManager.CurrentProfile;
+                        Logging.WriteDebug("[PartyGrind Sync {0}] Vendor tasks still pending: slots={1}, required > {2}, sell={3}, repair={4}, food={5}, drink={6}; profile sell grey/white/green/blue/purple={7}/{8}/{9}/{10}/{11}. Check merchant access, protected items and vendor stock.",
+                            me.Name, freeSlots, settings.TriggerTownFreeBagSlots, needs.NeedsSell, needs.NeedsRepair,
+                            needs.NeedsFood, needs.NeedsDrink, profile?.SellGrey, profile?.SellWhite,
+                            profile?.SellGreen, profile?.SellBlue, profile?.SellPurple);
+                        return Block("Vendor tasks remain unmet after five attempts.", out townTasksComplete);
+                    }
                 }
                 else
                 {
@@ -299,20 +336,11 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     }
 
                     if (me.IsMoving) WoWMovement.MoveStop();
-                    if (PerformVendorInteraction(vendor, needs))
-                    {
-                        var remaining = EvaluateLiveLocalNeeds(settings, leader);
-                        _stage1SellRepairBuyDone = !remaining.NeedsBuy && !remaining.NeedsRepair &&
-                            (!remaining.NeedsSell || (_mailRequested && !_stage1MailDone));
-                    }
-                    if (++_vendorAttempts >= 5 && !_stage1SellRepairBuyDone)
-                    {
-                        var remaining = EvaluateLiveLocalNeeds(settings, leader);
-                        if (_mailRequested && !_stage1MailDone && remaining.NeedsSell)
-                            _stage1SellRepairBuyDone = true;
-                        else
-                            return Block("Vendor tasks remain unmet after five attempts.", out townTasksComplete);
-                    }
+                    bool interacted = PerformVendorInteraction(vendor, needs, out string outcome);
+                    _vendorAttempts.Record(Environment.TickCount64, needs, freeSlots, interacted);
+                    Logging.WriteDebug("[PartyGrind Sync {0}] Vendor {1} ({2}): {3}; attempt={4}, slots={5}, sell={6}, repair={7}, food={8}, drink={9}.",
+                        me.Name, vendor.Name, vendor.Entry, outcome, _vendorAttempts.Count, freeSlots,
+                        needs.NeedsSell, needs.NeedsRepair, needs.NeedsFood, needs.NeedsDrink);
                     townTasksComplete = false;
                     return true;
                 }
@@ -378,7 +406,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     // Mail freed space or left other needs pending: retry the vendor stage
                     // with a fresh bounded attempt window.
                     _stage1SellRepairBuyDone = false;
-                    _vendorAttempts = 0;
+                    _vendorAttempts.Reset();
                     _stageStarted = Environment.TickCount64;
                     _regroupStarted = 0;
                     townTasksComplete = false;
@@ -444,6 +472,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             return true;
         }
 
+        internal static bool ShouldWaitForVendorBeforeMail(bool mailBeforeVendor, SquadVendorAttempts attempts, long now)
+            => mailBeforeVendor && attempts.IsConfirmationPending(now);
+
         private static Vendor? ResolveSellOrRepairVendor(TownNeedsEvaluation needs)
         {
             var vm = ProfileManager.CurrentProfile?.VendorManager;
@@ -455,8 +486,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             return vm.GetClosestVendor(Vendor.VendorType.Sell) ?? vm.GetClosestVendor(Vendor.VendorType.Repair);
         }
 
-        private static bool PerformVendorInteraction(Vendor? vendor, TownNeedsEvaluation needs)
+        private static bool PerformVendorInteraction(Vendor? vendor, TownNeedsEvaluation needs, out string outcome)
         {
+            outcome = "player unavailable";
             var me = StyxWoW.Me;
             if (me == null) return false;
 
@@ -469,7 +501,10 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 .FirstOrDefault();
 
             if (npc == null)
+            {
+                outcome = "configured merchant not found";
                 return false;
+            }
 
             if (!MerchantFrame.Instance.IsVisible)
             {
@@ -489,13 +524,18 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 }
             }
 
-            if (!MerchantFrame.Instance.IsVisible) return false;
+            if (!MerchantFrame.Instance.IsVisible)
+            {
+                outcome = "merchant window did not open";
+                return false;
+            }
             var openMerchant = MerchantFrame.Instance.Merchant;
             if (openMerchant != null && openMerchant.IsValid && openMerchant.Entry != npc.Entry)
             {
                 // The frame belongs to a different merchant — do not buy or blacklist
                 // anything against the selected vendor.
                 MerchantFrame.Instance.Close();
+                outcome = "merchant window belongs to another NPC";
                 return false;
             }
             if (MerchantFrame.Instance.IsVisible)
@@ -520,6 +560,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     MerchantFrame.Instance.Close();
             }
 
+            outcome = "vendor actions submitted; awaiting update";
             return true;
         }
 
@@ -645,4 +686,52 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             return false;
         }
     }
+    internal enum SquadVendorAttemptDecision { Wait, Try, Exhausted }
+
+    /// <summary>Spaces attempts and allows server-side bag updates before declaring failure.</summary>
+    internal sealed class SquadVendorAttempts
+    {
+        private const long ConfirmationDelayMs = 1500;
+        private const int MaxAttempts = 5;
+        private long _nextAttempt;
+        private TownNeedsEvaluation _before;
+        private int _slotsBefore;
+        public int Count { get; private set; }
+        public bool LastInteractionSucceeded { get; private set; }
+
+        public void Reset()
+        {
+            Count = 0;
+            _nextAttempt = 0;
+            LastInteractionSucceeded = false;
+        }
+
+        internal bool IsConfirmationPending(long now) => Count > 0 && now < _nextAttempt;
+
+        public SquadVendorAttemptDecision Evaluate(long now, TownNeedsEvaluation needs, int freeSlots)
+        {
+            if (IsConfirmationPending(now))
+                return SquadVendorAttemptDecision.Wait;
+
+            if (Count > 0 && LastInteractionSucceeded &&
+                (freeSlots > _slotsBefore ||
+                 (_before.NeedsSell && !needs.NeedsSell) ||
+                 (_before.NeedsRepair && !needs.NeedsRepair) ||
+                 (_before.NeedsFood && !needs.NeedsFood) ||
+                 (_before.NeedsDrink && !needs.NeedsDrink)))
+                Count = 0; // Partial progress earns a fresh set of attempts.
+
+            return Count >= MaxAttempts ? SquadVendorAttemptDecision.Exhausted : SquadVendorAttemptDecision.Try;
+        }
+
+        public void Record(long now, TownNeedsEvaluation needs, int freeSlots, bool succeeded)
+        {
+            Count++;
+            _before = needs;
+            _slotsBefore = freeSlots;
+            LastInteractionSucceeded = succeeded;
+            _nextAttempt = now + ConfirmationDelayMs;
+        }
+    }
+
 }

@@ -19,7 +19,7 @@
         GlowBrush="{DynamicResource MahApps.Brushes.Accent}"
         Closing="Window_Closing"
         Loaded="Window_Loaded">
-    <Grid x:Name="LayoutRoot">
+    <Grid>
         <!-- Bot Selector ComboBox -->
         <ComboBox x:Name="cmbBotSelector"
                   IsEditable="False"

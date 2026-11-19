@@ -166,11 +166,17 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                             // Running keeps the composite active and handled this tick;
                             // a cast also wins. Only Failure falls through to explicit healing.
                             if (status == RunStatus.Running || me.IsCasting || me.ChanneledCastingSpellId != 0)
+                            {
+                                SquadPartySyncService.LogAction("Running heal routine");
                                 return true;
+                            }
                             healBehavior.Stop(null);
                             _activeHealBehavior = null;
                             if (status == RunStatus.Success)
+                            {
+                                SquadPartySyncService.LogAction("Running heal routine");
                                 return true;
+                            }
                         }
                         catch (Exception ex)
                         {
@@ -203,7 +209,11 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
                 if (SpellManager.CanCast(spellName, targetUnit, true, false))
                 {
-                    if (SpellManager.Cast(spellName, targetUnit)) return true;
+                    if (SpellManager.Cast(spellName, targetUnit))
+                    {
+                        SquadPartySyncService.LogAction("Healing " + targetUnit.Name + " with " + spellName);
+                        return true;
+                    }
                 }
 
             }
