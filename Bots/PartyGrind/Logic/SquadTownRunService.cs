@@ -47,6 +47,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private bool _stage2TrainDone;
         private bool _wasInTownRun;
         private bool _mailRequested;
+        private bool _sellRepairVisitDone;
+        private readonly Dictionary<int, (bool Food, bool Drink)> _vendorStock = new();
         private int _mailAttempts;
         private readonly SquadVendorAttempts _vendorAttempts = new();
         private long _stageStarted;
@@ -85,8 +87,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             bool mailboxAvailable = ProfileManager.CurrentProfile?.MailboxManager?.GetClosestMailbox() != null ||
                 string.IsNullOrWhiteSpace(CharacterSettings.Instance.MailRecipient) ||
                 !Styx.Logic.Inventory.InventoryManager.GetItemsToMail().Any();
-            bool vendorAvailable = !needs.NeedsSell && !needs.NeedsRepair && !needs.NeedsBuy ||
-                ResolveSellOrRepairVendor(needs) != null;
+            bool vendorAvailable = _sellRepairVisitDone && !needs.NeedsSell && !needs.NeedsRepair && needs.NeedsBuy
+                ? ResolveBuyVendor(needs) != null
+                : ResolveSellOrRepairVendor(GetVendorWorkNeeds(needs)) != null;
             bool trainerAvailable = !needs.NeedsTrain || ResolveClassTrainerLocation(me, out _, out _).HasValue;
             WoWPoint rally = leader != null && (leader.TownRallyX != 0f || leader.TownRallyY != 0f)
                 ? new WoWPoint(leader.TownRallyX, leader.TownRallyY, leader.TownRallyZ)
@@ -101,10 +104,11 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 "Class trainer not found; training remains pending." => trainerAvailable,
                 "Rally is on another map; cross-map town travel is unavailable." =>
                     leader != null && (!leader.TownRallyMapId.HasValue || leader.TownRallyMapId == me.MapId),
-                "Town task timed out before completion." => !needs.Any ||
+                "Town task timed out before completion." =>
+                    (_sellRepairVisitDone && !needs.Any) ||
                     (retryAllowed && vendorAvailable && mailboxAvailable && trainerAvailable),
                 "Vendor tasks remain unmet after five attempts." =>
-                    (!needs.NeedsSell && !needs.NeedsRepair && !needs.NeedsBuy) ||
+                    (_sellRepairVisitDone && !needs.NeedsSell && !needs.NeedsRepair && !needs.NeedsBuy) ||
                     (retryAllowed && vendorAvailable),
                 "Mailbox failed to open or finish mailing after three attempts." => mailboxAvailable &&
                     (!Styx.Logic.Inventory.InventoryManager.GetItemsToMail().Any() || retryAllowed),
@@ -130,6 +134,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             _stage2TrainDone = false;
             _wasInTownRun = false;
             _mailRequested = false;
+            _sellRepairVisitDone = false;
+            _vendorStock.Clear();
             _mailAttempts = 0;
             _vendorAttempts.Reset();
             _stageStarted = Environment.TickCount64;
@@ -282,6 +288,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 (needs.NeedsBuy || needs.NeedsRepair || needs.NeedsSell))
             {
                 _stage1SellRepairBuyDone = false;
+                _sellRepairVisitDone = false;
                 _vendorAttempts.Reset();
                 _stageStarted = Environment.TickCount64;
                 _regroupStarted = 0;
@@ -293,6 +300,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (!_stage1SellRepairBuyDone && !mailBeforeVendor)
             {
                 int freeSlots = (int)me.FreeNormalBagSlots;
+                var vendorNeeds = GetVendorWorkNeeds(needs);
                 var decision = _vendorAttempts.Evaluate(Environment.TickCount64, needs, freeSlots);
                 if (decision == SquadVendorAttemptDecision.Wait)
                 {
@@ -300,44 +308,48 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     return true;
                 }
 
-                if (!needs.NeedsSell && !needs.NeedsRepair && !needs.NeedsBuy)
-                {
-                    _stage1SellRepairBuyDone = true;
-                }
-                else if (_vendorAttempts.LastInteractionSucceeded && _mailRequested && !_stage1MailDone &&
-                         needs.NeedsSell && !needs.NeedsBuy && !needs.NeedsRepair)
+                if (IsVendorWorkComplete(_sellRepairVisitDone, needs))
                 {
                     _stage1SellRepairBuyDone = true;
                 }
                 else if (decision == SquadVendorAttemptDecision.Exhausted)
                 {
-                    if (_mailRequested && !_stage1MailDone && needs.NeedsSell)
-                        _stage1SellRepairBuyDone = true;
-                    else
-                    {
-                        var profile = ProfileManager.CurrentProfile;
-                        Logging.WriteDebug("[PartyGrind Sync {0}] Vendor tasks still pending: slots={1}, required > {2}, sell={3}, repair={4}, food={5}, drink={6}; profile sell grey/white/green/blue/purple={7}/{8}/{9}/{10}/{11}. Check merchant access, protected items and vendor stock.",
-                            me.Name, freeSlots, settings.TriggerTownFreeBagSlots, needs.NeedsSell, needs.NeedsRepair,
-                            needs.NeedsFood, needs.NeedsDrink, profile?.SellGrey, profile?.SellWhite,
-                            profile?.SellGreen, profile?.SellBlue, profile?.SellPurple);
-                        return Block("Vendor tasks remain unmet after five attempts.", out townTasksComplete);
-                    }
+                    var profile = ProfileManager.CurrentProfile;
+                    Logging.WriteDebug("[PartyGrind Sync {0}] Vendor tasks still pending: slots={1}, required > {2}, sell={3}, repair={4}, food={5}, drink={6}; profile sell grey/white/green/blue/purple={7}/{8}/{9}/{10}/{11}. Check merchant access, protected items and vendor stock.",
+                        me.Name, freeSlots, settings.TriggerTownFreeBagSlots, needs.NeedsSell, needs.NeedsRepair,
+                        needs.NeedsFood, needs.NeedsDrink, profile?.SellGrey, profile?.SellWhite,
+                        profile?.SellGreen, profile?.SellBlue, profile?.SellPurple);
+                    return Block("Vendor tasks remain unmet after five attempts.", out townTasksComplete);
                 }
                 else
                 {
-                    Vendor? vendor = ResolveSellOrRepairVendor(needs);
+                    bool sellAndRepair = !_sellRepairVisitDone || needs.NeedsSell || needs.NeedsRepair;
+                    Vendor? vendor = sellAndRepair
+                        ? ResolveSellOrRepairVendor(vendorNeeds)
+                        : ResolveBuyVendor(needs);
                     if (vendor == null) return Block("No eligible vendor found.", out townTasksComplete);
                     WoWPoint targetLoc = vendor.Location;
                     if (me.Location.Distance(targetLoc) > 5.0f)
                     {
-                        Navigator.MoveTo(targetLoc, "TownRun: moving to vendor");
+                        Navigator.MoveTo(targetLoc, sellAndRepair
+                            ? "TownRun: moving to vendor"
+                            : "TownRun: moving to consumable vendor");
                         townTasksComplete = false;
                         return true;
                     }
 
                     if (me.IsMoving) WoWMovement.MoveStop();
-                    bool interacted = PerformVendorInteraction(vendor, needs, out string outcome);
+                    bool interacted = PerformVendorInteraction(vendor, vendorNeeds, sellAndRepair, out string outcome);
                     _vendorAttempts.Record(Environment.TickCount64, needs, freeSlots, interacted);
+                    if (interacted)
+                    {
+                        if (sellAndRepair)
+                        {
+                            _sellRepairVisitDone = true;
+                            if (!needs.NeedsSell && !needs.NeedsRepair)
+                                _vendorAttempts.ResetAttemptBudget();
+                        }
+                    }
                     Logging.WriteDebug("[PartyGrind Sync {0}] Vendor {1} ({2}): {3}; attempt={4}, slots={5}, sell={6}, repair={7}, food={8}, drink={9}.",
                         me.Name, vendor.Name, vendor.Entry, outcome, _vendorAttempts.Count, freeSlots,
                         needs.NeedsSell, needs.NeedsRepair, needs.NeedsFood, needs.NeedsDrink);
@@ -406,6 +418,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     // Mail freed space or left other needs pending: retry the vendor stage
                     // with a fresh bounded attempt window.
                     _stage1SellRepairBuyDone = false;
+                    _sellRepairVisitDone = false;
                     _vendorAttempts.Reset();
                     _stageStarted = Environment.TickCount64;
                     _regroupStarted = 0;
@@ -467,7 +480,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             }
 
             var remainingNeeds = EvaluateLiveLocalNeeds(settings, leader);
-            townTasksComplete = !remainingNeeds.NeedsSell && !remainingNeeds.NeedsRepair &&
+            townTasksComplete = _stage1SellRepairBuyDone && !remainingNeeds.NeedsSell && !remainingNeeds.NeedsRepair &&
                 !remainingNeeds.NeedsBuy && !remainingNeeds.NeedsTrain && !remainingNeeds.NeedsMail;
             return true;
         }
@@ -475,18 +488,88 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         internal static bool ShouldWaitForVendorBeforeMail(bool mailBeforeVendor, SquadVendorAttempts attempts, long now)
             => mailBeforeVendor && attempts.IsConfirmationPending(now);
 
+        internal static bool IsVendorWorkComplete(bool sellRepairVisitDone, TownNeedsEvaluation needs)
+            => sellRepairVisitDone && !needs.NeedsSell && !needs.NeedsRepair && !needs.NeedsBuy;
+
+        internal static TownNeedsEvaluation GetVendorWorkNeeds(TownNeedsEvaluation needs)
+        {
+            return new TownNeedsEvaluation
+            {
+                NeedsSell = true,
+                NeedsRepair = true,
+                NeedsBuy = needs.NeedsBuy,
+                NeedsFood = needs.NeedsFood,
+                NeedsDrink = needs.NeedsDrink
+            };
+        }
+
         private static Vendor? ResolveSellOrRepairVendor(TownNeedsEvaluation needs)
         {
             var vm = ProfileManager.CurrentProfile?.VendorManager;
             if (vm == null) return null;
             if (needs.NeedsRepair)
-                return vm.GetClosestVendor(Vendor.VendorType.Repair) ?? vm.GetClosestVendor(Vendor.VendorType.Sell);
+                return vm.GetClosestVendor(Vendor.VendorType.Repair);
             if (needs.NeedsBuy)
                 return vm.GetClosestVendor(Vendor.VendorType.Food) ?? vm.GetClosestVendor(Vendor.VendorType.Restock) ?? vm.GetClosestVendor(Vendor.VendorType.Sell);
             return vm.GetClosestVendor(Vendor.VendorType.Sell) ?? vm.GetClosestVendor(Vendor.VendorType.Repair);
         }
 
-        private static bool PerformVendorInteraction(Vendor? vendor, TownNeedsEvaluation needs, out string outcome)
+        internal static bool CanSupplyNeededConsumables(TownNeedsEvaluation needs, bool hasFood, bool hasDrink)
+            => (!needs.NeedsFood && !needs.NeedsDrink) ||
+                (needs.NeedsFood && hasFood) || (needs.NeedsDrink && hasDrink);
+
+        private Vendor? ResolveBuyVendor(TownNeedsEvaluation needs)
+        {
+            var vm = ProfileManager.CurrentProfile?.VendorManager;
+            if (vm == null) return null;
+            var excluded = _vendorStock
+                .Where(v => !CanSupplyNeededConsumables(needs, v.Value.Food, v.Value.Drink))
+                .Select(v => v.Key).ToHashSet();
+            return vm.GetClosestVendor(Vendor.VendorType.Food, excluded)
+                ?? vm.GetClosestVendor(Vendor.VendorType.Restock, excluded)
+                ?? vm.GetClosestVendor(Vendor.VendorType.Sell, excluded)
+                ?? vm.GetClosestVendor(Vendor.VendorType.Repair, excluded);
+        }
+
+        internal static bool IsVendorCatalogueComplete(int loadedCount, int observedCount, bool allItemInfoLoaded)
+            => loadedCount >= 0 && loadedCount == observedCount && allItemInfoLoaded;
+
+        private static void ObserveMerchantCatalogue()
+        {
+            Lua.DoString(@"
+                if not CopilotBuddyTownMerchantCatalogue then
+                    local f = CreateFrame('Frame')
+                    CopilotBuddyTownMerchantCatalogue = f
+                    f:RegisterEvent('MERCHANT_SHOW')
+                    f:RegisterEvent('MERCHANT_UPDATE')
+                    f:RegisterEvent('MERCHANT_CLOSED')
+                    f:SetScript('OnEvent', function(self, event)
+                        if event == 'MERCHANT_CLOSED' then
+                            self.guid = nil
+                            self.count = nil
+                        else
+                            self.guid = UnitGUID('npc')
+                            self.count = GetMerchantNumItems()
+                        end
+                    end)
+                end");
+        }
+
+        private static int GetLoadedMerchantCatalogueCount()
+            => Lua.GetReturnVal<int>(@"
+                local f = CopilotBuddyTownMerchantCatalogue
+                if f and f.guid and f.guid == UnitGUID('npc') and
+                    MerchantFrame and MerchantFrame:IsVisible() and
+                    f.count == GetMerchantNumItems() then
+                    return f.count
+                end
+                return -1", 0);
+
+        private bool PerformVendorInteraction(
+            Vendor? vendor,
+            TownNeedsEvaluation vendorNeeds,
+            bool sellAndRepair,
+            out string outcome)
         {
             outcome = "player unavailable";
             var me = StyxWoW.Me;
@@ -506,6 +589,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 return false;
             }
 
+            ObserveMerchantCatalogue();
             if (!MerchantFrame.Instance.IsVisible)
             {
                 npc.Interact();
@@ -540,20 +624,36 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             }
             if (MerchantFrame.Instance.IsVisible)
             {
-                if (needs.NeedsSell)
-                    Vendors.SellAllItems();
-                if (needs.NeedsRepair)
-                    Vendors.RepairAllItems();
-                if (needs.NeedsBuy)
+                if (sellAndRepair)
                 {
+                    Vendors.SellAllItems();
+                    Vendors.RepairAllItems();
+                }
+                if (!sellAndRepair && vendorNeeds.NeedsBuy)
+                {
+                    Vendors.WaitForMerchantItemCache();
+                    bool hasFood = MerchantFrame.Instance.GetBestFoodFromVendor() != -1;
+                    bool hasDrink = MerchantFrame.Instance.GetBestDrinkFromVendor() != -1;
+                    var catalogue = MerchantFrame.Instance.GetAllMerchantItems();
+                    int loadedCount = GetLoadedMerchantCatalogueCount();
+                    if (vendor != null && openMerchant != null && openMerchant.IsValid &&
+                        openMerchant.Entry == npc.Entry && IsVendorCatalogueComplete(
+                            loadedCount, catalogue.Length, catalogue.All(i => i.ItemInfo != null)))
+                        _vendorStock[vendor.Entry] = (hasFood, hasDrink);
+                    if (!CanSupplyNeededConsumables(vendorNeeds, hasFood, hasDrink))
+                    {
+                        MerchantFrame.Instance.Close();
+                        outcome = "merchant has no usable consumable matching remaining needs";
+                        return false;
+                    }
                     if (vendor != null && (vendor.Type == Vendor.VendorType.Food || vendor.Type == Vendor.VendorType.Restock))
                     {
                         BotPoi.Current = new BotPoi(vendor, PoiType.Buy);
-                        Vendors.BuyItems(needs.NeedsFood, needs.NeedsDrink);
+                        Vendors.BuyItems(vendorNeeds.NeedsFood, vendorNeeds.NeedsDrink);
                     }
                     else
                     {
-                        BuyFoodAndDrinkDirectly(needs.NeedsFood, needs.NeedsDrink);
+                        BuyFoodAndDrinkDirectly(vendorNeeds.NeedsFood, vendorNeeds.NeedsDrink);
                     }
                 }
                 if (MerchantFrame.Instance.IsVisible)
@@ -706,7 +806,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             LastInteractionSucceeded = false;
         }
 
-        internal bool IsConfirmationPending(long now) => Count > 0 && now < _nextAttempt;
+        internal void ResetAttemptBudget() => Count = 0;
+
+        internal bool IsConfirmationPending(long now) => now < _nextAttempt;
 
         public SquadVendorAttemptDecision Evaluate(long now, TownNeedsEvaluation needs, int freeSlots)
         {

@@ -104,6 +104,8 @@ namespace Styx.PartyGrind
 
             string team = settings?.TeamId ?? "Squad";
             string phaseText = leader?.Phase.ToString() ?? "Standalone";
+            if (leader?.Phase == SquadPhase.TownRun && !string.IsNullOrEmpty(leader.TownRunRequestedByName))
+                phaseText += " (" + leader.TownRunRequestedByName + ")";
             string ipcStatus = settings?.IsCoordinator == true ? "Host" : (SquadContext.IsIpcConnected ? "IPC OK" : "Reconnecting");
             _headerText.Text = $"PartyGrind HUD  |  {team} ({ipcStatus})  |  Faza: {phaseText}";
 

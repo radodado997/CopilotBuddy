@@ -64,6 +64,28 @@ namespace CopilotBuddy.PartyGrind.Tests
         }
 
         [Fact]
+        public void FreshBuyBudgetPreservesMandatoryVisitConfirmationDelay()
+        {
+            var retry = new SquadVendorAttempts();
+            var needs = new TownNeedsEvaluation { NeedsBuy = true, NeedsDrink = true };
+            for (int i = 0; i < 4; i++)
+                retry.Record(i * 1500L, needs, 10, false);
+            retry.Record(6000, needs, 10, true);
+            retry.ResetAttemptBudget();
+
+            Assert.Equal(0, retry.Count);
+            Assert.True(retry.IsConfirmationPending(7499));
+            Assert.Equal(SquadVendorAttemptDecision.Wait, retry.Evaluate(7499, needs, 10));
+            for (int i = 0; i < 5; i++)
+            {
+                long now = 7500 + i * 1500L;
+                Assert.Equal(SquadVendorAttemptDecision.Try, retry.Evaluate(now, needs, 10));
+                retry.Record(now, needs, 10, false);
+            }
+            Assert.Equal(SquadVendorAttemptDecision.Exhausted, retry.Evaluate(15000, needs, 10));
+        }
+
+        [Fact]
         public void CompletedRepairOrConsumableNeedIsRecognizedAsProgress()
         {
             var retry = new SquadVendorAttempts();

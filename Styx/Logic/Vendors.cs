@@ -232,7 +232,7 @@ namespace Styx.Logic
 			ForceSell = false;
 		}
 
-		private static void WaitForMerchantItemCache()
+		internal static void WaitForMerchantItemCache()
 		{
 			List<uint> unknown = _merchantFrame.GetAllMerchantItems().Where(i => i.ItemInfo == null).Select(i => i.ItemId).Distinct().ToList();
 			if (unknown.Count == 0)

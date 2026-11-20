@@ -103,6 +103,22 @@ namespace Styx.PartyGrind.IPC
         public int ProtocolVersion { get; set; } = 1;
     }
 
+    /// <summary>
+    /// Normalized "idę do miasta" announcement. A member raises it through
+    /// <see cref="SquadMemberState.TownRunRequested"/>; the coordinator consumes it and
+    /// rebroadcasts it in <see cref="SquadLeaderState.TownRunRequestedByName"/> so every
+    /// squadmate receives the signal and can do its own sell/repair/buy/mail/train.
+    /// </summary>
+    public class SquadTownRunRequest
+    {
+        public string CharacterName { get; set; } = string.Empty;
+        public ulong Guid { get; set; }
+        public SquadRole Role { get; set; }
+        /// <summary>Comma-separated reasons: Sell, Repair, Buy, Train, Mail.</summary>
+        public string Reason { get; set; } = string.Empty;
+        public long RequestedUtcMs { get; set; }
+    }
+
     public class SquadBreadcrumb
     {
         public uint MapId { get; set; }
@@ -209,6 +225,11 @@ namespace Styx.PartyGrind.IPC
         public bool AllTownTasksComplete { get; set; }
         /// <summary>True while combat/death recovery temporarily takes priority over an active town run.</summary>
         public bool TownRunInterrupted { get; set; }
+        /// <summary>Last town-run announcement rebroadcast to the squad (empty when none).</summary>
+        public string TownRunRequestedByName { get; set; } = string.Empty;
+        public string TownRunRequestReason { get; set; } = string.Empty;
+        public long TownRunRequestedUtcMs { get; set; }
+        public Dictionary<string, long> TownRunRequestAcknowledgements { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 
         // Wipe / Corpse Run
         public float SquadCorpseRallyX { get; set; }
@@ -292,6 +313,13 @@ namespace Styx.PartyGrind.IPC
         public bool TownTasksComplete { get; set; }
         public int FreeBagSlots { get; set; }
         public float LowestDurabilityPct { get; set; }
+
+        // TownRun announcement (member -> coordinator). Carried on the periodic
+        // MemberState message so it cannot be dropped by the bounded outbound queue;
+        // the coordinator turns it into a synchronized TownRun and rebroadcasts it.
+        public bool TownRunRequested { get; set; }
+        public string TownRunRequestReason { get; set; } = string.Empty;
+        public long TownRunRequestedUtcMs { get; set; }
 
         // Profile Hash & SubProfile Verification
         public string LoadedProfileHash { get; set; } = string.Empty;
