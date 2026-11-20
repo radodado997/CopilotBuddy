@@ -599,7 +599,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     Vendors.WaitForMerchantItemCache();
                     bool hasFood = MerchantFrame.Instance.GetBestFoodFromVendor() != -1;
                     bool hasDrink = MerchantFrame.Instance.GetBestDrinkFromVendor() != -1;
-                    if (vendor != null && MerchantFrame.Instance.GetAllMerchantItems().All(i => i.ItemInfo != null))
+                    var catalogue = MerchantFrame.Instance.GetAllMerchantItems();
+                    if (vendor != null && catalogue.Length > 0 && catalogue.All(i => i.ItemInfo != null))
                         _vendorStock[vendor.Entry] = (hasFood, hasDrink);
                     if (!CanSupplyNeededConsumables(vendorNeeds, hasFood, hasDrink))
                     {

@@ -229,6 +229,7 @@ namespace Styx.PartyGrind.IPC
         public string TownRunRequestedByName { get; set; } = string.Empty;
         public string TownRunRequestReason { get; set; } = string.Empty;
         public long TownRunRequestedUtcMs { get; set; }
+        public Dictionary<string, long> TownRunRequestAcknowledgements { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 
         // Wipe / Corpse Run
         public float SquadCorpseRallyX { get; set; }

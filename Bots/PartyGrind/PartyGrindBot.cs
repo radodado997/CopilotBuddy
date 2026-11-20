@@ -62,7 +62,7 @@ namespace CopilotBuddy.Bots.PartyGrind
         private bool _wasInCombat;
         private bool _townTasksCompleteLocal;
         private bool _townRunRequestPending;
-        private bool _townRunRequestEchoed;
+        private long _townRunRequestAcknowledgedUtcMs;
         private string _townRunRequestReason = string.Empty;
         private long _townRunRequestUtcMs;
         private long _deathStartedUtcMs;
@@ -153,7 +153,7 @@ namespace CopilotBuddy.Bots.PartyGrind
             _wasInCombat = false;
             _townTasksCompleteLocal = false;
             _townRunRequestPending = false;
-            _townRunRequestEchoed = false;
+            _townRunRequestAcknowledgedUtcMs = 0;
             _townRunRequestReason = string.Empty;
             _townRunRequestUtcMs = 0;
             _deathStartedUtcMs = 0;
@@ -272,7 +272,7 @@ namespace CopilotBuddy.Bots.PartyGrind
             // An explicit announcement is a deliberate group action, so it works even when
             // the automatic SyncTownRuns trigger is disabled.
             _townRunRequestPending = true;
-            _townRunRequestEchoed = false;
+            _townRunRequestAcknowledgedUtcMs = 0;
             _townRunRequestReason = string.IsNullOrWhiteSpace(reason) ? "Manual" : reason.Trim();
             // A repeated manual request must produce a fresh, strictly increasing
             // timestamp so the coordinator does not treat it as the previous one.
@@ -709,12 +709,22 @@ namespace CopilotBuddy.Bots.PartyGrind
             // Raise the "idę do miasta" announcement on the periodic telemetry. It is
             // repeated until the local needs are resolved, so a lost IPC frame can never
             // swallow the signal; the coordinator acknowledges it by timestamp.
+            if (_townRunRequestPending && leader?.TownRunRequestAcknowledgements != null)
+            {
+                foreach (var acknowledgement in leader.TownRunRequestAcknowledgements)
+                {
+                    if (string.Equals(acknowledgement.Key, me.Name, StringComparison.OrdinalIgnoreCase))
+                        _townRunRequestAcknowledgedUtcMs = Math.Max(
+                            _townRunRequestAcknowledgedUtcMs, acknowledgement.Value);
+                }
+            }
+
             if (settings.SyncTownRuns && townNeeds.Any)
             {
                 if (!_townRunRequestPending)
                 {
                     _townRunRequestPending = true;
-                    _townRunRequestEchoed = false;
+                    _townRunRequestAcknowledgedUtcMs = 0;
                     _townRunRequestReason = BuildTownRequestReason(townNeeds);
                     _townRunRequestUtcMs = Math.Max(now, _townRunRequestUtcMs + 1);
                     Logging.Write("[PartyGrind Sync {0}] Announcing town run: {1}", me.Name, _townRunRequestReason);
@@ -722,16 +732,13 @@ namespace CopilotBuddy.Bots.PartyGrind
             }
             else if (_townRunRequestPending)
             {
-                // The coordinator echoes the announcement in LeaderState. Remember that it
-                // saw the request, then drop it once the synchronized run has finished; the
-                // echo itself is cleared from LeaderState on completion, so it cannot be
-                // used as the "finished" marker.
-                if (leader != null && leader.TownRunRequestedUtcMs >= _townRunRequestUtcMs)
-                    _townRunRequestEchoed = true;
-                if (_townRunRequestEchoed && (leader == null || leader.Phase != SquadPhase.TownRun))
+                if (_townRunRequestUtcMs > 0 &&
+                    _townRunRequestAcknowledgedUtcMs >= _townRunRequestUtcMs &&
+                    leader != null && leader.AllTownTasksComplete &&
+                    leader.Phase != SquadPhase.TownRun)
                 {
                     _townRunRequestPending = false;
-                    _townRunRequestEchoed = false;
+                    _townRunRequestAcknowledgedUtcMs = 0;
                 }
             }
 

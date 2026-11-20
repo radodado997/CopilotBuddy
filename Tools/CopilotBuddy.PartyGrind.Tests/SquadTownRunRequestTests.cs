@@ -97,6 +97,7 @@ namespace CopilotBuddy.PartyGrind.Tests
             Assert.Equal(SquadPhase.Grinding, done.Phase);
             Assert.True(done.AllTownTasksComplete);
             Assert.Empty(done.TownRunRequestedByName);
+            Assert.Equal(request.RequestedUtcMs, done.TownRunRequestAcknowledgements["HealB"]);
 
             // The same announcement (same timestamp) is already acknowledged.
             t += 1000;
@@ -262,6 +263,9 @@ namespace CopilotBuddy.PartyGrind.Tests
                 MakeProfile(), 0, 0, 0, 0f, t, localTownRunRequest: local);
             Assert.Equal(SquadPhase.TownRun, updated.Phase);
             Assert.Equal("DpsC", updated.TownRunRequestedByName);
+            Assert.Equal(first.RequestedUtcMs, updated.TownRunRequestAcknowledgements["HealB"]);
+            Assert.Equal(second.RequestedUtcMs, updated.TownRunRequestAcknowledgements["DpsC"]);
+            Assert.Equal(local.RequestedUtcMs, updated.TownRunRequestAcknowledgements["TankA"]);
 
             // Both members finish: the run completes and neither announcement replays.
             t += 1000;
@@ -274,6 +278,8 @@ namespace CopilotBuddy.PartyGrind.Tests
                 MakeProfile(), 0, 0, 0, 0f, t, localTownRunRequest: local);
             Assert.Equal(SquadPhase.Grinding, done.Phase);
             Assert.Empty(done.TownRunRequestedByName);
+            Assert.Equal(first.RequestedUtcMs, done.TownRunRequestAcknowledgements["HealB"]);
+            Assert.Equal(second.RequestedUtcMs, done.TownRunRequestAcknowledgements["DpsC"]);
 
             t += 1000;
             var after = coord.EvaluateTick(settings, MakeLeader(townComplete: true),
@@ -284,6 +290,29 @@ namespace CopilotBuddy.PartyGrind.Tests
                 },
                 MakeProfile(), 0, 0, 0, 0f, t, localTownRunRequest: local);
             Assert.Equal(SquadPhase.Grinding, after.Phase);
+        }
+
+        [Fact]
+        public void Acknowledgements_SurviveSerializationWithoutDisplayedRequest()
+        {
+            var leader = new SquadLeaderState
+            {
+                Phase = SquadPhase.Grinding,
+                AllTownTasksComplete = true
+            };
+            leader.TownRunRequestAcknowledgements["HealB"] = 1000;
+            leader.TownRunRequestAcknowledgements["DpsC"] = 2000;
+
+            string json = SquadJson.SerializeEnvelope(SquadMessageTypes.LeaderState, "TestSquad", 1, leader);
+            var envelope = SquadJson.DeserializeEnvelope(json);
+            Assert.NotNull(envelope);
+            var restored = SquadJson.DeserializePayload<SquadLeaderState>(envelope!);
+
+            Assert.NotNull(restored);
+            Assert.Equal(0L, restored!.TownRunRequestedUtcMs);
+            Assert.True(restored.AllTownTasksComplete);
+            Assert.Equal(1000L, restored.TownRunRequestAcknowledgements["HealB"]);
+            Assert.Equal(2000L, restored.TownRunRequestAcknowledgements["DpsC"]);
         }
 
         private SquadSettings CreateSettings(bool syncTownRuns = true)

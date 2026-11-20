@@ -557,6 +557,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 TownRunRequestedByName = _townRunRequestedByName,
                 TownRunRequestReason = _townRunRequestReason,
                 TownRunRequestedUtcMs = _townRunRequestedUtcMs,
+                TownRunRequestAcknowledgements = new Dictionary<string, long>(_townRunRequestAckUtcMs, StringComparer.OrdinalIgnoreCase),
                 SquadCorpseRallyX = profile.SafeCorpseRallyX,
                 SquadCorpseRallyY = profile.SafeCorpseRallyY,
                 SquadCorpseRallyZ = profile.SafeCorpseRallyZ,
