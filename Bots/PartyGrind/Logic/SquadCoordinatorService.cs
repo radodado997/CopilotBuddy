@@ -60,6 +60,11 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
         private bool _isWaitingForFollower;
         private bool _isHardBacktracking;
+        private long _waitingSinceUtcMs;
+        private long _notWaitingSinceUtcMs;
+        private bool _isWaitingForFollowerDebounced;
+
+        private const long DistanceDebounceMs = 2000L;
         private bool _inTownRun;
         private bool _allTownTasksComplete;
         private bool _inLootWindow;
@@ -85,7 +90,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         public bool IsPausedManually { get; set; }
         public string ManualPauseReason { get; set; } = string.Empty;
         public bool IsWaitingForFollower => _isWaitingForFollower;
+        public bool IsWaitingForFollowerDebounced => _isWaitingForFollowerDebounced;
         public bool IsHardBacktracking => _isHardBacktracking;
+        public float MaxFollowerDistance { get; private set; }
 
         public void Reset()
         {
@@ -96,6 +103,10 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             ClearBreadcrumbs();
             _isWaitingForFollower = false;
             _isHardBacktracking = false;
+            _waitingSinceUtcMs = 0;
+            _notWaitingSinceUtcMs = 0;
+            _isWaitingForFollowerDebounced = false;
+            MaxFollowerDistance = 0f;
             _inTownRun = false;
             _allTownTasksComplete = false;
             _inLootWindow = false;
@@ -266,6 +277,31 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 _isHardBacktracking = true;
             else if (_isHardBacktracking && maxFollowerDist <= settings.ResumeDistance)
                 _isHardBacktracking = false;
+
+            MaxFollowerDistance = maxFollowerDist;
+            bool rawWaiting = maxFollowerDist > settings.SoftWaitDistance;
+            bool rawResume = maxFollowerDist <= settings.ResumeDistance;
+            if (rawWaiting)
+            {
+                if (_waitingSinceUtcMs == 0)
+                    _waitingSinceUtcMs = nowUtcMs;
+                _notWaitingSinceUtcMs = 0;
+                if (nowUtcMs - _waitingSinceUtcMs >= DistanceDebounceMs)
+                    _isWaitingForFollowerDebounced = true;
+            }
+            else if (rawResume)
+            {
+                if (_notWaitingSinceUtcMs == 0)
+                    _notWaitingSinceUtcMs = nowUtcMs;
+                _waitingSinceUtcMs = 0;
+                if (nowUtcMs - _notWaitingSinceUtcMs >= DistanceDebounceMs)
+                    _isWaitingForFollowerDebounced = false;
+            }
+            else
+            {
+                _waitingSinceUtcMs = 0;
+                _notWaitingSinceUtcMs = 0;
+            }
 
             // 5. Evaluate combat, death/resurrection, looting, resting, provisioning, town run.
             bool anyInCombat = rosterStates.Any(m => m.IsInCombat);
