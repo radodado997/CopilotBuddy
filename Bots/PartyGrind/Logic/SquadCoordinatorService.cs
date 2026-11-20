@@ -52,6 +52,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             public string LevelSource = string.Empty;
             public (string Source, int Raw)? RejectedLevel;
             public bool Disconnected;
+            public bool GraceExpired;
             public float XpPercent;
             public long LastSeenUtcMs;
             public bool NeedsRest;
@@ -204,12 +205,14 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 Logging.WriteDebug("[PartyGrind Level] Disconnected member={0} guid={1} confirmed={2} graceMs={3}",
                     rec.Name, rec.Guid, rec.Level, graceMs);
             }
-            foreach (var rec in _history.Values.Where(r => r.Disconnected && nowUtcMs - r.LastSeenUtcMs > graceMs).ToList())
+            foreach (var rec in _history.Values.Where(r => r.Disconnected && !r.GraceExpired && nowUtcMs - r.LastSeenUtcMs > graceMs))
             {
                 Logging.WriteDebug("[PartyGrind Level] Grace expired member={0} guid={1} confirmed={2}", rec.Name, rec.Guid, rec.Level);
-                _history.Remove(rec.Name);
+                rec.GraceExpired = true;
+                rec.LastState = null;
+                rec.NeedsRest = false;
             }
-            var lowest = _history.Values.Where(r => r.Level > 0)
+            var lowest = _history.Values.Where(r => !r.GraceExpired && r.Level > 0)
                 .OrderBy(r => r.Level).ThenBy(r => r.XpPercent).ThenBy(r => r.Name, StringComparer.OrdinalIgnoreCase)
                 .FirstOrDefault();
             int effectiveMinLevel = lowest?.Level ?? 0;
@@ -734,6 +737,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (rec.Disconnected)
                 Logging.WriteDebug("[PartyGrind Level] Reconnected member={0} guid={1} afterMs={2}", name, state.Guid, nowUtcMs - rec.LastSeenUtcMs);
             rec.Disconnected = false;
+            rec.GraceExpired = false;
             if (state.Guid != 0) rec.Guid = state.Guid;
             rec.Role = state.Role;
             rec.Class = state.Class;
@@ -756,8 +760,11 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 if (rec.RejectedLevel.HasValue)
                     Logging.WriteDebug("[PartyGrind Level] Recovered member={0} guid={1} source={2} raw={3}", name, state.Guid, source, state.Level);
                 rec.RejectedLevel = null;
-                if (source != "handshake" || state.Level != rec.Level)
-                    rec.XpPercent = ComputeXpPercent(state);
+                if (source != "handshake")
+                {
+                    float xp = ComputeXpPercent(state);
+                    rec.XpPercent = state.Level == rec.Level ? Math.Max(rec.XpPercent, xp) : xp;
+                }
                 rec.Level = state.Level;
                 rec.LevelSource = source;
             }
@@ -944,14 +951,14 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
             foreach (var kv in _history)
             {
-                if (activeByName.ContainsKey(kv.Key))
+                if (kv.Value.GraceExpired || activeByName.ContainsKey(kv.Key))
                     continue;
                 if (kv.Value.LastState == null)
                 {
                     result.Add(new SquadMemberSummary
                     {
                         CharacterName = kv.Value.Name, Guid = kv.Value.Guid,
-                        Role = kv.Value.Role, Class = kv.Value.Class, Level = kv.Value.Level,
+                        Role = kv.Value.Role, Class = kv.Value.Class, Level = kv.Value.Level, XpPercent = kv.Value.XpPercent,
                         HasTelemetry = false, IsConnected = connectedNames.Contains(kv.Key),
                         DistanceToLeader = -1f, StateLabel = "Awaiting telemetry"
                     });

@@ -140,6 +140,58 @@ namespace CopilotBuddy.PartyGrind.Tests
         }
 
         [Fact]
+        public void SameLevelXpRegression_IsIgnoredUntilLevelUp()
+        {
+            var coordinator = new SquadCoordinatorService();
+            var settings = CreateDefaultSettings();
+            var leader = MakeLeaderState(15);
+            var member = MakeConnectedClient("Healer", 0, SquadRole.Healer, WoWClass.Priest, 13, 1000);
+            SquadLeaderState Tick(long time) => coordinator.EvaluateTick(settings, leader, new[] { member },
+                new SquadProfileSnapshot(), 0, 0, 0, 0, time);
+            var sample = member.LatestState!;
+            sample.NextLevelXp = 100;
+            sample.CurrentXp = 45;
+            Tick(1000);
+            sample.CurrentXp = 0;
+            var regressed = Tick(2000);
+            Assert.Equal(45f, regressed.LowestMemberXpPercent);
+            Assert.Equal(45f, regressed.Members.Single(m => m.CharacterName == "Healer").XpPercent);
+            sample.Level = 14;
+            Assert.Equal(0f, Tick(3000).LowestMemberXpPercent);
+        }
+
+        [Fact]
+        public void AfterGraceExpires_ReconnectUsesConfirmedProgressOnlyForSameIdentity()
+        {
+            var coordinator = new SquadCoordinatorService();
+            var settings = CreateDefaultSettings();
+            var leader = MakeLeaderState(15);
+            SquadLeaderState Tick(long time, params SquadConnectedMemberSnapshot[] members) =>
+                coordinator.EvaluateTick(settings, leader, members, new SquadProfileSnapshot(), 0, 0, 0, 0, time);
+            var member = MakeConnectedClient("Healer", 0, SquadRole.Healer, WoWClass.Priest, 13, 1000);
+            member.LatestState!.CurrentXp = 45;
+            member.LatestState.NextLevelXp = 100;
+            Tick(1000, member);
+            var expired = Tick(121001);
+            Assert.Equal(15, expired.EffectiveSquadMinLevel);
+            Assert.DoesNotContain(expired.Members, m => m.CharacterName == "Healer");
+            var reconnect = new SquadConnectedMemberSnapshot
+            {
+                CharacterName = "Healer", IsConnected = true,
+                Handshake = new SquadHandshake { CharacterName = "Healer", Guid = member.Handshake.Guid, Level = 1 }
+            };
+            var returned = Tick(122000, reconnect);
+            Assert.Equal(13, returned.EffectiveSquadMinLevel);
+            Assert.Equal(45f, returned.LowestMemberXpPercent);
+            Assert.Equal(45f, returned.Members.Single(m => m.CharacterName == "Healer").XpPercent);
+            Tick(242001);
+            reconnect.Handshake.Guid++;
+            var replacement = Tick(243000, reconnect);
+            Assert.Equal(1, replacement.EffectiveSquadMinLevel);
+            Assert.Equal(0f, replacement.LowestMemberXpPercent);
+        }
+
+        [Fact]
         public void UnknownLevels_DoNotSelectProfile_AndRealLevelOneIsAccepted()
         {
             var coordinator = new SquadCoordinatorService();
