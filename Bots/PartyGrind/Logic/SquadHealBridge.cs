@@ -39,6 +39,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private static readonly Dictionary<ulong, (double Distance, long Progress)> _resProgress = new();
         private static readonly Dictionary<ulong, long> _resPending = new();
         private static readonly Dictionary<ulong, long> _resCastRetry = new();
+        private static readonly Dictionary<string, long> _healDiagRetry = new();
         private static Composite? _activeHealBehavior;
 
         /// <summary>Stops a retained routine when healing is no longer being ticked.</summary>
@@ -48,6 +49,15 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 return;
             try { _activeHealBehavior.Stop(null); } catch { }
             _activeHealBehavior = null;
+        }
+
+        private static void LogHealDiagnostic(string key, string message)
+        {
+            long now = Environment.TickCount64;
+            if (_healDiagRetry.TryGetValue(key, out long allowedAt) && now < allowedAt)
+                return;
+            _healDiagRetry[key] = now + 15000;
+            SquadPartySyncService.LogAction(message);
         }
         private static readonly string[] RangedAssistSpells =
         {
@@ -202,7 +212,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 if (string.IsNullOrEmpty(spellName))
                 {
                     if (targetUnit.HealthPercent < 60)
-                        SquadPartySyncService.LogAction("Heal: no spell for " + targetUnit.Name + " (" + targetUnit.Class + ")");
+                        LogHealDiagnostic(targetUnit.Guid + "|no-spell", "Heal: no spell for " + targetUnit.Name + " (" + targetUnit.Class + ")");
                     continue;
                 }
 
@@ -221,7 +231,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 }
                 else if (targetUnit.HealthPercent < 50)
                 {
-                    SquadPartySyncService.LogAction("Heal blocked: " + spellName + " for " + targetUnit.Name);
+                    LogHealDiagnostic(targetUnit.Guid + "|blocked", "Heal blocked: " + spellName + " for " + targetUnit.Name);
                 }
 
             }

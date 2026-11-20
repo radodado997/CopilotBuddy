@@ -244,18 +244,34 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (!needFood && !needDrink)
                 return false;
 
-            bool isWater = !needFood;
-            string baseName = isWater ? "Conjure Water" : "Conjure Food";
-            var known = GetKnownRankSpells(baseName);
-            int? rank = SelectBestConjureRank(isWater, me.Level, me.Level, known);
-            if (rank == null)
+            var foodKnown = GetKnownRankSpells("Conjure Food");
+            int? foodRank = needFood ? SelectBestConjureRank(isWater: false, me.Level, me.Level, foodKnown) : null;
+            var waterKnown = GetKnownRankSpells("Conjure Water");
+            int? waterRank = SelectBestConjureRank(isWater: true, me.Level, me.Level, waterKnown);
+
+            bool isWater;
+            int rank;
+            if (foodRank != null)
+            {
+                isWater = false;
+                rank = foodRank.Value;
+            }
+            else if (waterRank != null)
+            {
+                isWater = true;
+                rank = waterRank.Value;
+            }
+            else
             {
                 SquadPartySyncService.LogAction("Conjure: no known rank for self");
                 return false;
             }
 
-            int spellId = known.First(r => r.Rank == rank.Value).SpellId;
-            if (!SpellManager.CanCast(spellId, me, false, false))
+            string baseName = isWater ? "Conjure Water" : "Conjure Food";
+            var known = isWater ? waterKnown : foodKnown;
+            int spellId = known.First(r => r.Rank == rank).SpellId;
+            var selectedSpell = me.KnownSpells.FirstOrDefault(s => s.Id == spellId);
+            if (selectedSpell == null || !SpellManager.CanCast(selectedSpell, me, false, false))
                 return false;
 
             if (me.IsMoving) WoWMovement.MoveStop();
@@ -263,7 +279,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             WoWSpell? conjureSpell = WoWSpell.FromId(spellId);
             string castName = !string.IsNullOrEmpty(conjureSpell?.Name)
                 ? conjureSpell!.Name
-                : $"{baseName}(Rank {rank.Value})";
+                : $"{baseName}(Rank {rank})";
             Lua.DoString($"CastSpellByName('{castName}')");
             return true;
         }
@@ -567,8 +583,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 int? foodRank = SelectBestConjureRank(isWater: false, receiverLevel, me.Level, foodRanks);
                 if (foodRank.HasValue)
                 {
-                    int foodSpellId = foodRanks.First(r => r.Rank == foodRank.Value).SpellId;
-                    if (!SpellManager.CanCast(foodSpellId, me, false, false))
+                    var selectedSpell = me.KnownSpells.FirstOrDefault(s => s.Id == foodRanks.First(r => r.Rank == foodRank.Value).SpellId);
+                    if (selectedSpell == null || !SpellManager.CanCast(selectedSpell, me, false, false))
                     {
                         SquadPartySyncService.LogAction("Conjure: not ready");
                         return true;
@@ -592,8 +608,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 int? waterRank = SelectBestConjureRank(isWater: true, receiverLevel, me.Level, waterRanks);
                 if (waterRank.HasValue)
                 {
-                    int waterSpellId = waterRanks.First(r => r.Rank == waterRank.Value).SpellId;
-                    if (!SpellManager.CanCast(waterSpellId, me, false, false))
+                    var selectedSpell = me.KnownSpells.FirstOrDefault(s => s.Id == waterRanks.First(r => r.Rank == waterRank.Value).SpellId);
+                    if (selectedSpell == null || !SpellManager.CanCast(selectedSpell, me, false, false))
                     {
                         SquadPartySyncService.LogAction("Conjure: not ready");
                         return true;
