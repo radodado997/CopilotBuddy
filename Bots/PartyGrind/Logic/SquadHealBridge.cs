@@ -39,6 +39,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private static readonly Dictionary<ulong, (double Distance, long Progress)> _resProgress = new();
         private static readonly Dictionary<ulong, long> _resPending = new();
         private static readonly Dictionary<ulong, long> _resCastRetry = new();
+        private static readonly Dictionary<string, long> _healDiagRetry = new();
         private static Composite? _activeHealBehavior;
 
         /// <summary>Stops a retained routine when healing is no longer being ticked.</summary>
@@ -48,6 +49,15 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 return;
             try { _activeHealBehavior.Stop(null); } catch { }
             _activeHealBehavior = null;
+        }
+
+        private static void LogHealDiagnostic(string key, string message)
+        {
+            long now = Environment.TickCount64;
+            if (_healDiagRetry.TryGetValue(key, out long allowedAt) && now < allowedAt)
+                return;
+            _healDiagRetry[key] = now + 15000;
+            Logging.WriteDebug($"[PartyGrind Heal {StyxWoW.Me?.Name}] {message}");
         }
         private static readonly string[] RangedAssistSpells =
         {
@@ -198,9 +208,18 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 int injured78 = CountInjuredAllies(candidates, 78.0);
                 int injured82 = CountInjuredAllies(candidates, 82.0);
 
-                string? spellName = SelectHealSpellForClass(me, targetUnit, injured78, injured82, emergencyOnly);
-                if (string.IsNullOrEmpty(spellName))
+                var (spellName, blockedSpell) = SelectHealSpellForClass(me, targetUnit, injured78, injured82, emergencyOnly);
+                if (spellName == null)
+                {
+                    if (blockedSpell != null)
+                    {
+                        if (targetUnit.HealthPercent < 50)
+                            LogHealDiagnostic(targetUnit.Guid + "|blocked", "Heal blocked: " + blockedSpell + " for " + targetUnit.Name);
+                    }
+                    else if (targetUnit.HealthPercent < 60)
+                        LogHealDiagnostic(targetUnit.Guid + "|no-spell", "Heal: no spell for " + targetUnit.Name + " (" + targetUnit.Class + ")");
                     continue;
+                }
 
                 if (SpellManager.Spells.TryGetValue(spellName, out WoWSpell? spellInfo) && spellInfo.CastTime > 0 && me.IsMoving)
                 {
@@ -214,6 +233,10 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                         SquadPartySyncService.LogAction("Healing " + targetUnit.Name + " with " + spellName);
                         return true;
                     }
+                }
+                else if (targetUnit.HealthPercent < 50)
+                {
+                    LogHealDiagnostic(targetUnit.Guid + "|blocked", "Heal blocked: " + spellName + " for " + targetUnit.Name);
                 }
 
             }
@@ -425,7 +448,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             return result;
         }
 
-        private static string? SelectHealSpellForClass(
+        private static (string? SpellName, string? BlockedSpell) SelectHealSpellForClass(
             LocalPlayer me,
             WoWUnit target,
             int injured78Count,
@@ -435,78 +458,91 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             double hp = target.HealthPercent;
             bool isTank = SquadContext.IsMemberRole(target.Guid, SquadRole.TankLeader);
 
+            string? blockedSpell = null;
+
+            bool CanCastHeal(string spellName)
+            {
+                if (!SpellManager.HasSpell(spellName))
+                    return false;
+                if (SpellManager.CanCast(spellName, target, true, false))
+                    return true;
+
+                blockedSpell ??= spellName;
+                return false;
+            }
+
             switch (me.Class)
             {
                 case WoWClass.Priest:
-                    if (!emergencyOnly && injured78Count >= 3 && SpellManager.CanCast("Prayer of Healing", target, true, false))
-                        return "Prayer of Healing";
-                    if (!emergencyOnly && injured78Count >= 2 && SpellManager.CanCast("Circle of Healing", target, true, false))
-                        return "Circle of Healing";
+                    if (!emergencyOnly && injured78Count >= 3 && CanCastHeal("Prayer of Healing"))
+                        return ("Prayer of Healing", null);
+                    if (!emergencyOnly && injured78Count >= 2 && CanCastHeal("Circle of Healing"))
+                        return ("Circle of Healing", null);
                     if (hp < 85.0 && !target.HasAura("Weakened Soul") && !target.HasAura("Power Word: Shield") &&
-                        SpellManager.CanCast("Power Word: Shield", target, true, false))
-                        return "Power Word: Shield";
+                        CanCastHeal("Power Word: Shield"))
+                        return ("Power Word: Shield", null);
                     if (!emergencyOnly && hp < 90.0 && !HasMyAura(me.Guid, target, "Renew") &&
-                        SpellManager.CanCast("Renew", target, true, false))
-                        return "Renew";
-                    if (hp < 60.0 && SpellManager.CanCast("Flash Heal", target, true, false))
-                        return "Flash Heal";
-                    if (SpellManager.CanCast("Greater Heal", target, true, false))
-                        return "Greater Heal";
-                    if (SpellManager.CanCast("Heal", target, true, false))
-                        return "Heal";
-                    if (SpellManager.CanCast("Lesser Heal", target, true, false))
-                        return "Lesser Heal";
+                        CanCastHeal("Renew"))
+                        return ("Renew", null);
+                    if (hp < 60.0 && CanCastHeal("Flash Heal"))
+                        return ("Flash Heal", null);
+                    if (CanCastHeal("Greater Heal"))
+                        return ("Greater Heal", null);
+                    if (CanCastHeal("Heal"))
+                        return ("Heal", null);
+                    if (CanCastHeal("Lesser Heal"))
+                        return ("Lesser Heal", null);
                     break;
 
                 case WoWClass.Paladin:
                     if (!emergencyOnly && isTank && !HasMyAura(me.Guid, target, "Beacon of Light") &&
-                        SpellManager.CanCast("Beacon of Light", target, true, false))
-                        return "Beacon of Light";
+                        CanCastHeal("Beacon of Light"))
+                        return ("Beacon of Light", null);
                     if (!emergencyOnly && isTank && !HasMyAura(me.Guid, target, "Sacred Shield") &&
-                        SpellManager.CanCast("Sacred Shield", target, true, false))
-                        return "Sacred Shield";
-                    if (hp < 70.0 && SpellManager.CanCast("Holy Shock", target, true, false))
-                        return "Holy Shock";
-                    if (hp < 80.0 && SpellManager.CanCast("Flash of Light", target, true, false))
-                        return "Flash of Light";
-                    if (SpellManager.CanCast("Holy Light", target, true, false))
-                        return "Holy Light";
+                        CanCastHeal("Sacred Shield"))
+                        return ("Sacred Shield", null);
+                    if (hp < 70.0 && CanCastHeal("Holy Shock"))
+                        return ("Holy Shock", null);
+                    if (hp < 80.0 && CanCastHeal("Flash of Light"))
+                        return ("Flash of Light", null);
+                    if (CanCastHeal("Holy Light"))
+                        return ("Holy Light", null);
                     break;
 
                 case WoWClass.Druid:
-                    if (!emergencyOnly && injured78Count >= 2 && SpellManager.CanCast("Wild Growth", target, true, false))
-                        return "Wild Growth";
+                    if (!emergencyOnly && injured78Count >= 2 && CanCastHeal("Wild Growth"))
+                        return ("Wild Growth", null);
                     if (!emergencyOnly && isTank && hp < 95.0 && !HasMyAura(me.Guid, target, "Lifebloom") &&
-                        SpellManager.CanCast("Lifebloom", target, true, false))
-                        return "Lifebloom";
+                        CanCastHeal("Lifebloom"))
+                        return ("Lifebloom", null);
                     if (!emergencyOnly && hp < 90.0 && !HasMyAura(me.Guid, target, "Rejuvenation") &&
-                        SpellManager.CanCast("Rejuvenation", target, true, false))
-                        return "Rejuvenation";
+                        CanCastHeal("Rejuvenation"))
+                        return ("Rejuvenation", null);
                     if (hp < 75.0 && !HasMyAura(me.Guid, target, "Regrowth") &&
-                        SpellManager.CanCast("Regrowth", target, true, false))
-                        return "Regrowth";
-                    if (hp < 70.0 && SpellManager.CanCast("Nourish", target, true, false))
-                        return "Nourish";
-                    if (SpellManager.CanCast("Healing Touch", target, true, false))
-                        return "Healing Touch";
+                        CanCastHeal("Regrowth"))
+                        return ("Regrowth", null);
+                    if (hp < 70.0 && CanCastHeal("Nourish"))
+                        return ("Nourish", null);
+                    if (CanCastHeal("Healing Touch"))
+                        return ("Healing Touch", null);
                     break;
 
                 case WoWClass.Shaman:
                     if (!emergencyOnly && isTank && !HasMyAura(me.Guid, target, "Earth Shield") &&
-                        SpellManager.CanCast("Earth Shield", target, true, false))
-                        return "Earth Shield";
-                    if (!emergencyOnly && injured82Count >= 2 && SpellManager.CanCast("Chain Heal", target, true, false))
-                        return "Chain Heal";
-                    if (hp < 85.0 && SpellManager.CanCast("Riptide", target, true, false))
-                        return "Riptide";
-                    if (hp < 65.0 && SpellManager.CanCast("Lesser Healing Wave", target, true, false))
-                        return "Lesser Healing Wave";
-                    if (SpellManager.CanCast("Healing Wave", target, true, false))
-                        return "Healing Wave";
+                        CanCastHeal("Earth Shield"))
+                        return ("Earth Shield", null);
+                    if (!emergencyOnly && injured82Count >= 2 && CanCastHeal("Chain Heal"))
+                        return ("Chain Heal", null);
+                    if (hp < 85.0 && CanCastHeal("Riptide"))
+                        return ("Riptide", null);
+                    if (hp < 65.0 && CanCastHeal("Lesser Healing Wave"))
+                        return ("Lesser Healing Wave", null);
+                    if (CanCastHeal("Healing Wave"))
+                        return ("Healing Wave", null);
                     break;
             }
 
-            return null;
+            return (null, blockedSpell);
         }
 
         private static bool HasMyAura(ulong myGuid, WoWUnit unit, string auraName)
