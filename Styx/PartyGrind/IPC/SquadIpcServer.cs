@@ -22,6 +22,7 @@ namespace Styx.PartyGrind.IPC
         public int SlotIndex { get; init; }
         public SquadHandshake Handshake { get; init; } = new SquadHandshake();
         public SquadMemberState? LatestState { get; init; }
+        public SquadTownRunRequest? LatestTownRunRequest { get; init; }
         public long LastReceivedUtcMs { get; init; }
         public bool IsConnected { get; init; }
     }
@@ -42,6 +43,7 @@ namespace Styx.PartyGrind.IPC
             public string CharacterName = string.Empty;
             public SquadHandshake Handshake = new SquadHandshake();
             public SquadMemberState? LatestState;
+            public SquadTownRunRequest? LatestTownRunRequest;
             public long LastReceivedUtcMs;
             public int SlotIndex = -1;
             public volatile bool Closed;
@@ -200,6 +202,7 @@ namespace Styx.PartyGrind.IPC
                         SlotIndex = session.SlotIndex,
                         Handshake = session.Handshake,
                         LatestState = session.LatestState,
+                        LatestTownRunRequest = session.LatestTownRunRequest,
                         LastReceivedUtcMs = session.LastReceivedUtcMs,
                         IsConnected = alive
                     });
@@ -455,6 +458,19 @@ namespace Styx.PartyGrind.IPC
                         return;
                     session.LastReceivedUtcMs = now;
                     session.LatestState = state;
+                    // The announcement rides the periodic telemetry on purpose: a one-shot
+                    // control frame could be dropped by the bounded outbound queue, while
+                    // MemberState is resent until the coordinator clears it.
+                    session.LatestTownRunRequest = state.TownRunRequested && state.TownRunRequestedUtcMs > 0
+                        ? new SquadTownRunRequest
+                        {
+                            CharacterName = session.CharacterName,
+                            Guid = state.Guid,
+                            Role = state.Role,
+                            Reason = state.TownRunRequestReason ?? string.Empty,
+                            RequestedUtcMs = state.TownRunRequestedUtcMs
+                        }
+                        : null;
                     session.Handshake = new SquadHandshake
                     {
                         CharacterName = session.CharacterName,

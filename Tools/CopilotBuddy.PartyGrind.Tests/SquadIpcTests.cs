@@ -321,5 +321,75 @@ namespace CopilotBuddy.PartyGrind.Tests
             await WaitUntilAsync(() => restartedClient.LatestLeaderState?.Phase == SquadPhase.Grinding);
             Assert.Equal(11, restartedClient.LatestLeaderState!.EffectiveSquadMinLevel);
         }
+
+        [Fact]
+        public async Task MemberState_TownRunRequest_IsExposedOnSnapshot_AndCleared()
+        {
+            using var server = new SquadIpcServer(0, "AlphaTeam", memberSecrets: Secrets);
+            server.DisconnectTimeoutMs = 5000;
+            server.Start();
+            using var client = new SquadIpcClient(server.Port, "AlphaTeam", memberSecret: Secret("Follower"))
+            {
+                DisconnectTimeoutMs = 5000
+            };
+            client.Start(() => new SquadHandshake
+            {
+                CharacterName = "Follower",
+                Guid = 42,
+                Class = WoWClass.Priest,
+                Role = SquadRole.Healer,
+                Level = 5
+            });
+
+            await WaitUntilAsync(() => server.GetMemberSnapshots().Count == 1);
+
+            client.SendMemberState(new SquadMemberState
+            {
+                CharacterName = "Follower",
+                Guid = 42,
+                Class = WoWClass.Priest,
+                Role = SquadRole.Healer,
+                Level = 5,
+                MapId = 0,
+                X = 1f,
+                Y = 2f,
+                Z = 3f,
+                CorpseX = 1f,
+                CorpseY = 2f,
+                CorpseZ = 3f,
+                TownRunRequested = true,
+                TownRunRequestReason = "Sell,Repair",
+                TownRunRequestedUtcMs = 12345
+            });
+
+            await WaitUntilAsync(() => server.GetMemberSnapshots().Single().LatestTownRunRequest != null);
+            var request = server.GetMemberSnapshots().Single().LatestTownRunRequest!;
+            Assert.Equal("Follower", request.CharacterName);
+            Assert.Equal(42UL, request.Guid);
+            Assert.Equal(SquadRole.Healer, request.Role);
+            Assert.Equal("Sell,Repair", request.Reason);
+            Assert.Equal(12345, request.RequestedUtcMs);
+
+            // Clearing the announcement on the member must clear it on the session too,
+            // otherwise the coordinator would keep treating it as pending.
+            client.SendMemberState(new SquadMemberState
+            {
+                CharacterName = "Follower",
+                Guid = 42,
+                Class = WoWClass.Priest,
+                Role = SquadRole.Healer,
+                Level = 5,
+                MapId = 0,
+                X = 1f,
+                Y = 2f,
+                Z = 3f,
+                CorpseX = 1f,
+                CorpseY = 2f,
+                CorpseZ = 3f,
+                TownRunRequested = false
+            });
+
+            await WaitUntilAsync(() => server.GetMemberSnapshots().Single().LatestTownRunRequest == null);
+        }
     }
 }

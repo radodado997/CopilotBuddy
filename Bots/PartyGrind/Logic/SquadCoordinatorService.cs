@@ -77,6 +77,10 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private string _activeTradeTarget = string.Empty;
         private long _provisionStartedUtcMs;
         private bool _assignedFood, _assignedDrink, _assignedHealthstone;
+        private string _townRunRequestedByName = string.Empty;
+        private string _townRunRequestReason = string.Empty;
+        private long _townRunRequestedUtcMs;
+        private readonly Dictionary<string, long> _townRunRequestAckUtcMs = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
 
         public bool IsPausedManually { get; set; }
         public string ManualPauseReason { get; set; } = string.Empty;
@@ -106,6 +110,10 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             _activeProvisioner = string.Empty;
             _activeTradeTarget = string.Empty;
             _provisionStartedUtcMs = 0;
+            _townRunRequestedByName = string.Empty;
+            _townRunRequestReason = string.Empty;
+            _townRunRequestedUtcMs = 0;
+            _townRunRequestAckUtcMs.Clear();
         }
 
         /// <summary>
@@ -123,7 +131,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             float leaderFacing,
             long nowUtcMs,
             float? effectiveProfileLevelHint = null,
-            Func<int, SquadProfileSnapshot>? resolveProfile = null)
+            Func<int, SquadProfileSnapshot>? resolveProfile = null,
+            SquadTownRunRequest? localTownRunRequest = null)
         {
             if (settings == null) throw new ArgumentNullException(nameof(settings));
             if (leaderLocal == null) throw new ArgumentNullException(nameof(leaderLocal));
@@ -346,21 +355,54 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     anyNeedsRest = true;
             }
 
-            // Evaluate TownRun trigger & completion gate.
+            // Evaluate TownRun trigger & completion gate. A member announcement
+            // (TownRunRequested) is the explicit "idę do miasta" signal and always starts a
+            // group run; the per-member Needs* flags are the automatic trigger and only
+            // apply while SyncTownRuns is enabled.
             var townRally = new WoWPoint(profile.TownRallyX, profile.TownRallyY, profile.TownRallyZ);
-            if (!_inTownRun && settings.SyncTownRuns && !anyInCombat && !anyDead)
+            SquadTownRunRequest? townRequest = ResolveTownRunRequest(connectedClients, localTownRunRequest);
+
+            if (!_inTownRun)
             {
+                if (townRequest != null)
+                {
+                    _townRunRequestedByName = townRequest.CharacterName;
+                    _townRunRequestReason = townRequest.Reason;
+                    _townRunRequestedUtcMs = townRequest.RequestedUtcMs;
+                }
+
                 bool anyNeedsTown = rosterStates.Any(m =>
-                    !m.IsDead && !m.IsGhost &&
-                    (m.NeedsSell || m.NeedsRepair || m.NeedsBuy || m.NeedsTrain || m.NeedsMail));
-                if (anyNeedsTown)
+                    !m.IsDead && !m.IsGhost && HasTownNeed(m));
+                if (!anyInCombat && !anyDead && (townRequest != null || (settings.SyncTownRuns && anyNeedsTown)))
                 {
                     _inTownRun = true;
                     _allTownTasksComplete = false;
+                    if (townRequest != null)
+                    {
+                        // Consume every pending announcement, including older ones, so a
+                        // superseded request cannot resurface after the run finishes.
+                        AckAllTownRunRequests(connectedClients, localTownRunRequest);
+                    }
+                    else
+                    {
+                        _townRunRequestedByName = string.Empty;
+                        _townRunRequestReason = string.Empty;
+                        _townRunRequestedUtcMs = 0;
+                    }
                 }
             }
-            else if (_inTownRun)
+            else
             {
+                // A second member may announce while the run is already active: keep the
+                // newest announcement visible without restarting the run.
+                if (townRequest != null)
+                {
+                    AckTownRunRequest(townRequest);
+                    _townRunRequestedByName = townRequest.CharacterName;
+                    _townRunRequestReason = townRequest.Reason;
+                    _townRunRequestedUtcMs = townRequest.RequestedUtcMs;
+                }
+
                 // Completion must account for every connected participant, including a
                 // reconnecting member that has not yet sent a telemetry sample.
                 var townParticipants = new List<SquadMemberState>(1 + connectedClients.Count) { leaderLocal };
@@ -377,8 +419,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 }
                 bool pendingTelemetry = connectedClients.Any(s => s.IsConnected && s.LatestState == null &&
                     !string.IsNullOrWhiteSpace(s.CharacterName));
-                bool anyStillHasNeed = townParticipants.Any(m =>
-                    m.NeedsSell || m.NeedsRepair || m.NeedsBuy || m.NeedsTrain || m.NeedsMail);
+                bool anyStillHasNeed = townParticipants.Any(m => HasTownNeed(m));
                 bool allDoneAndAtRally = !pendingTelemetry && townParticipants.Count > 0 && townParticipants.All(m =>
                     m.TownTasksComplete &&
                     (!profile.TownRallyMapId.HasValue || m.MapId == profile.TownRallyMapId.Value) &&
@@ -388,6 +429,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 {
                     _allTownTasksComplete = true;
                     _inTownRun = false;
+                    _townRunRequestedByName = string.Empty;
+                    _townRunRequestReason = string.Empty;
+                    _townRunRequestedUtcMs = 0;
                 }
                 else
                 {
@@ -514,6 +558,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 TownRallyMapId = profile.TownRallyMapId,
                 AllTownTasksComplete = _allTownTasksComplete,
                 TownRunInterrupted = _inTownRun && (anyInCombat || anyDead),
+                TownRunRequestedByName = _townRunRequestedByName,
+                TownRunRequestReason = _townRunRequestReason,
+                TownRunRequestedUtcMs = _townRunRequestedUtcMs,
                 SquadCorpseRallyX = profile.SafeCorpseRallyX,
                 SquadCorpseRallyY = profile.SafeCorpseRallyY,
                 SquadCorpseRallyZ = profile.SafeCorpseRallyZ,
@@ -524,6 +571,68 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 MemberRoles = roles,
                 Members = summaries
             };
+        }
+
+        /// <summary>
+        /// Picks the newest not-yet-consumed town-run announcement. Acknowledgement is
+        /// deliberately left to the caller: a request deferred by combat must stay
+        /// pending so it can still start the run once the fight is over.
+        /// </summary>
+        private SquadTownRunRequest? ResolveTownRunRequest(
+            IReadOnlyList<SquadConnectedMemberSnapshot> connectedClients,
+            SquadTownRunRequest? localRequest)
+        {
+            SquadTownRunRequest? best = null;
+            ConsiderTownRunRequest(localRequest, ref best);
+            foreach (var snap in connectedClients)
+            {
+                if (!snap.IsConnected)
+                    continue;
+                ConsiderTownRunRequest(snap.LatestTownRunRequest, ref best);
+            }
+            return best;
+        }
+
+        private void ConsiderTownRunRequest(SquadTownRunRequest? request, ref SquadTownRunRequest? best)
+        {
+            if (!IsTownRunRequestActionable(request))
+                return;
+            if (best == null || request!.RequestedUtcMs > best.RequestedUtcMs)
+                best = request;
+        }
+
+        private void AckAllTownRunRequests(
+            IReadOnlyList<SquadConnectedMemberSnapshot> connectedClients,
+            SquadTownRunRequest? localRequest)
+        {
+            AckTownRunRequest(localRequest);
+            foreach (var snap in connectedClients)
+            {
+                if (snap.IsConnected)
+                    AckTownRunRequest(snap.LatestTownRunRequest);
+            }
+        }
+
+        private bool IsTownRunRequestActionable(SquadTownRunRequest? request)
+        {
+            if (request == null || string.IsNullOrWhiteSpace(request.CharacterName) || request.RequestedUtcMs <= 0)
+                return false;
+            string name = request.CharacterName.Trim();
+            return !_townRunRequestAckUtcMs.TryGetValue(name, out long ack) || request.RequestedUtcMs > ack;
+        }
+
+        private void AckTownRunRequest(SquadTownRunRequest? request)
+        {
+            if (request == null || string.IsNullOrWhiteSpace(request.CharacterName))
+                return;
+            string name = request.CharacterName.Trim();
+            if (!_townRunRequestAckUtcMs.TryGetValue(name, out long ack) || request.RequestedUtcMs > ack)
+                _townRunRequestAckUtcMs[name] = request.RequestedUtcMs;
+        }
+
+        private static bool HasTownNeed(SquadMemberState m)
+        {
+            return m.NeedsSell || m.NeedsRepair || m.NeedsBuy || m.NeedsTrain || m.NeedsMail;
         }
 
         /// <summary>

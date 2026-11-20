@@ -61,6 +61,10 @@ namespace CopilotBuddy.Bots.PartyGrind
         private long _pullStartedUtcMs;
         private bool _wasInCombat;
         private bool _townTasksCompleteLocal;
+        private bool _townRunRequestPending;
+        private bool _townRunRequestEchoed;
+        private string _townRunRequestReason = string.Empty;
+        private long _townRunRequestUtcMs;
         private long _deathStartedUtcMs;
         private bool _localWasNeedingRest;
         private bool _lootFilterAttached;
@@ -148,6 +152,10 @@ namespace CopilotBuddy.Bots.PartyGrind
             _pullStartedUtcMs = 0;
             _wasInCombat = false;
             _townTasksCompleteLocal = false;
+            _townRunRequestPending = false;
+            _townRunRequestEchoed = false;
+            _townRunRequestReason = string.Empty;
+            _townRunRequestUtcMs = 0;
             _deathStartedUtcMs = 0;
             _localWasNeedingRest = false;
 
@@ -240,7 +248,8 @@ namespace CopilotBuddy.Bots.PartyGrind
                     _currentSecondaryGuid,
                     _pullStartedUtcMs,
                     StyxWoW.Me.Rotation,
-                    now);
+                    now,
+                    localTownRunRequest: GetLocalTownRunRequest());
                 SquadContext.UpdateLeaderState(leaderState);
                 _ipcServer.BroadcastLeaderState(leaderState, populateRoster: false);
             }
@@ -250,6 +259,53 @@ namespace CopilotBuddy.Bots.PartyGrind
         {
             _coordinator.IsPausedManually = false;
             _coordinator.ManualPauseReason = string.Empty;
+        }
+
+        /// <summary>
+        /// Announces to the squad that this character is heading to town. The coordinator
+        /// converts the announcement into a synchronized TownRun, so every member can do
+        /// its own sell/repair/buy/mail/train and then waits at the rally point together.
+        /// The announcement is also raised automatically when local town needs appear.
+        /// </summary>
+        public void RequestTownRun(string reason)
+        {
+            // An explicit announcement is a deliberate group action, so it works even when
+            // the automatic SyncTownRuns trigger is disabled.
+            _townRunRequestPending = true;
+            _townRunRequestReason = string.IsNullOrWhiteSpace(reason) ? "Manual" : reason.Trim();
+            // A repeated manual request must produce a fresh, strictly increasing
+            // timestamp so the coordinator does not treat it as the previous one.
+            _townRunRequestUtcMs = Math.Max(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), _townRunRequestUtcMs + 1);
+            Logging.Write("[PartyGrind Sync {0}] Town run requested: {1}",
+                StyxWoW.Me?.Name ?? "?", _townRunRequestReason);
+        }
+
+        private SquadTownRunRequest? GetLocalTownRunRequest()
+        {
+            if (!_townRunRequestPending || _townRunRequestUtcMs <= 0)
+                return null;
+            var me = StyxWoW.Me;
+            if (me == null || string.IsNullOrWhiteSpace(me.Name))
+                return null;
+            return new SquadTownRunRequest
+            {
+                CharacterName = me.Name,
+                Guid = me.Guid,
+                Role = settings.Role,
+                Reason = _townRunRequestReason,
+                RequestedUtcMs = _townRunRequestUtcMs
+            };
+        }
+
+        private static string BuildTownRequestReason(TownNeedsEvaluation needs)
+        {
+            var reasons = new List<string>(5);
+            if (needs.NeedsSell) reasons.Add("Sell");
+            if (needs.NeedsRepair) reasons.Add("Repair");
+            if (needs.NeedsBuy) reasons.Add("Buy");
+            if (needs.NeedsTrain) reasons.Add("Train");
+            if (needs.NeedsMail) reasons.Add("Mail");
+            return string.Join(",", reasons);
         }
 
         public override void Pulse()
@@ -382,7 +438,9 @@ namespace CopilotBuddy.Bots.PartyGrind
                 _currentSecondaryGuid,
                 _pullStartedUtcMs,
                 StyxWoW.Me?.Rotation ?? 0f,
-                now, resolveProfile: level =>
+                now,
+                localTownRunRequest: GetLocalTownRunRequest(),
+                resolveProfile: level =>
                 {
                     if (_lastAppliedEffectiveLevel != level)
                     {
@@ -646,6 +704,35 @@ namespace CopilotBuddy.Bots.PartyGrind
                 townNeeds.NeedsSell || townNeeds.NeedsRepair || townNeeds.NeedsBuy || townNeeds.NeedsTrain || townNeeds.NeedsMail)
                 _townTasksCompleteLocal = false;
 
+            // Raise the "idę do miasta" announcement on the periodic telemetry. It is
+            // repeated until the local needs are resolved, so a lost IPC frame can never
+            // swallow the signal; the coordinator acknowledges it by timestamp.
+            if (settings.SyncTownRuns && townNeeds.Any)
+            {
+                if (!_townRunRequestPending)
+                {
+                    _townRunRequestPending = true;
+                    _townRunRequestEchoed = false;
+                    _townRunRequestReason = BuildTownRequestReason(townNeeds);
+                    _townRunRequestUtcMs = Math.Max(now, _townRunRequestUtcMs + 1);
+                    Logging.Write("[PartyGrind Sync {0}] Announcing town run: {1}", me.Name, _townRunRequestReason);
+                }
+            }
+            else if (_townRunRequestPending)
+            {
+                // The coordinator echoes the announcement in LeaderState. Remember that it
+                // saw the request, then drop it once the synchronized run has finished; the
+                // echo itself is cleared from LeaderState on completion, so it cannot be
+                // used as the "finished" marker.
+                if (leader != null && leader.TownRunRequestedUtcMs >= _townRunRequestUtcMs)
+                    _townRunRequestEchoed = true;
+                if (_townRunRequestEchoed && (leader == null || leader.Phase != SquadPhase.TownRun))
+                {
+                    _townRunRequestPending = false;
+                    _townRunRequestEchoed = false;
+                }
+            }
+
             string xmlPath = ProfileManager.XmlLocation ?? string.Empty;
             if (!string.IsNullOrEmpty(xmlPath) && !string.Equals(xmlPath, _cachedProfilePath, StringComparison.OrdinalIgnoreCase))
             {
@@ -713,6 +800,9 @@ namespace CopilotBuddy.Bots.PartyGrind
                 TownTasksComplete = _townTasksCompleteLocal,
                 FreeBagSlots = (int)me.FreeNormalBagSlots,
                 LowestDurabilityPct = (float)me.LowestDurabilityPercent,
+                TownRunRequested = _townRunRequestPending,
+                TownRunRequestReason = _townRunRequestReason,
+                TownRunRequestedUtcMs = _townRunRequestUtcMs,
                 LoadedProfileHash = _cachedProfileHash,
                 ActiveSubProfileMinLevel = currentSub?.MinLevel ?? 1,
                 ActiveSubProfileMaxLevel = currentSub?.MaxLevel ?? 85
