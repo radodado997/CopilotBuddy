@@ -5,6 +5,20 @@ namespace CopilotBuddy.PartyGrind.Tests
 {
     public sealed class SquadTownRunMandatoryVendorTests
     {
+        [Theory]
+        [InlineData(0, 0, true, true)]
+        [InlineData(-1, 0, true, false)]
+        [InlineData(2, 0, true, false)]
+        [InlineData(2, 1, true, false)]
+        [InlineData(2, 2, false, false)]
+        [InlineData(2, 2, true, true)]
+        public void CatalogueCaching_RequiresAuthoritativeCountAndCompleteItemInfo(
+            int loadedCount, int observedCount, bool allItemInfoLoaded, bool expected)
+        {
+            Assert.Equal(expected, SquadTownRunService.IsVendorCatalogueComplete(
+                loadedCount, observedCount, allItemInfoLoaded));
+        }
+
         [Fact]
         public void VendorWorkNeeds_AreMandatoryEvenWhenThresholdsAreQuiet()
         {

@@ -531,6 +531,40 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 ?? vm.GetClosestVendor(Vendor.VendorType.Repair, excluded);
         }
 
+        internal static bool IsVendorCatalogueComplete(int loadedCount, int observedCount, bool allItemInfoLoaded)
+            => loadedCount >= 0 && loadedCount == observedCount && allItemInfoLoaded;
+
+        private static void ObserveMerchantCatalogue()
+        {
+            Lua.DoString(@"
+                if not CopilotBuddyTownMerchantCatalogue then
+                    local f = CreateFrame('Frame')
+                    CopilotBuddyTownMerchantCatalogue = f
+                    f:RegisterEvent('MERCHANT_SHOW')
+                    f:RegisterEvent('MERCHANT_UPDATE')
+                    f:RegisterEvent('MERCHANT_CLOSED')
+                    f:SetScript('OnEvent', function(self, event)
+                        if event == 'MERCHANT_CLOSED' then
+                            self.guid = nil
+                            self.count = nil
+                        else
+                            self.guid = UnitGUID('npc')
+                            self.count = GetMerchantNumItems()
+                        end
+                    end)
+                end");
+        }
+
+        private static int GetLoadedMerchantCatalogueCount()
+            => Lua.GetReturnVal<int>(@"
+                local f = CopilotBuddyTownMerchantCatalogue
+                if f and f.guid and f.guid == UnitGUID('npc') and
+                    MerchantFrame and MerchantFrame:IsVisible() and
+                    f.count == GetMerchantNumItems() then
+                    return f.count
+                end
+                return -1", 0);
+
         private bool PerformVendorInteraction(
             Vendor? vendor,
             TownNeedsEvaluation vendorNeeds,
@@ -555,6 +589,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 return false;
             }
 
+            ObserveMerchantCatalogue();
             if (!MerchantFrame.Instance.IsVisible)
             {
                 npc.Interact();
@@ -600,7 +635,10 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     bool hasFood = MerchantFrame.Instance.GetBestFoodFromVendor() != -1;
                     bool hasDrink = MerchantFrame.Instance.GetBestDrinkFromVendor() != -1;
                     var catalogue = MerchantFrame.Instance.GetAllMerchantItems();
-                    if (vendor != null && catalogue.Length > 0 && catalogue.All(i => i.ItemInfo != null))
+                    int loadedCount = GetLoadedMerchantCatalogueCount();
+                    if (vendor != null && openMerchant != null && openMerchant.IsValid &&
+                        openMerchant.Entry == npc.Entry && IsVendorCatalogueComplete(
+                            loadedCount, catalogue.Length, catalogue.All(i => i.ItemInfo != null)))
                         _vendorStock[vendor.Entry] = (hasFood, hasDrink);
                     if (!CanSupplyNeededConsumables(vendorNeeds, hasFood, hasDrink))
                     {
