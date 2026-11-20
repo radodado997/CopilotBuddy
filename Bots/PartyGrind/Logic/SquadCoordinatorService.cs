@@ -789,6 +789,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             }
         }
 
+        private static bool CanProvideHealthstoneTo(SquadMemberState provider, SquadMemberState receiver) =>
+            provider.CanProvideHealthstone && provider.HealthstoneMinReceiverLevel is int minLevel && receiver.Level >= minLevel;
+
         private void EvaluateProvisioningArbitration(
             SquadSettings settings,
             List<SquadMemberState> rosterStates,
@@ -808,7 +811,19 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     (recv != null && ((_assignedFood && recv.WantsFood) ||
                         (_assignedDrink && recv.WantsDrink) || (_assignedHealthstone && recv.WantsHealthstone))));
 
-                if (timedOut)
+                bool healthstoneSupplyLost = _assignedHealthstone &&
+                    (prov == null || (!prov.IsProvisioningBusy &&
+                        (recv == null || !CanProvideHealthstoneTo(prov, recv)) &&
+                        (!prov.IsHealthstoneRitualPending || timedOut)));
+
+                if (healthstoneSupplyLost)
+                {
+                    Logging.WriteDebug("[PartyGrind Provision] Released '{0}' -> '{1}' (healthstone unavailable)",
+                        _activeProvisioner, _activeTradeTarget);
+                    SquadPartySyncService.MarkActivity();
+                    ClearProvisioning();
+                }
+                else if (timedOut)
                 {
                     if (!string.IsNullOrEmpty(_activeTradeTarget))
                         RecordProvisionCooldown(_activeTradeTarget, settings.ProvisionCooldownSeconds, nowUtcMs);
@@ -872,7 +887,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                         m.MapId == warlock.MapId &&
                         lockPos.Distance(new WoWPoint(m.X, m.Y, m.Z)) <= 40f &&
                         m.FreeBagSlots >= 2 &&
-                        m.WantsHealthstone &&
+                        m.WantsHealthstone && CanProvideHealthstoneTo(warlock, m) &&
                         !IsOnProvisionCooldown(m.CharacterName, nowUtcMs));
 
                     if (target != null)

@@ -863,6 +863,9 @@ namespace CopilotBuddy.Bots.PartyGrind
             int foodCount = SquadProvisioningService.CountFoodInBags();
             int drinkCount = SquadProvisioningService.CountDrinksInBags();
             bool hasHs = SquadProvisioningService.HasHealthstoneInBags();
+            int? healthstoneMinReceiverLevel = me.Class == WoWClass.Warlock && settings.EnableWarlockHealthstones
+                ? SquadProvisioningService.GetHealthstoneMinReceiverLevel(me)
+                : null;
             bool squadHasWarlock = me.Class == WoWClass.Warlock ||
                 (leader?.Members?.Any(m => m.IsConnected && m.Class == WoWClass.Warlock) ?? false);
 
@@ -977,7 +980,9 @@ namespace CopilotBuddy.Bots.PartyGrind
                 IsProvisioningBusy = _provisioning.IsTradeBusy,
                 CanProvideMageFood = me.Class == WoWClass.Mage && settings.EnableMageProvisioning && SpellManager.HasSpell("Conjure Food"),
                 CanProvideMageDrink = me.Class == WoWClass.Mage && settings.EnableMageProvisioning && SpellManager.HasSpell("Conjure Water"),
-                CanProvideHealthstone = me.Class == WoWClass.Warlock && settings.EnableWarlockHealthstones && me.Level >= 10 && SpellManager.HasSpell("Create Healthstone"),
+                CanProvideHealthstone = healthstoneMinReceiverLevel.HasValue,
+                HealthstoneMinReceiverLevel = healthstoneMinReceiverLevel,
+                IsHealthstoneRitualPending = _provisioning.IsSoulwellPending(now),
                 NeedsSell = townNeeds.NeedsSell,
                 NeedsRepair = townNeeds.NeedsRepair,
                 NeedsBuy = townNeeds.NeedsBuy,
@@ -1085,6 +1090,12 @@ namespace CopilotBuddy.Bots.PartyGrind
                             ? RunStatus.Success
                             : RunStatus.Failure;
                     })
+                ),
+
+                new Decorator(
+                    ctx => SquadContext.GetLeaderStateSnapshot()?.Phase == SquadPhase.Grinding &&
+                        _provisioning.TryUseSoulwellWhileGrinding(SquadContext.ActiveSettings ?? SquadSettings.Instance),
+                    new Action(ctx => RunStatus.Success)
                 ),
 
                 // 8. Cross-party Buffs out of combat
