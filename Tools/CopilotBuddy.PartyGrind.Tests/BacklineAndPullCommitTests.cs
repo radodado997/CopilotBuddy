@@ -170,6 +170,28 @@ namespace CopilotBuddy.PartyGrind.Tests
         }
 
         [Fact]
+        public void BacklineHysteresis_LeavingExitRadiusRestartsReachDebounce()
+        {
+            var m = PartyGrindBot.EvaluateBacklineMovement(2.5f, true, 0, 1000, out long reached);
+            Assert.Equal(BacklineMovement.MoveToSlot, m);
+            Assert.Equal(1000L, reached);
+
+            m = PartyGrindBot.EvaluateBacklineMovement(4.0f, true, reached, 1300, out reached);
+            Assert.Equal(BacklineMovement.MoveToSlot, m);
+            Assert.Equal(0L, reached);
+
+            m = PartyGrindBot.EvaluateBacklineMovement(2.5f, true, reached, 1400, out reached);
+            Assert.Equal(BacklineMovement.MoveToSlot, m);
+            Assert.Equal(1400L, reached);
+
+            m = PartyGrindBot.EvaluateBacklineMovement(2.5f, true, reached, 1500, out reached);
+            Assert.Equal(BacklineMovement.MoveToSlot, m);
+
+            m = PartyGrindBot.EvaluateBacklineMovement(2.5f, true, reached, 1900, out reached);
+            Assert.Equal(BacklineMovement.HoldPosition, m);
+        }
+
+        [Fact]
         public void BacklineLatch_HoldsSlotUntilTargetChangesTankDriftsOrExpires()
         {
             var tank0 = new WoWPoint(100, 100, 0);
@@ -233,6 +255,12 @@ namespace CopilotBuddy.PartyGrind.Tests
 
             Assert.Equal(5UL, PartyGrindBot.ResolveCoordinatorFocusGuid(
                 5, false, true, false, true, false, 0, false));
+
+            Assert.Equal(7UL, PartyGrindBot.ResolveCoordinatorFocusGuid(
+                7, false, false, true, false, true, 42, true));
+
+            Assert.Equal(42UL, PartyGrindBot.ResolveCoordinatorFocusGuid(
+                42, false, false, true, false, true, 42, true));
         }
 
         [Fact]

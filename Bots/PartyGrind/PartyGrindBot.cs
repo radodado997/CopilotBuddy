@@ -642,6 +642,7 @@ namespace CopilotBuddy.Bots.PartyGrind
         {
             _pullCommittedGuid = targetGuid;
             _pullCommittedUntilMs = nowUtcMs + PullCommitTimeoutMs;
+            _pullStartedUtcMs = nowUtcMs;
         }
 
         private void ClearPullCommit()
@@ -714,7 +715,13 @@ namespace CopilotBuddy.Bots.PartyGrind
             bool commitActive)
         {
             if (commitActive && committedGuid != 0)
-                return committedGuid;
+            {
+                bool hostileThreatTakesPrecedence = resolvedFocusGuid != 0 &&
+                                                    resolvedFocusGuid != committedGuid &&
+                                                    !focusIdle;
+                if (!hostileThreatTakesPrecedence)
+                    return committedGuid;
+            }
             if (resolvedFocusGuid != 0 && focusIdle &&
                 (localCannotPull || !phaseGrinding || waitingForFollower || !canInitiatePull))
                 return 0UL;
@@ -1126,7 +1133,13 @@ namespace CopilotBuddy.Bots.PartyGrind
             if (me.Combat)
                 return true;
 
-            if (leader != null && (leader.InCombat || leader.FocusTargetGuid != 0))
+            if (leader != null && leader.InCombat)
+                return true;
+
+            var restSource = SquadContext.GetLocalMemberStateSnapshot();
+            bool restRequired = (leader != null && leader.Phase == SquadPhase.Resting) ||
+                                restSource?.NeedsRest == true;
+            if (leader != null && leader.FocusTargetGuid != 0 && !restRequired)
                 return true;
 
             if (settings.Role == SquadRole.Healer && SquadHealBridge.HasHealCandidate(leader))
@@ -1315,7 +1328,7 @@ namespace CopilotBuddy.Bots.PartyGrind
             {
                 bool engaged = me.Combat || guardTarget.Combat || guardTarget.IsTargetingMyPartyMember;
                 float engageRange = settings.Role == SquadRole.Healer ? BacklineCombatRangeHealer : BacklineCombatRangeRanged;
-                if (ShouldYieldBacklineToCombat(engaged, guardTarget.Distance, guardTarget.InLineOfSpellSight, engageRange))
+                if (ShouldYieldBacklineToCombat(engaged, (float)guardTarget.Distance, guardTarget.InLineOfSpellSight, engageRange))
                     return false;
             }
 
@@ -1390,7 +1403,11 @@ namespace CopilotBuddy.Bots.PartyGrind
                 newReachedAtMs = 0;
                 return BacklineMovement.MoveToSlot;
             }
-            if (distanceToSlot < BacklineExitDistance)
+            if (distanceToSlot >= BacklineExitDistance)
+            {
+                newReachedAtMs = 0;
+            }
+            else
             {
                 if (newReachedAtMs == 0)
                     newReachedAtMs = nowUtcMs;
