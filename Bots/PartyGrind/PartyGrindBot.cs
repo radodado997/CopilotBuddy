@@ -47,6 +47,7 @@ namespace CopilotBuddy.Bots.PartyGrind
         private Composite? _root;
 
         private long _lastIpcSendUtcMs;
+        private long _lastIdleSnapshotUtcMs;
         private long _lastTownRallySearchUtcMs;
         private uint _cachedTownRallyMapId;
         private WoWPoint _cachedTownRallyPoint;
@@ -77,6 +78,7 @@ namespace CopilotBuddy.Bots.PartyGrind
         private const float BacklineCombatRangeHealer = 35.0f;
         private const long PullCommitTimeoutMs = 10000L;
         private const float PullCommitMaxTargetDistance = 60.0f;
+        private const long IdleSnapshotIntervalMs = 5000L;
         private bool _wasInCombat;
         private bool _townTasksCompleteLocal;
         private bool _townRunRequestPending;
@@ -163,6 +165,7 @@ namespace CopilotBuddy.Bots.PartyGrind
             _coordinator.Reset();
             _townRun.Reset();
             _lastIpcSendUtcMs = 0;
+            _lastIdleSnapshotUtcMs = 0;
             _lastAppliedEffectiveLevel = 0;
             _lastAttemptedLeaderProfilePath = string.Empty;
             _currentFocusGuid = 0;
@@ -355,6 +358,42 @@ namespace CopilotBuddy.Bots.PartyGrind
             {
                 PulseFollower(settings, localState, now);
             }
+
+            EmitIdleSnapshot(now);
+        }
+
+        private void EmitIdleSnapshot(long now)
+        {
+            long lastLogUtcMs = Math.Max(SquadPartySyncService.LastActionUtcMs, _lastIdleSnapshotUtcMs);
+            if (lastLogUtcMs != 0 && now - lastLogUtcMs < IdleSnapshotIntervalMs)
+                return;
+            var me = StyxWoW.Me;
+            var name = me?.Name;
+            if (me == null || string.IsNullOrWhiteSpace(name))
+                return;
+            var leader = SquadContext.GetLeaderStateSnapshot();
+            var local = SquadContext.GetLocalMemberStateSnapshot();
+            ulong focusGuid = leader is { FocusTargetGuid: not 0 } ? leader.FocusTargetGuid : _currentFocusGuid;
+            string focusName = focusGuid != 0
+                ? ObjectManager.GetObjectByGuid<WoWUnit>(focusGuid)?.Name ?? "?"
+                : "-";
+            long commitRemainingMs = _pullCommittedGuid != 0 ? Math.Max(0L, _pullCommittedUntilMs - now) : 0L;
+            Logging.WriteDebug(
+                "[PartyGrind Sync {0}] Idle@{1} phase={2} focus={3}:{4} commit={5}ms wait={6} dist={7:F0} prov='{8}' tgt='{9}' rest={10} casting={11} pos=({12:F0},{13:F0},{14:F0})",
+                name,
+                now,
+                leader?.Phase.ToString() ?? "-",
+                focusGuid,
+                focusName,
+                commitRemainingMs,
+                _coordinator.IsWaitingForFollowerDebounced,
+                _coordinator.MaxFollowerDistance,
+                leader?.ActiveProvisionerName ?? string.Empty,
+                leader?.ActiveTradeTargetName ?? string.Empty,
+                local?.NeedsRest ?? false,
+                me.IsCasting || me.ChanneledCastingSpellId != 0,
+                me.Location.X, me.Location.Y, me.Location.Z);
+            _lastIdleSnapshotUtcMs = now;
         }
 
         private static Dictionary<string, string> LoadMemberSecrets(SquadSettings settings)
@@ -631,6 +670,11 @@ namespace CopilotBuddy.Bots.PartyGrind
                 _pullStartedUtcMs = 0;
             }
 
+            if (newFocusGuid != _currentFocusGuid)
+            {
+                Logging.WriteDebug("[PartyGrind Focus] {0} -> {1}", _currentFocusGuid, newFocusGuid);
+                SquadPartySyncService.MarkActivity();
+            }
             _currentFocusGuid = newFocusGuid;
 
             WoWUnit? secondary = Targeting.Instance.TargetList
@@ -643,12 +687,16 @@ namespace CopilotBuddy.Bots.PartyGrind
             _pullCommittedGuid = targetGuid;
             _pullCommittedUntilMs = nowUtcMs + PullCommitTimeoutMs;
             _pullStartedUtcMs = nowUtcMs;
+            Logging.WriteDebug("[PartyGrind Commit] Started {0} ({1}s)", targetGuid, PullCommitTimeoutMs / 1000L);
+            SquadPartySyncService.MarkActivity();
         }
 
         private void ClearPullCommit()
         {
             _pullCommittedGuid = 0;
             _pullCommittedUntilMs = 0;
+            Logging.WriteDebug("[PartyGrind Commit] Released");
+            SquadPartySyncService.MarkActivity();
         }
 
         private void ResetBacklineState()
@@ -1013,17 +1061,26 @@ namespace CopilotBuddy.Bots.PartyGrind
                         var settings = SquadContext.ActiveSettings ?? SquadSettings.Instance;
                         var provisionLeader = SquadContext.GetLeaderStateSnapshot();
                         var me = StyxWoW.Me;
-                        if (me != null && me.Mounted && provisionLeader != null &&
+                        bool iAmPairMember = me != null && provisionLeader != null &&
                             (string.Equals(me.Name, provisionLeader.ActiveProvisionerName, StringComparison.OrdinalIgnoreCase) ||
-                             string.Equals(me.Name, provisionLeader.ActiveTradeTargetName, StringComparison.OrdinalIgnoreCase)))
+                             string.Equals(me.Name, provisionLeader.ActiveTradeTargetName, StringComparison.OrdinalIgnoreCase));
+                        if (me != null && me.Mounted && iAmPairMember)
                         {
                             Mount.Dismount("Squad provisioning");
+                            SquadPartySyncService.LogAction("Provision: dismounting");
                             return RunStatus.Success;
                         }
-                        if (provisionLeader?.Members.Any(m => m.IsMounted &&
-                            (string.Equals(m.CharacterName, provisionLeader.ActiveProvisionerName, StringComparison.OrdinalIgnoreCase) ||
-                             string.Equals(m.CharacterName, provisionLeader.ActiveTradeTargetName, StringComparison.OrdinalIgnoreCase))) == true)
-                            return RunStatus.Success;
+                        if (iAmPairMember)
+                        {
+                            var mountedPartner = provisionLeader!.Members?.FirstOrDefault(m => m.IsMounted &&
+                                (string.Equals(m.CharacterName, provisionLeader.ActiveProvisionerName, StringComparison.OrdinalIgnoreCase) ||
+                                 string.Equals(m.CharacterName, provisionLeader.ActiveTradeTargetName, StringComparison.OrdinalIgnoreCase)));
+                            if (mountedPartner != null)
+                            {
+                                SquadPartySyncService.LogAction("Provision: waiting for " + mountedPartner.CharacterName + " to dismount");
+                                return RunStatus.Success;
+                            }
+                        }
                         return _provisioning.RunProvisioningTick(settings, provisionLeader)
                             ? RunStatus.Success
                             : RunStatus.Failure;

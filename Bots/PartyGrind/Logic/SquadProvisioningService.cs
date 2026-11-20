@@ -396,6 +396,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     OnTradeCancelledOrTimeout(_activeTradeTarget, settings.ProvisionCooldownSeconds);
                     return false;
                 }
+                SquadPartySyncService.LogAction("Provision: trade offer pending " + _activeTradeTarget);
                 return true;
             }
 
@@ -420,6 +421,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                         string.Equals(m.CharacterName, leader.ActiveProvisionerName, StringComparison.OrdinalIgnoreCase));
                     if (prov != null && me.Location.Distance(new WoWPoint(prov.X, prov.Y, prov.Z)) > 5f)
                     {
+                        SquadPartySyncService.LogAction("Provision: approaching " + prov.CharacterName);
                         Navigator.MoveTo(new WoWPoint(prov.X, prov.Y, prov.Z), "Approaching provisioner " + prov.CharacterName);
                         return true;
                     }
@@ -701,6 +703,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             _tradeStartedUtcMs = now;
             _tradeItemsPlaced = false;
             _offeredItems.Clear();
+            SquadPartySyncService.LogAction("Provision: offering trade to " + targetSummary.CharacterName);
             TradeFrame.Instance.InitiateTrade("target");
             return true;
         }
