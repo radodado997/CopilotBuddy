@@ -200,7 +200,11 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
                 string? spellName = SelectHealSpellForClass(me, targetUnit, injured78, injured82, emergencyOnly);
                 if (string.IsNullOrEmpty(spellName))
+                {
+                    if (targetUnit.HealthPercent < 60)
+                        SquadPartySyncService.LogAction("Heal: no spell for " + targetUnit.Name + " (" + targetUnit.Class + ")");
                     continue;
+                }
 
                 if (SpellManager.Spells.TryGetValue(spellName, out WoWSpell? spellInfo) && spellInfo.CastTime > 0 && me.IsMoving)
                 {
@@ -214,6 +218,10 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                         SquadPartySyncService.LogAction("Healing " + targetUnit.Name + " with " + spellName);
                         return true;
                     }
+                }
+                else if (targetUnit.HealthPercent < 50)
+                {
+                    SquadPartySyncService.LogAction("Heal blocked: " + spellName + " for " + targetUnit.Name);
                 }
 
             }

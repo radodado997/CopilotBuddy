@@ -929,7 +929,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                 IsProvisioningBusy = _provisioning.IsTradeBusy,
                 CanProvideMageFood = me.Class == WoWClass.Mage && settings.EnableMageProvisioning && SpellManager.HasSpell("Conjure Food"),
                 CanProvideMageDrink = me.Class == WoWClass.Mage && settings.EnableMageProvisioning && SpellManager.HasSpell("Conjure Water"),
-                CanProvideHealthstone = me.Class == WoWClass.Warlock && settings.EnableWarlockHealthstones && me.Level >= 10,
+                CanProvideHealthstone = me.Class == WoWClass.Warlock && settings.EnableWarlockHealthstones && me.Level >= 10 && SpellManager.HasSpell("Create Healthstone"),
                 NeedsSell = townNeeds.NeedsSell,
                 NeedsRepair = townNeeds.NeedsRepair,
                 NeedsBuy = townNeeds.NeedsBuy,
@@ -1469,6 +1469,8 @@ namespace CopilotBuddy.Bots.PartyGrind
                 Mount.Dismount("Resting");
 
             var settings = SquadContext.ActiveSettings ?? SquadSettings.Instance;
+            if (SquadProvisioningService.TryConjureForSelf(settings))
+                return RunStatus.Success;
             if (me.HealthPercent < settings.ResumeRestHealthPct && !me.HasAura("Food") && !me.HasAura("Refreshment"))
                 Rest.FeedImmediate();
 

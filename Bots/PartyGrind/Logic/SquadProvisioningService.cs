@@ -231,6 +231,43 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             return me.BagItems.Any(i => i != null && i.IsValid && IsHealthstoneName(i.Name));
         }
 
+        public static bool TryConjureForSelf(SquadSettings settings)
+        {
+            var me = StyxWoW.Me;
+            if (me == null || me.Class != WoWClass.Mage || !settings.EnableMageProvisioning ||
+                me.Combat || me.Dead || me.IsCasting || me.ChanneledCastingSpellId != 0)
+                return false;
+
+            bool usesMana = me.PowerType == WoWPowerType.Mana;
+            bool needFood = CountFoodInBags() < settings.MinMemberFoodStack;
+            bool needDrink = usesMana && CountDrinksInBags() < settings.MinMemberDrinkStack;
+            if (!needFood && !needDrink)
+                return false;
+
+            bool isWater = !needFood;
+            string baseName = isWater ? "Conjure Water" : "Conjure Food";
+            var known = GetKnownRankSpells(baseName);
+            int? rank = SelectBestConjureRank(isWater, me.Level, me.Level, known);
+            if (rank == null)
+            {
+                SquadPartySyncService.LogAction("Conjure: no known rank for self");
+                return false;
+            }
+
+            int spellId = known.First(r => r.Rank == rank.Value).SpellId;
+            if (!SpellManager.CanCast(spellId, me, false, false))
+                return false;
+
+            if (me.IsMoving) WoWMovement.MoveStop();
+            SquadPartySyncService.LogAction("Provision: conjuring for self");
+            WoWSpell? conjureSpell = WoWSpell.FromId(spellId);
+            string castName = !string.IsNullOrEmpty(conjureSpell?.Name)
+                ? conjureSpell!.Name
+                : $"{baseName}(Rank {rank.Value})";
+            Lua.DoString($"CastSpellByName('{castName}')");
+            return true;
+        }
+
         private void OnTradeCancelledOrTimeout(string targetName, int cooldownSeconds)
         {
             if (!TradeFrame.IsPartnerAuthorized(targetName, _activeTradeTarget)) return;
@@ -319,6 +356,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 return HandleOpenTradeFrame(me, settings, leader, now);
             }
 
+            if (TryConjureForSelf(settings))
+                return true;
+
             // 2. Clean up stale initiated trade timeout if frame never opened.
             if (!string.IsNullOrEmpty(_activeTradeTarget))
             {
@@ -360,9 +400,14 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 {
                     var prov = leader.Members?.FirstOrDefault(m =>
                         string.Equals(m.CharacterName, leader.ActiveProvisionerName, StringComparison.OrdinalIgnoreCase));
-                    if (prov != null && me.Location.Distance(new WoWPoint(prov.X, prov.Y, prov.Z)) > 8f)
+                    if (prov != null && me.Location.Distance(new WoWPoint(prov.X, prov.Y, prov.Z)) > 5f)
                     {
                         Navigator.MoveTo(new WoWPoint(prov.X, prov.Y, prov.Z), "Approaching provisioner " + prov.CharacterName);
+                        return true;
+                    }
+                    if (prov != null)
+                    {
+                        SquadPartySyncService.LogAction("Provision: waiting for offer");
                         return true;
                     }
                 }
@@ -522,6 +567,12 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 int? foodRank = SelectBestConjureRank(isWater: false, receiverLevel, me.Level, foodRanks);
                 if (foodRank.HasValue)
                 {
+                    int foodSpellId = foodRanks.First(r => r.Rank == foodRank.Value).SpellId;
+                    if (!SpellManager.CanCast(foodSpellId, me, false, false))
+                    {
+                        SquadPartySyncService.LogAction("Conjure: not ready");
+                        return true;
+                    }
                     if (me.IsMoving) WoWMovement.MoveStop();
                     Lua.DoString($"CastSpellByName('Conjure Food(Rank {foodRank.Value})')");
                     return true;
@@ -541,6 +592,12 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 int? waterRank = SelectBestConjureRank(isWater: true, receiverLevel, me.Level, waterRanks);
                 if (waterRank.HasValue)
                 {
+                    int waterSpellId = waterRanks.First(r => r.Rank == waterRank.Value).SpellId;
+                    if (!SpellManager.CanCast(waterSpellId, me, false, false))
+                    {
+                        SquadPartySyncService.LogAction("Conjure: not ready");
+                        return true;
+                    }
                     if (me.IsMoving) WoWMovement.MoveStop();
                     Lua.DoString($"CastSpellByName('Conjure Water(Rank {waterRank.Value})')");
                     return true;
@@ -584,11 +641,15 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 {
                     var selectedSpell = me.KnownSpells.FirstOrDefault(s => s.Id == hsRanks.First(r => r.Rank == hsRank.Value).SpellId);
                     if (selectedSpell == null || !SpellManager.CanCast(selectedSpell, me, false, false))
+                    {
+                        SquadPartySyncService.LogAction("Healthstone: conjure not ready");
                         return false;
+                    }
                     if (me.IsMoving) WoWMovement.MoveStop();
                     Lua.DoString($"CastSpellByName('Create Healthstone(Rank {hsRank.Value})')");
                     return true;
                 }
+                SquadPartySyncService.LogAction("Healthstone: no conjure rank");
                 return false;
             }
 
@@ -605,7 +666,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (targetPlayer == null || !targetPlayer.IsValid || targetPlayer.Dead)
                 return false;
 
-            if (targetPlayer.Distance > 8f)
+            if (!targetPlayer.WithinInteractRange)
             {
                 Navigator.MoveTo(targetPlayer.Location, "Moving to trade " + targetPlayer.Name);
                 return true;
