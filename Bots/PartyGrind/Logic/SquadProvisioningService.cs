@@ -247,7 +247,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             var foodKnown = GetKnownRankSpells("Conjure Food");
             int? foodRank = needFood ? SelectBestConjureRank(isWater: false, me.Level, me.Level, foodKnown) : null;
             var waterKnown = GetKnownRankSpells("Conjure Water");
-            int? waterRank = SelectBestConjureRank(isWater: true, me.Level, me.Level, waterKnown);
+            int? waterRank = needDrink ? SelectBestConjureRank(isWater: true, me.Level, me.Level, waterKnown) : null;
 
             bool isWater;
             int rank;
@@ -273,6 +273,12 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             var selectedSpell = me.KnownSpells.FirstOrDefault(s => s.Id == spellId);
             if (selectedSpell == null || !SpellManager.CanCast(selectedSpell, me, false, false))
                 return false;
+
+            if (me.FreeNormalBagSlots == 0)
+            {
+                SquadPartySyncService.LogAction("Conjure: no bag space for self");
+                return false;
+            }
 
             if (me.IsMoving) WoWMovement.MoveStop();
             SquadPartySyncService.LogAction("Provision: conjuring for self");

@@ -57,7 +57,25 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (_healDiagRetry.TryGetValue(key, out long allowedAt) && now < allowedAt)
                 return;
             _healDiagRetry[key] = now + 15000;
-            SquadPartySyncService.LogAction(message);
+            Logging.WriteDebug("[PartyGrind Sync {0}] {1}", StyxWoW.Me?.Name ?? string.Empty, message);
+        }
+
+        private static string? FindBlockedKnownHealSpell(LocalPlayer me, WoWUnit target)
+        {
+            string[] probes = me.Class switch
+            {
+                WoWClass.Priest => new[] { "Lesser Heal", "Heal", "Flash Heal", "Greater Heal" },
+                WoWClass.Paladin => new[] { "Holy Light", "Flash of Light" },
+                WoWClass.Druid => new[] { "Healing Touch", "Regrowth", "Nourish" },
+                WoWClass.Shaman => new[] { "Lesser Healing Wave", "Healing Wave" },
+                _ => System.Array.Empty<string>()
+            };
+            foreach (string probe in probes)
+            {
+                if (SpellManager.HasSpell(probe) && !SpellManager.CanCast(probe, target, true, false))
+                    return probe;
+            }
+            return null;
         }
         private static readonly string[] RangedAssistSpells =
         {
@@ -212,7 +230,13 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 if (string.IsNullOrEmpty(spellName))
                 {
                     if (targetUnit.HealthPercent < 60)
-                        LogHealDiagnostic(targetUnit.Guid + "|no-spell", "Heal: no spell for " + targetUnit.Name + " (" + targetUnit.Class + ")");
+                    {
+                        string? blockedProbe = FindBlockedKnownHealSpell(me, targetUnit);
+                        if (blockedProbe != null)
+                            LogHealDiagnostic(targetUnit.Guid + "|known-blocked", "Heal: cannot cast " + blockedProbe + " for " + targetUnit.Name);
+                        else
+                            LogHealDiagnostic(targetUnit.Guid + "|no-spell", "Heal: no spell for " + targetUnit.Name + " (" + targetUnit.Class + ")");
+                    }
                     continue;
                 }
 
