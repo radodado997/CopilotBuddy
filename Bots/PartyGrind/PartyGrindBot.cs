@@ -620,10 +620,10 @@ namespace CopilotBuddy.Bots.PartyGrind
                 _pullCommittedGuid,
                 commitActive);
 
-            if (newFocusGuid != 0 && newFocusGuid != _currentFocusGuid)
+            if (newFocusGuid != 0 && newFocusGuid != _currentFocusGuid && !commitActive)
             {
                 _pullStartedUtcMs = now;
-                if (!commitActive && focus != null && focus.Guid == newFocusGuid && focusIdle)
+                if (focus != null && focus.Guid == newFocusGuid && focusIdle)
                     BeginPullCommit(newFocusGuid, now);
             }
             else if (newFocusGuid == 0)
