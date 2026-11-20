@@ -48,6 +48,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private bool _wasInTownRun;
         private bool _mailRequested;
         private bool _sellRepairVisitDone;
+        private readonly Dictionary<int, (bool Food, bool Drink)> _vendorStock = new();
         private int _mailAttempts;
         private readonly SquadVendorAttempts _vendorAttempts = new();
         private long _stageStarted;
@@ -86,7 +87,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             bool mailboxAvailable = ProfileManager.CurrentProfile?.MailboxManager?.GetClosestMailbox() != null ||
                 string.IsNullOrWhiteSpace(CharacterSettings.Instance.MailRecipient) ||
                 !Styx.Logic.Inventory.InventoryManager.GetItemsToMail().Any();
-            bool vendorAvailable = ResolveSellOrRepairVendor(GetVendorWorkNeeds(needs)) != null;
+            bool vendorAvailable = _sellRepairVisitDone && !needs.NeedsSell && !needs.NeedsRepair && needs.NeedsBuy
+                ? ResolveBuyVendor(needs) != null
+                : ResolveSellOrRepairVendor(GetVendorWorkNeeds(needs)) != null;
             bool trainerAvailable = !needs.NeedsTrain || ResolveClassTrainerLocation(me, out _, out _).HasValue;
             WoWPoint rally = leader != null && (leader.TownRallyX != 0f || leader.TownRallyY != 0f)
                 ? new WoWPoint(leader.TownRallyX, leader.TownRallyY, leader.TownRallyZ)
@@ -132,6 +135,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             _wasInTownRun = false;
             _mailRequested = false;
             _sellRepairVisitDone = false;
+            _vendorStock.Clear();
             _mailAttempts = 0;
             _vendorAttempts.Reset();
             _stageStarted = Environment.TickCount64;
@@ -322,7 +326,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     bool sellAndRepair = !_sellRepairVisitDone || needs.NeedsSell || needs.NeedsRepair;
                     Vendor? vendor = sellAndRepair
                         ? ResolveSellOrRepairVendor(vendorNeeds)
-                        : ResolveBuyVendor();
+                        : ResolveBuyVendor(needs);
                     if (vendor == null) return Block("No eligible vendor found.", out townTasksComplete);
                     WoWPoint targetLoc = vendor.Location;
                     if (me.Location.Distance(targetLoc) > 5.0f)
@@ -339,7 +343,12 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     _vendorAttempts.Record(Environment.TickCount64, needs, freeSlots, interacted);
                     if (interacted)
                     {
-                        if (sellAndRepair) _sellRepairVisitDone = true;
+                        if (sellAndRepair)
+                        {
+                            _sellRepairVisitDone = true;
+                            if (!needs.NeedsSell && !needs.NeedsRepair)
+                                _vendorAttempts.ResetAttemptBudget();
+                        }
                     }
                     Logging.WriteDebug("[PartyGrind Sync {0}] Vendor {1} ({2}): {3}; attempt={4}, slots={5}, sell={6}, repair={7}, food={8}, drink={9}.",
                         me.Name, vendor.Name, vendor.Entry, outcome, _vendorAttempts.Count, freeSlots,
@@ -505,17 +514,24 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             return vm.GetClosestVendor(Vendor.VendorType.Sell) ?? vm.GetClosestVendor(Vendor.VendorType.Repair);
         }
 
-        private static Vendor? ResolveBuyVendor()
+        internal static bool CanSupplyNeededConsumables(TownNeedsEvaluation needs, bool hasFood, bool hasDrink)
+            => (!needs.NeedsFood && !needs.NeedsDrink) ||
+                (needs.NeedsFood && hasFood) || (needs.NeedsDrink && hasDrink);
+
+        private Vendor? ResolveBuyVendor(TownNeedsEvaluation needs)
         {
             var vm = ProfileManager.CurrentProfile?.VendorManager;
             if (vm == null) return null;
-            return vm.GetClosestVendor(Vendor.VendorType.Food)
-                ?? vm.GetClosestVendor(Vendor.VendorType.Restock)
-                ?? vm.GetClosestVendor(Vendor.VendorType.Sell)
-                ?? vm.GetClosestVendor(Vendor.VendorType.Repair);
+            var excluded = _vendorStock
+                .Where(v => !CanSupplyNeededConsumables(needs, v.Value.Food, v.Value.Drink))
+                .Select(v => v.Key).ToHashSet();
+            return vm.GetClosestVendor(Vendor.VendorType.Food, excluded)
+                ?? vm.GetClosestVendor(Vendor.VendorType.Restock, excluded)
+                ?? vm.GetClosestVendor(Vendor.VendorType.Sell, excluded)
+                ?? vm.GetClosestVendor(Vendor.VendorType.Repair, excluded);
         }
 
-        private static bool PerformVendorInteraction(
+        private bool PerformVendorInteraction(
             Vendor? vendor,
             TownNeedsEvaluation vendorNeeds,
             bool sellAndRepair,
@@ -580,6 +596,17 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 }
                 if (!sellAndRepair && vendorNeeds.NeedsBuy)
                 {
+                    Vendors.WaitForMerchantItemCache();
+                    bool hasFood = MerchantFrame.Instance.GetBestFoodFromVendor() != -1;
+                    bool hasDrink = MerchantFrame.Instance.GetBestDrinkFromVendor() != -1;
+                    if (vendor != null && MerchantFrame.Instance.GetAllMerchantItems().All(i => i.ItemInfo != null))
+                        _vendorStock[vendor.Entry] = (hasFood, hasDrink);
+                    if (!CanSupplyNeededConsumables(vendorNeeds, hasFood, hasDrink))
+                    {
+                        MerchantFrame.Instance.Close();
+                        outcome = "merchant has no usable consumable matching remaining needs";
+                        return false;
+                    }
                     if (vendor != null && (vendor.Type == Vendor.VendorType.Food || vendor.Type == Vendor.VendorType.Restock))
                     {
                         BotPoi.Current = new BotPoi(vendor, PoiType.Buy);
@@ -740,7 +767,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             LastInteractionSucceeded = false;
         }
 
-        internal bool IsConfirmationPending(long now) => Count > 0 && now < _nextAttempt;
+        internal void ResetAttemptBudget() => Count = 0;
+
+        internal bool IsConfirmationPending(long now) => now < _nextAttempt;
 
         public SquadVendorAttemptDecision Evaluate(long now, TownNeedsEvaluation needs, int freeSlots)
         {

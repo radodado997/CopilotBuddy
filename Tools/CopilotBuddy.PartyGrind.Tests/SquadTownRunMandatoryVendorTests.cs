@@ -55,6 +55,23 @@ namespace CopilotBuddy.PartyGrind.Tests
         }
 
         [Theory]
+        [InlineData(false, true, true, false, false)]
+        [InlineData(false, true, false, true, true)]
+        [InlineData(true, false, false, true, false)]
+        [InlineData(true, false, true, false, true)]
+        [InlineData(true, true, true, false, true)]
+        [InlineData(true, true, false, true, true)]
+        [InlineData(true, true, false, false, false)]
+        [InlineData(false, false, false, false, true)]
+        public void ConsumableStock_MustMatchAtLeastOneRemainingNeed(
+            bool needsFood, bool needsDrink, bool hasFood, bool hasDrink, bool expected)
+        {
+            var needs = new TownNeedsEvaluation { NeedsFood = needsFood, NeedsDrink = needsDrink };
+
+            Assert.Equal(expected, SquadTownRunService.CanSupplyNeededConsumables(needs, hasFood, hasDrink));
+        }
+
+        [Theory]
         [InlineData(false, false, false, false, false)]
         [InlineData(true, false, false, false, true)]
         [InlineData(true, true, false, false, false)]

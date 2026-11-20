@@ -104,6 +104,9 @@ namespace Styx.Logic.Profiles
         /// For Sell type, also accepts Repair and Ammo vendors (they can all buy items).
         /// </summary>
         public Vendor GetClosestVendor(Vendor.VendorType type)
+            => GetClosestVendor(type, null);
+
+        internal Vendor GetClosestVendor(Vendor.VendorType type, ISet<int> excludedEntries)
         {
             try
             {
@@ -137,6 +140,9 @@ namespace Styx.Logic.Profiles
                     }
                 }
 
+                if (source != null && excludedEntries != null)
+                    source = source.Where(v => !excludedEntries.Contains(v.Entry)).ToList();
+
                 if (source == null || source.Count == 0)
                 {
                     // Only fall back to Data.bin if FindVendorsAutomatically is enabled
@@ -144,7 +150,8 @@ namespace Styx.Logic.Profiles
                     {
                         try
                         {
-                            HashSet<int> excluded = new HashSet<int>();
+                            HashSet<int> excluded = excludedEntries == null
+                                ? new HashSet<int>() : new HashSet<int>(excludedEntries);
                             foreach (Vendor blacklisted in Blacklist)
                                 excluded.Add(blacklisted.Entry);
 
