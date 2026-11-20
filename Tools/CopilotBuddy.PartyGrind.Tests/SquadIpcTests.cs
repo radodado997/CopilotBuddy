@@ -65,6 +65,19 @@ namespace CopilotBuddy.PartyGrind.Tests
         }
 
         [Fact]
+        public async Task InvalidTelemetryLevel_DoesNotOverwriteOriginalHandshake()
+        {
+            using var server = new SquadIpcServer(0, "Retry", memberSecrets: Secrets);
+            server.Start();
+            using var client = new SquadIpcClient(server.Port, "Retry", memberSecret: Secret("Follower"));
+            client.Start(() => new SquadHandshake { CharacterName = "Follower", Guid = 42, Level = 13 });
+            await WaitUntilAsync(() => server.GetMemberSnapshots().Count == 1);
+            client.SendMemberState(new SquadMemberState { CharacterName = "Follower", Guid = 42, Level = 0 });
+            await WaitUntilAsync(() => server.GetMemberSnapshots().SingleOrDefault()?.LatestState?.Level == 0);
+            Assert.Equal(13, Assert.Single(server.GetMemberSnapshots()).Handshake.Level);
+        }
+
+        [Fact]
         public async Task SameClient_ReconnectsAutomaticallyAfterListenerRestart()
         {
             using var server = new SquadIpcServer(0, "Retry", memberSecrets: Secrets);

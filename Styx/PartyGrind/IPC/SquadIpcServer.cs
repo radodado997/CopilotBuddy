@@ -471,15 +471,6 @@ namespace Styx.PartyGrind.IPC
                             RequestedUtcMs = state.TownRunRequestedUtcMs
                         }
                         : null;
-                    session.Handshake = new SquadHandshake
-                    {
-                        CharacterName = session.CharacterName,
-                        Guid = state.Guid,
-                        Class = state.Class,
-                        Role = state.Role,
-                        Level = state.Level,
-                        ProtocolVersion = session.Handshake.ProtocolVersion
-                    };
                 }
 
                 MemberStateReceived?.Invoke(state);
