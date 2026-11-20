@@ -29,9 +29,21 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private static string _lastAction = string.Empty;
         private static string _lastActionCharacter = string.Empty;
 
+        internal static long LastActionUtcMs;
+
         internal static void ResetActionLog()
         {
-            lock (ActionLogLock) { _lastAction = _lastActionCharacter = string.Empty; }
+            lock (ActionLogLock)
+            {
+                _lastAction = _lastActionCharacter = string.Empty;
+                LastActionUtcMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            }
+        }
+
+        internal static void MarkActivity()
+        {
+            lock (ActionLogLock)
+                LastActionUtcMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         }
 
         internal static void LogAction(string action)
@@ -43,6 +55,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 if (_lastAction == action && _lastActionCharacter == name) return;
                 _lastAction = action;
                 _lastActionCharacter = name;
+                LastActionUtcMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
                 Logging.WriteDebug("[PartyGrind Sync {0}] {1}", name, action);
             }
         }

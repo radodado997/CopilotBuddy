@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using Styx;
 using Styx.Combat.CombatRoutine;
+using Styx.Helpers;
 using Styx.Logic.Pathing;
 using Styx.PartyGrind;
 using Styx.PartyGrind.IPC;
@@ -81,6 +82,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private string _activeProvisioner = string.Empty;
         private string _activeTradeTarget = string.Empty;
         private long _provisionStartedUtcMs;
+        private SquadPhase? _lastLoggedPhase;
         private bool _assignedFood, _assignedDrink, _assignedHealthstone;
         private string _townRunRequestedByName = string.Empty;
         private string _townRunRequestReason = string.Empty;
@@ -474,6 +476,12 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             // Provisioning arbitration.
             if (anyInCombat || anyDead || _inTownRun || anyNeedsRest || _migratingZone)
             {
+                if (!string.IsNullOrEmpty(_activeProvisioner))
+                {
+                    Logging.WriteDebug("[PartyGrind Provision] Cleared '{0}' (combat/death/town/rest/migration)",
+                        _activeProvisioner);
+                    SquadPartySyncService.MarkActivity();
+                }
                 ClearProvisioning();
             }
             else
@@ -537,6 +545,14 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             else
             {
                 phase = SquadPhase.Grinding;
+            }
+
+            if (_lastLoggedPhase != phase)
+            {
+                Logging.WriteDebug("[PartyGrind Phase] {0} -> {1} (provisioner='{2}', target='{3}', pause='{4}')",
+                    _lastLoggedPhase?.ToString() ?? "init", phase, _activeProvisioner, _activeTradeTarget, pauseReason);
+                SquadPartySyncService.MarkActivity();
+                _lastLoggedPhase = phase;
             }
 
             // 7. Build member summaries for HUD & peer services.
@@ -796,6 +812,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 {
                     if (!string.IsNullOrEmpty(_activeTradeTarget))
                         RecordProvisionCooldown(_activeTradeTarget, settings.ProvisionCooldownSeconds, nowUtcMs);
+                    Logging.WriteDebug("[PartyGrind Provision] Timeout '{0}' -> '{1}' (cooldown {2}s)",
+                        _activeProvisioner, _activeTradeTarget, settings.ProvisionCooldownSeconds);
+                    SquadPartySyncService.MarkActivity();
                     ClearProvisioning();
                 }
                 else if (stillNeeded)
@@ -804,6 +823,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 }
                 else
                 {
+                    Logging.WriteDebug("[PartyGrind Provision] Done '{0}' -> '{1}' (needs resolved)",
+                        _activeProvisioner, _activeTradeTarget);
+                    SquadPartySyncService.MarkActivity();
                     ClearProvisioning();
                 }
             }
@@ -831,6 +853,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                         _activeProvisioner = mage.CharacterName;
                         _activeTradeTarget = target.CharacterName;
                         _provisionStartedUtcMs = nowUtcMs;
+                        Logging.WriteDebug("[PartyGrind Provision] Assigned '{0}' -> '{1}' (food={2}, drink={3})",
+                            mage.CharacterName, target.CharacterName, _assignedFood, _assignedDrink);
+                        SquadPartySyncService.MarkActivity();
                         return;
                     }
                 }
@@ -857,6 +882,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                         _activeProvisioner = warlock.CharacterName;
                         _activeTradeTarget = target.CharacterName;
                         _provisionStartedUtcMs = nowUtcMs;
+                        Logging.WriteDebug("[PartyGrind Provision] Assigned '{0}' -> '{1}' (healthstone)",
+                            warlock.CharacterName, target.CharacterName);
+                        SquadPartySyncService.MarkActivity();
                         return;
                     }
                 }

@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using Styx;
 using Styx.Combat.CombatRoutine;
+using Styx.Helpers;
 using Styx.Logic.Combat;
 using Styx.PartyGrind;
 using Styx.PartyGrind.IPC;
@@ -219,7 +220,10 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             foreach (string aura in preferredAuras)
             {
                 if (!me.HasAura(aura) && SpellManager.CanCast(aura, me, false, false))
+                {
+                    SquadPartySyncService.LogAction("Buffing aura " + aura);
                     return SpellManager.Cast(aura, me);
+                }
                 if (me.GetAllAuras().Any(a => a.Name == aura && a.CreatorGuid == me.Guid))
                     break;
             }
@@ -242,6 +246,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     !ally.HasAura("Greater " + desiredBlessing) &&
                     SpellManager.CanCast(desiredBlessing, ally, true, false))
                 {
+                    SquadPartySyncService.LogAction("Buffing " + ally.Name + ": " + desiredBlessing);
                     return SpellManager.Cast(desiredBlessing, ally);
                 }
             }
