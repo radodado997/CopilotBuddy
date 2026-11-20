@@ -47,6 +47,7 @@ namespace CopilotBuddy.Bots.PartyGrind
         private Composite? _root;
 
         private long _lastIpcSendUtcMs;
+        private long _lastIdleSnapshotUtcMs;
         private long _lastTownRallySearchUtcMs;
         private uint _cachedTownRallyMapId;
         private WoWPoint _cachedTownRallyPoint;
@@ -164,6 +165,7 @@ namespace CopilotBuddy.Bots.PartyGrind
             _coordinator.Reset();
             _townRun.Reset();
             _lastIpcSendUtcMs = 0;
+            _lastIdleSnapshotUtcMs = 0;
             _lastAppliedEffectiveLevel = 0;
             _lastAttemptedLeaderProfilePath = string.Empty;
             _currentFocusGuid = 0;
@@ -362,23 +364,26 @@ namespace CopilotBuddy.Bots.PartyGrind
 
         private void EmitIdleSnapshot(long now)
         {
-            if (SquadPartySyncService.LastActionUtcMs != 0 &&
-                now - SquadPartySyncService.LastActionUtcMs < IdleSnapshotIntervalMs)
+            long lastLogUtcMs = Math.Max(SquadPartySyncService.LastActionUtcMs, _lastIdleSnapshotUtcMs);
+            if (lastLogUtcMs != 0 && now - lastLogUtcMs < IdleSnapshotIntervalMs)
                 return;
             var me = StyxWoW.Me;
-            if (me == null)
+            var name = me?.Name;
+            if (me == null || string.IsNullOrWhiteSpace(name))
                 return;
             var leader = SquadContext.GetLeaderStateSnapshot();
             var local = SquadContext.GetLocalMemberStateSnapshot();
-            string focusName = _currentFocusGuid != 0
-                ? ObjectManager.GetObjectByGuid<WoWUnit>(_currentFocusGuid)?.Name ?? "?"
+            ulong focusGuid = leader is { FocusTargetGuid: not 0 } ? leader.FocusTargetGuid : _currentFocusGuid;
+            string focusName = focusGuid != 0
+                ? ObjectManager.GetObjectByGuid<WoWUnit>(focusGuid)?.Name ?? "?"
                 : "-";
             long commitRemainingMs = _pullCommittedGuid != 0 ? Math.Max(0L, _pullCommittedUntilMs - now) : 0L;
-            SquadPartySyncService.LogAction(string.Format(
-                "Idle@{0} phase={1} focus={2}:{3} commit={4}ms wait={5} dist={6:F0} prov='{7}' tgt='{8}' rest={9} casting={10} pos=({11:F0},{12:F0},{13:F0})",
+            Logging.WriteDebug(
+                "[PartyGrind Sync {0}] Idle@{1} phase={2} focus={3}:{4} commit={5}ms wait={6} dist={7:F0} prov='{8}' tgt='{9}' rest={10} casting={11} pos=({12:F0},{13:F0},{14:F0})",
+                name,
                 now,
                 leader?.Phase.ToString() ?? "-",
-                _currentFocusGuid,
+                focusGuid,
                 focusName,
                 commitRemainingMs,
                 _coordinator.IsWaitingForFollowerDebounced,
@@ -387,7 +392,8 @@ namespace CopilotBuddy.Bots.PartyGrind
                 leader?.ActiveTradeTargetName ?? string.Empty,
                 local?.NeedsRest ?? false,
                 me.IsCasting || me.ChanneledCastingSpellId != 0,
-                me.Location.X, me.Location.Y, me.Location.Z));
+                me.Location.X, me.Location.Y, me.Location.Z);
+            _lastIdleSnapshotUtcMs = now;
         }
 
         private static Dictionary<string, string> LoadMemberSecrets(SquadSettings settings)
