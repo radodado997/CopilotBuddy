@@ -272,6 +272,7 @@ namespace CopilotBuddy.Bots.PartyGrind
             // An explicit announcement is a deliberate group action, so it works even when
             // the automatic SyncTownRuns trigger is disabled.
             _townRunRequestPending = true;
+            _townRunRequestEchoed = false;
             _townRunRequestReason = string.IsNullOrWhiteSpace(reason) ? "Manual" : reason.Trim();
             // A repeated manual request must produce a fresh, strictly increasing
             // timestamp so the coordinator does not treat it as the previous one.
@@ -287,6 +288,7 @@ namespace CopilotBuddy.Bots.PartyGrind
             var me = StyxWoW.Me;
             if (me == null || string.IsNullOrWhiteSpace(me.Name))
                 return null;
+            var settings = SquadContext.ActiveSettings ?? SquadSettings.Instance;
             return new SquadTownRunRequest
             {
                 CharacterName = me.Name,

@@ -471,7 +471,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             }
 
             var remainingNeeds = EvaluateLiveLocalNeeds(settings, leader);
-            townTasksComplete = !remainingNeeds.NeedsSell && !remainingNeeds.NeedsRepair &&
+            townTasksComplete = _stage1SellRepairBuyDone && !remainingNeeds.NeedsSell && !remainingNeeds.NeedsRepair &&
                 !remainingNeeds.NeedsBuy && !remainingNeeds.NeedsTrain && !remainingNeeds.NeedsMail;
             return true;
         }

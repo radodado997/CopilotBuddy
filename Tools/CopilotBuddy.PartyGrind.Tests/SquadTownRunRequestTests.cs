@@ -103,7 +103,7 @@ namespace CopilotBuddy.PartyGrind.Tests
             var after = coord.EvaluateTick(settings, MakeLeader(townComplete: true), clients,
                 MakeProfile(), 0, 0, 0, 0f, t);
             Assert.Equal(SquadPhase.Grinding, after.Phase);
-            Assert.False(after.AllTownTasksComplete);
+            Assert.True(after.AllTownTasksComplete);
         }
 
         [Fact]
@@ -219,12 +219,19 @@ namespace CopilotBuddy.PartyGrind.Tests
                 MakeProfile(), 0, 0, 0, 0f, t);
             Assert.Equal(SquadPhase.Grinding, inCombat.Phase);
             Assert.Empty(inCombat.TownRunRequestedByName);
+            Assert.Empty(inCombat.TownRunRequestReason);
+            Assert.Equal(0L, inCombat.TownRunRequestedUtcMs);
 
             t += 1000;
             var afterCombat = coord.EvaluateTick(settings, MakeLeader(), clients,
                 MakeProfile(), 0, 0, 0, 0f, t);
-            Assert.Equal(SquadPhase.TownRun, afterCombat.Phase);
-            Assert.Equal("HealB", afterCombat.TownRunRequestedByName);
+            Assert.Equal(SquadPhase.Looting, afterCombat.Phase);
+
+            t += Math.Max(1, settings.MaxLootWindowSeconds) * 1000L + 1;
+            var afterLoot = coord.EvaluateTick(settings, MakeLeader(), clients,
+                MakeProfile(), 0, 0, 0, 0f, t);
+            Assert.Equal(SquadPhase.TownRun, afterLoot.Phase);
+            Assert.Equal("HealB", afterLoot.TownRunRequestedByName);
         }
 
         [Fact]
@@ -245,13 +252,14 @@ namespace CopilotBuddy.PartyGrind.Tests
             // DpsC announces while the run is active.
             t += 1000;
             var second = MakeRequest("DpsC", mage.Guid, mage.Role, t, "Repair");
+            var local = MakeRequest("TankA", 100, SquadRole.TankLeader, t - 1, "Manual");
             var updated = coord.EvaluateTick(settings, MakeLeader(townComplete: true),
                 new[]
                 {
                     MakeClient(healer, 0, t, first),
                     MakeClient(mage, 1, t, second)
                 },
-                MakeProfile(), 0, 0, 0, 0f, t);
+                MakeProfile(), 0, 0, 0, 0f, t, localTownRunRequest: local);
             Assert.Equal(SquadPhase.TownRun, updated.Phase);
             Assert.Equal("DpsC", updated.TownRunRequestedByName);
 
@@ -263,7 +271,7 @@ namespace CopilotBuddy.PartyGrind.Tests
                     MakeClient(MakeMember("HealB", 0, SquadRole.Healer, WoWClass.Priest, 10, townComplete: true), 0, t, first),
                     MakeClient(mage, 1, t, second)
                 },
-                MakeProfile(), 0, 0, 0, 0f, t);
+                MakeProfile(), 0, 0, 0, 0f, t, localTownRunRequest: local);
             Assert.Equal(SquadPhase.Grinding, done.Phase);
             Assert.Empty(done.TownRunRequestedByName);
 
@@ -274,7 +282,7 @@ namespace CopilotBuddy.PartyGrind.Tests
                     MakeClient(MakeMember("HealB", 0, SquadRole.Healer, WoWClass.Priest, 10, townComplete: true), 0, t, first),
                     MakeClient(mage, 1, t, second)
                 },
-                MakeProfile(), 0, 0, 0, 0f, t);
+                MakeProfile(), 0, 0, 0, 0f, t, localTownRunRequest: local);
             Assert.Equal(SquadPhase.Grinding, after.Phase);
         }
 

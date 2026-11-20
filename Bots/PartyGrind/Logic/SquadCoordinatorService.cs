@@ -364,13 +364,6 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
             if (!_inTownRun)
             {
-                if (townRequest != null)
-                {
-                    _townRunRequestedByName = townRequest.CharacterName;
-                    _townRunRequestReason = townRequest.Reason;
-                    _townRunRequestedUtcMs = townRequest.RequestedUtcMs;
-                }
-
                 bool anyNeedsTown = rosterStates.Any(m =>
                     !m.IsDead && !m.IsGhost && HasTownNeed(m));
                 if (!anyInCombat && !anyDead && (townRequest != null || (settings.SyncTownRuns && anyNeedsTown)))
@@ -379,6 +372,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     _allTownTasksComplete = false;
                     if (townRequest != null)
                     {
+                        _townRunRequestedByName = townRequest.CharacterName;
+                        _townRunRequestReason = townRequest.Reason;
+                        _townRunRequestedUtcMs = townRequest.RequestedUtcMs;
                         // Consume every pending announcement, including older ones, so a
                         // superseded request cannot resurface after the run finishes.
                         AckAllTownRunRequests(connectedClients, localTownRunRequest);
@@ -397,7 +393,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 // newest announcement visible without restarting the run.
                 if (townRequest != null)
                 {
-                    AckTownRunRequest(townRequest);
+                    AckAllTownRunRequests(connectedClients, localTownRunRequest);
                     _townRunRequestedByName = townRequest.CharacterName;
                     _townRunRequestReason = townRequest.Reason;
                     _townRunRequestedUtcMs = townRequest.RequestedUtcMs;
