@@ -21,6 +21,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         public string SubProfileName { get; set; } = string.Empty;
         public int SubProfileMinLevel { get; set; } = 1;
         public int SubProfileMaxLevel { get; set; } = 85;
+        /// <summary>Highest MaxLevel of the loaded profile's sub-profiles; 0 when unknown.</summary>
+        public int ProfileMaxLevel { get; set; }
         public uint MapId { get; set; }
         public float HotspotX { get; set; }
         public float HotspotY { get; set; }
@@ -232,6 +234,20 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             rosterStates.RemoveAll(m => !telemetryNames.Contains(m.CharacterName.Trim()));
             if (effectiveMinLevel > 0 && resolveProfile != null) profile = resolveProfile(effectiveMinLevel);
 
+            // The squad grinds until its lowest member passes the highest level range of the
+            // loaded profile. Any member above that range keeps grinding with the squad
+            // instead of being dropped from the profile. An unknown profile maximum never
+            // ends the session: the sub-profile stays loaded and the squad keeps grinding.
+            // The cap is only meaningful once every expected member has reported a level:
+            // a member that is still missing could be the lowest one and keep the squad below
+            // the maximum, so an incomplete roster is treated as unknown and never caps.
+            var reportedLevelNames = new HashSet<string>(
+                _history.Values.Where(r => !r.GraceExpired && r.Level > 0).Select(r => r.Name),
+                StringComparer.OrdinalIgnoreCase);
+            bool awaitingExpectedMember = settings.GetExpectedMemberNames()
+                .Any(n => !reportedLevelNames.Contains(n));
+            int profileMaxLevel = profile.ProfileMaxLevel;
+
             // Detect sub-profile transition -> MigratingZone.
             string subProfileKey = $"{profile.ProfileXmlPath}|{profile.ProfileXmlHash}|{profile.SubProfileName}|{profile.SubProfileMinLevel}|{profile.SubProfileMaxLevel}|{profile.MapId}";
             if (profile.HasProfile)
@@ -308,6 +324,14 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             // not proof that nobody can resurrect. Do not act on an incomplete roster.
             bool rosterIncomplete = connectedClients.Any(s => s.IsConnected &&
                 s.LatestState == null && !string.IsNullOrWhiteSpace(s.CharacterName));
+
+            // Level cap: the squad has finished the profile only when its lowest member passed
+            // the profile maximum and every expected member reported a level. A missing or
+            // not-yet-reporting member is unknown, so the cap stays false until all of them
+            // are accounted for instead of ending the session on a partial roster.
+            bool levelCapReached = profile.HasProfile && profileMaxLevel > 0 &&
+                !rosterIncomplete && !awaitingExpectedMember &&
+                effectiveMinLevel > profileMaxLevel;
 
             if (_wasAnyInCombat && !anyInCombat && !allDead)
             {
@@ -561,9 +585,11 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 ActiveSubProfileName = profile.SubProfileName,
                 ActiveSubProfileMinLevel = profile.SubProfileMinLevel,
                 ActiveSubProfileMaxLevel = profile.SubProfileMaxLevel,
+                ProfileMaxLevel = profileMaxLevel,
                 EffectiveSquadMinLevel = effectiveMinLevel,
                 LowestMemberName = lowestName,
                 LowestMemberXpPercent = lowestXpPct,
+                LevelCapReached = levelCapReached,
                 MapId = leaderLocal.MapId,
                 ZoneId = leaderLocal.ZoneId,
                 X = leaderLocal.X,

@@ -79,6 +79,7 @@ namespace CopilotBuddy.Bots.PartyGrind
         private const long PullCommitTimeoutMs = 10000L;
         private const float PullCommitMaxTargetDistance = 60.0f;
         private const long IdleSnapshotIntervalMs = 5000L;
+        private const int TerminalStateDeliveryTimeoutMs = 1000;
         private bool _wasInCombat;
         private bool _townTasksCompleteLocal;
         private bool _townRunRequestPending;
@@ -88,6 +89,9 @@ namespace CopilotBuddy.Bots.PartyGrind
         private long _deathStartedUtcMs;
         private bool _localWasNeedingRest;
         private bool _lootFilterAttached;
+        private bool _levelCapStopRequested;
+        private SquadLeaderStateDelivery? _terminalStateDelivery;
+        private long _terminalStateDeliveryDeadlineMs;
         private SquadTravelProgress _travelProgress = new();
         private static Composite? _activeCombatRoutine, _activeRestRoutine;
         private static bool _combatTicked, _restTicked, _healTicked;
@@ -181,6 +185,8 @@ namespace CopilotBuddy.Bots.PartyGrind
             _townRunRequestAcknowledgedUtcMs = 0;
             _townRunRequestReason = string.Empty;
             _townRunRequestUtcMs = 0;
+            _levelCapStopRequested = false;
+            _terminalStateDelivery = null;
             _deathStartedUtcMs = 0;
             _localWasNeedingRest = false;
 
@@ -192,6 +198,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                 SquadContext.EffectiveLevelOverride = _lastAppliedEffectiveLevel;
 
                 ProfileManager.LevelOverrideSelector = () => _lastAppliedEffectiveLevel;
+                ProfileManager.KeepProfileAboveLevelRange = true;
                 BotEvents.Profile.OnNewProfileLoaded += OnProfileRevisionLoaded;
 
                 SquadTankBridge.AttachTargetingFilters();
@@ -230,6 +237,7 @@ namespace CopilotBuddy.Bots.PartyGrind
         {
             Cleanup(() => { BotEvents.Profile.OnNewProfileLoaded -= OnProfileRevisionLoaded; });
             Cleanup(() => { ProfileManager.LevelOverrideSelector = null; });
+            Cleanup(() => { ProfileManager.KeepProfileAboveLevelRange = false; });
             Cleanup(() => { ProfileManager.RefreshProfileForLevel(); });
             Cleanup(() => { Mount.OnMountUp -= SquadFormationService.HandleMountUpEvent; });
             Cleanup(() => { SquadTankBridge.DetachTargetingFilters(); });
@@ -469,10 +477,28 @@ namespace CopilotBuddy.Bots.PartyGrind
 
         private void StopIpc()
         {
+            AwaitTerminalStateDelivered();
             try { _ipcServer?.Dispose(); } catch { }
             _ipcServer = null;
             try { _ipcClient?.Dispose(); } catch { }
             _ipcClient = null;
+        }
+
+        /// <summary>
+        /// Holds the IPC shutdown until the terminal leader state reached every session's
+        /// socket. The wait is bounded: a peer that stopped reading must not stall the bot.
+        /// </summary>
+        private void AwaitTerminalStateDelivered()
+        {
+            SquadLeaderStateDelivery? delivery = _terminalStateDelivery;
+            _terminalStateDelivery = null;
+            if (delivery == null || delivery.IsDelivered)
+                return;
+
+            int remainingMs = (int)Math.Max(0, _terminalStateDeliveryDeadlineMs - Environment.TickCount64);
+            if (!delivery.Wait(remainingMs))
+                Logging.Write("[PartyGrind Level] Terminal leader state was still unsent after {0} ms; closing IPC anyway.",
+                    TerminalStateDeliveryTimeoutMs);
         }
 
         private SquadHandshake BuildLocalHandshake()
@@ -533,11 +559,22 @@ namespace CopilotBuddy.Bots.PartyGrind
 
             SquadPartyBuffService.UpdateRaidTargetMarkers(settings, leaderState);
 
-            if (_ipcServer != null && (now - _lastIpcSendUtcMs) >= 100)
+            // The terminal state must reach the squad before the IPC server goes away, so the
+            // first level-cap tick bypasses the throttle. Later ticks keep the normal cadence.
+            bool terminalStatePending = leaderState.LevelCapReached && !_levelCapStopRequested &&
+                _terminalStateDelivery == null;
+            if (_ipcServer != null && (terminalStatePending || (now - _lastIpcSendUtcMs) >= 100))
             {
+                SquadLeaderStateDelivery delivery = _ipcServer.BroadcastLeaderState(leaderState, populateRoster: false);
                 _lastIpcSendUtcMs = now;
-                _ipcServer.BroadcastLeaderState(leaderState, populateRoster: false);
+                if (terminalStatePending)
+                {
+                    _terminalStateDeliveryDeadlineMs = Environment.TickCount64 + TerminalStateDeliveryTimeoutMs;
+                    _terminalStateDelivery = delivery;
+                }
             }
+
+            StopAtLevelCap(leaderState);
         }
 
         private void PulseFollower(SquadSettings settings, SquadMemberState localState, long now)
@@ -567,6 +604,8 @@ namespace CopilotBuddy.Bots.PartyGrind
                     if (ProfileManager.CurrentOuterProfile != null)
                         ProfileManager.RefreshProfileForLevel();
                 }
+
+                StopAtLevelCap(leaderState);
             }
 
             if (_ipcClient != null && ((now - _lastIpcSendUtcMs) >= 120 || localState.IsInCombat != _wasInCombat))
@@ -575,6 +614,33 @@ namespace CopilotBuddy.Bots.PartyGrind
                 _ipcClient.SendMemberState(localState);
             }
             _wasInCombat = localState.IsInCombat;
+        }
+
+        /// <summary>
+        /// Ends the session once the lowest squad member passes the highest level range of the
+        /// loaded profile. Every member keeps grinding until then, including a member (or the
+        /// leader) that already outleveled the profile, so the squad never loses a client.
+        /// </summary>
+        private void StopAtLevelCap(SquadLeaderState leaderState)
+        {
+            if (!leaderState.LevelCapReached)
+            {
+                _levelCapStopRequested = false;
+                _terminalStateDelivery = null;
+                return;
+            }
+
+            SquadLeaderStateDelivery? delivery = _terminalStateDelivery;
+            if (delivery != null && !delivery.IsDelivered && Environment.TickCount64 < _terminalStateDeliveryDeadlineMs)
+                return;
+
+            if (_levelCapStopRequested)
+                return;
+
+            _levelCapStopRequested = true;
+            Logging.Write("[PartyGrind Level] Lowest member {0} (L{1}) passed the profile maximum L{2}. Stopping the squad.",
+                leaderState.LowestMemberName, leaderState.EffectiveSquadMinLevel, leaderState.ProfileMaxLevel);
+            TreeRoot.Stop("PartyGrind level cap reached");
         }
 
         private bool EnsureLeaderProfile(SquadLeaderState leader)
@@ -818,6 +884,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                 SubProfileName = current?.Name ?? outer?.Name ?? string.Empty,
                 SubProfileMinLevel = current?.MinLevel ?? 1,
                 SubProfileMaxLevel = current?.MaxLevel ?? 85,
+                ProfileMaxLevel = ProfileManager.TopProfileMaxLevel,
                 MapId = StyxWoW.Me?.MapId ?? 0,
                 HotspotX = hotspot.X,
                 HotspotY = hotspot.Y,

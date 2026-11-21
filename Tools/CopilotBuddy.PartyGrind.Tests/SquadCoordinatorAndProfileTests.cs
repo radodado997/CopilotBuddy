@@ -25,6 +25,7 @@ namespace CopilotBuddy.PartyGrind.Tests
             Directory.CreateDirectory(_tempDir);
             SquadContext.Reset();
             ProfileManager.LevelOverrideSelector = null;
+            ProfileManager.KeepProfileAboveLevelRange = false;
         }
 
         public void Dispose()
@@ -33,6 +34,7 @@ namespace CopilotBuddy.PartyGrind.Tests
             typeof(ProfileManager).GetField("_currentProfile", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic)!.SetValue(null, _previousCurrent);
             typeof(ProfileManager).GetProperty(nameof(ProfileManager.XmlLocation))!.SetValue(null, _previousXml);
             ProfileManager.LevelOverrideSelector = null;
+            ProfileManager.KeepProfileAboveLevelRange = false;
             SquadContext.Reset();
             try
             {
@@ -719,6 +721,188 @@ namespace CopilotBuddy.PartyGrind.Tests
                 snap, 0, 0, 0, 0f, t);
             Assert.Equal(SquadPhase.CorpseRun, timedOut.Phase);
             Assert.True(timedOut.ReleaseCorpseOrder);
+        }
+
+        [Fact]
+        public void MemberAboveProfileMaxLevel_KeepsProfileLoadedAndSquadGrinding()
+        {
+            string xmlPath = Path.Combine(_tempDir, "CappedGrind.xml");
+            File.WriteAllText(xmlPath, @"<HBProfile>
+  <Name>Capped 1-10</Name>
+  <SubProfile>
+    <Name>Only L1-10</Name>
+    <MinLevel>1</MinLevel>
+    <MaxLevel>10</MaxLevel>
+    <GrindArea>
+      <Name>Spot</Name>
+      <TargetMinLevel>1</TargetMinLevel>
+      <TargetMaxLevel>10</TargetMaxLevel>
+      <Hotspots><Hotspot X=""100"" Y=""100"" Z=""0"" /></Hotspots>
+    </GrindArea>
+  </SubProfile>
+</HBProfile>");
+
+            ProfileManager.KeepProfileAboveLevelRange = true;
+            ProfileManager.LevelOverrideSelector = SquadContext.GetEffectiveProfileLevel;
+            SquadContext.EffectiveLevelOverride = 12;
+            ProfileManager.LoadNew(xmlPath, rememberMe: false);
+
+            Assert.Equal(10, ProfileManager.TopProfileMaxLevel);
+            Assert.NotNull(ProfileManager.CurrentProfile);
+            Assert.Equal("Only L1-10", ProfileManager.CurrentProfile!.Name);
+
+            var settings = CreateDefaultSettings();
+            var coord = new SquadCoordinatorService();
+            long t = 10_000L;
+            var snap = new SquadProfileSnapshot
+            {
+                ProfileXmlPath = xmlPath,
+                ProfileXmlHash = "hash",
+                SubProfileName = ProfileManager.CurrentProfile.Name,
+                SubProfileMinLevel = ProfileManager.CurrentProfile.MinLevel,
+                SubProfileMaxLevel = ProfileManager.CurrentProfile.MaxLevel,
+                ProfileMaxLevel = ProfileManager.TopProfileMaxLevel,
+                MapId = 0,
+                HotspotX = 100f,
+                HotspotY = 100f
+            };
+
+            // The leader outleveled the profile but the lowest member is still 9 -> grind on.
+            var grinding = coord.EvaluateTick(
+                settings,
+                MakeLeaderState(level: 12),
+                new[]
+                {
+                    MakeConnectedClient("HealB", 0, SquadRole.Healer, WoWClass.Priest, 9, t),
+                    MakeConnectedClient("DpsC", 1, SquadRole.DpsRanged, WoWClass.Mage, 9, t)
+                },
+                snap, 0, 0, 0, 0f, t);
+
+            Assert.Equal(9, grinding.EffectiveSquadMinLevel);
+            Assert.Equal(10, grinding.ProfileMaxLevel);
+            Assert.False(grinding.LevelCapReached);
+            Assert.Equal(SquadPhase.Grinding, grinding.Phase);
+            Assert.True(SquadTankBridge.CanInitiatePull(grinding, settings.MaxPullGatherDistance));
+
+            // The lowest member reaches the profile maximum itself -> still grinding.
+            t += 500;
+            var atMax = coord.EvaluateTick(
+                settings,
+                MakeLeaderState(level: 12),
+                new[]
+                {
+                    MakeConnectedClient("HealB", 0, SquadRole.Healer, WoWClass.Priest, 10, t),
+                    MakeConnectedClient("DpsC", 1, SquadRole.DpsRanged, WoWClass.Mage, 10, t)
+                },
+                snap, 0, 0, 0, 0f, t);
+
+            Assert.Equal(10, atMax.EffectiveSquadMinLevel);
+            Assert.False(atMax.LevelCapReached);
+            Assert.Equal(SquadPhase.Grinding, atMax.Phase);
+
+            // The last member reaches level 11 (> 10) -> the squad has finished the profile.
+            t += 500;
+            var capped = coord.EvaluateTick(
+                settings,
+                MakeLeaderState(level: 12),
+                new[]
+                {
+                    MakeConnectedClient("HealB", 0, SquadRole.Healer, WoWClass.Priest, 11, t),
+                    MakeConnectedClient("DpsC", 1, SquadRole.DpsRanged, WoWClass.Mage, 11, t)
+                },
+                snap, 0, 0, 0, 0f, t);
+
+            Assert.Equal(11, capped.EffectiveSquadMinLevel);
+            Assert.True(capped.LevelCapReached);
+        }
+
+        [Fact]
+        public void LevelCap_WaitsForEveryExpectedMemberBeforeEndingTheSquad()
+        {
+            var settings = CreateDefaultSettings();
+            settings.ExpectedMemberNamesCsv = "TankA,HealB,DpsC";
+            var coord = new SquadCoordinatorService();
+            long t = 20_000L;
+            var snap = new SquadProfileSnapshot
+            {
+                ProfileXmlPath = "squad.xml",
+                SubProfileName = "L1-10",
+                SubProfileMinLevel = 1,
+                SubProfileMaxLevel = 10,
+                ProfileMaxLevel = 10,
+                MapId = 0,
+                HotspotX = 100f,
+                HotspotY = 100f
+            };
+
+            // The two reporting members are above the maximum, but DpsC never reported a level.
+            var incomplete = coord.EvaluateTick(
+                settings,
+                MakeLeaderState(level: 12),
+                new[] { MakeConnectedClient("HealB", 0, SquadRole.Healer, WoWClass.Priest, 11, t) },
+                snap, 0, 0, 0, 0f, t);
+
+            Assert.False(incomplete.LevelCapReached);
+            Assert.Equal(SquadPhase.Grinding, incomplete.Phase);
+
+            // DpsC is still below the maximum, so the squad keeps grinding.
+            var lowestBelow = coord.EvaluateTick(
+                settings,
+                MakeLeaderState(level: 12),
+                new[]
+                {
+                    MakeConnectedClient("HealB", 0, SquadRole.Healer, WoWClass.Priest, 11, t + 500),
+                    MakeConnectedClient("DpsC", 1, SquadRole.DpsRanged, WoWClass.Mage, 10, t + 500)
+                },
+                snap, 0, 0, 0, 0f, t + 500);
+
+            Assert.False(lowestBelow.LevelCapReached);
+            Assert.Equal(10, lowestBelow.EffectiveSquadMinLevel);
+
+            // Every expected member reported and all are above the maximum -> cap.
+            var capped = coord.EvaluateTick(
+                settings,
+                MakeLeaderState(level: 12),
+                new[]
+                {
+                    MakeConnectedClient("HealB", 0, SquadRole.Healer, WoWClass.Priest, 11, t + 1000),
+                    MakeConnectedClient("DpsC", 1, SquadRole.DpsRanged, WoWClass.Mage, 11, t + 1000)
+                },
+                snap, 0, 0, 0, 0f, t + 1000);
+
+            Assert.True(capped.LevelCapReached);
+        }
+
+        [Fact]
+        public void FlatProfileAboveItsRange_IsUnloadedNormallyAndKeptInSquadMode()
+        {
+            string xmlPath = Path.Combine(_tempDir, "VanillaGrind.xml");
+            File.WriteAllText(xmlPath, @"<HBProfile>
+  <Name>Vanilla 1-10</Name>
+  <MinLevel>1</MinLevel>
+  <MaxLevel>10</MaxLevel>
+  <GrindArea>
+    <Name>Spot</Name>
+    <TargetMinLevel>1</TargetMinLevel>
+    <TargetMaxLevel>10</TargetMaxLevel>
+    <Hotspots><Hotspot X=""100"" Y=""100"" Z=""0"" /></Hotspots>
+  </GrindArea>
+</HBProfile>");
+
+            ProfileManager.KeepProfileAboveLevelRange = false;
+            ProfileManager.LevelOverrideSelector = () => 11;
+            ProfileManager.LoadNew(xmlPath, rememberMe: false);
+
+            Assert.Null(ProfileManager.CurrentProfile);
+
+            // The same out-of-range level still resolves in squad mode, so the member
+            // that outleveled the profile keeps its grind area and does not stop.
+            ProfileManager.KeepProfileAboveLevelRange = true;
+            ProfileManager.LoadNew(xmlPath, rememberMe: false);
+
+            Assert.NotNull(ProfileManager.CurrentProfile);
+            Assert.Equal("Vanilla 1-10", ProfileManager.CurrentProfile!.Name);
+            Assert.Equal(10, ProfileManager.TopProfileMaxLevel);
         }
     }
 }

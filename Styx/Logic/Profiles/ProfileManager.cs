@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using Styx.Helpers;
 using Styx.Logic.BehaviorTree;
@@ -97,6 +98,32 @@ namespace Styx.Logic.Profiles
 		public static Func<int>? LevelOverrideSelector { get; set; }
 
 		/// <summary>
+		/// Squad mode: never let a container profile own a level match, and keep the widest
+		/// level-scoped sub-profile loaded above its MaxLevel instead of resolving to nothing.
+		/// PartyGrindBot enables this because it selects the sub-profile with the squad minimum
+		/// level: a member that outlevels the profile must not unload it, and the squad ends
+		/// through its own level gate once the lowest member passes the profile maximum.
+		/// </summary>
+		public static bool KeepProfileAboveLevelRange { get; set; }
+
+		/// <summary>
+		/// Highest MaxLevel of every level-scoped profile in the loaded profile (0 when none is
+		/// loaded). Only profiles without sub-profiles are level-scoped: a container profile
+		/// carries the default 1-85 range, which describes no real level gate.
+		/// </summary>
+		public static int TopProfileMaxLevel
+		{
+			get
+			{
+				var outer = _currentOuterProfile;
+				if (outer == null)
+					return 0;
+				Profile? top = FindHighestReachedProfile(outer.GetScopeSortedProfiles(), int.MaxValue, 0, false);
+				return top?.MaxLevel ?? 0;
+			}
+		}
+
+		/// <summary>
 		/// Re-evaluates the active sub-profile against the current effective level
 		/// (<see cref="LevelOverrideSelector"/> or <c>ObjectManager.Me?.Level</c>).
 		/// </summary>
@@ -136,6 +163,11 @@ namespace Styx.Logic.Profiles
 			for (int i = 0; i < sortedProfiles.Count; i++)
 			{
 				// BUG-10: Check ContinentId matches current map (HB 4.3.4)
+				// A container profile only groups its sub-profiles. Its default 1-85 range is
+				// not a real level gate and it carries no grind area, so in squad mode it must
+				// never win over a real level-scoped sub-profile.
+				if (KeepProfileAboveLevelRange && IsContainerProfile(sortedProfiles[i]))
+					continue;
 				if ((sortedProfiles[i].ContinentId == -1 || (long)sortedProfiles[i].ContinentId == (long)mapId)
 					&& level >= sortedProfiles[i].MinLevel && level < sortedProfiles[i].MaxLevel)
 				{
@@ -152,6 +184,8 @@ namespace Styx.Logic.Profiles
 			{
 				for (int i = 0; i < sortedProfiles.Count; i++)
 				{
+					if (KeepProfileAboveLevelRange && IsContainerProfile(sortedProfiles[i]))
+						continue;
 					if (level >= sortedProfiles[i].MinLevel && level < sortedProfiles[i].MaxLevel)
 					{
 						return sortedProfiles[i];
@@ -159,7 +193,55 @@ namespace Styx.Logic.Profiles
 				}
 			}
 
+			// The last level range owns its MaxLevel and everything above it. A caller that
+			// sets KeepProfileAboveLevelRange (PartyGrindBot) keeps the deepest range the
+			// squad has already reached instead of unloading the profile and stopping.
+			if (KeepProfileAboveLevelRange)
+			{
+				Profile? highest = FindHighestReachedProfile(sortedProfiles, level, mapId, me != null);
+				if (highest != null)
+				{
+					Logging.WriteDebug("Level {0} is above the profile level ranges; keeping sub-profile '{1}' (L{2}-{3}).",
+						level, highest.Name, highest.MinLevel, highest.MaxLevel);
+					return highest;
+				}
+			}
+
 			return null;
+		}
+
+		/// <summary>
+		/// A container profile only groups its sub-profiles and adds no grind area of its own.
+		/// </summary>
+		private static bool IsContainerProfile(Profile profile)
+		{
+			return profile.SubProfiles.Count > 0 && profile.GrindArea == null;
+		}
+
+		/// <summary>
+		/// Widest level-scoped grindeable sub-profile whose range starts at or below
+		/// <paramref name="level"/>. Used both for the top of the profile and for the clamp
+		/// above the last level range, so only a candidate that can actually grind is picked.
+		/// </summary>
+		private static Profile? FindHighestReachedProfile(List<Profile> sortedProfiles, int level, uint mapId, bool requireContinent)
+		{
+			Profile? highest = null;
+			for (int i = 0; i < sortedProfiles.Count; i++)
+			{
+				Profile candidate = sortedProfiles[i];
+				if (IsContainerProfile(candidate))
+					continue;
+				// GrindArea falls back to the parent, so this is the effective area.
+				if (candidate.GrindArea == null)
+					continue;
+				if (requireContinent && candidate.ContinentId != -1 && (long)candidate.ContinentId != (long)mapId)
+					continue;
+				if (level < candidate.MinLevel)
+					continue;
+				if (highest == null || candidate.MaxLevel > highest.MaxLevel)
+					highest = candidate;
+			}
+			return highest;
 		}
 
 		/// <summary>

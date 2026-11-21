@@ -28,16 +28,75 @@ namespace Styx.PartyGrind.IPC
     }
 
     /// <summary>
+    /// Completion signal for a leader-state frame. It is satisfied only once every targeted
+    /// session has actually written the frame to its socket, not when it was queued, so a
+    /// caller that is about to shut the server down can wait for real delivery.
+    /// </summary>
+    public sealed class SquadLeaderStateDelivery
+    {
+        private readonly TaskCompletionSource _delivered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _pending;
+
+        internal SquadLeaderStateDelivery(int sessions)
+        {
+            _pending = sessions;
+            if (sessions <= 0)
+                _delivered.TrySetResult();
+        }
+
+        public Task WhenDelivered => _delivered.Task;
+
+        public bool IsDelivered => _delivered.Task.IsCompleted;
+
+        /// <summary>
+        /// Marks one targeted session as settled. A session that was already gone counts as
+        /// settled too, so a lost peer can never keep the caller waiting forever.
+        /// </summary>
+        internal void MarkSettled()
+        {
+            if (Interlocked.Decrement(ref _pending) <= 0)
+                _delivered.TrySetResult();
+        }
+
+        public bool Wait(int timeoutMs)
+        {
+            try { return _delivered.Task.Wait(Math.Max(0, timeoutMs)); }
+            catch (AggregateException) { return false; }
+        }
+    }
+
+    /// <summary>
     /// Non-blocking TCP loopback NDJSON IPC server hosted by the Coordinator client.
     /// </summary>
     public sealed class SquadIpcServer : IDisposable
     {
+        private sealed class OutboundFrame
+        {
+            public readonly string Line;
+            public readonly SquadLeaderStateDelivery? Delivery;
+            private int _settled;
+
+            public OutboundFrame(string line, SquadLeaderStateDelivery? delivery)
+            {
+                Line = line;
+                Delivery = delivery;
+            }
+
+            public void Settle()
+            {
+                if (Interlocked.Exchange(ref _settled, 1) == 0)
+                    Delivery?.MarkSettled();
+            }
+        }
+
         private sealed class MemberSession : IDisposable
         {
+            internal const int OutboundCapacity = 32;
+
             public readonly long SessionId;
             public readonly TcpClient Tcp;
             public readonly StreamWriter Writer;
-            public readonly Channel<string> Outbound;
+            public readonly Channel<OutboundFrame> Outbound;
             public readonly CancellationTokenSource Cts = new CancellationTokenSource();
             public SquadPeerAuthentication? Authentication;
             public string CharacterName = string.Empty;
@@ -47,6 +106,8 @@ namespace Styx.PartyGrind.IPC
             public long LastReceivedUtcMs;
             public int SlotIndex = -1;
             public volatile bool Closed;
+            private readonly HashSet<OutboundFrame> _pendingFrames = new HashSet<OutboundFrame>();
+            private readonly Queue<OutboundFrame> _pendingOrder = new Queue<OutboundFrame>();
 
             public MemberSession(long sessionId, TcpClient tcp)
             {
@@ -55,19 +116,85 @@ namespace Styx.PartyGrind.IPC
                 tcp.NoDelay = true;
                 var stream = tcp.GetStream();
                 Writer = new StreamWriter(stream, new UTF8Encoding(false)) { AutoFlush = false, NewLine = "\n" };
-                Outbound = Channel.CreateBounded<string>(new BoundedChannelOptions(32)
+                Outbound = Channel.CreateBounded<OutboundFrame>(new BoundedChannelOptions(OutboundCapacity)
                 {
                     FullMode = BoundedChannelFullMode.DropOldest,
                     SingleReader = true,
                     SingleWriter = false
-                });
+                }, SettleFrame);
                 LastReceivedUtcMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             }
 
-            public void EnqueueLine(string line)
+            /// <summary>
+            /// Queues one line for the writer. The optional delivery is settled here if the
+            /// frame cannot be queued, and by the writer once the line is flushed.
+            /// </summary>
+            public void EnqueueLine(string line, SquadLeaderStateDelivery? delivery = null)
             {
-                if (!Closed)
-                    Outbound.Writer.TryWrite(line);
+                var frame = new OutboundFrame(line, delivery);
+
+                if (delivery != null)
+                {
+                    lock (_pendingFrames)
+                    {
+                        _pendingOrder.Enqueue(frame);
+                        _pendingFrames.Add(frame);
+                    }
+                }
+
+                // A frame that never enters the channel is already gone, so its delivery
+                // settles here rather than waiting for a writer that will never see it.
+                if (Closed || !Outbound.Writer.TryWrite(frame))
+                    SettleFrame(frame);
+            }
+
+            /// <summary>
+            /// Drops <paramref name="frame"/> from the eviction ledger without settling it. The
+            /// channel cannot discard a frame a writer already took, so once the send loop owns
+            /// it only the write itself may settle the delivery.
+            /// </summary>
+            public void MarkInFlight(OutboundFrame frame)
+            {
+                lock (_pendingFrames)
+                {
+                    _pendingFrames.Remove(frame);
+                    while (_pendingOrder.Count > 0 && !_pendingFrames.Contains(_pendingOrder.Peek()))
+                        _pendingOrder.Dequeue();
+                }
+            }
+
+            /// <summary>
+            /// Marks <paramref name="frame"/> settled and forgets it, so a delivery completes
+            /// exactly once whether the writer sent it or the session tore down first.
+            /// </summary>
+            public void SettleFrame(OutboundFrame frame)
+            {
+                lock (_pendingFrames)
+                {
+                    _pendingFrames.Remove(frame);
+                    while (_pendingOrder.Count > 0 && !_pendingFrames.Contains(_pendingOrder.Peek()))
+                        _pendingOrder.Dequeue();
+                }
+                frame.Settle();
+            }
+
+            /// <summary>
+            /// Fails every frame still owed to a writer so their deliveries settle instead of
+            /// waiting on a session that will never send again. Only touches the pending set,
+            /// never the channel reader that the send loop owns.
+            /// </summary>
+            public void AbandonPendingDeliveries()
+            {
+                OutboundFrame[] pending;
+                lock (_pendingFrames)
+                {
+                    pending = new OutboundFrame[_pendingFrames.Count];
+                    _pendingFrames.CopyTo(pending);
+                    _pendingFrames.Clear();
+                    _pendingOrder.Clear();
+                }
+                foreach (var frame in pending)
+                    frame.Settle();
             }
 
             public void Dispose()
@@ -76,6 +203,7 @@ namespace Styx.PartyGrind.IPC
                 Closed = true;
                 try { Cts.Cancel(); } catch { }
                 try { Outbound.Writer.TryComplete(); } catch { }
+                AbandonPendingDeliveries();
                 try { Tcp.Close(); } catch { }
                 try { Tcp.Dispose(); } catch { }
                 try { Cts.Dispose(); } catch { }
@@ -215,11 +343,13 @@ namespace Styx.PartyGrind.IPC
         /// Broadcasts <see cref="SquadLeaderState"/> to every connected client session without blocking.
         /// Automatically populates <see cref="SquadLeaderState.MemberAssignments"/> and
         /// <see cref="SquadLeaderState.MemberRoles"/> when empty or stale.
+        /// Returns a delivery signal that completes only after every targeted session has
+        /// written the frame, so a caller can wait for transmission before shutting down.
         /// </summary>
-        public void BroadcastLeaderState(SquadLeaderState state, bool populateRoster = true)
+        public SquadLeaderStateDelivery BroadcastLeaderState(SquadLeaderState state, bool populateRoster = true)
         {
             if (state == null || !IsListening)
-                return;
+                return new SquadLeaderStateDelivery(0);
 
             List<MemberSession> targets;
             lock (_sessionsLock)
@@ -240,15 +370,20 @@ namespace Styx.PartyGrind.IPC
                 targets = _namedSessions.Values.Where(s => !s.Closed && (populateRoster || state.MemberAssignments.ContainsKey(s.CharacterName))).ToList();
             }
 
+            // The delivery is completed by each session's writer after the frame reaches the
+            // socket, so the caller can wait for real transmission instead of assuming the
+            // enqueue was delivery.
+            var delivery = new SquadLeaderStateDelivery(targets.Count);
             if (targets.Count == 0)
-                return;
+                return delivery;
 
             long seq = Interlocked.Increment(ref _nextSequenceId);
             string line = SquadJson.SerializeEnvelope(SquadMessageTypes.LeaderState, _teamId, seq, state);
             foreach (var session in targets)
             {
-                session.EnqueueLine(line);
+                session.EnqueueLine(line, delivery);
             }
+            return delivery;
         }
 
         private async Task AcceptLoopAsync(TcpListener listener, CancellationToken ct)
@@ -358,13 +493,26 @@ namespace Styx.PartyGrind.IPC
         {
             try
             {
-                await foreach (string line in session.Outbound.Reader.ReadAllAsync(ct).ConfigureAwait(false))
+                await foreach (OutboundFrame frame in session.Outbound.Reader.ReadAllAsync(ct).ConfigureAwait(false))
                 {
-                    string frame;
-                    try { frame = session.Authentication!.Protect(line); }
-                    catch (ArgumentException) { continue; }
-                    await session.Writer.WriteLineAsync(frame.AsMemory(), ct).ConfigureAwait(false);
-                    await session.Writer.FlushAsync(ct).ConfigureAwait(false);
+                    // The frame left the channel, so it can no longer be evicted; only the
+                    // write below may settle its delivery now.
+                    session.MarkInFlight(frame);
+
+                    // Settle in a finally: a frame that cannot be written is gone, and its
+                    // delivery must not keep a shutdown waiting on a session that failed.
+                    try
+                    {
+                        string protectedFrame;
+                        try { protectedFrame = session.Authentication!.Protect(frame.Line); }
+                        catch (ArgumentException) { continue; }
+                        await session.Writer.WriteLineAsync(protectedFrame.AsMemory(), ct).ConfigureAwait(false);
+                        await session.Writer.FlushAsync(ct).ConfigureAwait(false);
+                    }
+                    finally
+                    {
+                        session.SettleFrame(frame);
+                    }
                 }
             }
             catch (OperationCanceledException)
@@ -375,6 +523,10 @@ namespace Styx.PartyGrind.IPC
             }
             catch (ObjectDisposedException)
             {
+            }
+            finally
+            {
+                session.AbandonPendingDeliveries();
             }
         }
 
