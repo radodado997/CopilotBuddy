@@ -191,9 +191,13 @@ namespace Styx.PartyGrind.IPC
         public string ActiveSubProfileName { get; set; } = string.Empty;
         public int ActiveSubProfileMinLevel { get; set; } = 1;
         public int ActiveSubProfileMaxLevel { get; set; } = 85;
+        /// <summary>Highest MaxLevel among the loaded profile's sub-profiles; 0 when unknown.</summary>
+        public int ProfileMaxLevel { get; set; }
         public int EffectiveSquadMinLevel { get; set; } = 1;
         public string LowestMemberName { get; set; } = string.Empty;
         public float LowestMemberXpPercent { get; set; }
+        /// <summary>True when the lowest squad member passed the loaded profile's top level range.</summary>
+        public bool LevelCapReached { get; set; }
 
         // Position, Combat & Focus Target
         public uint MapId { get; set; }

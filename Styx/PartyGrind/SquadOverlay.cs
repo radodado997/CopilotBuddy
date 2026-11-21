@@ -153,12 +153,13 @@ namespace Styx.PartyGrind
                 string lowest = string.IsNullOrEmpty(leader.LowestMemberName) ? "-" : leader.LowestMemberName;
                 _footerText.Text = string.Format(
                     CultureInfo.InvariantCulture,
-                    "Aktualny SubProfile: [{0}-{1}] {2}  |  Najniższy gracz: {3} (Lvl {4}, {5:F0}% XP)",
+                    "Aktualny SubProfile: [{0}-{1}] {2}  |  Najniższy gracz: {3} (Lvl {4}/{5}, {6:F0}% XP)",
                     leader.ActiveSubProfileMinLevel,
                     leader.ActiveSubProfileMaxLevel,
                     subName,
                     lowest,
                     leader.EffectiveSquadMinLevel,
+                    leader.ProfileMaxLevel,
                     leader.LowestMemberXpPercent);
             }
             else

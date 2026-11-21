@@ -88,6 +88,7 @@ namespace CopilotBuddy.Bots.PartyGrind
         private long _deathStartedUtcMs;
         private bool _localWasNeedingRest;
         private bool _lootFilterAttached;
+        private bool _levelCapStopRequested;
         private SquadTravelProgress _travelProgress = new();
         private static Composite? _activeCombatRoutine, _activeRestRoutine;
         private static bool _combatTicked, _restTicked, _healTicked;
@@ -179,6 +180,7 @@ namespace CopilotBuddy.Bots.PartyGrind
             _townRunRequestAcknowledgedUtcMs = 0;
             _townRunRequestReason = string.Empty;
             _townRunRequestUtcMs = 0;
+            _levelCapStopRequested = false;
             _deathStartedUtcMs = 0;
             _localWasNeedingRest = false;
 
@@ -190,6 +192,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                 SquadContext.EffectiveLevelOverride = StyxWoW.Me?.Level ?? 1;
 
                 ProfileManager.LevelOverrideSelector = () => _lastAppliedEffectiveLevel > 0 ? _lastAppliedEffectiveLevel : SquadContext.GetEffectiveProfileLevel();
+                ProfileManager.KeepProfileAboveLevelRange = true;
                 BotEvents.Profile.OnNewProfileLoaded += OnProfileRevisionLoaded;
 
                 SquadTankBridge.AttachTargetingFilters();
@@ -228,6 +231,7 @@ namespace CopilotBuddy.Bots.PartyGrind
         {
             Cleanup(() => { BotEvents.Profile.OnNewProfileLoaded -= OnProfileRevisionLoaded; });
             Cleanup(() => { ProfileManager.LevelOverrideSelector = null; });
+            Cleanup(() => { ProfileManager.KeepProfileAboveLevelRange = false; });
             Cleanup(() => { ProfileManager.RefreshProfileForLevel(); });
             Cleanup(() => { Mount.OnMountUp -= SquadFormationService.HandleMountUpEvent; });
             Cleanup(() => { SquadTankBridge.DetachTargetingFilters(); });
@@ -530,6 +534,7 @@ namespace CopilotBuddy.Bots.PartyGrind
             }
 
             SquadPartyBuffService.UpdateRaidTargetMarkers(settings, leaderState);
+            StopAtLevelCap(leaderState);
 
             if (_ipcServer != null && (now - _lastIpcSendUtcMs) >= 100)
             {
@@ -560,6 +565,8 @@ namespace CopilotBuddy.Bots.PartyGrind
                     if (ProfileManager.CurrentOuterProfile != null)
                         ProfileManager.RefreshProfileForLevel();
                 }
+
+                StopAtLevelCap(leaderState);
             }
 
             if (_ipcClient != null && ((now - _lastIpcSendUtcMs) >= 120 || localState.IsInCombat != _wasInCombat))
@@ -568,6 +575,27 @@ namespace CopilotBuddy.Bots.PartyGrind
                 _ipcClient.SendMemberState(localState);
             }
             _wasInCombat = localState.IsInCombat;
+        }
+
+        /// <summary>
+        /// Ends the session once the lowest squad member passes the highest level range of the
+        /// loaded profile. Every member keeps grinding until then, including a member (or the
+        /// leader) that already outleveled the profile, so the squad never loses a client.
+        /// </summary>
+        private void StopAtLevelCap(SquadLeaderState leaderState)
+        {
+            if (!leaderState.LevelCapReached)
+            {
+                _levelCapStopRequested = false;
+                return;
+            }
+            if (_levelCapStopRequested)
+                return;
+
+            _levelCapStopRequested = true;
+            Logging.Write("[PartyGrind Level] Lowest member {0} (L{1}) passed the profile maximum L{2}. Stopping the squad.",
+                leaderState.LowestMemberName, leaderState.EffectiveSquadMinLevel, leaderState.ProfileMaxLevel);
+            TreeRoot.Stop("PartyGrind level cap reached");
         }
 
         private bool EnsureLeaderProfile(SquadLeaderState leader)
@@ -811,6 +839,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                 SubProfileName = current?.Name ?? outer?.Name ?? string.Empty,
                 SubProfileMinLevel = current?.MinLevel ?? 1,
                 SubProfileMaxLevel = current?.MaxLevel ?? 85,
+                ProfileMaxLevel = ProfileManager.TopProfileMaxLevel,
                 MapId = StyxWoW.Me?.MapId ?? 0,
                 HotspotX = hotspot.X,
                 HotspotY = hotspot.Y,
