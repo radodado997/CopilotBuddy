@@ -79,6 +79,7 @@ namespace CopilotBuddy.Bots.PartyGrind
         private const long PullCommitTimeoutMs = 10000L;
         private const float PullCommitMaxTargetDistance = 60.0f;
         private const long IdleSnapshotIntervalMs = 5000L;
+        private const int TerminalStateDeliveryTimeoutMs = 1000;
         private bool _wasInCombat;
         private bool _townTasksCompleteLocal;
         private bool _townRunRequestPending;
@@ -89,6 +90,7 @@ namespace CopilotBuddy.Bots.PartyGrind
         private bool _localWasNeedingRest;
         private bool _lootFilterAttached;
         private bool _levelCapStopRequested;
+        private SquadLeaderStateDelivery? _terminalStateDelivery;
         private SquadTravelProgress _travelProgress = new();
         private static Composite? _activeCombatRoutine, _activeRestRoutine;
         private static bool _combatTicked, _restTicked, _healTicked;
@@ -183,6 +185,7 @@ namespace CopilotBuddy.Bots.PartyGrind
             _townRunRequestReason = string.Empty;
             _townRunRequestUtcMs = 0;
             _levelCapStopRequested = false;
+            _terminalStateDelivery = null;
             _deathStartedUtcMs = 0;
             _localWasNeedingRest = false;
 
@@ -473,10 +476,27 @@ namespace CopilotBuddy.Bots.PartyGrind
 
         private void StopIpc()
         {
+            AwaitTerminalStateDelivered();
             try { _ipcServer?.Dispose(); } catch { }
             _ipcServer = null;
             try { _ipcClient?.Dispose(); } catch { }
             _ipcClient = null;
+        }
+
+        /// <summary>
+        /// Holds the IPC shutdown until the terminal leader state reached every session's
+        /// socket. The wait is bounded: a peer that stopped reading must not stall the bot.
+        /// </summary>
+        private void AwaitTerminalStateDelivered()
+        {
+            SquadLeaderStateDelivery? delivery = _terminalStateDelivery;
+            _terminalStateDelivery = null;
+            if (delivery == null || delivery.IsDelivered)
+                return;
+
+            if (!delivery.Wait(TerminalStateDeliveryTimeoutMs))
+                Logging.Write("[PartyGrind Level] Terminal leader state was still unsent after {0} ms; closing IPC anyway.",
+                    TerminalStateDeliveryTimeoutMs);
         }
 
         private SquadHandshake BuildLocalHandshake()
@@ -539,11 +559,14 @@ namespace CopilotBuddy.Bots.PartyGrind
 
             // The terminal state must reach the squad before the IPC server goes away, so the
             // first level-cap tick bypasses the throttle. Later ticks keep the normal cadence.
-            bool terminalStatePending = leaderState.LevelCapReached && !_levelCapStopRequested;
+            bool terminalStatePending = leaderState.LevelCapReached && !_levelCapStopRequested &&
+                _terminalStateDelivery == null;
             if (_ipcServer != null && (terminalStatePending || (now - _lastIpcSendUtcMs) >= 100))
             {
+                SquadLeaderStateDelivery delivery = _ipcServer.BroadcastLeaderState(leaderState, populateRoster: false);
                 _lastIpcSendUtcMs = now;
-                _ipcServer.BroadcastLeaderState(leaderState, populateRoster: false);
+                if (terminalStatePending)
+                    _terminalStateDelivery = delivery;
             }
 
             StopAtLevelCap(leaderState);
@@ -598,8 +621,16 @@ namespace CopilotBuddy.Bots.PartyGrind
             if (!leaderState.LevelCapReached)
             {
                 _levelCapStopRequested = false;
+                _terminalStateDelivery = null;
                 return;
             }
+
+            // Do not stop before the terminal frame is on the wire. StopIpc waits for the same
+            // signal, so one more tick is all this normally costs.
+            SquadLeaderStateDelivery? delivery = _terminalStateDelivery;
+            if (delivery != null && !delivery.IsDelivered)
+                return;
+
             if (_levelCapStopRequested)
                 return;
 

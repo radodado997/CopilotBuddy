@@ -336,6 +336,48 @@ namespace CopilotBuddy.PartyGrind.Tests
         }
 
         [Fact]
+        public async Task LeaderStateDelivery_CompletesOnlyAfterTheFrameReachesTheClient()
+        {
+            using var server = new SquadIpcServer(0, "Retry", memberSecrets: Secrets);
+            server.Start();
+            using var client = new SquadIpcClient(server.Port, "Retry", memberSecret: Secret("Follower"));
+            client.Start(() => new SquadHandshake { CharacterName = "Follower", Guid = 42, Level = 10 });
+            await WaitUntilAsync(() => server.GetMemberSnapshots().Count == 1);
+
+            var delivery = server.BroadcastLeaderState(new SquadLeaderState
+            {
+                LeaderName = "Tank",
+                Phase = SquadPhase.Grinding,
+                EffectiveSquadMinLevel = 11,
+                LevelCapReached = true
+            });
+
+            Assert.True(delivery.Wait(4000));
+            Assert.True(delivery.IsDelivered);
+            // The write completing must mean the frame is on the wire, so the client receives
+            // it without any further leader-state broadcast.
+            await WaitUntilAsync(() => client.LatestLeaderState?.LevelCapReached == true);
+            Assert.Equal(11, client.LatestLeaderState!.EffectiveSquadMinLevel);
+        }
+
+        [Fact]
+        public async Task LeaderStateDelivery_IsSettledWhenAMemberDisappearsBeforeTheWrite()
+        {
+            using var server = new SquadIpcServer(0, "Retry", memberSecrets: Secrets);
+            server.Start();
+            using var client = new SquadIpcClient(server.Port, "Retry", memberSecret: Secret("Follower"));
+            client.Start(() => new SquadHandshake { CharacterName = "Follower", Guid = 42, Level = 10 });
+            await WaitUntilAsync(() => server.GetMemberSnapshots().Count == 1);
+
+            // Drop the only peer, then broadcast: a vanished session must not leave the
+            // delivery pending forever while the coordinator waits to shut down.
+            client.Stop();
+            await WaitUntilAsync(() => server.GetMemberSnapshots().Count == 0);
+            var delivery = server.BroadcastLeaderState(new SquadLeaderState { LeaderName = "Tank" });
+            Assert.True(delivery.Wait(4000));
+        }
+
+        [Fact]
         public async Task MemberState_TownRunRequest_IsExposedOnSnapshot_AndCleared()
         {
             using var server = new SquadIpcServer(0, "AlphaTeam", memberSecrets: Secrets);
