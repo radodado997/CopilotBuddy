@@ -851,8 +851,10 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (!settings.EnableWarlockHealthstones)
                 return false;
 
+            var memberGuids = SquadContext.GetKnownMemberGuids();
+            memberGuids.Remove(0);
             var well = gameObjects.FirstOrDefault(g => g != null && g.IsValid && g.Entry == SoulwellObjectEntry &&
-                g.Location.Distance(me.Location) <= 25f);
+                memberGuids.Contains(g.CreatedByGuid) && g.Location.Distance(me.Location) <= 25f);
             if (well == null || HasHealthstoneInBags())
                 return false;
 
