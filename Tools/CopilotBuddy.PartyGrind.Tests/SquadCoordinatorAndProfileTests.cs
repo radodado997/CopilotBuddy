@@ -106,6 +106,97 @@ namespace CopilotBuddy.PartyGrind.Tests
         }
 
         [Fact]
+        public void HealthstoneAssignment_SkipsUnavailableOrTooHighLevelSupply()
+        {
+            var coordinator = new SquadCoordinatorService();
+            var settings = CreateDefaultSettings();
+            var receiver = MakeLeaderState(20);
+            receiver.WantsHealthstone = true;
+            receiver.FreeBagSlots = 5;
+            var warlock = MakeConnectedClient("Warlock", 0, SquadRole.DpsRanged, WoWClass.Warlock, 34, 1000);
+            var provider = warlock.LatestState!;
+
+            SquadLeaderState Tick(long now) => coordinator.EvaluateTick(settings, receiver, new[] { warlock },
+                new SquadProfileSnapshot(), 0, 0, 0, 0, now);
+
+            Assert.Equal(SquadPhase.Grinding, Tick(1000).Phase);
+            provider.CanProvideHealthstone = true;
+            Assert.Empty(Tick(1100).ActiveProvisionerName);
+            provider.HealthstoneMinReceiverLevel = 22;
+            Assert.Empty(Tick(1200).ActiveProvisionerName);
+            receiver.Level = 22;
+            Assert.Equal("Warlock", Tick(1300).ActiveProvisionerName);
+        }
+
+        [Fact]
+        public void LostHealthstoneSupply_ReleasesAssignmentWithoutReceiverCooldown()
+        {
+            var coordinator = new SquadCoordinatorService();
+            var settings = CreateDefaultSettings();
+            settings.TradeOfferTimeoutSeconds = 7;
+            settings.ProvisionCooldownSeconds = 30;
+            var receiver = MakeLeaderState(22);
+            receiver.WantsHealthstone = true;
+            receiver.FreeBagSlots = 5;
+            var warlock = MakeConnectedClient("Warlock", 0, SquadRole.DpsRanged, WoWClass.Warlock, 34, 1000);
+            var provider = warlock.LatestState!;
+            provider.CanProvideHealthstone = true;
+            provider.HealthstoneMinReceiverLevel = 10;
+
+            SquadLeaderState Tick(long now) => coordinator.EvaluateTick(settings, receiver, new[] { warlock },
+                new SquadProfileSnapshot(), 0, 0, 0, 0, now);
+
+            Assert.Equal(receiver.CharacterName, Tick(1000).ActiveTradeTargetName);
+            provider.CanProvideHealthstone = false;
+            provider.HealthstoneMinReceiverLevel = null;
+            var released = Tick(2000);
+            Assert.Equal(SquadPhase.Grinding, released.Phase);
+            Assert.Empty(released.ActiveTradeTargetName);
+
+            provider.CanProvideHealthstone = true;
+            provider.HealthstoneMinReceiverLevel = 10;
+            Assert.Equal(receiver.CharacterName, Tick(3000).ActiveTradeTargetName);
+
+            provider.CanProvideHealthstone = false;
+            provider.HealthstoneMinReceiverLevel = null;
+            Assert.Empty(Tick(14000).ActiveTradeTargetName);
+            provider.CanProvideHealthstone = true;
+            provider.HealthstoneMinReceiverLevel = 10;
+            Assert.Equal(receiver.CharacterName, Tick(15000).ActiveTradeTargetName);
+        }
+
+        [Fact]
+        public void LastShardSpentOnRitual_KeepsAssignmentPastTradeTimeoutUntilRitualWaitEnds()
+        {
+            var coordinator = new SquadCoordinatorService();
+            var settings = CreateDefaultSettings();
+            settings.TradeOfferTimeoutSeconds = 4;
+            var receiver = MakeLeaderState(70);
+            receiver.WantsHealthstone = true;
+            receiver.FreeBagSlots = 5;
+            var warlock = MakeConnectedClient("Warlock", 0, SquadRole.DpsRanged, WoWClass.Warlock, 70, 1000);
+            var provider = warlock.LatestState!;
+            provider.CanProvideHealthstone = true;
+            provider.HealthstoneMinReceiverLevel = 10;
+
+            SquadLeaderState Tick(long now) => coordinator.EvaluateTick(settings, receiver, new[] { warlock },
+                new SquadProfileSnapshot(), 0, 0, 0, 0, now);
+
+            Assert.Equal(receiver.CharacterName, Tick(1000).ActiveTradeTargetName);
+            provider.CanProvideHealthstone = false;
+            provider.HealthstoneMinReceiverLevel = null;
+            provider.IsHealthstoneRitualPending = true;
+            Assert.Equal(receiver.CharacterName, Tick(7000).ActiveTradeTargetName);
+            Assert.Equal(receiver.CharacterName, Tick(9000).ActiveTradeTargetName);
+            provider.IsHealthstoneRitualPending = false;
+            Assert.Empty(Tick(13000).ActiveTradeTargetName);
+
+            provider.CanProvideHealthstone = true;
+            provider.HealthstoneMinReceiverLevel = 10;
+            Assert.Equal(receiver.CharacterName, Tick(14000).ActiveTradeTargetName);
+        }
+
+        [Fact]
         public void LogoutAndReconnect_RetainConfirmedLevelAndXpUntilGraceExpires()
         {
             var coordinator = new SquadCoordinatorService();

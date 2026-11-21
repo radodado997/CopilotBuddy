@@ -46,6 +46,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         public const uint RefreshmentTableObjectEntry = 186812U;
         public const uint SoulwellObjectEntry = 181621U;
         public const uint ArcanePowderItemEntry = 17020U;
+        private const uint SoulShardItemEntry = 6265U;
+        private const long SoulwellSetupWindowMs = 6000L;
         private const uint ItemFlagSoulbound = 0x1U;
 
         private static readonly (int Rank, int CasterLevel, int ItemReqLevel)[] ConjureWaterRanks =
@@ -73,6 +75,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private readonly List<(int Slot, uint Entry, int Count)> _offeredItems = new();
         private ulong _assistedRitualGuid;
         private byte _assistedRitualProgress;
+        private long _soulwellPendingUntilUtcMs;
+        private long _nextSoulwellCheckUtcMs;
 
         public bool IsTradeBusy => !string.IsNullOrEmpty(_activeTradeTarget) || TradeFrame.Instance.IsVisible;
 
@@ -116,7 +120,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 return null;
 
             return bagItems
-                .Where(i => !i.IsSoulbound && i.StackCount > 0 && i.RequiredLevel <= receiverLevel)
+                .Where(i => IsTradableStack(i.IsSoulbound, i.StackCount) && i.RequiredLevel <= receiverLevel)
                 .Where(i =>
                     (wantFood && i.IsFood) ||
                     (wantDrink && i.IsDrink) ||
@@ -231,6 +235,45 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             return me.BagItems.Any(i => i != null && i.IsValid && IsHealthstoneName(i.Name));
         }
 
+        private static bool HasSoulShard(IEnumerable<WoWItem> bagItems) =>
+            bagItems.Any(i => i != null && i.IsValid && i.Entry == SoulShardItemEntry && i.StackCount > 0);
+
+        private static bool IsTradableStack(bool isSoulbound, long count) => !isSoulbound && count > 0;
+
+        public static int? GetHealthstoneMinReceiverLevel(
+            int casterLevel,
+            bool canCreate,
+            IReadOnlyList<(int Rank, int SpellId)> knownRanks,
+            int? readyStoneMinLevel)
+        {
+            int? minLevel = readyStoneMinLevel;
+            if (canCreate)
+            {
+                foreach (var row in CreateHealthstoneRanks)
+                {
+                    if (casterLevel >= row.CasterLevel && knownRanks.Any(k => k.Rank == row.Rank) &&
+                        (!minLevel.HasValue || row.ItemReqLevel < minLevel.Value))
+                        minLevel = row.ItemReqLevel;
+                }
+            }
+            return minLevel;
+        }
+
+        internal static int? GetHealthstoneMinReceiverLevel(LocalPlayer me)
+        {
+            var bagItems = me.BagItems;
+            int? readyStoneMinLevel = bagItems.Where(i => i != null && i.IsValid &&
+                    IsTradableStack((i.Flags & ItemFlagSoulbound) != 0, i.StackCount) && IsHealthstoneName(i.Name))
+                .Select(i => (int?)i.RequiredLevel).Min();
+            bool canCreate = HasSoulShard(bagItems) && me.FreeNormalBagSlots > 0;
+            IReadOnlyList<(int Rank, int SpellId)> knownRanks = canCreate
+                ? GetKnownRankSpells("Create Healthstone")
+                : Array.Empty<(int, int)>();
+            return GetHealthstoneMinReceiverLevel(me.Level, canCreate, knownRanks, readyStoneMinLevel);
+        }
+
+        internal bool IsSoulwellPending(long now) => now < _soulwellPendingUntilUtcMs;
+
         public static bool TryConjureForSelf(SquadSettings settings)
         {
             var me = StyxWoW.Me;
@@ -299,6 +342,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
         public void Stop()
         {
+            _soulwellPendingUntilUtcMs = 0;
+            _nextSoulwellCheckUtcMs = 0;
             if (!string.IsNullOrEmpty(_activeTradeTarget) && (!TradeFrame.Instance.IsVisible ||
                 TradeFrame.IsPartnerAuthorized(TradeFrame.Instance.PartnerName, _activeTradeTarget)))
                 TradeFrame.Instance.CancelTrade();
@@ -405,7 +450,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 return true;
 
             // 4. Warlock Soulstone on Healer (or Tank fallback) out of combat when missing.
-            if (me.Class == WoWClass.Warlock && settings.EnableWarlockHealthstones && TryMaintainSoulstone(me, leader))
+            if (me.Class == WoWClass.Warlock && settings.EnableWarlockHealthstones &&
+                !IsSoulwellPending(now) && TryMaintainSoulstone(me, leader))
                 return true;
 
             // 5. Provider behavior when Coordinator authorized us (or solo in phase Provisioning).
@@ -629,32 +675,38 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
         private bool RunWarlockProvisionerTick(LocalPlayer me, SquadSettings settings, SquadLeaderState leader, long now)
         {
+            if (IsSoulwellPending(now))
+                return true;
+
             var members = leader.Members ?? new List<SquadMemberSummary>();
-            var needers = members.Where(m =>
-                m.IsConnected && !m.IsDead && !m.IsGhost &&
-                !string.Equals(m.CharacterName, me.Name, StringComparison.OrdinalIgnoreCase) &&
-                m.WantsHealthstone).ToList();
-
-            if (settings.UseRitualTablesWhenAvailable &&
-                me.Level >= 68 &&
-                needers.Count >= 2 &&
-                SpellManager.CanCast("Ritual of Souls", me, false, false))
-            {
-                if (me.IsMoving) WoWMovement.MoveStop();
-                return SpellManager.Cast("Ritual of Souls", me);
-            }
-
             string targetName = leader.ActiveTradeTargetName;
             if (string.IsNullOrEmpty(targetName) || IsOnCooldown(targetName))
                 return false;
 
             var targetSummary = members.FirstOrDefault(m =>
                 string.Equals(m.CharacterName, targetName, StringComparison.OrdinalIgnoreCase));
-            if (targetSummary == null || targetSummary.FreeBagSlots < 2)
+            if (targetSummary == null || targetSummary.FreeBagSlots < 2 || !targetSummary.WantsHealthstone)
                 return false;
+
+            bool hasShard = HasSoulShard(me.BagItems);
+            if (hasShard && settings.UseRitualTablesWhenAvailable && me.Level >= 68 &&
+                members.Count(m => m.IsConnected && !m.IsDead && !m.IsGhost && m.WantsHealthstone &&
+                    !string.Equals(m.CharacterName, me.Name, StringComparison.OrdinalIgnoreCase)) >= 2 &&
+                SpellManager.CanCast("Ritual of Souls", me, false, false))
+            {
+                if (me.IsMoving) WoWMovement.MoveStop();
+                if (SpellManager.Cast("Ritual of Souls", me))
+                {
+                    _soulwellPendingUntilUtcMs = now + SoulwellSetupWindowMs;
+                    return true;
+                }
+            }
 
             if (FindTradableBagItem(me, targetSummary.Level, false, false, true) == null)
             {
+                if (!hasShard || me.FreeNormalBagSlots == 0)
+                    return false;
+
                 var hsRanks = GetKnownRankSpells("Create Healthstone");
                 int? hsRank = SelectBestHealthstoneRank(targetSummary.Level, me.Level, hsRanks);
                 if (hsRank.HasValue)
@@ -768,20 +820,53 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             }
 
             // 3. Click Soulwell when lacking a Healthstone.
-            if (settings.EnableWarlockHealthstones && !HasHealthstoneInBags())
+            return TryUseSoulwell(me, settings, gameObjects, out _);
+        }
+
+        internal bool TryUseSoulwellWhileGrinding(SquadSettings settings)
+        {
+            var me = StyxWoW.Me;
+            if (!settings.UseRitualTablesWhenAvailable || !settings.EnableWarlockHealthstones ||
+                me == null || !me.IsAlive || me.Combat || me.Mounted || me.IsCasting || me.ChanneledCastingSpellId != 0)
+                return false;
+
+            long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            if (now < _nextSoulwellCheckUtcMs)
+                return false;
+
+            _nextSoulwellCheckUtcMs = now + 1000L;
+            if (me.FreeNormalBagSlots < 2 || !TryUseSoulwell(me, settings,
+                ObjectManager.GetObjectsOfType<WoWGameObject>(false, false), out bool approaching))
+                return false;
+
+            if (approaching)
+                _nextSoulwellCheckUtcMs = 0;
+            return true;
+        }
+
+        private static bool TryUseSoulwell(LocalPlayer me, SquadSettings settings,
+            IEnumerable<WoWGameObject> gameObjects, out bool approaching)
+        {
+            approaching = false;
+            if (!settings.EnableWarlockHealthstones)
+                return false;
+
+            var memberGuids = SquadContext.GetKnownMemberGuids();
+            memberGuids.Remove(0);
+            var well = gameObjects.FirstOrDefault(g => g != null && g.IsValid && g.Entry == SoulwellObjectEntry &&
+                memberGuids.Contains(g.CreatedByGuid) && g.Location.Distance(me.Location) <= 25f);
+            if (well == null || HasHealthstoneInBags())
+                return false;
+
+            if (well.Location.Distance(me.Location) > 4.5f)
             {
-                var well = gameObjects.FirstOrDefault(g => g.Entry == SoulwellObjectEntry);
-                if (well != null)
-                {
-                    if (well.Location.Distance(me.Location) > 4.5f)
-                        Navigator.MoveTo(well.Location, "Moving to Soulwell");
-                    else
-                        well.Interact();
-                    return true;
-                }
+                var result = Navigator.MoveTo(well.Location, "Moving to Soulwell");
+                approaching = result is not (MoveResult.Failed or MoveResult.PathGenerationFailed);
+                return approaching;
             }
 
-            return false;
+            well.Interact();
+            return true;
         }
 
         private static bool TryMaintainSoulstone(LocalPlayer me, SquadLeaderState? leader)
@@ -796,7 +881,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 .Select(p => p.Unit).FirstOrDefault();
             if (target == null) return false;
 
-            WoWItem? stone = me.BagItems.FirstOrDefault(i => i != null && i.IsValid && IsSoulstoneName(i.Name));
+            var bagItems = me.BagItems;
+            WoWItem? stone = bagItems.FirstOrDefault(i => i != null && i.IsValid && IsSoulstoneName(i.Name));
             if (stone != null)
             {
                 if (stone.Cooldown == 0)
@@ -807,7 +893,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 return false;
             }
 
-            if (SpellManager.CanCast("Create Soulstone", me, false, false))
+            if (HasSoulShard(bagItems) && me.FreeNormalBagSlots > 0 &&
+                SpellManager.CanCast("Create Soulstone", me, false, false))
             {
                 if (me.IsMoving) WoWMovement.MoveStop();
                 return SpellManager.Cast("Create Soulstone", me);
@@ -836,8 +923,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             // Route live bag offers through the same selector the tests exercise, so
             // level, binding and stack rules have a single implementation.
             var eligible = candidates
-                .Where(i => i != null && i.IsValid && i.StackCount > 0 &&
-                            (i.Flags & ItemFlagSoulbound) == 0 &&
+                .Where(i => i != null && i.IsValid &&
+                            IsTradableStack((i.Flags & ItemFlagSoulbound) != 0, i.StackCount) &&
                             i.RequiredLevel <= receiverLevel)
                 .ToList();
             // Keep each snapshot paired with its live item so the chosen stack is the
