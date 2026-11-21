@@ -74,7 +74,7 @@ namespace Styx.Logic.Profiles
 					}
 					
 					Logging.Write("No profile loaded. Stopping bot.");
-					TreeRoot.Stop();
+					TreeRoot.Stop("No matching profile: " + XmlLocation);
 					return null;
 				}
 				return _currentProfile;

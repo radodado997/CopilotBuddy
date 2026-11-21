@@ -48,7 +48,11 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             public ulong Guid;
             public SquadRole Role;
             public WoWClass Class;
-            public int Level = 1;
+            public int Level;
+            public string LevelSource = string.Empty;
+            public (string Source, int Raw)? RejectedLevel;
+            public bool Disconnected;
+            public bool GraceExpired;
             public float XpPercent;
             public long LastSeenUtcMs;
             public bool NeedsRest;
@@ -59,6 +63,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private readonly Dictionary<string, long> _provisionCooldownUntilMs = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
         private readonly List<SquadBreadcrumb> _breadcrumbs = new List<SquadBreadcrumb>();
 
+        private int? _lastLoggedMinLevel;
         private bool _isWaitingForFollower;
         private bool _isHardBacktracking;
         private long _waitingSinceUtcMs;
@@ -101,6 +106,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             IsPausedManually = false;
             ManualPauseReason = string.Empty;
             _history.Clear();
+            _lastLoggedMinLevel = null;
             _provisionCooldownUntilMs.Clear();
             ClearBreadcrumbs();
             _isWaitingForFollower = false;
@@ -157,7 +163,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (!string.IsNullOrWhiteSpace(leaderLocal.CharacterName))
             {
                 connectedNames.Add(leaderLocal.CharacterName.Trim());
-                UpsertHistory(leaderLocal, settings, nowUtcMs);
+                UpsertHistory(leaderLocal, "local", nowUtcMs);
             }
 
             var assignments = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
@@ -178,7 +184,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     Guid = snap.Handshake.Guid,
                     Class = snap.Handshake.Class,
                     Role = snap.Handshake.Role,
-                    Level = Math.Max(1, snap.Handshake.Level)
+                    Level = snap.Handshake.Level
                 };
 
                 roles[name] = state.Role;
@@ -186,47 +192,37 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 {
                     connectedNames.Add(name);
                     rosterStates.Add(state);
-                    UpsertHistory(state, settings, nowUtcMs);
+                    UpsertHistory(state, snap.LatestState == null ? "handshake" : "telemetry", nowUtcMs, snap.Handshake.Level);
                     if (snap.LatestState == null) _history[name].LastState = null;
                 }
             }
 
             // 2. Compute EffectiveSquadMinLevel (including recently disconnected members within DisconnectGraceSeconds).
             long graceMs = Math.Max(0, settings.DisconnectGraceSeconds) * 1000L;
-            var levelCandidates = new List<(string Name, int Level, float XpPct)>();
-
-            foreach (var m in rosterStates)
+            foreach (var rec in _history.Values.Where(r => !r.Disconnected && !connectedNames.Contains(r.Name)))
             {
-                string name = m.CharacterName?.Trim() ?? string.Empty;
-                if (string.IsNullOrEmpty(name)) continue;
-                levelCandidates.Add((name, Math.Max(1, m.Level), ComputeXpPercent(m)));
+                rec.Disconnected = true;
+                Logging.WriteDebug("[PartyGrind Level] Disconnected member={0} guid={1} confirmed={2} graceMs={3}",
+                    rec.Name, rec.Guid, rec.Level, graceMs);
             }
-
-            foreach (var kv in _history)
+            foreach (var rec in _history.Values.Where(r => r.Disconnected && !r.GraceExpired && nowUtcMs - r.LastSeenUtcMs > graceMs))
             {
-                if (connectedNames.Contains(kv.Key))
-                    continue;
-                if ((nowUtcMs - kv.Value.LastSeenUtcMs) <= graceMs)
-                {
-                    levelCandidates.Add((kv.Value.Name, Math.Max(1, kv.Value.Level), kv.Value.XpPercent));
-                }
+                Logging.WriteDebug("[PartyGrind Level] Grace expired member={0} guid={1} confirmed={2}", rec.Name, rec.Guid, rec.Level);
+                rec.GraceExpired = true;
+                rec.LastState = null;
+                rec.NeedsRest = false;
             }
-
-            int effectiveMinLevel = Math.Max(1, leaderLocal.Level);
-            string lowestName = leaderLocal.CharacterName ?? string.Empty;
-            float lowestXpPct = ComputeXpPercent(leaderLocal);
-
-            if (levelCandidates.Count > 0)
+            var lowest = _history.Values.Where(r => !r.GraceExpired && r.Level > 0)
+                .OrderBy(r => r.Level).ThenBy(r => r.XpPercent).ThenBy(r => r.Name, StringComparer.OrdinalIgnoreCase)
+                .FirstOrDefault();
+            int effectiveMinLevel = lowest?.Level ?? 0;
+            string lowestName = lowest?.Name ?? string.Empty;
+            float lowestXpPct = lowest?.XpPercent ?? 0f;
+            if (_lastLoggedMinLevel != effectiveMinLevel)
             {
-                var lowest = levelCandidates
-                    .OrderBy(c => c.Level)
-                    .ThenBy(c => c.XpPct)
-                    .ThenBy(c => c.Name, StringComparer.OrdinalIgnoreCase)
-                    .First();
-
-                effectiveMinLevel = lowest.Level;
-                lowestName = lowest.Name;
-                lowestXpPct = lowest.XpPct;
+                Logging.WriteDebug("[PartyGrind Level] Profile minimum {0} -> {1} member={2} guid={3} source={4} inGrace={5}",
+                    _lastLoggedMinLevel, effectiveMinLevel, lowestName, lowest?.Guid, lowest?.LevelSource, lowest?.Disconnected);
+                _lastLoggedMinLevel = effectiveMinLevel;
             }
 
             var telemetryNames = new HashSet<string>(
@@ -234,11 +230,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 StringComparer.OrdinalIgnoreCase);
             telemetryNames.Add(leaderLocal.CharacterName.Trim());
             rosterStates.RemoveAll(m => !telemetryNames.Contains(m.CharacterName.Trim()));
-            foreach (var name in _history.Where(kv => !connectedNames.Contains(kv.Key) &&
-                nowUtcMs - kv.Value.LastSeenUtcMs > graceMs).Select(kv => kv.Key).ToList())
-                _history.Remove(name);
-
-            if (resolveProfile != null) profile = resolveProfile(effectiveMinLevel);
+            if (effectiveMinLevel > 0 && resolveProfile != null) profile = resolveProfile(effectiveMinLevel);
 
             // Detect sub-profile transition -> MigratingZone.
             string subProfileKey = $"{profile.ProfileXmlPath}|{profile.ProfileXmlHash}|{profile.SubProfileName}|{profile.SubProfileMinLevel}|{profile.SubProfileMaxLevel}|{profile.MapId}";
@@ -448,7 +440,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                         Guid = snap.Handshake.Guid,
                         Class = snap.Handshake.Class,
                         Role = snap.Handshake.Role,
-                        Level = Math.Max(1, snap.Handshake.Level)
+                        Level = snap.Handshake.Level
                     });
                 }
                 bool pendingTelemetry = connectedClients.Any(s => s.IsConnected && s.LatestState == null &&
@@ -730,23 +722,55 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             _provisionCooldownUntilMs[characterName.Trim()] = nowUtcMs + Math.Max(1, cooldownSeconds) * 1000L;
         }
 
-        private void UpsertHistory(SquadMemberState state, SquadSettings settings, long nowUtcMs)
+        private void UpsertHistory(SquadMemberState state, string source, long nowUtcMs, int handshakeLevel = 0)
         {
             string name = state.CharacterName?.Trim() ?? string.Empty;
             if (string.IsNullOrEmpty(name))
                 return;
 
-            if (!_history.TryGetValue(name, out var rec))
+            if (!_history.TryGetValue(name, out var rec) || (state.Guid != 0 && rec.Guid != 0 && state.Guid != rec.Guid))
             {
                 rec = new MemberHistoryRecord { Name = name };
                 _history[name] = rec;
             }
 
-            rec.Guid = state.Guid;
+            if (rec.Disconnected)
+                Logging.WriteDebug("[PartyGrind Level] Reconnected member={0} guid={1} afterMs={2}", name, state.Guid, nowUtcMs - rec.LastSeenUtcMs);
+            rec.Disconnected = false;
+            rec.GraceExpired = false;
+            if (state.Guid != 0) rec.Guid = state.Guid;
             rec.Role = state.Role;
             rec.Class = state.Class;
-            rec.Level = Math.Max(1, state.Level);
-            rec.XpPercent = ComputeXpPercent(state);
+            int previousLevel = rec.Level;
+            if (handshakeLevel > rec.Level && handshakeLevel <= byte.MaxValue)
+            {
+                rec.Level = handshakeLevel;
+                rec.XpPercent = 0f;
+                rec.LevelSource = "handshake";
+            }
+            if (state.Level is <= 0 or > byte.MaxValue || state.Level < rec.Level)
+            {
+                if (rec.RejectedLevel != (source, state.Level))
+                    Logging.WriteDebug("[PartyGrind Level] Rejected member={0} guid={1} source={2} raw={3} confirmed={4} confirmedSource={5}",
+                        name, state.Guid, source, state.Level, rec.Level, rec.LevelSource);
+                rec.RejectedLevel = (source, state.Level);
+            }
+            else
+            {
+                if (rec.RejectedLevel.HasValue)
+                    Logging.WriteDebug("[PartyGrind Level] Recovered member={0} guid={1} source={2} raw={3}", name, state.Guid, source, state.Level);
+                rec.RejectedLevel = null;
+                if (source != "handshake")
+                {
+                    float xp = ComputeXpPercent(state);
+                    rec.XpPercent = state.Level == rec.Level ? Math.Max(rec.XpPercent, xp) : xp;
+                }
+                rec.Level = state.Level;
+                rec.LevelSource = source;
+            }
+            if (rec.Level != previousLevel)
+                Logging.WriteDebug("[PartyGrind Level] Accepted member={0} guid={1} source={2} level={3}->{4}",
+                    name, rec.Guid, rec.LevelSource, previousLevel, rec.Level);
             rec.LastSeenUtcMs = nowUtcMs;
             rec.LastState = state;
         }
@@ -944,14 +968,14 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
             foreach (var kv in _history)
             {
-                if (activeByName.ContainsKey(kv.Key))
+                if (kv.Value.GraceExpired || activeByName.ContainsKey(kv.Key))
                     continue;
                 if (kv.Value.LastState == null)
                 {
                     result.Add(new SquadMemberSummary
                     {
                         CharacterName = kv.Value.Name, Guid = kv.Value.Guid,
-                        Role = kv.Value.Role, Class = kv.Value.Class, Level = kv.Value.Level,
+                        Role = kv.Value.Role, Class = kv.Value.Class, Level = kv.Value.Level, XpPercent = kv.Value.XpPercent,
                         HasTelemetry = false, IsConnected = connectedNames.Contains(kv.Key),
                         DistanceToLeader = -1f, StateLabel = "Awaiting telemetry"
                     });
@@ -972,6 +996,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
         private SquadMemberSummary ToSummary(SquadMemberState m, bool isConnected, WoWPoint leaderPoint, uint leaderMapId)
         {
+            _history.TryGetValue(m.CharacterName.Trim(), out var rec);
             string label = m.IsDead || m.IsGhost ? "Dead"
                 : m.IsInCombat ? "Combat"
                 : !m.TownTasksComplete && (m.NeedsSell || m.NeedsRepair || m.NeedsBuy || m.NeedsTrain || m.NeedsMail) && _inTownRun ? "TownRun"
@@ -987,8 +1012,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 Guid = m.Guid,
                 Role = m.Role,
                 Class = m.Class,
-                Level = m.Level,
-                XpPercent = ComputeXpPercent(m),
+                Level = rec?.Level ?? m.Level,
+                XpPercent = rec?.XpPercent ?? ComputeXpPercent(m),
                 XpPerHour = m.XpPerHour,
                 HealthPercent = m.HealthPercent,
                 PowerPercent = m.PowerPercent,
