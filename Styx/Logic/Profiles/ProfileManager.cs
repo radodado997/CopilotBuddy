@@ -219,8 +219,9 @@ namespace Styx.Logic.Profiles
 		}
 
 		/// <summary>
-		/// Widest level-scoped sub-profile whose range starts at or below <paramref name="level"/>.
-		/// Used both for the top of the profile and for the clamp above the last level range.
+		/// Widest level-scoped grindeable sub-profile whose range starts at or below
+		/// <paramref name="level"/>. Used both for the top of the profile and for the clamp
+		/// above the last level range, so only a candidate that can actually grind is picked.
 		/// </summary>
 		private static Profile? FindHighestReachedProfile(List<Profile> sortedProfiles, int level, uint mapId, bool requireContinent)
 		{
@@ -229,6 +230,9 @@ namespace Styx.Logic.Profiles
 			{
 				Profile candidate = sortedProfiles[i];
 				if (IsContainerProfile(candidate))
+					continue;
+				// GrindArea falls back to the parent, so this is the effective area.
+				if (candidate.GrindArea == null)
 					continue;
 				if (requireContinent && candidate.ContinentId != -1 && (long)candidate.ContinentId != (long)mapId)
 					continue;

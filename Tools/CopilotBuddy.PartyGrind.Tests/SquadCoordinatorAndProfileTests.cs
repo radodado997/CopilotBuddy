@@ -618,6 +618,63 @@ namespace CopilotBuddy.PartyGrind.Tests
         }
 
         [Fact]
+        public void LevelCap_WaitsForEveryExpectedMemberBeforeEndingTheSquad()
+        {
+            var settings = CreateDefaultSettings();
+            settings.ExpectedMemberNamesCsv = "TankA,HealB,DpsC";
+            var coord = new SquadCoordinatorService();
+            long t = 20_000L;
+            var snap = new SquadProfileSnapshot
+            {
+                ProfileXmlPath = "squad.xml",
+                SubProfileName = "L1-10",
+                SubProfileMinLevel = 1,
+                SubProfileMaxLevel = 10,
+                ProfileMaxLevel = 10,
+                MapId = 0,
+                HotspotX = 100f,
+                HotspotY = 100f
+            };
+
+            // The two reporting members are above the maximum, but DpsC never reported a level.
+            var incomplete = coord.EvaluateTick(
+                settings,
+                MakeLeaderState(level: 12),
+                new[] { MakeConnectedClient("HealB", 0, SquadRole.Healer, WoWClass.Priest, 11, t) },
+                snap, 0, 0, 0, 0f, t);
+
+            Assert.False(incomplete.LevelCapReached);
+            Assert.Equal(SquadPhase.Grinding, incomplete.Phase);
+
+            // DpsC is still below the maximum, so the squad keeps grinding.
+            var lowestBelow = coord.EvaluateTick(
+                settings,
+                MakeLeaderState(level: 12),
+                new[]
+                {
+                    MakeConnectedClient("HealB", 0, SquadRole.Healer, WoWClass.Priest, 11, t + 500),
+                    MakeConnectedClient("DpsC", 1, SquadRole.DpsRanged, WoWClass.Mage, 10, t + 500)
+                },
+                snap, 0, 0, 0, 0f, t + 500);
+
+            Assert.False(lowestBelow.LevelCapReached);
+            Assert.Equal(10, lowestBelow.EffectiveSquadMinLevel);
+
+            // Every expected member reported and all are above the maximum -> cap.
+            var capped = coord.EvaluateTick(
+                settings,
+                MakeLeaderState(level: 12),
+                new[]
+                {
+                    MakeConnectedClient("HealB", 0, SquadRole.Healer, WoWClass.Priest, 11, t + 1000),
+                    MakeConnectedClient("DpsC", 1, SquadRole.DpsRanged, WoWClass.Mage, 11, t + 1000)
+                },
+                snap, 0, 0, 0, 0f, t + 1000);
+
+            Assert.True(capped.LevelCapReached);
+        }
+
+        [Fact]
         public void FlatProfileAboveItsRange_IsUnloadedNormallyAndKeptInSquadMode()
         {
             string xmlPath = Path.Combine(_tempDir, "VanillaGrind.xml");

@@ -534,13 +534,17 @@ namespace CopilotBuddy.Bots.PartyGrind
             }
 
             SquadPartyBuffService.UpdateRaidTargetMarkers(settings, leaderState);
-            StopAtLevelCap(leaderState);
 
-            if (_ipcServer != null && (now - _lastIpcSendUtcMs) >= 100)
+            // The terminal state must reach the squad before the IPC server goes away, so the
+            // first level-cap tick bypasses the throttle. Later ticks keep the normal cadence.
+            bool terminalStatePending = leaderState.LevelCapReached && !_levelCapStopRequested;
+            if (_ipcServer != null && (terminalStatePending || (now - _lastIpcSendUtcMs) >= 100))
             {
                 _lastIpcSendUtcMs = now;
                 _ipcServer.BroadcastLeaderState(leaderState, populateRoster: false);
             }
+
+            StopAtLevelCap(leaderState);
         }
 
         private void PulseFollower(SquadSettings settings, SquadMemberState localState, long now)
