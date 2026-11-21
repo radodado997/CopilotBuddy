@@ -110,6 +110,23 @@ namespace CopilotBuddy.PartyGrind.Tests
         }
 
         [Fact]
+        public void HealthstoneSupply_WithoutShardRequiresReadyStone()
+        {
+            var knownRanks = new[] { (1, 6201), (2, 6202) };
+            Assert.Null(SquadProvisioningService.GetHealthstoneMinReceiverLevel(22, false, knownRanks, null));
+            Assert.Equal(22, SquadProvisioningService.GetHealthstoneMinReceiverLevel(22, false, knownRanks, 22));
+        }
+
+        [Fact]
+        public void HealthstoneSupply_WithShardUsesLowestLearnedRankOrReadyStone()
+        {
+            var knownRanks = new[] { (2, 6202), (3, 5699) };
+            Assert.Null(SquadProvisioningService.GetHealthstoneMinReceiverLevel(21, true, knownRanks, null));
+            Assert.Equal(22, SquadProvisioningService.GetHealthstoneMinReceiverLevel(34, true, knownRanks, 34));
+            Assert.Equal(10, SquadProvisioningService.GetHealthstoneMinReceiverLevel(34, true, knownRanks, 10));
+        }
+
+        [Fact]
         public void SelectBestTradableItem_AndConjureRank_EnforcesReceiverLevelRequirement()
         {
             var mageBags = new[]

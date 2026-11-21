@@ -167,7 +167,9 @@ namespace CopilotBuddy.Bots.PartyGrind
             _townRun.Reset();
             _lastIpcSendUtcMs = 0;
             _lastIdleSnapshotUtcMs = 0;
-            _lastAppliedEffectiveLevel = 0;
+            _lastAppliedEffectiveLevel = StyxWoW.IsInGame ? StyxWoW.Me?.Level ?? 0 : 0;
+            if (_lastAppliedEffectiveLevel is <= 0 or > byte.MaxValue)
+                throw new HonorbuddyUnableToStartException("[PartyGrind Level] Cannot start until the local character is in world with a readable level.");
             _lastAttemptedLeaderProfilePath = string.Empty;
             _currentFocusGuid = 0;
             _currentSecondaryGuid = 0;
@@ -189,9 +191,9 @@ namespace CopilotBuddy.Bots.PartyGrind
                 SquadContext.Reset();
                 SquadContext.IsActive = true;
                 SquadContext.ActiveSettings = settings;
-                SquadContext.EffectiveLevelOverride = StyxWoW.Me?.Level ?? 1;
+                SquadContext.EffectiveLevelOverride = _lastAppliedEffectiveLevel;
 
-                ProfileManager.LevelOverrideSelector = () => _lastAppliedEffectiveLevel > 0 ? _lastAppliedEffectiveLevel : SquadContext.GetEffectiveProfileLevel();
+                ProfileManager.LevelOverrideSelector = () => _lastAppliedEffectiveLevel;
                 ProfileManager.KeepProfileAboveLevelRange = true;
                 BotEvents.Profile.OnNewProfileLoaded += OnProfileRevisionLoaded;
 
@@ -487,7 +489,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                 Guid = me?.Guid ?? 0UL,
                 Class = me?.Class ?? WoWClass.None,
                 Role = settings.Role,
-                Level = me?.Level ?? 1
+                Level = StyxWoW.IsInGame ? me?.Level ?? 0 : 0
             };
         }
 
@@ -550,12 +552,17 @@ namespace CopilotBuddy.Bots.PartyGrind
         private void PulseFollower(SquadSettings settings, SquadMemberState localState, long now)
         {
             bool connected = _ipcClient != null && _ipcClient.IsConnected;
+            if (SquadContext.IsIpcConnected != connected)
+                Logging.WriteDebug("[PartyGrind IPC] Coordinator connection {0} member={1}", connected ? "restored" : "lost", localState.CharacterName);
             SquadContext.IsIpcConnected = connected;
 
             var leaderState = connected ? _ipcClient?.LatestLeaderState : null;
             if (leaderState == null) SquadContext.UpdateLeaderState(null);
             if (leaderState != null)
             {
+                if (leaderState.EffectiveSquadMinLevel > 0 && leaderState.EffectiveSquadMinLevel != _lastAppliedEffectiveLevel)
+                    Logging.WriteDebug("[PartyGrind Level] Received minimum {0} -> {1} from={2} lowest={3} subProfile={4}",
+                        _lastAppliedEffectiveLevel, leaderState.EffectiveSquadMinLevel, leaderState.LeaderName, leaderState.LowestMemberName, leaderState.ActiveSubProfileName);
                 if (settings.AutoLoadCoordinatorProfile && !EnsureLeaderProfile(leaderState))
                 {
                     SquadContext.UpdateLeaderState(null);
@@ -650,7 +657,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                 _nextLeaderProfileLookupUtcMs = now + 10000L;
                 return false;
             }
-            _lastAppliedEffectiveLevel = leader.EffectiveSquadMinLevel;
+            if (leader.EffectiveSquadMinLevel > 0) _lastAppliedEffectiveLevel = leader.EffectiveSquadMinLevel;
             ProfileManager.RefreshProfileForLevel();
             return true;
         }
@@ -896,6 +903,9 @@ namespace CopilotBuddy.Bots.PartyGrind
             int foodCount = SquadProvisioningService.CountFoodInBags();
             int drinkCount = SquadProvisioningService.CountDrinksInBags();
             bool hasHs = SquadProvisioningService.HasHealthstoneInBags();
+            int? healthstoneMinReceiverLevel = me.Class == WoWClass.Warlock && settings.EnableWarlockHealthstones
+                ? SquadProvisioningService.GetHealthstoneMinReceiverLevel(me)
+                : null;
             bool squadHasWarlock = me.Class == WoWClass.Warlock ||
                 (leader?.Members?.Any(m => m.IsConnected && m.Class == WoWClass.Warlock) ?? false);
 
@@ -970,7 +980,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                 Guid = me.Guid,
                 Role = settings.Role,
                 Class = me.Class,
-                Level = me.Level,
+                Level = StyxWoW.IsInGame ? me.Level : 0,
                 CurrentXp = me.XP,
                 NextLevelXp = me.NextLevelXP,
                 XpPerHour = GameStats.XPPerHour,
@@ -1010,7 +1020,9 @@ namespace CopilotBuddy.Bots.PartyGrind
                 IsProvisioningBusy = _provisioning.IsTradeBusy,
                 CanProvideMageFood = me.Class == WoWClass.Mage && settings.EnableMageProvisioning && SpellManager.HasSpell("Conjure Food"),
                 CanProvideMageDrink = me.Class == WoWClass.Mage && settings.EnableMageProvisioning && SpellManager.HasSpell("Conjure Water"),
-                CanProvideHealthstone = me.Class == WoWClass.Warlock && settings.EnableWarlockHealthstones && me.Level >= 10 && SpellManager.HasSpell("Create Healthstone"),
+                CanProvideHealthstone = healthstoneMinReceiverLevel.HasValue,
+                HealthstoneMinReceiverLevel = healthstoneMinReceiverLevel,
+                IsHealthstoneRitualPending = _provisioning.IsSoulwellPending(now),
                 NeedsSell = townNeeds.NeedsSell,
                 NeedsRepair = townNeeds.NeedsRepair,
                 NeedsBuy = townNeeds.NeedsBuy,
@@ -1118,6 +1130,12 @@ namespace CopilotBuddy.Bots.PartyGrind
                             ? RunStatus.Success
                             : RunStatus.Failure;
                     })
+                ),
+
+                new Decorator(
+                    ctx => SquadContext.GetLeaderStateSnapshot()?.Phase == SquadPhase.Grinding &&
+                        _provisioning.TryUseSoulwellWhileGrinding(SquadContext.ActiveSettings ?? SquadSettings.Instance),
+                    new Action(ctx => RunStatus.Success)
                 ),
 
                 // 8. Cross-party Buffs out of combat

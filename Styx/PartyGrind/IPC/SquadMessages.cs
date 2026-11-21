@@ -307,6 +307,8 @@ namespace Styx.PartyGrind.IPC
         public bool CanProvideMageFood { get; set; }
         public bool CanProvideMageDrink { get; set; }
         public bool CanProvideHealthstone { get; set; }
+        public int? HealthstoneMinReceiverLevel { get; set; }
+        public bool IsHealthstoneRitualPending { get; set; }
 
         // TownRun
         public bool NeedsSell { get; set; }

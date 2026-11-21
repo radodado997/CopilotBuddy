@@ -107,6 +107,205 @@ namespace CopilotBuddy.PartyGrind.Tests
             Assert.Empty(coordinator.ManualPauseReason);
         }
 
+        [Fact]
+        public void HealthstoneAssignment_SkipsUnavailableOrTooHighLevelSupply()
+        {
+            var coordinator = new SquadCoordinatorService();
+            var settings = CreateDefaultSettings();
+            var receiver = MakeLeaderState(20);
+            receiver.WantsHealthstone = true;
+            receiver.FreeBagSlots = 5;
+            var warlock = MakeConnectedClient("Warlock", 0, SquadRole.DpsRanged, WoWClass.Warlock, 34, 1000);
+            var provider = warlock.LatestState!;
+
+            SquadLeaderState Tick(long now) => coordinator.EvaluateTick(settings, receiver, new[] { warlock },
+                new SquadProfileSnapshot(), 0, 0, 0, 0, now);
+
+            Assert.Equal(SquadPhase.Grinding, Tick(1000).Phase);
+            provider.CanProvideHealthstone = true;
+            Assert.Empty(Tick(1100).ActiveProvisionerName);
+            provider.HealthstoneMinReceiverLevel = 22;
+            Assert.Empty(Tick(1200).ActiveProvisionerName);
+            receiver.Level = 22;
+            Assert.Equal("Warlock", Tick(1300).ActiveProvisionerName);
+        }
+
+        [Fact]
+        public void LostHealthstoneSupply_ReleasesAssignmentWithoutReceiverCooldown()
+        {
+            var coordinator = new SquadCoordinatorService();
+            var settings = CreateDefaultSettings();
+            settings.TradeOfferTimeoutSeconds = 7;
+            settings.ProvisionCooldownSeconds = 30;
+            var receiver = MakeLeaderState(22);
+            receiver.WantsHealthstone = true;
+            receiver.FreeBagSlots = 5;
+            var warlock = MakeConnectedClient("Warlock", 0, SquadRole.DpsRanged, WoWClass.Warlock, 34, 1000);
+            var provider = warlock.LatestState!;
+            provider.CanProvideHealthstone = true;
+            provider.HealthstoneMinReceiverLevel = 10;
+
+            SquadLeaderState Tick(long now) => coordinator.EvaluateTick(settings, receiver, new[] { warlock },
+                new SquadProfileSnapshot(), 0, 0, 0, 0, now);
+
+            Assert.Equal(receiver.CharacterName, Tick(1000).ActiveTradeTargetName);
+            provider.CanProvideHealthstone = false;
+            provider.HealthstoneMinReceiverLevel = null;
+            var released = Tick(2000);
+            Assert.Equal(SquadPhase.Grinding, released.Phase);
+            Assert.Empty(released.ActiveTradeTargetName);
+
+            provider.CanProvideHealthstone = true;
+            provider.HealthstoneMinReceiverLevel = 10;
+            Assert.Equal(receiver.CharacterName, Tick(3000).ActiveTradeTargetName);
+
+            provider.CanProvideHealthstone = false;
+            provider.HealthstoneMinReceiverLevel = null;
+            Assert.Empty(Tick(14000).ActiveTradeTargetName);
+            provider.CanProvideHealthstone = true;
+            provider.HealthstoneMinReceiverLevel = 10;
+            Assert.Equal(receiver.CharacterName, Tick(15000).ActiveTradeTargetName);
+        }
+
+        [Fact]
+        public void LastShardSpentOnRitual_KeepsAssignmentPastTradeTimeoutUntilRitualWaitEnds()
+        {
+            var coordinator = new SquadCoordinatorService();
+            var settings = CreateDefaultSettings();
+            settings.TradeOfferTimeoutSeconds = 4;
+            var receiver = MakeLeaderState(70);
+            receiver.WantsHealthstone = true;
+            receiver.FreeBagSlots = 5;
+            var warlock = MakeConnectedClient("Warlock", 0, SquadRole.DpsRanged, WoWClass.Warlock, 70, 1000);
+            var provider = warlock.LatestState!;
+            provider.CanProvideHealthstone = true;
+            provider.HealthstoneMinReceiverLevel = 10;
+
+            SquadLeaderState Tick(long now) => coordinator.EvaluateTick(settings, receiver, new[] { warlock },
+                new SquadProfileSnapshot(), 0, 0, 0, 0, now);
+
+            Assert.Equal(receiver.CharacterName, Tick(1000).ActiveTradeTargetName);
+            provider.CanProvideHealthstone = false;
+            provider.HealthstoneMinReceiverLevel = null;
+            provider.IsHealthstoneRitualPending = true;
+            Assert.Equal(receiver.CharacterName, Tick(7000).ActiveTradeTargetName);
+            Assert.Equal(receiver.CharacterName, Tick(9000).ActiveTradeTargetName);
+            provider.IsHealthstoneRitualPending = false;
+            Assert.Empty(Tick(13000).ActiveTradeTargetName);
+
+            provider.CanProvideHealthstone = true;
+            provider.HealthstoneMinReceiverLevel = 10;
+            Assert.Equal(receiver.CharacterName, Tick(14000).ActiveTradeTargetName);
+        }
+
+        [Fact]
+        public void LogoutAndReconnect_RetainConfirmedLevelAndXpUntilGraceExpires()
+        {
+            var coordinator = new SquadCoordinatorService();
+            var settings = CreateDefaultSettings();
+            var leader = MakeLeaderState(15);
+            var profile = new SquadProfileSnapshot();
+            var levels = new List<int>();
+            SquadLeaderState Tick(long time, params SquadConnectedMemberSnapshot[] members) =>
+                coordinator.EvaluateTick(settings, leader, members, profile, 0, 0, 0, 0, time,
+                    resolveProfile: level => { levels.Add(level); return profile; });
+            var member = MakeConnectedClient("Healer", 0, SquadRole.Healer, WoWClass.Priest, 13, 1000);
+            member.LatestState!.CurrentXp = 45;
+            member.LatestState.NextLevelXp = 100;
+            Tick(1000, member);
+            member.LatestState.Level = 0;
+            member.LatestState.CurrentXp = 0;
+            var degraded = Tick(2000, member);
+            Assert.Equal(45f, degraded.LowestMemberXpPercent);
+            Assert.Equal(13, degraded.Members.Single(m => m.CharacterName == "Healer").Level);
+            Tick(3000);
+            var reconnect = new SquadConnectedMemberSnapshot
+            {
+                CharacterName = "Healer", IsConnected = true,
+                Handshake = new SquadHandshake { CharacterName = "Healer", Guid = member.Handshake.Guid, Level = 1 }
+            };
+            Assert.Equal(45f, Tick(4000, reconnect).LowestMemberXpPercent);
+            member.LatestState.Level = 14;
+            Tick(5000, member);
+            Tick(125000);
+            Tick(125001);
+            Assert.Equal(new[] { 13, 13, 13, 13, 14, 14, 15 }, levels);
+        }
+
+        [Fact]
+        public void SameLevelXpRegression_IsIgnoredUntilLevelUp()
+        {
+            var coordinator = new SquadCoordinatorService();
+            var settings = CreateDefaultSettings();
+            var leader = MakeLeaderState(15);
+            var member = MakeConnectedClient("Healer", 0, SquadRole.Healer, WoWClass.Priest, 13, 1000);
+            SquadLeaderState Tick(long time) => coordinator.EvaluateTick(settings, leader, new[] { member },
+                new SquadProfileSnapshot(), 0, 0, 0, 0, time);
+            var sample = member.LatestState!;
+            sample.NextLevelXp = 100;
+            sample.CurrentXp = 45;
+            Tick(1000);
+            sample.CurrentXp = 0;
+            var regressed = Tick(2000);
+            Assert.Equal(45f, regressed.LowestMemberXpPercent);
+            Assert.Equal(45f, regressed.Members.Single(m => m.CharacterName == "Healer").XpPercent);
+            sample.Level = 14;
+            Assert.Equal(0f, Tick(3000).LowestMemberXpPercent);
+        }
+
+        [Fact]
+        public void AfterGraceExpires_ReconnectUsesConfirmedProgressOnlyForSameIdentity()
+        {
+            var coordinator = new SquadCoordinatorService();
+            var settings = CreateDefaultSettings();
+            var leader = MakeLeaderState(15);
+            SquadLeaderState Tick(long time, params SquadConnectedMemberSnapshot[] members) =>
+                coordinator.EvaluateTick(settings, leader, members, new SquadProfileSnapshot(), 0, 0, 0, 0, time);
+            var member = MakeConnectedClient("Healer", 0, SquadRole.Healer, WoWClass.Priest, 13, 1000);
+            member.LatestState!.CurrentXp = 45;
+            member.LatestState.NextLevelXp = 100;
+            Tick(1000, member);
+            var expired = Tick(121001);
+            Assert.Equal(15, expired.EffectiveSquadMinLevel);
+            Assert.DoesNotContain(expired.Members, m => m.CharacterName == "Healer");
+            var reconnect = new SquadConnectedMemberSnapshot
+            {
+                CharacterName = "Healer", IsConnected = true,
+                Handshake = new SquadHandshake { CharacterName = "Healer", Guid = member.Handshake.Guid, Level = 1 }
+            };
+            var returned = Tick(122000, reconnect);
+            Assert.Equal(13, returned.EffectiveSquadMinLevel);
+            Assert.Equal(45f, returned.LowestMemberXpPercent);
+            Assert.Equal(45f, returned.Members.Single(m => m.CharacterName == "Healer").XpPercent);
+            Tick(242001);
+            reconnect.Handshake.Guid++;
+            var replacement = Tick(243000, reconnect);
+            Assert.Equal(1, replacement.EffectiveSquadMinLevel);
+            Assert.Equal(0f, replacement.LowestMemberXpPercent);
+        }
+
+        [Fact]
+        public void UnknownLevels_DoNotSelectProfile_AndRealLevelOneIsAccepted()
+        {
+            var coordinator = new SquadCoordinatorService();
+            var settings = CreateDefaultSettings();
+            var leader = MakeLeaderState(0);
+            var member = MakeConnectedClient("New", 0, SquadRole.Healer, WoWClass.Priest, 0, 1000);
+            var profile = new SquadProfileSnapshot();
+            var levels = new List<int>();
+            SquadLeaderState Tick() => coordinator.EvaluateTick(settings, leader, new[] { member },
+                profile, 0, 0, 0, 0, 1000, resolveProfile: level => { levels.Add(level); return profile; });
+            Assert.Equal(0, Tick().EffectiveSquadMinLevel);
+            Assert.Empty(levels);
+            leader.Level = 15;
+            Assert.Equal(15, Tick().EffectiveSquadMinLevel);
+            leader.Level = 1;
+            Assert.Equal(15, Tick().EffectiveSquadMinLevel);
+            member.LatestState!.Level = 1;
+            Assert.Equal("New", Tick().LowestMemberName);
+            Assert.Equal(new[] { 15, 15, 1 }, levels);
+        }
+
         private SquadSettings CreateDefaultSettings()
         {
             string path = Path.Combine(_tempDir, "SquadSettings_Test.xml");
