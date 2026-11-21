@@ -166,10 +166,11 @@ namespace CopilotBuddy.PartyGrind.Tests
         }
 
         [Fact]
-        public void LastShardSpentOnRitual_KeepsAssignmentUntilRitualWaitEnds()
+        public void LastShardSpentOnRitual_KeepsAssignmentPastTradeTimeoutUntilRitualWaitEnds()
         {
             var coordinator = new SquadCoordinatorService();
             var settings = CreateDefaultSettings();
+            settings.TradeOfferTimeoutSeconds = 4;
             var receiver = MakeLeaderState(70);
             receiver.WantsHealthstone = true;
             receiver.FreeBagSlots = 5;
@@ -185,9 +186,14 @@ namespace CopilotBuddy.PartyGrind.Tests
             provider.CanProvideHealthstone = false;
             provider.HealthstoneMinReceiverLevel = null;
             provider.IsHealthstoneRitualPending = true;
-            Assert.Equal(receiver.CharacterName, Tick(2000).ActiveTradeTargetName);
+            Assert.Equal(receiver.CharacterName, Tick(7000).ActiveTradeTargetName);
+            Assert.Equal(receiver.CharacterName, Tick(9000).ActiveTradeTargetName);
             provider.IsHealthstoneRitualPending = false;
-            Assert.Empty(Tick(8000).ActiveTradeTargetName);
+            Assert.Empty(Tick(13000).ActiveTradeTargetName);
+
+            provider.CanProvideHealthstone = true;
+            provider.HealthstoneMinReceiverLevel = 10;
+            Assert.Equal(receiver.CharacterName, Tick(14000).ActiveTradeTargetName);
         }
 
         private SquadSettings CreateDefaultSettings()

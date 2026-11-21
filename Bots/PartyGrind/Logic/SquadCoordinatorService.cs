@@ -801,20 +801,22 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
             if (!string.IsNullOrEmpty(_activeProvisioner))
             {
-                bool timedOut = (nowUtcMs - _provisionStartedUtcMs) > timeoutMs;
                 var prov = rosterStates.FirstOrDefault(m => string.Equals(m.CharacterName, _activeProvisioner, StringComparison.OrdinalIgnoreCase));
                 var recv = string.IsNullOrEmpty(_activeTradeTarget)
                     ? null
                     : rosterStates.FirstOrDefault(m => string.Equals(m.CharacterName, _activeTradeTarget, StringComparison.OrdinalIgnoreCase));
 
+                if (_assignedHealthstone && recv != null && prov?.IsHealthstoneRitualPending == true)
+                    return;
+
+                bool timedOut = (nowUtcMs - _provisionStartedUtcMs) > timeoutMs;
                 bool stillNeeded = prov != null && (prov.IsProvisioningBusy ||
                     (recv != null && ((_assignedFood && recv.WantsFood) ||
                         (_assignedDrink && recv.WantsDrink) || (_assignedHealthstone && recv.WantsHealthstone))));
 
                 bool healthstoneSupplyLost = _assignedHealthstone &&
                     (prov == null || (!prov.IsProvisioningBusy &&
-                        (recv == null || !CanProvideHealthstoneTo(prov, recv)) &&
-                        (!prov.IsHealthstoneRitualPending || timedOut)));
+                        (recv == null || !CanProvideHealthstoneTo(prov, recv))));
 
                 if (healthstoneSupplyLost)
                 {

@@ -450,7 +450,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 return true;
 
             // 4. Warlock Soulstone on Healer (or Tank fallback) out of combat when missing.
-            if (me.Class == WoWClass.Warlock && settings.EnableWarlockHealthstones && TryMaintainSoulstone(me, leader))
+            if (me.Class == WoWClass.Warlock && settings.EnableWarlockHealthstones &&
+                !IsSoulwellPending(now) && TryMaintainSoulstone(me, leader))
                 return true;
 
             // 5. Provider behavior when Coordinator authorized us (or solo in phase Provisioning).
@@ -674,6 +675,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
         private bool RunWarlockProvisionerTick(LocalPlayer me, SquadSettings settings, SquadLeaderState leader, long now)
         {
+            if (IsSoulwellPending(now))
+                return true;
+
             var members = leader.Members ?? new List<SquadMemberSummary>();
             string targetName = leader.ActiveTradeTargetName;
             if (string.IsNullOrEmpty(targetName) || IsOnCooldown(targetName))
@@ -683,9 +687,6 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 string.Equals(m.CharacterName, targetName, StringComparison.OrdinalIgnoreCase));
             if (targetSummary == null || targetSummary.FreeBagSlots < 2 || !targetSummary.WantsHealthstone)
                 return false;
-
-            if (IsSoulwellPending(now))
-                return true;
 
             bool hasShard = HasSoulShard(me.BagItems);
             if (hasShard && settings.UseRitualTablesWhenAvailable && me.Level >= 68 &&
@@ -819,7 +820,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             }
 
             // 3. Click Soulwell when lacking a Healthstone.
-            return TryUseSoulwell(me, settings, gameObjects, allowApproach: true);
+            return TryUseSoulwell(me, settings, gameObjects, out _);
         }
 
         internal bool TryUseSoulwellWhileGrinding(SquadSettings settings)
@@ -834,26 +835,35 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 return false;
 
             _nextSoulwellCheckUtcMs = now + 1000L;
-            return me.FreeNormalBagSlots >= 2 && TryUseSoulwell(me, settings,
-                ObjectManager.GetObjectsOfType<WoWGameObject>(false, false), allowApproach: false);
+            if (me.FreeNormalBagSlots < 2 || !TryUseSoulwell(me, settings,
+                ObjectManager.GetObjectsOfType<WoWGameObject>(false, false), out bool approaching))
+                return false;
+
+            if (approaching)
+                _nextSoulwellCheckUtcMs = 0;
+            return true;
         }
 
         private static bool TryUseSoulwell(LocalPlayer me, SquadSettings settings,
-            IEnumerable<WoWGameObject> gameObjects, bool allowApproach)
+            IEnumerable<WoWGameObject> gameObjects, out bool approaching)
         {
+            approaching = false;
             if (!settings.EnableWarlockHealthstones)
                 return false;
 
-            float maxDistance = allowApproach ? 25f : 4.5f;
             var well = gameObjects.FirstOrDefault(g => g != null && g.IsValid && g.Entry == SoulwellObjectEntry &&
-                g.Location.Distance(me.Location) <= maxDistance);
+                g.Location.Distance(me.Location) <= 25f);
             if (well == null || HasHealthstoneInBags())
                 return false;
 
-            if (allowApproach && well.Location.Distance(me.Location) > 4.5f)
-                Navigator.MoveTo(well.Location, "Moving to Soulwell");
-            else
-                well.Interact();
+            if (well.Location.Distance(me.Location) > 4.5f)
+            {
+                var result = Navigator.MoveTo(well.Location, "Moving to Soulwell");
+                approaching = result is not (MoveResult.Failed or MoveResult.PathGenerationFailed);
+                return approaching;
+            }
+
+            well.Interact();
             return true;
         }
 
