@@ -121,7 +121,7 @@ namespace Styx.PartyGrind.IPC
                     FullMode = BoundedChannelFullMode.DropOldest,
                     SingleReader = true,
                     SingleWriter = false
-                });
+                }, SettleFrame);
                 LastReceivedUtcMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             }
 
@@ -135,15 +135,10 @@ namespace Styx.PartyGrind.IPC
 
                 if (delivery != null)
                 {
-                    // The channel drops its oldest entry when full, so track the deliveries we
-                    // owe and settle the oldest as it is evicted. This keeps a stalled peer from
-                    // accumulating an unbounded set of frames that will never be written.
                     lock (_pendingFrames)
                     {
                         _pendingOrder.Enqueue(frame);
                         _pendingFrames.Add(frame);
-                        while (_pendingFrames.Count > OutboundCapacity)
-                            EvictOldestPending();
                     }
                 }
 
@@ -165,19 +160,6 @@ namespace Styx.PartyGrind.IPC
                     _pendingFrames.Remove(frame);
                     while (_pendingOrder.Count > 0 && !_pendingFrames.Contains(_pendingOrder.Peek()))
                         _pendingOrder.Dequeue();
-                }
-            }
-
-            private void EvictOldestPending()
-            {
-                while (_pendingOrder.Count > 0)
-                {
-                    var oldest = _pendingOrder.Dequeue();
-                    if (_pendingFrames.Remove(oldest))
-                    {
-                        oldest.Settle();
-                        return;
-                    }
                 }
             }
 

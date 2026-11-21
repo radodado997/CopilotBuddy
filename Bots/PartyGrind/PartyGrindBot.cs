@@ -91,6 +91,7 @@ namespace CopilotBuddy.Bots.PartyGrind
         private bool _lootFilterAttached;
         private bool _levelCapStopRequested;
         private SquadLeaderStateDelivery? _terminalStateDelivery;
+        private long _terminalStateDeliveryDeadlineMs;
         private SquadTravelProgress _travelProgress = new();
         private static Composite? _activeCombatRoutine, _activeRestRoutine;
         private static bool _combatTicked, _restTicked, _healTicked;
@@ -494,7 +495,8 @@ namespace CopilotBuddy.Bots.PartyGrind
             if (delivery == null || delivery.IsDelivered)
                 return;
 
-            if (!delivery.Wait(TerminalStateDeliveryTimeoutMs))
+            int remainingMs = (int)Math.Max(0, _terminalStateDeliveryDeadlineMs - Environment.TickCount64);
+            if (!delivery.Wait(remainingMs))
                 Logging.Write("[PartyGrind Level] Terminal leader state was still unsent after {0} ms; closing IPC anyway.",
                     TerminalStateDeliveryTimeoutMs);
         }
@@ -566,7 +568,10 @@ namespace CopilotBuddy.Bots.PartyGrind
                 SquadLeaderStateDelivery delivery = _ipcServer.BroadcastLeaderState(leaderState, populateRoster: false);
                 _lastIpcSendUtcMs = now;
                 if (terminalStatePending)
+                {
+                    _terminalStateDeliveryDeadlineMs = Environment.TickCount64 + TerminalStateDeliveryTimeoutMs;
                     _terminalStateDelivery = delivery;
+                }
             }
 
             StopAtLevelCap(leaderState);
@@ -625,10 +630,8 @@ namespace CopilotBuddy.Bots.PartyGrind
                 return;
             }
 
-            // Do not stop before the terminal frame is on the wire. StopIpc waits for the same
-            // signal, so one more tick is all this normally costs.
             SquadLeaderStateDelivery? delivery = _terminalStateDelivery;
-            if (delivery != null && !delivery.IsDelivered)
+            if (delivery != null && !delivery.IsDelivered && Environment.TickCount64 < _terminalStateDeliveryDeadlineMs)
                 return;
 
             if (_levelCapStopRequested)
