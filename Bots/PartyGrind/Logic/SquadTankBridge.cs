@@ -365,7 +365,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 if (me.Class == WoWClass.Paladin && !SpellManager.HasSpell("Hand of Reckoning"))
                 {
                     WoWUnit? attackedAlly = ObjectManager.GetObjectByGuid<WoWUnit>(loose.CurrentTargetGuid);
-                    if (attackedAlly != null && attackedAlly.IsValid && !attackedAlly.Dead)
+                    if (attackedAlly != null && attackedAlly.IsValid && !attackedAlly.Dead &&
+                        SpellManager.CanCast("Righteous Defense", attackedAlly, false, false))
                     {
                         if (attackedAlly.Distance > 38f || !attackedAlly.InLineOfSpellSight)
                         {

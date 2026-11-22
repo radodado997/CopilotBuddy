@@ -176,6 +176,17 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
             float trailDist = 3.0f + (Math.Max(0, memberSlotIndex) * 2.5f);
             float lateral = (memberSlotIndex % 2 == 0 ? 1f : -1f) * (1.5f + (memberSlotIndex / 2) * 1.2f);
+            float resumeDistance = leader.ResumeDistance > 0f
+                ? leader.ResumeDistance
+                : (SquadContext.ActiveSettings?.ResumeDistance ?? 20.0f);
+            float maxOffset = Math.Max(0.5f, resumeDistance - 2.6f);
+            float offsetMag = MathF.Sqrt(trailDist * trailDist + lateral * lateral);
+            if (offsetMag > maxOffset)
+            {
+                float scale = maxOffset / offsetMag;
+                trailDist *= scale;
+                lateral *= scale;
+            }
 
             return new WoWPoint(
                 baseAnchor.X + dirX * trailDist + perpX * lateral,

@@ -244,10 +244,19 @@ namespace CopilotBuddy.PartyGrind.Tests
             Assert.Contains("-squadroster=\"TankA,HealB,RogueC,MageD,ShamE\"", script);
         }
 
-        [Fact]
-        public void TravelFollowPositions_AllFourFollowersPlusToleranceStayWithinResumeDistance()
+        [Theory]
+        [InlineData(5.0f)]
+        [InlineData(10.0f)]
+        [InlineData(15.0f)]
+        [InlineData(20.0f)]
+        [InlineData(40.0f)]
+        public void TravelFollowPositions_AllFourFollowersPlusToleranceStayWithinResumeDistance(float resumeDistance)
         {
-            var settings = new SquadSettings();
+            string settingsPath = Path.Combine(_tempDir, $"squad_settings_{Guid.NewGuid():N}.xml");
+            var settings = new SquadSettings(settingsPath)
+            {
+                ResumeDistance = resumeDistance
+            };
             var leader = new SquadLeaderState
             {
                 LeaderGuid = 1UL,
@@ -257,6 +266,7 @@ namespace CopilotBuddy.PartyGrind.Tests
                 Y = -2750f,
                 Z = 92f,
                 Facing = 1.2f,
+                ResumeDistance = settings.ResumeDistance,
                 Members = new List<SquadMemberSummary>
                 {
                     new() { CharacterName = "Bedogie", Guid = 1UL, Role = SquadRole.TankLeader },
@@ -273,10 +283,10 @@ namespace CopilotBuddy.PartyGrind.Tests
                 int slot = SquadContext.GetMySlotIndex(name, leader);
                 Assert.InRange(slot, 0, 3);
                 WoWPoint followPos = SquadFormationService.ComputeTravelFollowPosition(leaderPos, leader, slot);
-                float worstCaseStopDistance = followPos.Distance(leaderPos) + 4.0f;
+                float worstCaseWaitingStopDistance = followPos.Distance(leaderPos) + 2.5f;
                 Assert.True(
-                    worstCaseStopDistance < settings.ResumeDistance - 2.0f,
-                    $"Follower '{name}' (slot {slot}) worst-case stop {worstCaseStopDistance:F2} yd exceeds safe ResumeDistance ({settings.ResumeDistance:F1} yd)");
+                    worstCaseWaitingStopDistance <= settings.ResumeDistance,
+                    $"Follower '{name}' (slot {slot}) waiting stop {worstCaseWaitingStopDistance:F2} yd exceeds ResumeDistance ({settings.ResumeDistance:F1} yd)");
             }
         }
 

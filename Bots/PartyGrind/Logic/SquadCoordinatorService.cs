@@ -600,6 +600,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 IsFlying = false,
                 InCombat = anyInCombat,
                 IsWaitingForFollower = _isWaitingForFollowerDebounced,
+                ResumeDistance = settings.ResumeDistance,
                 IsLootWindowActive = _inLootWindow,
                 IsDead = leaderLocal.IsDead,
                 IsGhost = leaderLocal.IsGhost,

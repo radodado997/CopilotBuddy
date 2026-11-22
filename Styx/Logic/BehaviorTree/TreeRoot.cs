@@ -376,11 +376,10 @@ namespace Styx.Logic.BehaviorTree
 				}
 			}
 
-			// HB 6.2.3 pattern: sleep OUTSIDE AcquireFrame so WoW can render
 			int remainingMs = (int)Math.Ceiling(1000.0 / TicksPerSecond - sw.Elapsed.TotalMilliseconds);
 			if (remainingMs > 0)
 			{
-				Thread.Sleep(remainingMs);
+				_stopRequestedEvent.Wait(remainingMs);
 			}
 		}
 

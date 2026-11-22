@@ -24,6 +24,7 @@ namespace Styx.Logic.Pathing
         private static readonly List<GlobalBlackspot> _globalBlackspots = new List<GlobalBlackspot>();
         private static readonly HashSet<Blackspot> _markedBlackspots = new HashSet<Blackspot>();
         private static readonly HashSet<Blackspot> _failedBlackspotMarks = new HashSet<Blackspot>();
+        private static readonly Dictionary<Blackspot, HashSet<TileIdentifier>> _pendingBlackspotTiles = new Dictionary<Blackspot, HashSet<TileIdentifier>>();
         private static readonly Dictionary<Blackspot, List<PolyKey>> _blackspotPolygons = new Dictionary<Blackspot, List<PolyKey>>();
         private static readonly Dictionary<PolyKey, byte> _originalPolyAreas = new Dictionary<PolyKey, byte>();
         private static readonly Dictionary<PolyKey, ushort> _originalPolyFlags = new Dictionary<PolyKey, ushort>();
@@ -204,12 +205,12 @@ namespace Styx.Logic.Pathing
 
                 lock (_lock)
                 {
+                    var loadedTile = new TileIdentifier(e.TileX, e.TileY);
                     foreach (var spot in _blackspots)
                     {
                         if (_failedBlackspotMarks.Contains(spot) && ShouldMarkOnTileLoaded(spot, e.TileX, e.TileY))
                         {
-                            _failedBlackspotMarks.Remove(spot);
-                            MarkBlackspotPolygons(spot, e.MapId, false);
+                            MarkBlackspotPolygons(spot, e.MapId, false, loadedTile);
                         }
                     }
 
@@ -217,8 +218,7 @@ namespace Styx.Logic.Pathing
                     {
                         if (globalSpot.MapId == e.MapId && _failedBlackspotMarks.Contains(globalSpot.Blackspot) && ShouldMarkOnTileLoaded(globalSpot.Blackspot, e.TileX, e.TileY))
                         {
-                            _failedBlackspotMarks.Remove(globalSpot.Blackspot);
-                            MarkBlackspotPolygons(globalSpot.Blackspot, e.MapId, false);
+                            MarkBlackspotPolygons(globalSpot.Blackspot, e.MapId, false, loadedTile);
                         }
                     }
                 }
@@ -381,6 +381,7 @@ namespace Styx.Logic.Pathing
                 {
                     _markedBlackspots.Clear();
                     _failedBlackspotMarks.Clear();
+                    _pendingBlackspotTiles.Clear();
                     _lastMarkedMapId = currentMapId;
                 }
             }
@@ -435,26 +436,74 @@ namespace Styx.Logic.Pathing
             MarkBlackspotPolygons(spot, mapId, true);
         }
 
-        /// <summary>
-        /// Checks whether a blackspot can affect a loaded MaNGOS ADT navigation tile.
-        /// </summary>
         private static bool ShouldMarkOnTileLoaded(Blackspot spot, int tileX, int tileY)
+        {
+            GetBlackspotTileBounds(spot, out int minX, out int maxX, out int minY, out int maxY);
+            return tileX >= minX && tileX <= maxX && tileY >= minY && tileY <= maxY;
+        }
+
+        private static void GetBlackspotTileBounds(Blackspot spot, out int minX, out int maxX, out int minY, out int maxY)
         {
             TileIdentifier min = TileIdentifier.GetByPosition(spot.Location.X - spot.Radius, spot.Location.Y - spot.Radius);
             TileIdentifier max = TileIdentifier.GetByPosition(spot.Location.X + spot.Radius, spot.Location.Y + spot.Radius);
 
-            int minX = Math.Min(min.X, max.X);
-            int maxX = Math.Max(min.X, max.X);
-            int minY = Math.Min(min.Y, max.Y);
-            int maxY = Math.Max(min.Y, max.Y);
+            minX = Math.Min(min.X, max.X);
+            maxX = Math.Max(min.X, max.X);
+            minY = Math.Min(min.Y, max.Y);
+            maxY = Math.Max(min.Y, max.Y);
+        }
 
-            return tileX >= minX && tileX <= maxX && tileY >= minY && tileY <= maxY;
+        private static bool UpdatePendingTilesForBlackspot(Blackspot spot, uint mapId, TileIdentifier? loadedTile = null)
+        {
+            GetBlackspotTileBounds(spot, out int minX, out int maxX, out int minY, out int maxY);
+            if (!_pendingBlackspotTiles.TryGetValue(spot, out HashSet<TileIdentifier>? pending))
+            {
+                pending = new HashSet<TileIdentifier>();
+                for (int tx = minX; tx <= maxX; tx++)
+                {
+                    for (int ty = minY; ty <= maxY; ty++)
+                    {
+                        TileIdentifier tile = new TileIdentifier(tx, ty);
+                        if (loadedTile.HasValue && loadedTile.Value.Equals(tile))
+                            continue;
+                        if (!TryIsTileLoaded(mapId, tx, ty))
+                            pending.Add(tile);
+                    }
+                }
+
+                if (pending.Count > 0)
+                    _pendingBlackspotTiles[spot] = pending;
+            }
+            else
+            {
+                if (loadedTile.HasValue)
+                    pending.Remove(loadedTile.Value);
+                pending.RemoveWhere(t => TryIsTileLoaded(mapId, t.X, t.Y));
+            }
+
+            if (pending.Count > 0)
+                return true;
+
+            _pendingBlackspotTiles.Remove(spot);
+            return false;
+        }
+
+        private static bool TryIsTileLoaded(uint mapId, int tileX, int tileY)
+        {
+            try
+            {
+                return NativeMethods.IsTileLoaded(mapId, tileX, tileY);
+            }
+            catch (Exception)
+            {
+                return false;
+            }
         }
 
         /// <summary>
         /// Marks navmesh polygons within a blackspot zone with high-cost area type.
         /// </summary>
-        private static void MarkBlackspotPolygons(Blackspot spot, uint mapId, bool ensureTiles)
+        private static void MarkBlackspotPolygons(Blackspot spot, uint mapId, bool ensureTiles, TileIdentifier? loadedTile = null)
         {
             IntPtr polyRefsPtr = IntPtr.Zero;
             try
@@ -483,6 +532,8 @@ namespace Styx.Logic.Pathing
                     Z = spot.Height
                 };
                 
+                bool hasUnloadedTiles = UpdatePendingTilesForBlackspot(spot, mapId, loadedTile);
+                
                 // Allocate unmanaged memory for polygon refs (ulong = 8 bytes)
                 int bufferSize = MaxPolygonsPerBlackspot * sizeof(ulong);
                 polyRefsPtr = Marshal.AllocHGlobal(bufferSize);
@@ -492,7 +543,7 @@ namespace Styx.Logic.Pathing
                 
                 if (polyCount <= 0)
                 {
-                    // Tiles might not be loaded yet; retry on tile-loaded/map-change, not every pathfind.
+                    _markedBlackspots.Remove(spot);
                     _failedBlackspotMarks.Add(spot);
                     Logging.Write(FormattableString.Invariant($"Warning: QueryPolygons failed while applying blackspot {spot.Location} with radius {spot.Radius} - tile not loaded?"));
                     return;
@@ -540,15 +591,23 @@ namespace Styx.Logic.Pathing
                     }
                 }
                 
-                // Track successfully marked blackspots so we don't re-mark them
                 if (markedCount > 0)
                 {
-                    _markedBlackspots.Add(spot);
-                    _failedBlackspotMarks.Remove(spot);
+                    if (hasUnloadedTiles)
+                    {
+                        _markedBlackspots.Remove(spot);
+                        _failedBlackspotMarks.Add(spot);
+                    }
+                    else
+                    {
+                        _markedBlackspots.Add(spot);
+                        _failedBlackspotMarks.Remove(spot);
+                    }
                     Logging.WriteDebug(FormattableString.Invariant($"[Blackspot] Marked {markedCount}/{polyCount} polygons at {spot.Location} (radius {spot.Radius})"));
                 }
                 else
                 {
+                    _markedBlackspots.Remove(spot);
                     _failedBlackspotMarks.Add(spot);
                     Logging.WriteDebug($"[Blackspot] Failed to mark any polygons at {spot.Location} (found {polyCount} polys)");
                 }
@@ -576,12 +635,14 @@ namespace Styx.Logic.Pathing
             {
                 _markedBlackspots.Remove(spot);
                 _failedBlackspotMarks.Remove(spot);
+                _pendingBlackspotTiles.Remove(spot);
                 return;
             }
 
             _blackspotPolygons.Remove(spot);
             _markedBlackspots.Remove(spot);
             _failedBlackspotMarks.Remove(spot);
+            _pendingBlackspotTiles.Remove(spot);
 
             int restoredCount = 0;
             foreach (var key in affectedPolys.Distinct())
