@@ -70,7 +70,7 @@ namespace Singular.ClassSpecific.Warlock
                 Spell.BuffSelf("Soulshatter", ret => Unit.NearbyUnfriendlyUnits.Any(u => u.IsTargetingMeOrPet)),
                 Spell.Cast("Death Coil", ret => StyxWoW.Me.HealthPercent <= 70),
 
-                new Decorator(ret => StyxWoW.Me.CurrentTarget.Fleeing,
+                new Decorator(ret => StyxWoW.Me.CurrentTarget != null && StyxWoW.Me.CurrentTarget.Fleeing,
                     Pet.CreateCastPetAction("Intercept")),
                 // WotLK: Felguard AoE is Cleave, not Felstorm (Felstorm replaced Cleave in Cata 4.0.1)
                 new Decorator(ret => StyxWoW.Me.GotAlivePet && Unit.NearbyUnfriendlyUnits.Count(u => u.Location.DistanceSqr(StyxWoW.Me.Pet.Location) < 10 * 10) > 1,
@@ -80,7 +80,7 @@ namespace Singular.ClassSpecific.Warlock
                             ret => Unit.NearbyUnfriendlyUnits.Count(u => u.DistanceSqr < 10 * 10 && StyxWoW.Me.IsSafelyFacing(u, 90)) >= 3),
 
                 Spell.BuffSelf("Howl of Terror", ret => Unit.NearbyUnfriendlyUnits.Count(u => u.DistanceSqr < 10 * 10) >= 3),
-                Spell.Buff("Fear", ret => Targeting.Instance.TargetList.ElementAtOrDefault(1), ret => !StyxWoW.Me.CurrentTarget.HasAura("Fear")),
+                Spell.Buff("Fear", ret => Targeting.Instance.TargetList.ElementAtOrDefault(1), ret => StyxWoW.Me.CurrentTarget != null && !StyxWoW.Me.CurrentTarget.HasAura("Fear")),
 
                 // Single target rotation
                 Spell.BuffSelf("Metamorphosis"),

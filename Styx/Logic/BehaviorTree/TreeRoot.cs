@@ -26,6 +26,7 @@ namespace Styx.Logic.BehaviorTree
 		private static string _statusText = "";
 		private static string _goalText = "";
 		private static readonly object _stateLock = new object();
+		private static readonly ManualResetEventSlim _stopRequestedEvent = new ManualResetEventSlim(false);
 		private static WindowPlacement? _lastNonMinimizedPlacement;
         private static IntPtr _lastPlacementHandle;
 		private static EventHandler<ShutdownRequestedEventArgs>? _onShutdownRequested;
@@ -569,6 +570,7 @@ namespace Styx.Logic.BehaviorTree
 					BotEvents.RaiseBotStartRequested();
 
 					// Worker thread transitions to Running once it starts ticking
+					_stopRequestedEvent.Reset();
 					_workerThread = new Thread(WorkerThread);
 					_workerThread.IsBackground = true;
 					_workerThread.Name = "TreeRoot Worker";
@@ -599,7 +601,6 @@ namespace Styx.Logic.BehaviorTree
 		/// </summary>
 		public static void Stop(string? reason = null)
 		{
-			Thread threadToInterrupt = null;
 			lock (_stateLock)
 			{
 				if (State != TreeRootState.Running && State != TreeRootState.Starting && State != TreeRootState.Paused)
@@ -607,18 +608,11 @@ namespace Styx.Logic.BehaviorTree
 
 				Logging.Write(Colors.DeepSkyBlue, "Bot stopping! Reason: {0}", reason ?? "User request");
 				State = TreeRootState.Stopping;
-				threadToInterrupt = _workerThread;
+				_stopRequestedEvent.Set();
 
 				// Raise OnBotStopRequested — same pattern as HB Legion
 				BotEvents.RaiseBotStopRequested();
 			}
-			// Wake the worker if it is sleeping between ticks so it sees State == Stopping
-			// immediately instead of waiting up to (1000/TPS) ms.
-			// Thread.Interrupt() only affects managed waits (Thread.Sleep, Monitor.Wait etc.);
-			// it is a no-op if the thread is executing native code or running a tick.
-			threadToInterrupt?.Interrupt();
-			// Stop() returns immediately. The worker thread sees State == Stopping,
-			// exits its while loop, and does cleanup in its own finally block.
 		}
 
 		private static void WorkerThread()

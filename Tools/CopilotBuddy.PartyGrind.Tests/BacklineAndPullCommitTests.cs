@@ -371,5 +371,80 @@ namespace CopilotBuddy.PartyGrind.Tests
             Assert.True(coord.IsWaitingForFollower);
             Assert.True(coord.IsWaitingForFollowerDebounced);
         }
+
+        [Fact]
+        public void PullCandidateDistance_RejectsTargetsBeyondCommitRadius()
+        {
+            Assert.True(PartyGrindBot.IsEligiblePullCandidateDistance(0.0));
+            Assert.True(PartyGrindBot.IsEligiblePullCandidateDistance(55.0));
+            Assert.False(PartyGrindBot.IsEligiblePullCandidateDistance(55.1));
+            Assert.False(PartyGrindBot.IsEligiblePullCandidateDistance(68.0));
+        }
+
+        [Fact]
+        public void CombatFocusStickiness_PreventsPingPongExceptForHealerPeel()
+        {
+            long switchedAt = 10_000L;
+
+            Assert.True(PartyGrindBot.ShouldRetainCombatFocus(
+                currentFocusGuid: 100UL,
+                candidateFocusGuid: 200UL,
+                currentFocusActiveInCombat: true,
+                candidateTargetsHealer: false,
+                currentTargetsHealer: false,
+                focusChangedUtcMs: switchedAt,
+                nowUtcMs: switchedAt + 500L));
+
+            Assert.False(PartyGrindBot.ShouldRetainCombatFocus(
+                currentFocusGuid: 100UL,
+                candidateFocusGuid: 200UL,
+                currentFocusActiveInCombat: true,
+                candidateTargetsHealer: true,
+                currentTargetsHealer: false,
+                focusChangedUtcMs: switchedAt,
+                nowUtcMs: switchedAt + 500L));
+
+            Assert.False(PartyGrindBot.ShouldRetainCombatFocus(
+                currentFocusGuid: 100UL,
+                candidateFocusGuid: 200UL,
+                currentFocusActiveInCombat: false,
+                candidateTargetsHealer: false,
+                currentTargetsHealer: false,
+                focusChangedUtcMs: switchedAt,
+                nowUtcMs: switchedAt + 500L));
+
+            Assert.False(PartyGrindBot.ShouldRetainCombatFocus(
+                currentFocusGuid: 100UL,
+                candidateFocusGuid: 200UL,
+                currentFocusActiveInCombat: true,
+                candidateTargetsHealer: false,
+                currentTargetsHealer: false,
+                focusChangedUtcMs: switchedAt,
+                nowUtcMs: switchedAt + 2600L));
+        }
+
+        [Fact]
+        public void CoordinatorLeaderState_PublishesDebouncedWaitingFlag()
+        {
+            var settings = CreateDefaultSettings();
+            var coord = new SquadCoordinatorService();
+            var profile = new SquadProfileSnapshot { MapId = 0 };
+            long t = 300_000L;
+
+            var initial = coord.EvaluateTick(
+                settings,
+                MakeLeaderState(100f, 100f),
+                new[] { MakeFollower("FollowerB", 140f, 100f, t) },
+                profile, 0, 0, 0, 0f, t);
+            Assert.False(initial.IsWaitingForFollower);
+
+            t += 2100L;
+            var debounced = coord.EvaluateTick(
+                settings,
+                MakeLeaderState(100f, 100f),
+                new[] { MakeFollower("FollowerB", 140f, 100f, t) },
+                profile, 0, 0, 0, 0f, t);
+            Assert.True(debounced.IsWaitingForFollower);
+        }
     }
 }

@@ -206,9 +206,8 @@ namespace Styx.Logic.Pathing
                 {
                     foreach (var spot in _blackspots)
                     {
-                        if (ShouldMarkOnTileLoaded(spot, e.TileX, e.TileY))
+                        if (_failedBlackspotMarks.Contains(spot) && ShouldMarkOnTileLoaded(spot, e.TileX, e.TileY))
                         {
-                            _markedBlackspots.Remove(spot);
                             _failedBlackspotMarks.Remove(spot);
                             MarkBlackspotPolygons(spot, e.MapId, false);
                         }
@@ -216,9 +215,8 @@ namespace Styx.Logic.Pathing
 
                     foreach (var globalSpot in _globalBlackspots)
                     {
-                        if (globalSpot.MapId == e.MapId && ShouldMarkOnTileLoaded(globalSpot.Blackspot, e.TileX, e.TileY))
+                        if (globalSpot.MapId == e.MapId && _failedBlackspotMarks.Contains(globalSpot.Blackspot) && ShouldMarkOnTileLoaded(globalSpot.Blackspot, e.TileX, e.TileY))
                         {
-                            _markedBlackspots.Remove(globalSpot.Blackspot);
                             _failedBlackspotMarks.Remove(globalSpot.Blackspot);
                             MarkBlackspotPolygons(globalSpot.Blackspot, e.MapId, false);
                         }
@@ -496,7 +494,7 @@ namespace Styx.Logic.Pathing
                 {
                     // Tiles might not be loaded yet; retry on tile-loaded/map-change, not every pathfind.
                     _failedBlackspotMarks.Add(spot);
-                    Logging.Write($"Warning: QueryPolygons failed while applying blackspot {spot.Location} with radius {spot.Radius} - tile not loaded?");
+                    Logging.Write(FormattableString.Invariant($"Warning: QueryPolygons failed while applying blackspot {spot.Location} with radius {spot.Radius} - tile not loaded?"));
                     return;
                 }
                 
@@ -547,7 +545,7 @@ namespace Styx.Logic.Pathing
                 {
                     _markedBlackspots.Add(spot);
                     _failedBlackspotMarks.Remove(spot);
-                    Logging.WriteDebug($"[Blackspot] Marked {markedCount}/{polyCount} polygons at {spot.Location} (radius {spot.Radius})");
+                    Logging.WriteDebug(FormattableString.Invariant($"[Blackspot] Marked {markedCount}/{polyCount} polygons at {spot.Location} (radius {spot.Radius})"));
                 }
                 else
                 {
@@ -612,7 +610,7 @@ namespace Styx.Logic.Pathing
 
             if (restoredCount > 0)
             {
-                Logging.WriteDebug($"[Blackspot] Restored {restoredCount} polygons at {spot.Location} (radius {spot.Radius})");
+                Logging.WriteDebug(FormattableString.Invariant($"[Blackspot] Restored {restoredCount} polygons at {spot.Location} (radius {spot.Radius})"));
             }
         }
 
@@ -713,7 +711,7 @@ namespace Styx.Logic.Pathing
                 }
                 
                 SaveGlobalBlackspots();
-                Logging.Write($"[Blackspot] Added global blackspot at {blackspot.Blackspot.Location} (radius {blackspot.Blackspot.Radius})");
+                Logging.Write(FormattableString.Invariant($"[Blackspot] Added global blackspot at {blackspot.Blackspot.Location} (radius {blackspot.Blackspot.Radius})"));
             }
         }
 

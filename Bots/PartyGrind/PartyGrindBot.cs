@@ -59,6 +59,7 @@ namespace CopilotBuddy.Bots.PartyGrind
         private int _lastAppliedEffectiveLevel;
         private ulong _currentFocusGuid;
         private ulong _currentSecondaryGuid;
+        private long _focusChangedUtcMs;
         private long _pullStartedUtcMs;
         private ulong _pullCommittedGuid;
         private long _pullCommittedUntilMs;
@@ -78,6 +79,8 @@ namespace CopilotBuddy.Bots.PartyGrind
         private const float BacklineCombatRangeHealer = 35.0f;
         private const long PullCommitTimeoutMs = 10000L;
         private const float PullCommitMaxTargetDistance = 60.0f;
+        private const float PullCandidateMaxDistance = 55.0f;
+        private const long CombatFocusStickyMs = 2500L;
         private const long IdleSnapshotIntervalMs = 5000L;
         private const int TerminalStateDeliveryTimeoutMs = 1000;
         private bool _wasInCombat;
@@ -93,8 +96,8 @@ namespace CopilotBuddy.Bots.PartyGrind
         private SquadLeaderStateDelivery? _terminalStateDelivery;
         private long _terminalStateDeliveryDeadlineMs;
         private SquadTravelProgress _travelProgress = new();
-        private static Composite? _activeCombatRoutine, _activeRestRoutine;
-        private static bool _combatTicked, _restTicked, _healTicked;
+        private static Composite? _activeCombatRoutine, _activeCombatBuffRoutine, _activePreCombatBuffRoutine, _activeRestRoutine;
+        private static bool _combatTicked, _combatBuffTicked, _preCombatBuffTicked, _restTicked, _healTicked;
 
         private sealed class RoutineAwareRoot : PrioritySelector
         {
@@ -102,11 +105,13 @@ namespace CopilotBuddy.Bots.PartyGrind
             public override RunStatus Tick(object context)
             {
                 if (IsRunning) { base.Stop(context); base.Start(context); }
-                _combatTicked = _restTicked = _healTicked = false;
+                _combatTicked = _combatBuffTicked = _preCombatBuffTicked = _restTicked = _healTicked = false;
                 try { return base.Tick(context); }
                 finally
                 {
                     if (!_combatTicked) StopRoutine(ref _activeCombatRoutine);
+                    if (!_combatBuffTicked) StopRoutine(ref _activeCombatBuffRoutine);
+                    if (!_preCombatBuffTicked) StopRoutine(ref _activePreCombatBuffRoutine);
                     // Healing has its own ownership flag: a healer tick that is actively
                     // handling a target must not be mistaken for a finished combat branch.
                     if (!_healTicked) SquadHealBridge.StopActiveHealBehavior();
@@ -176,6 +181,7 @@ namespace CopilotBuddy.Bots.PartyGrind
             _lastAttemptedLeaderProfilePath = string.Empty;
             _currentFocusGuid = 0;
             _currentSecondaryGuid = 0;
+            _focusChangedUtcMs = 0;
             _pullStartedUtcMs = 0;
             ClearPullCommit();
             ResetBacklineState();
@@ -249,6 +255,8 @@ namespace CopilotBuddy.Bots.PartyGrind
             }
 
             Cleanup(() => { StopRoutine(ref _activeCombatRoutine); });
+            Cleanup(() => { StopRoutine(ref _activeCombatBuffRoutine); });
+            Cleanup(() => { StopRoutine(ref _activePreCombatBuffRoutine); });
             Cleanup(() => { StopRoutine(ref _activeRestRoutine); });
             Cleanup(() => { SquadHealBridge.StopActiveHealBehavior(); });
             Cleanup(() => { ClearPullCommit(); });
@@ -265,6 +273,8 @@ namespace CopilotBuddy.Bots.PartyGrind
         public override void OnPaused()
         {
             StopRoutine(ref _activeCombatRoutine);
+            StopRoutine(ref _activeCombatBuffRoutine);
+            StopRoutine(ref _activePreCombatBuffRoutine);
             StopRoutine(ref _activeRestRoutine);
             SquadHealBridge.StopActiveHealBehavior();
             ClearPullCommit();
@@ -711,9 +721,15 @@ namespace CopilotBuddy.Bots.PartyGrind
                 focus = Targeting.Instance.FirstUnit;
             }
 
+            if (focus != null && !focus.Combat && !focus.IsTargetingMyPartyMember &&
+                !IsEligiblePullCandidateDistance(me.Location.Distance(focus.Location)))
+            {
+                focus = Targeting.Instance.TargetList.FirstOrDefault(u =>
+                    u != null && u.IsValid && !u.Dead && u.Attackable && !u.IsFriendly &&
+                    (u.Combat || u.IsTargetingMyPartyMember || IsEligiblePullCandidateDistance(me.Location.Distance(u.Location))));
+            }
+
             ulong resolvedFocusGuid = (focus != null && focus.IsValid && !focus.Dead && !focus.IsFriendly) ? focus.Guid : 0UL;
-            // An idle focus is only publishable when our just-captured telemetry says we
-            // are free to pull; active combat threats keep their separate selection path.
             var local = SquadContext.GetLocalMemberStateSnapshot();
             bool localCannotPull = local == null || local.IsDead || local.IsGhost || local.IsInCombat ||
                                    local.NeedsRest || local.IsLooting;
@@ -732,11 +748,37 @@ namespace CopilotBuddy.Bots.PartyGrind
                 _pullCommittedGuid,
                 commitActive);
 
+            if (newFocusGuid != 0 && _currentFocusGuid != 0 && newFocusGuid != _currentFocusGuid && !commitActive)
+            {
+                var prevUnit = ObjectManager.GetObjectByGuid<WoWUnit>(_currentFocusGuid);
+                bool prevStillActiveInCombat = prevUnit != null && prevUnit.IsValid && !prevUnit.Dead &&
+                                               !prevUnit.IsFriendly && prevUnit.Attackable &&
+                                               (prevUnit.Combat || prevUnit.IsTargetingMyPartyMember || prevUnit.IsTargetingMeOrPet);
+                bool newTargetsHealer = focus != null && focus.CurrentTargetGuid != 0 &&
+                                        SquadContext.IsMemberRole(focus.CurrentTargetGuid, SquadRole.Healer);
+                bool prevTargetsHealer = prevUnit != null && prevUnit.CurrentTargetGuid != 0 &&
+                                         SquadContext.IsMemberRole(prevUnit.CurrentTargetGuid, SquadRole.Healer);
+                if (ShouldRetainCombatFocus(
+                        _currentFocusGuid,
+                        newFocusGuid,
+                        prevStillActiveInCombat,
+                        newTargetsHealer,
+                        prevTargetsHealer,
+                        _focusChangedUtcMs,
+                        now))
+                {
+                    newFocusGuid = _currentFocusGuid;
+                }
+            }
+
             if (newFocusGuid != 0 && newFocusGuid != _currentFocusGuid && !commitActive)
             {
                 _pullStartedUtcMs = now;
-                if (focus != null && focus.Guid == newFocusGuid && focusIdle)
+                if (focus != null && focus.Guid == newFocusGuid && focusIdle &&
+                    IsEligiblePullCandidateDistance(me.Location.Distance(focus.Location)))
+                {
                     BeginPullCommit(newFocusGuid, now);
+                }
             }
             else if (newFocusGuid == 0)
             {
@@ -746,6 +788,7 @@ namespace CopilotBuddy.Bots.PartyGrind
             if (newFocusGuid != _currentFocusGuid)
             {
                 Logging.WriteDebug("[PartyGrind Focus] {0} -> {1}", _currentFocusGuid, newFocusGuid);
+                _focusChangedUtcMs = now;
                 SquadPartySyncService.MarkActivity();
             }
             _currentFocusGuid = newFocusGuid;
@@ -755,21 +798,50 @@ namespace CopilotBuddy.Bots.PartyGrind
             _currentSecondaryGuid = secondary?.Guid ?? 0UL;
         }
 
+        internal static bool IsEligiblePullCandidateDistance(double distance)
+        {
+            return distance <= PullCandidateMaxDistance;
+        }
+
+        internal static bool ShouldRetainCombatFocus(
+            ulong currentFocusGuid,
+            ulong candidateFocusGuid,
+            bool currentFocusActiveInCombat,
+            bool candidateTargetsHealer,
+            bool currentTargetsHealer,
+            long focusChangedUtcMs,
+            long nowUtcMs)
+        {
+            if (currentFocusGuid == 0 || candidateFocusGuid == 0 || currentFocusGuid == candidateFocusGuid)
+                return false;
+            if (!currentFocusActiveInCombat)
+                return false;
+            if (candidateTargetsHealer && !currentTargetsHealer)
+                return false;
+            return focusChangedUtcMs > 0 && (nowUtcMs - focusChangedUtcMs) < CombatFocusStickyMs;
+        }
+
         private void BeginPullCommit(ulong targetGuid, long nowUtcMs)
         {
             _pullCommittedGuid = targetGuid;
             _pullCommittedUntilMs = nowUtcMs + PullCommitTimeoutMs;
             _pullStartedUtcMs = nowUtcMs;
+            SquadContext.ActivePullCommitGuid = targetGuid;
             Logging.WriteDebug("[PartyGrind Commit] Started {0} ({1}s)", targetGuid, PullCommitTimeoutMs / 1000L);
             SquadPartySyncService.MarkActivity();
         }
 
         private void ClearPullCommit()
         {
+            bool wasActive = _pullCommittedGuid != 0;
             _pullCommittedGuid = 0;
             _pullCommittedUntilMs = 0;
-            Logging.WriteDebug("[PartyGrind Commit] Released");
-            SquadPartySyncService.MarkActivity();
+            SquadContext.ActivePullCommitGuid = 0;
+            if (wasActive)
+            {
+                Logging.WriteDebug("[PartyGrind Commit] Released");
+                SquadPartySyncService.MarkActivity();
+            }
         }
 
         private void ResetBacklineState()
@@ -1174,6 +1246,11 @@ namespace CopilotBuddy.Bots.PartyGrind
 
                 // 8. Cross-party Buffs out of combat
                 new Decorator(
+                    ctx => RunPreCombatBuffBehavior(),
+                    new Action(ctx => RunStatus.Success)
+                ),
+
+                new Decorator(
                     ctx => SquadPartyBuffService.RunOutOfCombatPartyBuffTick(
                         SquadContext.ActiveSettings ?? SquadSettings.Instance,
                         SquadContext.GetLeaderStateSnapshot()),
@@ -1559,6 +1636,28 @@ namespace CopilotBuddy.Bots.PartyGrind
             return wasMoving ? BacklineMovement.MoveToSlot : BacklineMovement.HoldPosition;
         }
 
+        private static bool RunPreCombatBuffBehavior()
+        {
+            var me = StyxWoW.Me;
+            if (me == null || me.Combat || me.Dead || me.IsGhost || me.Mounted)
+                return false;
+
+            if (SquadContext.ActivePullCommitGuid != 0)
+                return false;
+
+            var leader = SquadContext.GetLeaderStateSnapshot();
+            if (leader != null && (leader.InCombat || leader.FocusTargetGuid != 0 || leader.IsWaitingForFollower))
+                return false;
+
+            var preBuff = RoutineManager.Current?.PreCombatBuffBehavior;
+            if (preBuff == null)
+                return false;
+
+            _preCombatBuffTicked = true;
+            RunStatus status = TickRoutine(ref _activePreCombatBuffRoutine, preBuff);
+            return status != RunStatus.Failure;
+        }
+
         private static RunStatus RunRoutineCombat(ulong focusGuid)
         {
             var me = StyxWoW.Me;
@@ -1568,13 +1667,32 @@ namespace CopilotBuddy.Bots.PartyGrind
             if (focusGuid != 0 && (me.CurrentTarget == null || me.CurrentTarget.Dead || me.CurrentTargetGuid != focusGuid))
             {
                 var unit = ObjectManager.GetObjectByGuid<WoWUnit>(focusGuid);
-                if (unit != null && unit.IsValid && !unit.Dead)
+                if (unit == null || !unit.IsValid || unit.Dead || unit.IsFriendly)
+                {
+                    if (!me.Combat)
+                        return RunStatus.Failure;
+                }
+                else
+                {
                     unit.Target();
+                }
             }
+
+            if (!me.Combat && (me.CurrentTarget == null || !me.CurrentTarget.IsValid || me.CurrentTarget.Dead || me.CurrentTarget.IsFriendly))
+                return RunStatus.Failure;
 
             var routine = RoutineManager.Current;
             if (routine == null)
                 return RunStatus.Failure;
+
+            Composite? buffBehavior = me.Combat ? routine.CombatBuffBehavior : routine.PullBuffBehavior;
+            if (buffBehavior != null)
+            {
+                _combatBuffTicked = true;
+                RunStatus buffStatus = TickRoutine(ref _activeCombatBuffRoutine, buffBehavior);
+                if (buffStatus == RunStatus.Running)
+                    return RunStatus.Running;
+            }
 
             Composite? behavior = me.Combat ? routine.CombatBehavior : (routine.PullBehavior ?? routine.CombatBehavior);
             if (behavior == null)
@@ -1649,14 +1767,39 @@ namespace CopilotBuddy.Bots.PartyGrind
             if (me == null || me.Combat || me.Dead || me.IsGhost || me.FreeNormalBagSlots == 0)
                 return false;
 
+            if (SquadContext.ActivePullCommitGuid != 0)
+                return false;
+
             if (LootFrame.Instance.IsVisible)
                 return true;
 
             var leader = SquadContext.GetLeaderStateSnapshot();
-            if (leader != null && leader.Phase != SquadPhase.Looting && leader.Phase != SquadPhase.Grinding)
+            if (leader != null)
+            {
+                if (leader.InCombat || leader.FocusTargetGuid != 0)
+                    return false;
+                if (leader.Phase != SquadPhase.Looting && leader.Phase != SquadPhase.Grinding)
+                    return false;
+            }
+
+            if (HasNearbySquadThreat())
                 return false;
 
             return FindEligibleLoot() != null;
+        }
+
+        private static bool HasNearbySquadThreat()
+        {
+            var me = StyxWoW.Me;
+            if (me == null)
+                return false;
+
+            var memberGuids = SquadContext.GetKnownMemberGuids();
+            return ObjectManager.CachedUnits.Any(u =>
+                u != null && u.IsValid && !u.Dead && u.Combat && u.Attackable && !u.IsFriendly && !u.IsPlayer &&
+                u.Location.Distance(me.Location) <= 45f &&
+                (u.IsTargetingMeOrPet || u.IsTargetingMyPartyMember ||
+                 (u.CurrentTargetGuid != 0 && memberGuids.Contains(u.CurrentTargetGuid))));
         }
 
         private static readonly Dictionary<ulong, long> LootRetry = new();
@@ -1783,10 +1926,13 @@ namespace CopilotBuddy.Bots.PartyGrind
                 // 4. Ready to pull?
                 if (SquadTankBridge.CanInitiatePull(leader, settings.MaxPullGatherDistance))
                 {
-                    WoWUnit? target = Targeting.Instance.FirstUnit;
-                    if (target != null && target.IsValid && !target.Dead && target.Attackable && !target.IsFriendly)
+                    WoWUnit? target = Targeting.Instance.TargetList.FirstOrDefault(u =>
+                        u != null && u.IsValid && !u.Dead && u.Attackable && !u.IsFriendly &&
+                        IsEligiblePullCandidateDistance(me.Location.Distance(u.Location)));
+                    if (target != null)
                     {
                         _currentFocusGuid = target.Guid;
+                        _focusChangedUtcMs = now;
                         BeginPullCommit(target.Guid, now);
                         target.Target();
                         return RunRoutineCombat(target.Guid);
@@ -1826,7 +1972,8 @@ namespace CopilotBuddy.Bots.PartyGrind
 
                 int slotIdx = SquadContext.GetMySlotIndex(me.Name, leader);
                 WoWPoint followPos = SquadFormationService.ComputeTravelFollowPosition(me.Location, leader, slotIdx, _travelProgress);
-                if (me.Location.Distance(followPos) > 4.0f)
+                float stopWithin = leader.IsWaitingForFollower ? 2.5f : 4.0f;
+                if (me.Location.Distance(followPos) > stopWithin)
                 {
                     SquadPartySyncService.LogAction("Following " + leader.LeaderName);
                     Navigator.MoveTo(followPos, "Following " + leader.LeaderName);

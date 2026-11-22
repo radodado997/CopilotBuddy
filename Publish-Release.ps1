@@ -51,6 +51,14 @@ try {
 Write-Host '[OBFUSCAR] OK.'
 
 # ── 4. Résultat ─────────────────────────────────────────────────────────────
+$RoutinesSrc = Join-Path $ProjectDir 'BotRoutines'
+$RoutinesDst = Join-Path $OutPath 'Routines\Singular wotlk'
+if (Test-Path $RoutinesSrc) {
+    if (Test-Path $RoutinesDst) { Remove-Item -Recurse -Force $RoutinesDst }
+    New-Item -ItemType Directory -Force -Path $RoutinesDst | Out-Null
+    Copy-Item -Path (Join-Path $RoutinesSrc '*') -Destination $RoutinesDst -Recurse -Force
+    Write-Host "[ROUTINES] Copied BotRoutines -> $RoutinesDst"
+}
 Write-Host ''
 Write-Host "═══════════════════════════════════════════════"
 Write-Host " Output obfusqué : $OutPath"

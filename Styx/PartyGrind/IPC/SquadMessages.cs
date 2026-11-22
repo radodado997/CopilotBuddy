@@ -209,6 +209,7 @@ namespace Styx.PartyGrind.IPC
         public bool IsMounted { get; set; }
         public bool IsFlying { get; set; }
         public bool InCombat { get; set; }
+        public bool IsWaitingForFollower { get; set; }
         /// <summary>Authoritative bounded loot-window state from the coordinator.</summary>
         public bool IsLootWindowActive { get; set; }
         public bool IsDead { get; set; }
