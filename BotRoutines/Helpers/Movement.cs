@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Linq;
 using CommonBehaviors.Actions;
 using Singular.Settings;
@@ -232,12 +232,13 @@ namespace Singular.Helpers
                     ret => !SingularSettings.Instance.DisableAllMovement &&
                             SingularRoutine.CurrentWoWContext != WoWContext.Battlegrounds && 
                             requirements(ret) && !StyxWoW.Me.IsCasting &&
-                            !Group.MeIsTank && !StyxWoW.Me.CurrentTarget.MeIsBehind &&
+                            !Group.MeIsTank && StyxWoW.Me.CurrentTarget != null &&
+                            !StyxWoW.Me.CurrentTarget.MeIsBehind &&
                             StyxWoW.Me.CurrentTarget.IsAlive &&
                             (StyxWoW.Me.CurrentTarget.CurrentTarget == null || 
                              StyxWoW.Me.CurrentTarget.CurrentTarget != StyxWoW.Me || 
                              StyxWoW.Me.CurrentTarget.Stunned),
-                    new Action(ret => Navigator.MoveTo(CalculatePointBehindTarget())));
+                    new Action(ret => { if (StyxWoW.Me.CurrentTarget != null) Navigator.MoveTo(CalculatePointBehindTarget()); }));
         }
 
         private static WoWPoint CalculatePointBehindTarget()

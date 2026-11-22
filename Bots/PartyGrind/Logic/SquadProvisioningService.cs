@@ -419,9 +419,6 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 return HandleOpenTradeFrame(me, settings, leader, now);
             }
 
-            if (TryConjureForSelf(settings))
-                return true;
-
             // 2. Clean up stale initiated trade timeout if frame never opened.
             if (!string.IsNullOrEmpty(_activeTradeTarget))
             {
@@ -444,6 +441,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 SquadPartySyncService.LogAction("Provision: trade offer pending " + _activeTradeTarget);
                 return true;
             }
+
+            if (TryConjureForSelf(settings))
+                return true;
 
             // 3. Interact with nearby Refreshment Table / Soulwell / Ritual objects if needed!
             if (settings.UseRitualTablesWhenAvailable && TryUseNearbyRitualOrTable(me, settings))
@@ -473,6 +473,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     }
                     if (prov != null)
                     {
+                        if (me.IsMoving)
+                            WoWMovement.MoveStop();
                         SquadPartySyncService.LogAction("Provision: waiting for offer");
                         return true;
                     }
@@ -746,10 +748,14 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
             if (me.IsMoving) WoWMovement.MoveStop();
             if (me.CurrentTargetGuid != targetPlayer.Guid)
+            {
                 targetPlayer.Target();
-
-            if (me.CurrentTargetGuid != targetPlayer.Guid)
-                return false;
+                if (me.CurrentTargetGuid != targetPlayer.Guid)
+                {
+                    SquadPartySyncService.LogAction("Provision: targeting " + targetSummary.CharacterName);
+                    return true;
+                }
+            }
 
             _activeTradeTarget = targetSummary.CharacterName;
             _tradeStartedUtcMs = now;

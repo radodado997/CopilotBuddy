@@ -59,6 +59,13 @@
     <Content Remove="output\**" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Compile Remove="BotRoutines\**" />
+    <EmbeddedResource Remove="BotRoutines\**" />
+    <None Remove="BotRoutines\**" />
+    <Content Include="BotRoutines\**" Link="Routines\Singular wotlk\%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
 
   <!-- PostBuild: move satellite culture folders into Languages/ subdir (HB pattern) -->
   <Target Name="MoveSatelliteAssemblies" AfterTargets="Build">

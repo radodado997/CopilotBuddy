@@ -166,26 +166,30 @@ namespace Singular.ClassSpecific.Druid
                 Movement.CreateFaceTargetBehavior(),
 
                 new Decorator(
-                    ret => StyxWoW.Me.Level < 20,
-                    CreateFeralLevel1020Pull()),
+                    ret => StyxWoW.Me.CurrentTarget != null,
+                    new PrioritySelector(
+                        new Decorator(
+                            ret => StyxWoW.Me.Level < 20,
+                            CreateFeralLevel1020Pull()),
 
-                new Decorator(
-                    ret => StyxWoW.Me.Level < 46,
-                    CreateFeralLevel2046Pull()),
+                        new Decorator(
+                            ret => StyxWoW.Me.Level < 46,
+                            CreateFeralLevel2046Pull()),
 
-                Spell.BuffSelf("Cat Form"),
-                Spell.BuffSelf("Prowl", ret => StyxWoW.Me.CurrentTarget.DistanceSqr < 30 * 30),
-                Spell.Cast("Feral Charge - Cat"),
-                Spell.Cast("Dash",
-                    ret => StyxWoW.Me.CurrentTarget.Distance > Spell.MeleeRange + 2f &&
-                           !StyxWoW.Me.HasAura("Dash") &&
-                           (!SpellManager.HasSpell("Feral Charge - Cat") ||
-                           SpellManager.Spells["Feral Charge - Cat"].CooldownTimeLeft.TotalSeconds >= 3)),
-                Spell.Cast("Pounce"),
-                Spell.Cast("Shred", ret => StyxWoW.Me.CurrentTarget.MeIsBehind),
-                Spell.Cast("Mangle (Cat)"),
-                Spell.Cast("Moonfire", ret => StyxWoW.Me.CurrentTarget.Distance2DSqr < 10 * 10 && Math.Abs(StyxWoW.Me.CurrentTarget.Z - StyxWoW.Me.Z) > 5),
-                Movement.CreateMoveToMeleeBehavior(true)
+                        Spell.BuffSelf("Cat Form"),
+                        Spell.BuffSelf("Prowl", ret => StyxWoW.Me.CurrentTarget != null && StyxWoW.Me.CurrentTarget.DistanceSqr < 30 * 30),
+                        Spell.Cast("Feral Charge - Cat"),
+                        Spell.Cast("Dash",
+                            ret => StyxWoW.Me.CurrentTarget != null &&
+                                   StyxWoW.Me.CurrentTarget.Distance > Spell.MeleeRange + 2f &&
+                                   !StyxWoW.Me.HasAura("Dash") &&
+                                   (!SpellManager.HasSpell("Feral Charge - Cat") ||
+                                   SpellManager.Spells["Feral Charge - Cat"].CooldownTimeLeft.TotalSeconds >= 3)),
+                        Spell.Cast("Pounce"),
+                        Spell.Cast("Shred", ret => StyxWoW.Me.CurrentTarget != null && StyxWoW.Me.CurrentTarget.MeIsBehind),
+                        Spell.Cast("Mangle (Cat)"),
+                        Spell.Cast("Moonfire", ret => StyxWoW.Me.CurrentTarget != null && StyxWoW.Me.CurrentTarget.Distance2DSqr < 10 * 10 && Math.Abs(StyxWoW.Me.CurrentTarget.Z - StyxWoW.Me.Z) > 5),
+                        Movement.CreateMoveToMeleeBehavior(true)))
                 );
         }
 
@@ -205,7 +209,7 @@ namespace Singular.ClassSpecific.Druid
                 Helpers.Common.CreateAutoAttack(true),
                 Spell.WaitForCastOrChannel(),
                 new Decorator(
-                    ret => !Spell.IsGlobalCooldown(),
+                    ret => !Spell.IsGlobalCooldown() && StyxWoW.Me.CurrentTarget != null,
                     new PrioritySelector(
                 Helpers.Common.CreateInterruptSpellCast(ret => StyxWoW.Me.CurrentTarget),
 
@@ -218,7 +222,7 @@ namespace Singular.ClassSpecific.Druid
                     new PrioritySelector(
                         Spell.Cast("Ferocious Bite",
                             ret => StyxWoW.Me.ComboPoints == 5 ||
-                                   StyxWoW.Me.ComboPoints >= 2 && StyxWoW.Me.CurrentTarget.HealthPercent < 20),
+                                   StyxWoW.Me.ComboPoints >= 2 && StyxWoW.Me.CurrentTarget != null && StyxWoW.Me.CurrentTarget.HealthPercent < 20),
                         Spell.Cast("Swipe (Cat)"),
                         Spell.Cast("Mangle (Cat)")
                         )),
@@ -235,8 +239,8 @@ namespace Singular.ClassSpecific.Druid
                 Spell.BuffSelf("Tiger's Fury"),
                 Spell.Cast("Ferocious Bite",
                     ret => StyxWoW.Me.ComboPoints == 5 ||
-                           StyxWoW.Me.ComboPoints > 1 && StyxWoW.Me.CurrentTarget.HealthPercent < 20),
-                Spell.Cast("Shred", ret => StyxWoW.Me.CurrentTarget.MeIsBehind),
+                           StyxWoW.Me.ComboPoints > 1 && StyxWoW.Me.CurrentTarget != null && StyxWoW.Me.CurrentTarget.HealthPercent < 20),
+                Spell.Cast("Shred", ret => StyxWoW.Me.CurrentTarget != null && StyxWoW.Me.CurrentTarget.MeIsBehind),
 				Spell.Buff("Rake", true, ret => StyxWoW.Me.CurrentTarget),
                 Spell.Cast("Mangle (Cat)"))),
                 Movement.CreateMoveToMeleeBehavior(true)
@@ -256,7 +260,7 @@ namespace Singular.ClassSpecific.Druid
             return new PrioritySelector(
                 Spell.Cast("Ferocious Bite",
                     ret => StyxWoW.Me.ComboPoints == 5 ||
-                           StyxWoW.Me.ComboPoints > 1 && StyxWoW.Me.CurrentTarget.HealthPercent < 20),
+                           StyxWoW.Me.ComboPoints > 1 && StyxWoW.Me.CurrentTarget != null && StyxWoW.Me.CurrentTarget.HealthPercent < 20),
                 Spell.Buff("Rake", true, ret => StyxWoW.Me.CurrentTarget),
                 Spell.Cast("Mangle (Cat)"),
                 Movement.CreateMoveToMeleeBehavior(true)
@@ -281,7 +285,7 @@ namespace Singular.ClassSpecific.Druid
             return new PrioritySelector(
                 Spell.Cast("Ferocious Bite",
                     ret => StyxWoW.Me.ComboPoints == 5 ||
-                           StyxWoW.Me.ComboPoints > 1 && StyxWoW.Me.CurrentTarget.HealthPercent < 20),
+                           StyxWoW.Me.ComboPoints > 1 && StyxWoW.Me.CurrentTarget != null && StyxWoW.Me.CurrentTarget.HealthPercent < 20),
                 Spell.Buff("Rake", true, ret => StyxWoW.Me.CurrentTarget),
                 Spell.Cast("Mangle (Cat)"),
                 Movement.CreateMoveToMeleeBehavior(true)
