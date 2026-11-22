@@ -258,6 +258,7 @@ namespace Styx.PartyGrind.IPC
         public int TotalBossCount { get; set; }
         public bool AcceptLfgProposalOrder { get; set; }
         public bool TeleportOutOrder { get; set; }
+        public bool DungeonResetPendingOutside { get; set; }
         public string LfgStatusText { get; set; } = string.Empty;
         public bool HasRandomPartyMembers { get; set; }
         public ulong EffectiveTankGuid { get; set; }

@@ -511,11 +511,12 @@ namespace Bots.DungeonBuddy.Helpers
         public static string UnitId(this WoWPartyMember partyMember)
         {
             WoWPartyMember[] members = DungeonBuddy.PartyMemberInfos;
+            bool inRaid = StyxWoW.Me.IsInRaid;
 
             for (int i = 0; i < members.Length; i++)
             {
                 if (members[i].Guid == partyMember.Guid)
-                    return (StyxWoW.Me.IsInRaid ? "raid" : "party") + (i + 1);
+                    return inRaid ? members[i].UnitId : "party" + (i + 1);
             }
 
             return "none";
@@ -1642,9 +1643,11 @@ namespace Bots.DungeonBuddy.Helpers
                         var byGuid = ObjectManager.GetObjectByGuid<WoWPlayer>(tankGuid);
                         if (byGuid != null && byGuid.IsValid)
                             return byGuid;
+                        return null;
                     }
                     if (StyxWoW.Me != null && Styx.PartyGrind.SquadContext.ActiveRole == Styx.PartyGrind.SquadRole.TankLeader)
                         return StyxWoW.Me;
+                    return GetPartyMembersByRole(PartyRole.Tank).FirstOrDefault();
                 }
                 if (DungeonBuddySettings.Instance.QueueType == QueueType.SoloFarm) return StyxWoW.Me;
                 return GetPartyMembersByRole(PartyRole.Tank).FirstOrDefault();
@@ -1744,13 +1747,15 @@ namespace Bots.DungeonBuddy.Helpers
             bool dungeonMode = Styx.PartyGrind.SquadContext.IsDungeonModeActive;
             var leader = dungeonMode ? Styx.PartyGrind.SquadContext.GetLeaderStateSnapshot() : null;
 
-            foreach (var member in StyxWoW.Me.GroupInfo.RaidMembers)
+            ulong effectiveTankGuid = leader?.EffectiveTankGuid ?? 0UL;
+            var group = StyxWoW.Me.GroupInfo;
+            foreach (var member in dungeonMode ? group.AllMembers : group.RaidMembers)
             {
                 var player = member.ToPlayer();
                 if (player == null) continue;
 
                 string roleStr = Lua.GetReturnVal<string>(
-                    $"return UnitGroupRolesAssigned('{player.Name}')", 0);
+                    $"return UnitGroupRolesAssigned('{member.UnitId}')", 0);
                 
                 var playerRole = roleStr switch
                 {
@@ -1760,20 +1765,22 @@ namespace Bots.DungeonBuddy.Helpers
                     _ => PartyRole.None
                 };
 
-                if (playerRole == PartyRole.None && dungeonMode)
+                if (effectiveTankGuid != 0 && player.Guid == effectiveTankGuid)
                 {
-                    if (leader != null && leader.EffectiveTankGuid != 0 && player.Guid == leader.EffectiveTankGuid)
-                    {
-                        playerRole = PartyRole.Tank;
-                    }
-                    else
+                    playerRole = PartyRole.Tank;
+                }
+                else
+                {
+                    if (effectiveTankGuid != 0 && playerRole == PartyRole.Tank)
+                        playerRole = PartyRole.None;
+                    if (playerRole == PartyRole.None && dungeonMode)
                     {
                         var squadMember = Styx.PartyGrind.SquadContext.GetMemberByGuid(player.Guid);
                         if (squadMember != null)
                         {
                             playerRole = squadMember.Role switch
                             {
-                                Styx.PartyGrind.SquadRole.TankLeader => PartyRole.Tank,
+                                Styx.PartyGrind.SquadRole.TankLeader when effectiveTankGuid == 0 => PartyRole.Tank,
                                 Styx.PartyGrind.SquadRole.Healer => PartyRole.Healer,
                                 _ => PartyRole.Dps
                             };

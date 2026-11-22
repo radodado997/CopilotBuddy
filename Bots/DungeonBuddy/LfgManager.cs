@@ -91,9 +91,12 @@ namespace Bots.DungeonBuddy
         /// the underlying DBC wrapper is itself a port of HB 4.3.4
         /// LfgDungeons.dbc schema, so the lookup is faithful to the reference.
         /// </summary>
-        public static void QueueForRandomDungeon()
+        public static void QueueForRandomDungeon() => QueueForRandomDungeon(setRoles: true);
+
+        internal static void QueueForRandomDungeon(bool setRoles)
         {
-            SetLfgRoles();
+            if (setRoles)
+                SetLfgRoles();
 
             var dungeon = FindRandomDungeonByLevel(isHeroic: false);
             if (dungeon == null)
@@ -125,9 +128,12 @@ namespace Bots.DungeonBuddy
         /// entry, gated to level 80 — so non-80 characters will get the
         /// no-match branch (the DBC has no Random Heroic for their level).
         /// </summary>
-        public static void QueueForRandomHeroic()
+        public static void QueueForRandomHeroic() => QueueForRandomHeroic(setRoles: true);
+
+        internal static void QueueForRandomHeroic(bool setRoles)
         {
-            SetLfgRoles();
+            if (setRoles)
+                SetLfgRoles();
 
             var dungeon = FindRandomDungeonByLevel(isHeroic: true);
             if (dungeon == null)
@@ -173,11 +179,14 @@ namespace Bots.DungeonBuddy
         /// <summary>
         /// Queue pour un donjon spécifique
         /// </summary>
-        public static void QueueForSpecificDungeon(uint dungeonId)
+        public static void QueueForSpecificDungeon(uint dungeonId) => QueueForSpecificDungeon(dungeonId, setRoles: true);
+
+        internal static void QueueForSpecificDungeon(uint dungeonId, bool setRoles)
         {
             Logging.Write($"[DungeonBuddy] Queuing for dungeon ID {dungeonId}...");
 
-            SetLfgRoles();
+            if (setRoles)
+                SetLfgRoles();
 
             Lua.DoString($@"
                 ClearAllLFGDungeons();

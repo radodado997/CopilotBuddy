@@ -4,6 +4,7 @@ using System.Linq;
 using CopilotBuddy.Bots.PartyGrind.Forms;
 using CopilotBuddy.Bots.PartyGrind.Logic;
 using Styx;
+using Styx.Combat.CombatRoutine;
 using Styx.Logic.Pathing;
 using Styx.PartyGrind;
 using Styx.PartyGrind.IPC;
@@ -64,23 +65,22 @@ namespace CopilotBuddy.PartyGrind.Tests
                 PowerPercent = 100f,
                 PowerType = WoWPowerType.Mana,
                 FreeBagSlots = 20,
-                LowestDurabilityPercent = 100f,
+                LowestDurabilityPct = 100f,
                 MapId = insideDungeon ? 36U : 0U,
                 IsInsideDungeon = insideDungeon,
                 IsDead = isDead,
                 CanResurrect = canRes,
-                LfgProposalPending = proposalPending,
-                TimestampUtcMs = 10_000L
+                LfgProposalPending = proposalPending
             };
         }
 
-        private static SquadConnectedMemberSnapshot WrapClient(SquadMemberState state)
+        private static SquadConnectedMemberSnapshot WrapClient(SquadMemberState state, long receivedUtcMs = 10_000L)
         {
             return new SquadConnectedMemberSnapshot
             {
                 CharacterName = state.CharacterName,
                 IsConnected = true,
-                LastSeenUtcMs = state.TimestampUtcMs,
+                LastReceivedUtcMs = receivedUtcMs,
                 Handshake = new SquadHandshake
                 {
                     CharacterName = state.CharacterName,
@@ -159,6 +159,22 @@ namespace CopilotBuddy.PartyGrind.Tests
 
             Assert.Equal(SquadPhase.DungeonCompleteExit, exitState.Phase);
             Assert.True(exitState.TeleportOutOrder);
+
+            leader.IsInsideDungeon = false;
+            leader.MapId = 0U;
+            var leaderOutside = coord.EvaluateTick(
+                settings, leader, new[] { heal, dps }, new SquadProfileSnapshot(), 0, 0, 0, 0f, 31_000L,
+                dungeon: snapOutside);
+            Assert.Equal(SquadPhase.DungeonCompleteExit, leaderOutside.Phase);
+            Assert.True(leaderOutside.TeleportOutOrder);
+
+            heal.LatestState.IsInsideDungeon = false;
+            dps.LatestState.IsInsideDungeon = false;
+            var allOutside = coord.EvaluateTick(
+                settings, leader, new[] { heal, dps }, new SquadProfileSnapshot(), 0, 0, 0, 0f, 32_000L,
+                dungeon: snapOutside);
+            Assert.Equal(SquadPhase.DungeonQueueing, allOutside.Phase);
+            Assert.False(allOutside.TeleportOutOrder);
         }
 
         [Fact]
@@ -290,22 +306,27 @@ namespace CopilotBuddy.PartyGrind.Tests
 
             var coord = new SquadCoordinatorService();
             var settings = CreateDungeonSettings(SquadDungeonEntryMode.LfgRandomNormal);
-            settings.AllowCrossClientProvisioning = true;
 
             var leader = MakeMemberState("TankA", 10UL, SquadRole.TankLeader, WoWClass.Mage, 30, insideDungeon: true);
-            leader.CanConjureWater = true;
+            leader.CanProvideMageDrink = true;
             var healer = WrapClient(MakeMemberState("HealB", 11UL, SquadRole.Healer, WoWClass.Priest, 30, insideDungeon: true));
-            healer.LatestState!.ConjuredWaterCount = 0;
+            healer.LatestState!.DrinkCount = 0;
+            healer.LatestState.WantsDrink = true;
 
             var snapWithPug = new SquadDungeonSnapshot
             {
                 IsInsideDungeon = true,
                 ActiveDungeonId = 163U,
                 ActiveDungeonMapId = 189U,
-                HasRandomPartyMembers = true,
                 EffectiveTankGuid = 99UL
             };
 
+            var squadOnly = coord.EvaluateTick(
+                settings, leader, new[] { healer }, new SquadProfileSnapshot(), 0, 0, 0, 0f, 10_000L,
+                dungeon: snapWithPug);
+            Assert.Equal("TankA", squadOnly.ActiveProvisionerName);
+
+            snapWithPug.HasRandomPartyMembers = true;
             var state = coord.EvaluateTick(
                 settings, leader, new[] { healer }, new SquadProfileSnapshot(), 0, 0, 0, 0f, 20_000L,
                 dungeon: snapWithPug);
@@ -313,6 +334,70 @@ namespace CopilotBuddy.PartyGrind.Tests
             Assert.True(state.HasRandomPartyMembers);
             Assert.Equal(99UL, state.EffectiveTankGuid);
             Assert.Equal(SquadPhase.DungeonClearing, state.Phase);
+            Assert.Empty(state.ActiveProvisionerName);
+            Assert.Empty(state.ActiveTradeTargetName);
+
+            snapWithPug.HasRandomPartyMembers = false;
+            var resumed = coord.EvaluateTick(
+                settings, leader, new[] { healer }, new SquadProfileSnapshot(), 0, 0, 0, 0f, 21_000L,
+                dungeon: snapWithPug);
+            Assert.Equal("TankA", resumed.ActiveProvisionerName);
+        }
+
+        [Fact]
+        public void Coordinator_ResolvesDungeonAndPortalForTheEvaluatedMinimumLevel()
+        {
+            var coord = new SquadCoordinatorService();
+            var settings = CreateDungeonSettings(SquadDungeonEntryMode.WalkInPortalFarm);
+            var leader = MakeMemberState("TankA", 1UL, SquadRole.TankLeader, WoWClass.Warrior, 20);
+            var healer = WrapClient(MakeMemberState("HealB", 2UL, SquadRole.Healer, WoWClass.Priest, 18));
+            var decision = coord.EvaluateTick(
+                settings, leader, new[] { healer }, new SquadProfileSnapshot(), 0, 0, 0, 0f, 10_000L,
+                resolveDungeon: level => new SquadDungeonSnapshot
+                {
+                    ActiveDungeonId = level == 18 ? 8U : 6U,
+                    PortalX = level == 18 ? 180f : 200f
+                });
+
+            Assert.Equal(18, decision.EffectiveSquadMinLevel);
+            Assert.Equal(8U, decision.ActiveDungeonId);
+            Assert.Equal(180f, decision.DungeonPortalX);
+        }
+
+        [Fact]
+        public void CompletedRun_RequiresFreshOutsideTelemetryFromTheSameParticipant()
+        {
+            var member = MakeMemberState("HealB", 2UL, SquadRole.Healer, WoWClass.Priest, 20);
+            member.MapId = 1U;
+            Assert.False(SquadDungeonService.HasFreshExitEvidence(2UL, Array.Empty<SquadConnectedMemberSnapshot>(), 10_000L, 12_000L));
+            Assert.False(SquadDungeonService.HasFreshExitEvidence(2UL, new[] { WrapClient(member, 9_999L) }, 10_000L, 12_000L));
+            Assert.True(SquadDungeonService.HasFreshExitEvidence(2UL, new[] { WrapClient(member, 11_000L) }, 10_000L, 12_000L));
+            Assert.False(SquadDungeonService.HasFreshExitEvidence(2UL, new[] { WrapClient(member, 11_000L) }, 10_000L, 18_000L));
+            member.IsInsideDungeon = true;
+            Assert.False(SquadDungeonService.HasFreshExitEvidence(2UL, new[] { WrapClient(member, 11_500L) }, 10_000L, 12_000L));
+        }
+
+        [Fact]
+        public void PartyComposition_FallsBackToLivingConfiguredTankInsteadOfCoordinator()
+        {
+            var party = new[] { (1UL, false, true), (2UL, true, false), (3UL, false, true) };
+            var bots = new[] { 1UL, 3UL };
+
+            Assert.Equal((true, 3UL), SquadDungeonService.EvaluatePartyComposition(bots, party, new[] { 3UL }));
+            Assert.Equal((true, 0UL), SquadDungeonService.EvaluatePartyComposition(bots, party, new[] { 2UL }));
+        }
+
+        [Fact]
+        public void DungeonPosition_RejectsBreadcrumbWhoseFinalOffsetIsTooCloseToFocus()
+        {
+            var focus = new WoWPoint(50f, 50f, 5f);
+            var tank = new WoWPoint(50f, 55f, 5f);
+            var crumbs = new[] { new SquadBreadcrumb { X = 56f, Y = 55f, Z = 5f, MapId = 36U } };
+
+            var position = SquadFormationService.ComputeDungeonStandoffPosition(tank, 0f, focus, crumbs, 36U, 16f, 0, 1);
+
+            Assert.True(position.Distance(focus) >= 16f);
+            Assert.True(position.Y > tank.Y);
         }
 
         [Fact]

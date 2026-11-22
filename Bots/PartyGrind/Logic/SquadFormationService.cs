@@ -286,7 +286,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             int backlineSlotIndex,
             int totalBacklineCount)
         {
-            float dist = Math.Clamp(standoffDistance, 12f, 20f);
+            float dist = Math.Clamp(standoffDistance, 16f, 20f);
             float[] lateralOffsets = totalBacklineCount switch
             {
                 <= 1 => new[] { 0f },
@@ -319,10 +319,12 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                         float px = -uy;
                         float py = ux;
                         float clampedDist = Math.Min(dist, dTank + 3.0f);
-                        return new WoWPoint(
+                        var candidate = new WoWPoint(
                             tankPos.X + ux * clampedDist + px * lateral,
                             tankPos.Y + uy * clampedDist + py * lateral,
                             bcPt.Z);
+                        if (!focusTargetPos.HasValue || candidate.Distance(focusTargetPos.Value) >= dist)
+                            return candidate;
                     }
                 }
             }
@@ -332,7 +334,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             {
                 float dx = tankPos.X - focusTargetPos.Value.X;
                 float dy = tankPos.Y - focusTargetPos.Value.Y;
-                backAngle = (dx * dx + dy * dy) > 0.25f
+                backAngle = (dx != 0f || dy != 0f)
                     ? MathF.Atan2(dy, dx)
                     : tankFacingRadians + MathF.PI;
             }

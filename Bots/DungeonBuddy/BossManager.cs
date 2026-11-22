@@ -64,7 +64,16 @@ namespace Bots.DungeonBuddy
         }
 
         /// <summary>
-        /// HB 4.3.4 parity: returns the first Boss object that is not yet dead,
+        /// Uses <see cref="Styx.PartyGrind.SquadContext.ActiveKillOptionalBosses"/>
+        /// in squad dungeon mode and <c>DungeonBuddySettings.Instance.KillOptionalBosses</c> otherwise.
+        /// </summary>
+        public static bool KillOptionalBossesEnabled =>
+            Styx.PartyGrind.SquadContext.IsDungeonModeActive
+                ? Styx.PartyGrind.SquadContext.ActiveKillOptionalBosses
+                : DungeonBuddySettings.Instance.KillOptionalBosses;
+
+        /// <summary>
+        /// HB 4.3.4 parity: returns the first boss not marked dead, subject to the optional boss policy,
         /// in registration order — the profile's KillOrder, then any script-only bosses.
         /// Does NOT require the boss to be in ObjectManager range — using ObjectManager
         /// here would return null when bosses are out of draw distance at the dungeon
@@ -72,11 +81,6 @@ namespace Bots.DungeonBuddy
         /// Matches HB smethod_9: IsAlive check + Optional/KillOptionalBosses guard.
         /// (Faction guard omitted — inner Boss has no Faction field; all registered bosses default to Both.)
         /// </summary>
-        public static bool KillOptionalBossesEnabled =>
-            Styx.PartyGrind.SquadContext.IsDungeonModeActive
-                ? Styx.PartyGrind.SquadContext.ActiveKillOptionalBosses
-                : DungeonBuddySettings.Instance.KillOptionalBosses;
-
         public static Boss? CurrentBoss =>
             _bosses
                 .Where(b => !b.IsDead && (!b.IsOptional || KillOptionalBossesEnabled))

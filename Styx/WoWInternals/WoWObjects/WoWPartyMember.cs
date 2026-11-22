@@ -38,12 +38,16 @@ namespace Styx.WoWInternals.WoWObjects
         /// <summary>
         /// Creates a party member from a GUID.
         /// </summary>
-        public WoWPartyMember(ulong guid, bool isRaidMember)
+        public WoWPartyMember(ulong guid, bool isRaidMember) : this(guid, isRaidMember, 0)
+        {
+        }
+
+        internal WoWPartyMember(ulong guid, bool isRaidMember, int index)
         {
             _guid = guid;
             _isRaidMember = isRaidMember;
-            _unitId = isRaidMember ? "raid" : "party";
-            _index = 0;
+            _unitId = (isRaidMember ? "raid" : "party") + (index > 0 ? index.ToString() : string.Empty);
+            _index = index;
         }
 
         #endregion

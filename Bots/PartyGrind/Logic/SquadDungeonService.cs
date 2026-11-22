@@ -16,7 +16,8 @@ using Styx.WoWInternals.DBC;
 using Styx.WoWInternals.WoWObjects;
 using TreeSharp;
 
-using DbProfileManager = Bots.DungeonBuddy.Profiles.ProfileManager;
+using DbProfileManager = global::Bots.DungeonBuddy.Profiles.ProfileManager;
+using AvoidanceManager = global::Bots.DungeonBuddy.Avoidance.AvoidanceManager;
 
 namespace CopilotBuddy.Bots.PartyGrind.Logic
 {
@@ -31,6 +32,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         public int KilledBossCount { get; set; }
         public int TotalBossCount { get; set; }
         public bool IsDungeonComplete { get; set; }
+        public bool ResetPendingOutside { get; set; }
         public bool LfgProposalPending { get; set; }
         public string LfgMode { get; set; } = string.Empty;
         public bool HasRandomPartyMembers { get; set; }
@@ -109,15 +111,29 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private long _lastProposalAcceptUtcMs;
         private long _lastTeleportOutUtcMs;
         private int _instanceResetGeneration;
+        internal const float HotspotArrivalDistance = 4.5f;
+        private bool _runtimeInitialized;
         private bool _resetPendingOutside;
+        private uint _walkInRunDungeonId;
+        private uint _walkInRunMapId;
+        private int _hotspotIndex;
+        private long _completedAtUtcMs;
+        private readonly HashSet<ulong> _runParticipants = new();
+        private IReadOnlyList<SquadConnectedMemberSnapshot> _participantSnapshots = Array.Empty<SquadConnectedMemberSnapshot>();
         private Composite? _activeEncounterBehavior;
-        private uint _activeEncounterBossEntry;
+        private WoWUnit? _activeEncounterTarget;
 
         public int InstanceResetGeneration => _instanceResetGeneration;
 
         public void InitializeRuntime(SquadSettings settings)
         {
-            if (settings.BotMode != SquadBotMode.Dungeon)
+            if (SquadContext.ResolveBotMode(SquadContext.GetLeaderStateSnapshot(), settings) == SquadBotMode.Dungeon)
+                InitializeDungeonRuntime();
+        }
+
+        private void InitializeDungeonRuntime()
+        {
+            if (_runtimeInitialized)
                 return;
 
             if (!_scriptsLoaded)
@@ -133,6 +149,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             }
 
             WorldObstacleManager.Initialize();
+            _runtimeInitialized = true;
             _lastSyncedMapId = 0;
             _lastSyncedDungeonId = 0;
             _lastLfgPollUtcMs = 0;
@@ -140,7 +157,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             _lastRoleSetUtcMs = 0;
             _lastProposalAcceptUtcMs = 0;
             _lastTeleportOutUtcMs = 0;
-            _resetPendingOutside = false;
+            ClearWalkInRun();
             StopActiveEncounter();
         }
 
@@ -156,32 +173,36 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             try { BossManager.Reset(); } catch { }
             try { WorldObstacleManager.Shutdown(); } catch { }
             try { AvoidanceManager.Clear(); } catch { }
+            _runtimeInitialized = false;
             _lastSyncedMapId = 0;
             _lastSyncedDungeonId = 0;
-            _resetPendingOutside = false;
+            ClearWalkInRun();
         }
 
         public void StopActiveEncounter()
         {
             var active = _activeEncounterBehavior;
             _activeEncounterBehavior = null;
-            _activeEncounterBossEntry = 0;
+            var target = _activeEncounterTarget;
+            _activeEncounterTarget = null;
             if (active != null)
             {
-                try { active.Stop(null); } catch { }
+                try { active.Stop(target); } catch { }
             }
         }
 
         public void PulseEnvironment(SquadSettings settings, SquadLeaderState? leader, long nowUtcMs)
         {
-            SquadBotMode effectiveMode = leader?.BotMode ?? settings.BotMode;
-            if (effectiveMode != SquadBotMode.Dungeon)
+            if (SquadContext.ResolveBotMode(leader, settings) != SquadBotMode.Dungeon)
+            {
+                if (_runtimeInitialized)
+                    ShutdownRuntime();
                 return;
+            }
 
-            if (!_scriptsLoaded || !_lfgEventsAttached)
-                InitializeRuntime(settings);
+            InitializeDungeonRuntime();
 
-            Bots.DungeonBuddy.Helpers.ScriptHelpers.UpdateMovementBlocks();
+            global::Bots.DungeonBuddy.Helpers.ScriptHelpers.UpdateMovementBlocks();
             AvoidanceManager.Update();
             DynamicBlackspotManager.Pulse();
 
@@ -196,7 +217,10 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             }
 
             SyncActiveDungeon(settings, leader);
-            BossManager.CreateCheckForDeadBossBehavior().Tick(null);
+            var deadBossCheck = BossManager.CreateCheckForDeadBossBehavior();
+            deadBossCheck.Start(null);
+            try { deadBossCheck.Tick(null); }
+            finally { deadBossCheck.Stop(null); }
         }
 
         private void SyncActiveDungeon(SquadSettings settings, SquadLeaderState? leader)
@@ -212,18 +236,17 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             uint desiredDungeonId = 0;
             if (inDungeonMap)
             {
-                if (lfgId > 0)
+                if (entryMode != SquadDungeonEntryMode.WalkInPortalFarm && lfgId > 0)
                 {
                     desiredDungeonId = lfgId;
                 }
-                else if (leader != null && leader.ActiveDungeonId > 0)
-                {
-                    desiredDungeonId = leader.ActiveDungeonId;
-                }
                 else if (entryMode == SquadDungeonEntryMode.WalkInPortalFarm)
                 {
-                    int minLvl = SquadContext.GetEffectiveProfileLevel();
-                    desiredDungeonId = ResolveTargetDungeonId(settings, minLvl, !me.IsHorde);
+                    desiredDungeonId = ResolveWalkInTarget(settings, leader, SquadContext.GetEffectiveProfileLevel(), !me.IsHorde);
+                }
+                else if (!settings.IsCoordinator && leader?.ActiveDungeonMapId == me.MapId)
+                {
+                    desiredDungeonId = leader.ActiveDungeonId;
                 }
 
                 if (desiredDungeonId == 0)
@@ -234,6 +257,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
                 if (desiredDungeonId > 0 && (_lastSyncedDungeonId != desiredDungeonId || _lastSyncedMapId != me.MapId || DungeonManager.CurrentDungeon == null))
                 {
+                    StopActiveEncounter();
+                    _hotspotIndex = 0;
                     DungeonManager.SetDungeonById(desiredDungeonId);
                     LfgManager.DungeonCompletedReason = CompleteReason.None;
                     _lastSyncedDungeonId = desiredDungeonId;
@@ -242,32 +267,24 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             }
             else
             {
-                if (DungeonManager.CurrentDungeon != null && _lastSyncedMapId != 0 && _lastSyncedMapId != me.MapId)
+                if (_lastSyncedDungeonId != 0)
                 {
-                    if (BossManager.Bosses.Count > 0 && BossManager.CurrentBoss == null ||
-                        LfgManager.DungeonCompletedReason != CompleteReason.None)
-                    {
-                        _resetPendingOutside = true;
-                    }
                     StopActiveEncounter();
                     DungeonManager.Clear();
                     BossManager.Reset();
                     _lastSyncedDungeonId = 0;
+                    _hotspotIndex = 0;
                 }
                 _lastSyncedMapId = me.MapId;
-
-                if (entryMode == SquadDungeonEntryMode.WalkInPortalFarm)
-                {
-                    uint targetId = leader?.ActiveDungeonId > 0
-                        ? leader.ActiveDungeonId
-                        : ResolveTargetDungeonId(settings, SquadContext.GetEffectiveProfileLevel(), !me.IsHorde);
-                    if (targetId > 0 && DungeonManager.CurrentDungeon?.DungeonId != targetId)
-                    {
-                        DungeonManager.SetDungeonById(targetId);
-                        _lastSyncedDungeonId = targetId;
-                    }
-                }
             }
+        }
+
+        private uint ResolveWalkInTarget(SquadSettings settings, SquadLeaderState? leader, int level, bool isAlliance)
+        {
+            if (!settings.IsCoordinator && leader != null)
+                return leader.ActiveDungeonId;
+
+            return _walkInRunDungeonId != 0 ? _walkInRunDungeonId : ResolveTargetDungeonId(settings, level, isAlliance);
         }
 
         public static bool IsInDungeonMap(LocalPlayer? me)
@@ -361,8 +378,20 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             IReadOnlyCollection<ulong> squadBotGuids,
             IReadOnlyList<(ulong Guid, bool IsTankRoleAssigned, bool IsAlive)> inGamePartyMembers)
         {
+            var configuredTanks = coordinatorRole == SquadRole.TankLeader
+                ? new[] { coordinatorGuid }
+                : Array.Empty<ulong>();
+            return EvaluatePartyComposition(squadBotGuids, inGamePartyMembers, configuredTanks);
+        }
+
+        internal static (bool HasRandomPlayers, ulong EffectiveTankGuid) EvaluatePartyComposition(
+            IReadOnlyCollection<ulong> squadBotGuids,
+            IReadOnlyList<(ulong Guid, bool IsTankRoleAssigned, bool IsAlive)> inGamePartyMembers,
+            IReadOnlyCollection<ulong> configuredTanks)
+        {
             bool hasRandom = false;
             ulong assignedTankGuid = 0UL;
+            ulong configuredTankGuid = 0UL;
 
             foreach (var pm in inGamePartyMembers)
             {
@@ -372,15 +401,32 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     hasRandom = true;
                 if (pm.IsTankRoleAssigned && pm.IsAlive && assignedTankGuid == 0UL)
                     assignedTankGuid = pm.Guid;
+                if (pm.IsAlive && configuredTankGuid == 0UL && configuredTanks.Contains(pm.Guid))
+                    configuredTankGuid = pm.Guid;
             }
 
-            if (assignedTankGuid != 0UL)
-                return (hasRandom, assignedTankGuid);
+            return (hasRandom, assignedTankGuid != 0UL ? assignedTankGuid : configuredTankGuid);
+        }
 
-            if (coordinatorRole == SquadRole.TankLeader && coordinatorGuid != 0UL)
-                return (hasRandom, coordinatorGuid);
+        private void ClearWalkInRun()
+        {
+            _resetPendingOutside = false;
+            _walkInRunDungeonId = 0;
+            _walkInRunMapId = 0;
+            _hotspotIndex = 0;
+            _completedAtUtcMs = 0;
+            _runParticipants.Clear();
+            _participantSnapshots = Array.Empty<SquadConnectedMemberSnapshot>();
+        }
 
-            return (hasRandom, coordinatorGuid);
+        internal static bool HasFreshExitEvidence(
+            ulong participantGuid, IReadOnlyList<SquadConnectedMemberSnapshot> connected, long completedAtUtcMs, long nowUtcMs)
+        {
+            return connected.Any(m => m.LastReceivedUtcMs > completedAtUtcMs &&
+                                      m.LastReceivedUtcMs <= nowUtcMs &&
+                                      nowUtcMs - m.LastReceivedUtcMs <= 5000L &&
+                                      m.LatestState is { IsInsideDungeon: false } state &&
+                                      state.Guid == participantGuid);
         }
 
         public void RecordInstanceReset(long nowUtcMs)
@@ -388,7 +434,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             PruneResetHistory(nowUtcMs);
             _instanceResetTimestampsUtcMs.Add(nowUtcMs);
             _instanceResetGeneration++;
-            _resetPendingOutside = false;
+            ClearWalkInRun();
         }
 
         public void PruneResetHistory(long nowUtcMs)
@@ -427,12 +473,21 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         {
             var me = StyxWoW.Me;
             var botGuids = new HashSet<ulong>();
+            var configuredTanks = new HashSet<ulong>();
             if (me != null && me.Guid != 0)
+            {
                 botGuids.Add(me.Guid);
+                if (settings.Role == SquadRole.TankLeader)
+                    configuredTanks.Add(me.Guid);
+            }
             foreach (var c in connected)
             {
                 if (c.IsConnected && c.Handshake.Guid != 0)
+                {
                     botGuids.Add(c.Handshake.Guid);
+                    if (c.Handshake.Role == SquadRole.TankLeader)
+                        configuredTanks.Add(c.Handshake.Guid);
+                }
                 if (c.LatestState != null && c.LatestState.Guid != 0)
                     botGuids.Add(c.LatestState.Guid);
             }
@@ -442,33 +497,35 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             {
                 bool meTankAssigned = (me.Role & WoWPartyMember.GroupRole.Tank) != 0;
                 partyList.Add((me.Guid, meTankAssigned, me.IsAlive));
-                foreach (var pm in me.GroupInfo.RaidMembers)
+                foreach (var pm in me.GroupInfo.AllMembers)
                 {
                     if (pm.Guid == 0 || pm.Guid == me.Guid)
                         continue;
                     bool isTank = pm.HasRole(WoWPartyMember.GroupRole.Tank);
                     var pObj = pm.ToPlayer();
-                    bool alive = pObj != null ? pObj.IsAlive : (!pm.Dead && !pm.Ghost);
+                    bool alive = pObj is { IsValid: true } ? pObj.IsAlive : (pm.IsOnline && !pm.Dead && !pm.Ghost);
                     partyList.Add((pm.Guid, isTank, alive));
                 }
             }
 
-            var (hasRandom, effectiveTankGuid) = EvaluatePartyComposition(
-                me?.Guid ?? 0UL,
-                settings.Role,
-                botGuids,
-                partyList);
+            var (hasRandom, effectiveTankGuid) = EvaluatePartyComposition(botGuids, partyList, configuredTanks);
 
             bool inDungeon = IsInDungeonMap(me);
+            bool walkIn = settings.DungeonEntryMode == SquadDungeonEntryMode.WalkInPortalFarm;
             var currentDungeon = DungeonManager.CurrentDungeon;
-            uint activeId = currentDungeon?.DungeonId ?? LfgManager.CurrentLfgDungeonId;
-            if (activeId == 0 && settings.DungeonEntryMode == SquadDungeonEntryMode.WalkInPortalFarm ||
-                activeId == 0 && settings.DungeonEntryMode == SquadDungeonEntryMode.LfgSpecificByBracket)
+            uint activeId = inDungeon ? currentDungeon?.DungeonId ?? _lastSyncedDungeonId : 0U;
+            if (activeId == 0)
             {
-                activeId = ResolveTargetDungeonId(settings, effectiveMinLevel, me == null || !me.IsHorde);
+                activeId = walkIn
+                    ? ResolveWalkInTarget(settings, SquadContext.GetLeaderStateSnapshot(), effectiveMinLevel, me == null || !me.IsHorde)
+                    : LfgManager.CurrentLfgDungeonId;
+                if (!inDungeon && settings.IsCoordinator && settings.DungeonEntryMode == SquadDungeonEntryMode.LfgSpecificByBracket)
+                    activeId = ResolveTargetDungeonId(settings, effectiveMinLevel, me == null || !me.IsHorde);
             }
 
-            WoWPoint portal = currentDungeon?.Entrance ?? (activeId > 0 ? DungeonManager.GetEntranceForDungeon(activeId) : WoWPoint.Zero);
+            WoWPoint portal = inDungeon && currentDungeon != null
+                ? currentDungeon.Entrance
+                : (activeId > 0 ? DungeonManager.GetEntranceForDungeon(activeId) : WoWPoint.Zero);
             WoWPoint exit = currentDungeon?.ExitLocation ?? WoWPoint.Zero;
 
             var bosses = BossManager.Bosses;
@@ -479,14 +536,40 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 LfgManager.DungeonCompletedReason != CompleteReason.None ||
                 (totalBosses > 0 && currentBoss == null));
 
-            uint portalMapId = 0;
+            if (walkIn && settings.IsCoordinator && me != null)
+            {
+                _participantSnapshots = connected;
+                if (inDungeon)
+                {
+                    _walkInRunDungeonId = activeId;
+                    _walkInRunMapId = me.MapId;
+                    _runParticipants.UnionWith(partyList.Where(p => p.Guid != 0 && p.Guid != me.Guid).Select(p => p.Guid));
+                    if (complete && _completedAtUtcMs == 0)
+                    {
+                        _completedAtUtcMs = nowUtcMs;
+                        MarkResetPendingOutside();
+                    }
+                }
+                if (_walkInRunDungeonId != 0)
+                {
+                    foreach (var participant in connected)
+                    {
+                        if (participant.LatestState is { IsInsideDungeon: true, Guid: not 0 } state &&
+                            state.MapId == _walkInRunMapId && state.Guid != me.Guid &&
+                            partyList.Any(member => member.Guid == state.Guid))
+                            _runParticipants.Add(state.Guid);
+                    }
+                }
+            }
+
+            uint instanceMapId = 0;
             if (activeId > 0)
             {
                 try
                 {
                     var dbc = LfgDungeons.GetById(activeId);
-                    if (dbc?.Map != null)
-                        portalMapId = (uint)Math.Max(0, dbc.Map.Id);
+                    if (dbc != null)
+                        instanceMapId = (uint)Math.Max(0, dbc.MapId);
                 }
                 catch { }
             }
@@ -495,13 +578,14 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             {
                 IsInsideDungeon = inDungeon,
                 ActiveDungeonId = activeId,
-                ActiveDungeonMapId = inDungeon && me != null ? me.MapId : portalMapId,
+                ActiveDungeonMapId = inDungeon && me != null ? me.MapId : instanceMapId,
                 ActiveDungeonName = currentDungeon?.Name ?? string.Empty,
                 CurrentBossEntry = currentBoss?.Entry ?? 0U,
                 CurrentBossName = currentBoss?.Name ?? string.Empty,
                 KilledBossCount = killedBosses,
                 TotalBossCount = totalBosses,
                 IsDungeonComplete = complete,
+                ResetPendingOutside = _resetPendingOutside,
                 LfgProposalPending = LfgManager.ProposalPending || SafeGetLfgMode() == "proposal",
                 LfgMode = SafeGetLfgMode(),
                 HasRandomPartyMembers = hasRandom,
@@ -593,10 +677,12 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             }
 
             string[] expected = settings.GetExpectedMemberNames();
-            if (!settings.AllowPartialSquadLfg && expected.Length > 1)
+            if (!settings.AllowPartialSquadLfg)
             {
-                int inPartyCount = 1 + me.PartyMemberInfos.Count;
-                if (inPartyCount < expected.Length)
+                var partyNames = new HashSet<string>(
+                    me.GroupInfo.PartyMembers.Where(m => m.Guid != 0).Select(m => m.Name),
+                    StringComparer.OrdinalIgnoreCase) { me.Name };
+                if (!expected.All(partyNames.Contains))
                 {
                     SquadPartySyncService.LogAction("Dungeon: waiting for full party before LFG queue");
                     return true;
@@ -623,22 +709,22 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             switch (entryMode)
             {
                 case SquadDungeonEntryMode.LfgRandomHeroic:
-                    LfgManager.QueueForRandomHeroic();
+                    LfgManager.QueueForRandomHeroic(setRoles: false);
                     SquadPartySyncService.LogAction("Dungeon: queued Random Heroic");
                     break;
 
                 case SquadDungeonEntryMode.LfgSpecificByBracket:
                 {
                     int minLvl = leader?.EffectiveSquadMinLevel > 0 ? leader.EffectiveSquadMinLevel : me.Level;
-                    uint targetId = ResolveTargetDungeonId(settings, minLvl, !me.IsHorde);
+                    uint targetId = leader?.ActiveDungeonId ?? ResolveTargetDungeonId(settings, minLvl, !me.IsHorde);
                     if (targetId > 0)
                     {
-                        LfgManager.QueueForSpecificDungeon(targetId);
+                        LfgManager.QueueForSpecificDungeon(targetId, setRoles: false);
                         SquadPartySyncService.LogAction($"Dungeon: queued specific ID {targetId}");
                     }
                     else
                     {
-                        LfgManager.QueueForRandomDungeon();
+                        LfgManager.QueueForRandomDungeon(setRoles: false);
                         SquadPartySyncService.LogAction("Dungeon: queued Random Normal (fallback)");
                     }
                     break;
@@ -675,7 +761,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             }
             else
             {
-                LfgManager.QueueForRandomDungeon();
+                LfgManager.QueueForRandomDungeon(setRoles: false);
             }
         }
 
@@ -687,14 +773,18 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
             if (settings.IsCoordinator && _resetPendingOutside)
             {
-                bool allOutside = leader?.Members == null || leader.Members
-                    .Where(m => m.IsConnected)
-                    .All(m => m.MapId == me.MapId);
+                var visibleOutside = me.GroupInfo.AllMembers
+                    .Where(m => m.ToPlayer() is { IsValid: true })
+                    .Select(m => m.Guid)
+                    .ToHashSet();
+                bool allOutside = _completedAtUtcMs > 0 && _runParticipants.All(guid =>
+                    HasFreshExitEvidence(guid, _participantSnapshots, _completedAtUtcMs, nowUtcMs) ||
+                    (!_participantSnapshots.Any(m => m.Handshake.Guid == guid) && visibleOutside.Contains(guid)));
                 if (!allOutside)
                 {
                     if (me.IsMoving)
                         WoWMovement.MoveStop();
-                    SquadPartySyncService.LogAction("Dungeon: waiting for all members outside before ResetInstances");
+                    SquadPartySyncService.LogAction("Dungeon: waiting for exit confirmation from all run participants");
                     return true;
                 }
 
@@ -713,13 +803,18 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 return true;
             }
 
-            uint targetId = leader?.ActiveDungeonId > 0
-                ? leader.ActiveDungeonId
-                : ResolveTargetDungeonId(settings, SquadContext.GetEffectiveProfileLevel(), !me.IsHorde);
+            if (!settings.IsCoordinator && leader?.DungeonResetPendingOutside == true)
+            {
+                if (me.IsMoving)
+                    WoWMovement.MoveStop();
+                return true;
+            }
 
-            WoWPoint portal = leader != null && (leader.DungeonPortalX != 0f || leader.DungeonPortalY != 0f)
+            uint targetId = ResolveWalkInTarget(settings, leader, SquadContext.GetEffectiveProfileLevel(), !me.IsHorde);
+            WoWPoint portal = leader != null && leader.ActiveDungeonId == targetId &&
+                (leader.DungeonPortalX != 0f || leader.DungeonPortalY != 0f)
                 ? new WoWPoint(leader.DungeonPortalX, leader.DungeonPortalY, leader.DungeonPortalZ)
-                : (DungeonManager.CurrentDungeon?.Entrance ?? (targetId > 0 ? DungeonManager.GetEntranceForDungeon(targetId) : WoWPoint.Zero));
+                : (targetId > 0 ? DungeonManager.GetEntranceForDungeon(targetId) : WoWPoint.Zero);
 
             if (portal == WoWPoint.Zero)
                 return false;
@@ -831,7 +926,10 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         {
             var me = StyxWoW.Me;
             if (me == null || DungeonManager.CurrentDungeon == null || !IsInDungeonMap(me))
+            {
+                StopActiveEncounter();
                 return false;
+            }
 
             var scriptBehavior = DungeonManager.CurrentDungeonBehavior;
             if (scriptBehavior != null)
@@ -841,6 +939,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 RunStatus scriptStatus = scriptBehavior.Tick(null);
                 if (scriptStatus == RunStatus.Running || scriptStatus == RunStatus.Success)
                 {
+                    StopActiveEncounter();
                     if (scriptStatus != RunStatus.Running)
                         scriptBehavior.Stop(null);
                     return true;
@@ -848,13 +947,13 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             }
 
             WoWUnit? target = me.CurrentTarget;
-            if (me.Combat && target != null && target.IsValid && !target.Dead &&
-                BossManager.Bosses.Any(b => b.EntryId == target.Entry))
+            if (me.Combat && target != null && target.IsValid && target.IsAlive &&
+                BossManager.Bosses.Any(b => !b.IsDead && b.EntryId == target.Entry))
             {
-                if (target.Entry != _activeEncounterBossEntry)
+                if (target.Guid != _activeEncounterTarget?.Guid)
                 {
                     StopActiveEncounter();
-                    _activeEncounterBossEntry = target.Entry;
+                    _activeEncounterTarget = target;
                     _activeEncounterBehavior = DungeonManager.GetEncounterBehavior((int)target.Entry);
                     _activeEncounterBehavior?.Start(target);
                 }
@@ -869,6 +968,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 }
             }
 
+            StopActiveEncounter();
             return false;
         }
 
@@ -881,7 +981,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (BotPoi.Current.Type == PoiType.Hotspot && BotPoi.Current.Location != WoWPoint.Zero)
             {
                 WoWPoint hs = BotPoi.Current.Location;
-                if (me.Location.DistanceSqr(hs) <= 16f)
+                if (me.Location.Distance(hs) <= HotspotArrivalDistance)
                     BotPoi.Clear("Reached dungeon hotspot");
                 else
                     return hs;
@@ -921,23 +1021,25 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                         }
                         return crumb;
                     }
-                    return profileBoss.Location;
                 }
 
                 if (profileBoss != null && profileBoss.Location != WoWPoint.Zero)
                     return profileBoss.Location;
 
-                if (profile.HotSpots.Count > 0)
+                while (_hotspotIndex < profile.HotSpots.Count)
                 {
-                    WoWPoint nearestHs = profile.HotSpots
-                        .OrderBy(h => me.Location.DistanceSqr(h))
-                        .FirstOrDefault();
-                    return nearestHs;
+                    WoWPoint hotspot = profile.HotSpots[_hotspotIndex];
+                    if (hotspot != WoWPoint.Zero && me.Location.Distance(hotspot) > HotspotArrivalDistance)
+                        return hotspot;
+                    _hotspotIndex++;
                 }
             }
 
             return WoWPoint.Zero;
         }
+
+        internal static int GetBossReadinessManaPercent(SquadSettings settings) =>
+            Math.Max(45, settings.TriggerRestManaPct + 15);
 
         public static bool IsBossPrePullBarrierBlocking(
             SquadSettings settings,
@@ -961,7 +1063,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     return true;
                 if ((m.Role == SquadRole.Healer || m.Role == SquadRole.HybridOffHeal) &&
                     m.PowerType == WoWPowerType.Mana &&
-                    m.PowerPercent < Math.Max(45, settings.TriggerRestManaPct + 15))
+                    m.PowerPercent < GetBossReadinessManaPercent(settings))
                 {
                     return true;
                 }
