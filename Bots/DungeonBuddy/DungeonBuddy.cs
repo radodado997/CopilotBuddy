@@ -235,7 +235,13 @@ namespace Bots.DungeonBuddy
             get
             {
                 if (!(TreeRoot.Current is DungeonBuddy))
-                    return StyxWoW.Me.PartyMemberInfos.ToArray();
+                {
+                    if (StyxWoW.Me == null)
+                        return Array.Empty<WoWPartyMember>();
+                    return StyxWoW.Me.IsInRaid
+                        ? StyxWoW.Me.RaidMemberInfos.ToArray()
+                        : StyxWoW.Me.PartyMemberInfos.ToArray();
+                }
 
                 return _partyMemberInfos;
             }

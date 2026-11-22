@@ -1,0 +1,993 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Bots.DungeonBuddy;
+using Bots.DungeonBuddy.Avoidance;
+using Bots.DungeonBuddy.Enums;
+using Styx;
+using Styx.Helpers;
+using Styx.Logic;
+using Styx.Logic.Pathing;
+using Styx.Logic.POI;
+using Styx.PartyGrind;
+using Styx.PartyGrind.IPC;
+using Styx.WoWInternals;
+using Styx.WoWInternals.DBC;
+using Styx.WoWInternals.WoWObjects;
+using TreeSharp;
+
+using DbProfileManager = Bots.DungeonBuddy.Profiles.ProfileManager;
+
+namespace CopilotBuddy.Bots.PartyGrind.Logic
+{
+    public sealed class SquadDungeonSnapshot
+    {
+        public bool IsInsideDungeon { get; set; }
+        public uint ActiveDungeonId { get; set; }
+        public uint ActiveDungeonMapId { get; set; }
+        public string ActiveDungeonName { get; set; } = string.Empty;
+        public uint CurrentBossEntry { get; set; }
+        public string CurrentBossName { get; set; } = string.Empty;
+        public int KilledBossCount { get; set; }
+        public int TotalBossCount { get; set; }
+        public bool IsDungeonComplete { get; set; }
+        public bool LfgProposalPending { get; set; }
+        public string LfgMode { get; set; } = string.Empty;
+        public bool HasRandomPartyMembers { get; set; }
+        public ulong EffectiveTankGuid { get; set; }
+        public float PortalX { get; set; }
+        public float PortalY { get; set; }
+        public float PortalZ { get; set; }
+        public uint PortalMapId { get; set; }
+        public float ExitX { get; set; }
+        public float ExitY { get; set; }
+        public float ExitZ { get; set; }
+    }
+
+    public readonly struct DungeonBracketEntry
+    {
+        public DungeonBracketEntry(uint dungeonId, int minLevel, int maxLevel, bool allianceFriendly, bool hordeFriendly)
+        {
+            DungeonId = dungeonId;
+            MinLevel = minLevel;
+            MaxLevel = maxLevel;
+            AllianceFriendly = allianceFriendly;
+            HordeFriendly = hordeFriendly;
+        }
+
+        public uint DungeonId { get; }
+        public int MinLevel { get; }
+        public int MaxLevel { get; }
+        public bool AllianceFriendly { get; }
+        public bool HordeFriendly { get; }
+    }
+
+    public sealed class SquadDungeonService
+    {
+        private static readonly DungeonBracketEntry[] DefaultBracketPlaylist =
+        {
+            new DungeonBracketEntry(4, 13, 18, false, true),
+            new DungeonBracketEntry(6, 16, 22, true, false),
+            new DungeonBracketEntry(1, 17, 24, true, true),
+            new DungeonBracketEntry(8, 18, 25, true, true),
+            new DungeonBracketEntry(12, 22, 29, true, false),
+            new DungeonBracketEntry(10, 22, 28, true, true),
+            new DungeonBracketEntry(16, 25, 32, true, true),
+            new DungeonBracketEntry(18, 28, 33, true, true),
+            new DungeonBracketEntry(163, 31, 36, true, true),
+            new DungeonBracketEntry(164, 34, 39, true, true),
+            new DungeonBracketEntry(165, 36, 42, true, true),
+            new DungeonBracketEntry(20, 35, 42, true, true),
+            new DungeonBracketEntry(22, 37, 44, true, true),
+            new DungeonBracketEntry(24, 42, 50, true, true),
+            new DungeonBracketEntry(28, 46, 53, true, true),
+            new DungeonBracketEntry(30, 50, 56, true, true),
+            new DungeonBracketEntry(276, 54, 60, true, true),
+            new DungeonBracketEntry(40, 56, 61, true, true),
+            new DungeonBracketEntry(136, 59, 63, true, true),
+            new DungeonBracketEntry(137, 60, 64, true, true),
+            new DungeonBracketEntry(140, 61, 65, true, true),
+            new DungeonBracketEntry(146, 63, 67, true, true),
+            new DungeonBracketEntry(148, 64, 68, true, true),
+            new DungeonBracketEntry(202, 68, 72, true, true),
+            new DungeonBracketEntry(225, 70, 74, true, true),
+            new DungeonBracketEntry(204, 71, 75, true, true),
+            new DungeonBracketEntry(214, 73, 77, true, true),
+            new DungeonBracketEntry(216, 75, 79, true, true),
+            new DungeonBracketEntry(207, 77, 80, true, true),
+            new DungeonBracketEntry(206, 78, 80, true, true)
+        };
+
+        private readonly List<long> _instanceResetTimestampsUtcMs = new List<long>();
+        private bool _scriptsLoaded;
+        private bool _lfgEventsAttached;
+        private uint _lastSyncedMapId;
+        private uint _lastSyncedDungeonId;
+        private long _lastLfgPollUtcMs;
+        private long _lastQueueAttemptUtcMs;
+        private long _lastRoleSetUtcMs;
+        private long _lastProposalAcceptUtcMs;
+        private long _lastTeleportOutUtcMs;
+        private int _instanceResetGeneration;
+        private bool _resetPendingOutside;
+        private Composite? _activeEncounterBehavior;
+        private uint _activeEncounterBossEntry;
+
+        public int InstanceResetGeneration => _instanceResetGeneration;
+
+        public void InitializeRuntime(SquadSettings settings)
+        {
+            if (settings.BotMode != SquadBotMode.Dungeon)
+                return;
+
+            if (!_scriptsLoaded)
+            {
+                DungeonManager.LoadDungeonScripts();
+                _scriptsLoaded = true;
+            }
+
+            if (!_lfgEventsAttached)
+            {
+                LfgManager.AttachLfgEvents();
+                _lfgEventsAttached = true;
+            }
+
+            WorldObstacleManager.Initialize();
+            _lastSyncedMapId = 0;
+            _lastSyncedDungeonId = 0;
+            _lastLfgPollUtcMs = 0;
+            _lastQueueAttemptUtcMs = 0;
+            _lastRoleSetUtcMs = 0;
+            _lastProposalAcceptUtcMs = 0;
+            _lastTeleportOutUtcMs = 0;
+            _resetPendingOutside = false;
+            StopActiveEncounter();
+        }
+
+        public void ShutdownRuntime()
+        {
+            StopActiveEncounter();
+            if (_lfgEventsAttached)
+            {
+                try { LfgManager.DetachLfgEvents(); } catch { }
+                _lfgEventsAttached = false;
+            }
+            try { DungeonManager.Clear(); } catch { }
+            try { BossManager.Reset(); } catch { }
+            try { WorldObstacleManager.Shutdown(); } catch { }
+            try { AvoidanceManager.Clear(); } catch { }
+            _lastSyncedMapId = 0;
+            _lastSyncedDungeonId = 0;
+            _resetPendingOutside = false;
+        }
+
+        public void StopActiveEncounter()
+        {
+            var active = _activeEncounterBehavior;
+            _activeEncounterBehavior = null;
+            _activeEncounterBossEntry = 0;
+            if (active != null)
+            {
+                try { active.Stop(null); } catch { }
+            }
+        }
+
+        public void PulseEnvironment(SquadSettings settings, SquadLeaderState? leader, long nowUtcMs)
+        {
+            SquadBotMode effectiveMode = leader?.BotMode ?? settings.BotMode;
+            if (effectiveMode != SquadBotMode.Dungeon)
+                return;
+
+            if (!_scriptsLoaded || !_lfgEventsAttached)
+                InitializeRuntime(settings);
+
+            Bots.DungeonBuddy.Helpers.ScriptHelpers.UpdateMovementBlocks();
+            AvoidanceManager.Update();
+            DynamicBlackspotManager.Pulse();
+
+            if (nowUtcMs - _lastLfgPollUtcMs >= 750L)
+            {
+                _lastLfgPollUtcMs = nowUtcMs;
+                string mode = SafeGetLfgMode();
+                if (mode == "proposal" && !LfgManager.ProposalPending)
+                    LfgManager.ProposalPending = true;
+                else if (mode == "rolecheck" && !LfgManager.RoleCheckPending)
+                    LfgManager.RoleCheckPending = true;
+            }
+
+            SyncActiveDungeon(settings, leader);
+            BossManager.CreateCheckForDeadBossBehavior().Tick(null);
+        }
+
+        private void SyncActiveDungeon(SquadSettings settings, SquadLeaderState? leader)
+        {
+            var me = StyxWoW.Me;
+            if (me == null)
+                return;
+
+            bool inDungeonMap = IsInDungeonMap(me);
+            uint lfgId = LfgManager.CurrentLfgDungeonId;
+            SquadDungeonEntryMode entryMode = leader?.DungeonEntryMode ?? settings.DungeonEntryMode;
+
+            uint desiredDungeonId = 0;
+            if (inDungeonMap)
+            {
+                if (lfgId > 0)
+                {
+                    desiredDungeonId = lfgId;
+                }
+                else if (leader != null && leader.ActiveDungeonId > 0)
+                {
+                    desiredDungeonId = leader.ActiveDungeonId;
+                }
+                else if (entryMode == SquadDungeonEntryMode.WalkInPortalFarm)
+                {
+                    int minLvl = SquadContext.GetEffectiveProfileLevel();
+                    desiredDungeonId = ResolveTargetDungeonId(settings, minLvl, !me.IsHorde);
+                }
+
+                if (desiredDungeonId == 0)
+                {
+                    try { desiredDungeonId = DbProfileManager.GetLfgDungeonIdFromMapId(me.MapId); }
+                    catch { desiredDungeonId = 0; }
+                }
+
+                if (desiredDungeonId > 0 && (_lastSyncedDungeonId != desiredDungeonId || _lastSyncedMapId != me.MapId || DungeonManager.CurrentDungeon == null))
+                {
+                    DungeonManager.SetDungeonById(desiredDungeonId);
+                    LfgManager.DungeonCompletedReason = CompleteReason.None;
+                    _lastSyncedDungeonId = desiredDungeonId;
+                    _lastSyncedMapId = me.MapId;
+                }
+            }
+            else
+            {
+                if (DungeonManager.CurrentDungeon != null && _lastSyncedMapId != 0 && _lastSyncedMapId != me.MapId)
+                {
+                    if (BossManager.Bosses.Count > 0 && BossManager.CurrentBoss == null ||
+                        LfgManager.DungeonCompletedReason != CompleteReason.None)
+                    {
+                        _resetPendingOutside = true;
+                    }
+                    StopActiveEncounter();
+                    DungeonManager.Clear();
+                    BossManager.Reset();
+                    _lastSyncedDungeonId = 0;
+                }
+                _lastSyncedMapId = me.MapId;
+
+                if (entryMode == SquadDungeonEntryMode.WalkInPortalFarm)
+                {
+                    uint targetId = leader?.ActiveDungeonId > 0
+                        ? leader.ActiveDungeonId
+                        : ResolveTargetDungeonId(settings, SquadContext.GetEffectiveProfileLevel(), !me.IsHorde);
+                    if (targetId > 0 && DungeonManager.CurrentDungeon?.DungeonId != targetId)
+                    {
+                        DungeonManager.SetDungeonById(targetId);
+                        _lastSyncedDungeonId = targetId;
+                    }
+                }
+            }
+        }
+
+        public static bool IsInDungeonMap(LocalPlayer? me)
+        {
+            if (me == null)
+                return false;
+            try
+            {
+                return me.CurrentMap.IsDungeon || me.CurrentMap.IsRaid;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        public static string SafeGetLfgMode()
+        {
+            try
+            {
+                return (Lua.GetReturnVal<string>("return GetLFGMode() or ''", 0) ?? string.Empty).ToLowerInvariant();
+            }
+            catch
+            {
+                return string.Empty;
+            }
+        }
+
+        public static bool HasDeserterOrRandomCooldown()
+        {
+            var me = StyxWoW.Me;
+            if (me == null)
+                return false;
+            return me.HasAura(71041) || me.HasAura(26013);
+        }
+
+        public static uint ResolveTargetDungeonId(
+            SquadSettings settings,
+            int effectiveSquadMinLevel,
+            bool isAlliance,
+            IReadOnlyList<DungeonBracketEntry>? playlistOverride = null)
+        {
+            uint[] explicitIds = settings.GetSelectedDungeonIds();
+            if (explicitIds.Length > 0)
+            {
+                if (explicitIds.Length == 1 || effectiveSquadMinLevel <= 0)
+                    return explicitIds[0];
+
+                var playlist = playlistOverride ?? DefaultBracketPlaylist;
+                foreach (uint id in explicitIds)
+                {
+                    var match = playlist.FirstOrDefault(e => e.DungeonId == id);
+                    if (match.DungeonId == id && effectiveSquadMinLevel >= match.MinLevel && effectiveSquadMinLevel <= match.MaxLevel)
+                        return id;
+                }
+                return explicitIds[0];
+            }
+
+            if (effectiveSquadMinLevel <= 0)
+                return 0;
+
+            var entries = playlistOverride ?? DefaultBracketPlaylist;
+            DungeonBracketEntry? best = null;
+            foreach (var entry in entries)
+            {
+                if (isAlliance && !entry.AllianceFriendly)
+                    continue;
+                if (!isAlliance && !entry.HordeFriendly)
+                    continue;
+                if (effectiveSquadMinLevel >= entry.MinLevel && effectiveSquadMinLevel <= entry.MaxLevel)
+                {
+                    if (best == null || entry.MinLevel > best.Value.MinLevel)
+                        best = entry;
+                }
+            }
+
+            if (best.HasValue)
+                return best.Value.DungeonId;
+
+            var fallback = entries
+                .Where(e => (isAlliance && e.AllianceFriendly) || (!isAlliance && e.HordeFriendly))
+                .Where(e => e.MinLevel <= effectiveSquadMinLevel)
+                .OrderByDescending(e => e.MaxLevel)
+                .FirstOrDefault();
+            return fallback.DungeonId;
+        }
+
+        public static (bool HasRandomPlayers, ulong EffectiveTankGuid) EvaluatePartyComposition(
+            ulong coordinatorGuid,
+            SquadRole coordinatorRole,
+            IReadOnlyCollection<ulong> squadBotGuids,
+            IReadOnlyList<(ulong Guid, bool IsTankRoleAssigned, bool IsAlive)> inGamePartyMembers)
+        {
+            bool hasRandom = false;
+            ulong assignedTankGuid = 0UL;
+
+            foreach (var pm in inGamePartyMembers)
+            {
+                if (pm.Guid == 0)
+                    continue;
+                if (!squadBotGuids.Contains(pm.Guid))
+                    hasRandom = true;
+                if (pm.IsTankRoleAssigned && pm.IsAlive && assignedTankGuid == 0UL)
+                    assignedTankGuid = pm.Guid;
+            }
+
+            if (assignedTankGuid != 0UL)
+                return (hasRandom, assignedTankGuid);
+
+            if (coordinatorRole == SquadRole.TankLeader && coordinatorGuid != 0UL)
+                return (hasRandom, coordinatorGuid);
+
+            return (hasRandom, coordinatorGuid);
+        }
+
+        public void RecordInstanceReset(long nowUtcMs)
+        {
+            PruneResetHistory(nowUtcMs);
+            _instanceResetTimestampsUtcMs.Add(nowUtcMs);
+            _instanceResetGeneration++;
+            _resetPendingOutside = false;
+        }
+
+        public void PruneResetHistory(long nowUtcMs)
+        {
+            const long OneHourMs = 3600_000L;
+            _instanceResetTimestampsUtcMs.RemoveAll(ts => nowUtcMs - ts >= OneHourMs);
+        }
+
+        public int GetHourlyResetCount(long nowUtcMs)
+        {
+            PruneResetHistory(nowUtcMs);
+            return _instanceResetTimestampsUtcMs.Count;
+        }
+
+        public int GetLockoutRemainingSeconds(long nowUtcMs, int maxInstancesPerHour)
+        {
+            PruneResetHistory(nowUtcMs);
+            int cap = Math.Max(1, maxInstancesPerHour);
+            if (_instanceResetTimestampsUtcMs.Count < cap)
+                return 0;
+
+            long oldest = _instanceResetTimestampsUtcMs.Min();
+            long unlockAt = oldest + 3600_000L;
+            long remMs = Math.Max(0L, unlockAt - nowUtcMs);
+            return (int)Math.Ceiling(remMs / 1000.0);
+        }
+
+        public bool IsResetPendingOutside => _resetPendingOutside;
+
+        public void MarkResetPendingOutside()
+        {
+            _resetPendingOutside = true;
+        }
+
+        public SquadDungeonSnapshot CaptureSnapshot(SquadSettings settings, IReadOnlyList<SquadConnectedMemberSnapshot> connected, int effectiveMinLevel, long nowUtcMs)
+        {
+            var me = StyxWoW.Me;
+            var botGuids = new HashSet<ulong>();
+            if (me != null && me.Guid != 0)
+                botGuids.Add(me.Guid);
+            foreach (var c in connected)
+            {
+                if (c.IsConnected && c.Handshake.Guid != 0)
+                    botGuids.Add(c.Handshake.Guid);
+                if (c.LatestState != null && c.LatestState.Guid != 0)
+                    botGuids.Add(c.LatestState.Guid);
+            }
+
+            var partyList = new List<(ulong Guid, bool IsTankRoleAssigned, bool IsAlive)>();
+            if (me != null)
+            {
+                bool meTankAssigned = (me.Role & WoWPartyMember.GroupRole.Tank) != 0;
+                partyList.Add((me.Guid, meTankAssigned, me.IsAlive));
+                foreach (var pm in me.GroupInfo.RaidMembers)
+                {
+                    if (pm.Guid == 0 || pm.Guid == me.Guid)
+                        continue;
+                    bool isTank = pm.HasRole(WoWPartyMember.GroupRole.Tank);
+                    var pObj = pm.ToPlayer();
+                    bool alive = pObj != null ? pObj.IsAlive : (!pm.Dead && !pm.Ghost);
+                    partyList.Add((pm.Guid, isTank, alive));
+                }
+            }
+
+            var (hasRandom, effectiveTankGuid) = EvaluatePartyComposition(
+                me?.Guid ?? 0UL,
+                settings.Role,
+                botGuids,
+                partyList);
+
+            bool inDungeon = IsInDungeonMap(me);
+            var currentDungeon = DungeonManager.CurrentDungeon;
+            uint activeId = currentDungeon?.DungeonId ?? LfgManager.CurrentLfgDungeonId;
+            if (activeId == 0 && settings.DungeonEntryMode == SquadDungeonEntryMode.WalkInPortalFarm ||
+                activeId == 0 && settings.DungeonEntryMode == SquadDungeonEntryMode.LfgSpecificByBracket)
+            {
+                activeId = ResolveTargetDungeonId(settings, effectiveMinLevel, me == null || !me.IsHorde);
+            }
+
+            WoWPoint portal = currentDungeon?.Entrance ?? (activeId > 0 ? DungeonManager.GetEntranceForDungeon(activeId) : WoWPoint.Zero);
+            WoWPoint exit = currentDungeon?.ExitLocation ?? WoWPoint.Zero;
+
+            var bosses = BossManager.Bosses;
+            var currentBoss = BossManager.CurrentBoss;
+            int totalBosses = bosses.Count(b => !b.IsOptional || settings.KillOptionalBosses);
+            int killedBosses = bosses.Count(b => b.IsDead && (!b.IsOptional || settings.KillOptionalBosses));
+            bool complete = inDungeon && (
+                LfgManager.DungeonCompletedReason != CompleteReason.None ||
+                (totalBosses > 0 && currentBoss == null));
+
+            uint portalMapId = 0;
+            if (activeId > 0)
+            {
+                try
+                {
+                    var dbc = LfgDungeons.GetById(activeId);
+                    if (dbc?.Map != null)
+                        portalMapId = (uint)Math.Max(0, dbc.Map.Id);
+                }
+                catch { }
+            }
+
+            return new SquadDungeonSnapshot
+            {
+                IsInsideDungeon = inDungeon,
+                ActiveDungeonId = activeId,
+                ActiveDungeonMapId = inDungeon && me != null ? me.MapId : portalMapId,
+                ActiveDungeonName = currentDungeon?.Name ?? string.Empty,
+                CurrentBossEntry = currentBoss?.Entry ?? 0U,
+                CurrentBossName = currentBoss?.Name ?? string.Empty,
+                KilledBossCount = killedBosses,
+                TotalBossCount = totalBosses,
+                IsDungeonComplete = complete,
+                LfgProposalPending = LfgManager.ProposalPending || SafeGetLfgMode() == "proposal",
+                LfgMode = SafeGetLfgMode(),
+                HasRandomPartyMembers = hasRandom,
+                EffectiveTankGuid = effectiveTankGuid,
+                PortalX = portal.X,
+                PortalY = portal.Y,
+                PortalZ = portal.Z,
+                PortalMapId = me != null && !inDungeon ? me.MapId : 0U,
+                ExitX = exit.X,
+                ExitY = exit.Y,
+                ExitZ = exit.Z
+            };
+        }
+
+        public static void ApplySquadLfgRole(SquadRole role, bool isCoordinator)
+        {
+            bool tank = role == SquadRole.TankLeader;
+            bool healer = role == SquadRole.Healer;
+            bool dps = !tank && !healer;
+            string leaderFlag = isCoordinator ? "true" : "false";
+            Lua.DoString($"SetLFGRoles({leaderFlag},{(tank ? "true" : "false")},{(healer ? "true" : "false")},{(dps ? "true" : "false")})");
+        }
+
+        public bool RunQueueingOrEntryTick(SquadSettings settings, SquadLeaderState? leader, long nowUtcMs)
+        {
+            var me = StyxWoW.Me;
+            if (me == null || me.Dead || me.IsGhost)
+                return false;
+
+            if (LfgManager.RoleCheckPending || SafeGetLfgMode() == "rolecheck")
+            {
+                ApplySquadLfgRole(settings.Role, settings.IsCoordinator);
+                Lua.DoString("if LFDRoleCheckPopupAcceptButton and LFDRoleCheckPopupAcceptButton:IsVisible() then LFDRoleCheckPopupAcceptButton:Click() end; if StaticPopup1Button1 and StaticPopup1Button1:IsVisible() then StaticPopup1Button1:Click() end");
+                LfgManager.RoleCheckPending = false;
+                SquadPartySyncService.LogAction("Dungeon: confirmed LFG role check");
+                return true;
+            }
+
+            bool proposalActive = LfgManager.ProposalPending || SafeGetLfgMode() == "proposal";
+            bool shouldAccept = proposalActive && (settings.IsCoordinator || leader?.AcceptLfgProposalOrder == true || leader == null);
+            if (shouldAccept && nowUtcMs - _lastProposalAcceptUtcMs >= 1500L)
+            {
+                _lastProposalAcceptUtcMs = nowUtcMs;
+                LfgManager.AcceptProposal();
+                LfgManager.ProposalPending = false;
+                SquadPartySyncService.LogAction("Dungeon: accepting LFG proposal");
+                return true;
+            }
+
+            if (LfgManager.BootProposalActive)
+            {
+                LfgManager.BootProposalActive = false;
+                return true;
+            }
+
+            SquadDungeonEntryMode entryMode = leader?.DungeonEntryMode ?? settings.DungeonEntryMode;
+            if (entryMode == SquadDungeonEntryMode.WalkInPortalFarm)
+            {
+                return RunWalkInPortalEntryTick(settings, leader, nowUtcMs);
+            }
+
+            if (nowUtcMs - _lastRoleSetUtcMs >= 20000L)
+            {
+                _lastRoleSetUtcMs = nowUtcMs;
+                ApplySquadLfgRole(settings.Role, settings.IsCoordinator);
+            }
+
+            if (!settings.IsCoordinator)
+            {
+                if (me.IsMoving)
+                    WoWMovement.MoveStop();
+                SquadPartySyncService.LogAction("Dungeon: waiting for coordinator LFG queue");
+                return true;
+            }
+
+            string lfgMode = SafeGetLfgMode();
+            if (lfgMode == "queued" || lfgMode == "proposal" || lfgMode == "rolecheck" || lfgMode == "lfgparty")
+            {
+                if (me.IsMoving)
+                    WoWMovement.MoveStop();
+                SquadPartySyncService.LogAction("Dungeon: in LFG queue (" + lfgMode + ")");
+                return true;
+            }
+
+            if (HasDeserterOrRandomCooldown() ||
+                (leader?.Members != null && leader.Members.Any(m => m.IsConnected && (m.IsDead || m.IsGhost))))
+            {
+                return true;
+            }
+
+            string[] expected = settings.GetExpectedMemberNames();
+            if (!settings.AllowPartialSquadLfg && expected.Length > 1)
+            {
+                int inPartyCount = 1 + me.PartyMemberInfos.Count;
+                if (inPartyCount < expected.Length)
+                {
+                    SquadPartySyncService.LogAction("Dungeon: waiting for full party before LFG queue");
+                    return true;
+                }
+            }
+            else if (expected.Length > 1 && leader?.Members != null)
+            {
+                int connectedBots = leader.Members.Count(m => m.IsConnected);
+                int inPartyBots = 1 + me.PartyMemberInfos.Count(pm =>
+                    leader.Members.Any(m => m.IsConnected && m.Guid == pm.Guid));
+                if (inPartyBots < connectedBots)
+                {
+                    SquadPartySyncService.LogAction("Dungeon: waiting for connected squadmates to join party");
+                    return true;
+                }
+            }
+
+            if (nowUtcMs - _lastQueueAttemptUtcMs < 4000L)
+                return true;
+
+            _lastQueueAttemptUtcMs = nowUtcMs;
+            ApplySquadLfgRole(settings.Role, isCoordinator: true);
+
+            switch (entryMode)
+            {
+                case SquadDungeonEntryMode.LfgRandomHeroic:
+                    LfgManager.QueueForRandomHeroic();
+                    SquadPartySyncService.LogAction("Dungeon: queued Random Heroic");
+                    break;
+
+                case SquadDungeonEntryMode.LfgSpecificByBracket:
+                {
+                    int minLvl = leader?.EffectiveSquadMinLevel > 0 ? leader.EffectiveSquadMinLevel : me.Level;
+                    uint targetId = ResolveTargetDungeonId(settings, minLvl, !me.IsHorde);
+                    if (targetId > 0)
+                    {
+                        LfgManager.QueueForSpecificDungeon(targetId);
+                        SquadPartySyncService.LogAction($"Dungeon: queued specific ID {targetId}");
+                    }
+                    else
+                    {
+                        LfgManager.QueueForRandomDungeon();
+                        SquadPartySyncService.LogAction("Dungeon: queued Random Normal (fallback)");
+                    }
+                    break;
+                }
+
+                case SquadDungeonEntryMode.LfgRandomNormal:
+                default:
+                    QueueRandomDungeonForSquadLevel(leader?.EffectiveSquadMinLevel > 0 ? leader.EffectiveSquadMinLevel : me.Level);
+                    SquadPartySyncService.LogAction("Dungeon: queued Random Normal");
+                    break;
+            }
+
+            return true;
+        }
+
+        private static void QueueRandomDungeonForSquadLevel(int squadMinLevel)
+        {
+            LfgDungeons? chosen = null;
+            foreach (var kv in LfgDungeons.All)
+            {
+                var d = kv.Value;
+                if (!d.IsValid || !d.IsRandomDungeon || d.Difficulty != 0U)
+                    continue;
+                if (squadMinLevel >= d.MinLevel && squadMinLevel <= d.MaxLevel)
+                {
+                    chosen = d;
+                    break;
+                }
+            }
+
+            if (chosen != null)
+            {
+                Lua.DoString($"ClearAllLFGDungeons(); SetLFGDungeon({chosen.Id}); JoinLFG();");
+            }
+            else
+            {
+                LfgManager.QueueForRandomDungeon();
+            }
+        }
+
+        private bool RunWalkInPortalEntryTick(SquadSettings settings, SquadLeaderState? leader, long nowUtcMs)
+        {
+            var me = StyxWoW.Me!;
+            if (IsInDungeonMap(me))
+                return false;
+
+            if (settings.IsCoordinator && _resetPendingOutside)
+            {
+                bool allOutside = leader?.Members == null || leader.Members
+                    .Where(m => m.IsConnected)
+                    .All(m => m.MapId == me.MapId);
+                if (!allOutside)
+                {
+                    if (me.IsMoving)
+                        WoWMovement.MoveStop();
+                    SquadPartySyncService.LogAction("Dungeon: waiting for all members outside before ResetInstances");
+                    return true;
+                }
+
+                int remLockout = GetLockoutRemainingSeconds(nowUtcMs, settings.MaxInstancesPerHour);
+                if (remLockout > 0)
+                {
+                    if (me.IsMoving)
+                        WoWMovement.MoveStop();
+                    SquadPartySyncService.LogAction($"Dungeon: hourly instance cap reached ({remLockout}s remaining)");
+                    return true;
+                }
+
+                Logging.Write("[PartyGrind Dungeon] Resetting instances for next walk-in run.");
+                Lua.DoString("ResetInstances();");
+                RecordInstanceReset(nowUtcMs);
+                return true;
+            }
+
+            uint targetId = leader?.ActiveDungeonId > 0
+                ? leader.ActiveDungeonId
+                : ResolveTargetDungeonId(settings, SquadContext.GetEffectiveProfileLevel(), !me.IsHorde);
+
+            WoWPoint portal = leader != null && (leader.DungeonPortalX != 0f || leader.DungeonPortalY != 0f)
+                ? new WoWPoint(leader.DungeonPortalX, leader.DungeonPortalY, leader.DungeonPortalZ)
+                : (DungeonManager.CurrentDungeon?.Entrance ?? (targetId > 0 ? DungeonManager.GetEntranceForDungeon(targetId) : WoWPoint.Zero));
+
+            if (portal == WoWPoint.Zero)
+                return false;
+
+            float dist = me.Location.Distance(portal);
+            if (dist > 14f)
+            {
+                SquadPartySyncService.LogAction("Dungeon: moving to entrance portal");
+                Navigator.MoveTo(portal, "Moving to dungeon portal");
+                return true;
+            }
+
+            if (me.Mounted)
+            {
+                Mount.Dismount("Entering dungeon portal");
+                return true;
+            }
+
+            if (!settings.IsCoordinator && leader != null)
+            {
+                var local = SquadContext.GetLocalMemberStateSnapshot();
+                if (local != null && local.ObservedResetGeneration < leader.InstanceResetGeneration)
+                {
+                    if (me.IsMoving)
+                        WoWMovement.MoveStop();
+                    return true;
+                }
+            }
+
+            if (settings.IsCoordinator && leader?.Members != null)
+            {
+                bool squadGathered = leader.Members
+                    .Where(m => m.IsConnected && !m.IsDead && !m.IsGhost)
+                    .All(m => m.MapId != me.MapId || new WoWPoint(m.X, m.Y, m.Z).Distance(portal) <= 18f);
+                if (!squadGathered)
+                {
+                    if (me.IsMoving)
+                        WoWMovement.MoveStop();
+                    SquadPartySyncService.LogAction("Dungeon: waiting at portal for squadmates");
+                    return true;
+                }
+            }
+
+            SquadPartySyncService.LogAction("Dungeon: stepping through portal");
+            WoWMovement.ClickToMove(portal);
+            return true;
+        }
+
+        public bool RunCompleteExitTick(SquadSettings settings, SquadLeaderState? leader, long nowUtcMs)
+        {
+            var me = StyxWoW.Me;
+            if (me == null)
+                return false;
+
+            if (!IsInDungeonMap(me))
+                return false;
+
+            SquadDungeonEntryMode entryMode = leader?.DungeonEntryMode ?? settings.DungeonEntryMode;
+            if (entryMode != SquadDungeonEntryMode.WalkInPortalFarm)
+            {
+                if (nowUtcMs - _lastTeleportOutUtcMs >= 3500L)
+                {
+                    _lastTeleportOutUtcMs = nowUtcMs;
+                    bool leaveParty = leader?.HasRandomPartyMembers == true && settings.ExpectedMemberNamesCsv.Trim().Length == 0;
+                    Lua.DoString(leaveParty ? "LeaveParty(); LFGTeleport(true);" : "LFGTeleport(true);");
+                    LfgManager.DungeonCompletedReason = CompleteReason.None;
+                    SquadPartySyncService.LogAction("Dungeon: teleporting out of completed LFG instance");
+                }
+                return true;
+            }
+
+            WoWPoint exit = DungeonManager.CurrentDungeon?.ExitLocation ??
+                (leader != null && (leader.DungeonExitX != 0f || leader.DungeonExitY != 0f)
+                    ? new WoWPoint(leader.DungeonExitX, leader.DungeonExitY, leader.DungeonExitZ)
+                    : WoWPoint.Zero);
+
+            if (exit != WoWPoint.Zero)
+            {
+                SquadPartySyncService.LogAction("Dungeon: walking to exit portal");
+                if (me.Location.Distance(exit) > 5f)
+                    Navigator.MoveTo(exit, "Exiting completed dungeon");
+                else
+                    WoWMovement.ClickToMove(exit);
+                return true;
+            }
+
+            return false;
+        }
+
+        public bool TryRunAvoidanceStep()
+        {
+            var me = StyxWoW.Me;
+            if (me == null || !IsInDungeonMap(me))
+                return false;
+
+            if (!AvoidanceManager.IsInAvoidance(me.Location))
+                return false;
+
+            WoWPoint safe = AvoidanceManager.GetSafePoint(me.Location);
+            if (safe == WoWPoint.Zero)
+                return false;
+
+            SquadPartySyncService.LogAction("Dungeon: moving out of ground hazard");
+            Navigator.MoveTo(safe, "Avoiding dungeon hazard");
+            return true;
+        }
+
+        public bool TryRunDungeonScriptBehaviors()
+        {
+            var me = StyxWoW.Me;
+            if (me == null || DungeonManager.CurrentDungeon == null || !IsInDungeonMap(me))
+                return false;
+
+            var scriptBehavior = DungeonManager.CurrentDungeonBehavior;
+            if (scriptBehavior != null)
+            {
+                if (!scriptBehavior.IsRunning)
+                    scriptBehavior.Start(null);
+                RunStatus scriptStatus = scriptBehavior.Tick(null);
+                if (scriptStatus == RunStatus.Running || scriptStatus == RunStatus.Success)
+                {
+                    if (scriptStatus != RunStatus.Running)
+                        scriptBehavior.Stop(null);
+                    return true;
+                }
+            }
+
+            WoWUnit? target = me.CurrentTarget;
+            if (me.Combat && target != null && target.IsValid && !target.Dead &&
+                BossManager.Bosses.Any(b => b.EntryId == target.Entry))
+            {
+                if (target.Entry != _activeEncounterBossEntry)
+                {
+                    StopActiveEncounter();
+                    _activeEncounterBossEntry = target.Entry;
+                    _activeEncounterBehavior = DungeonManager.GetEncounterBehavior((int)target.Entry);
+                    _activeEncounterBehavior?.Start(target);
+                }
+
+                if (_activeEncounterBehavior != null)
+                {
+                    RunStatus encStatus = _activeEncounterBehavior.Tick(target);
+                    if (encStatus != RunStatus.Running)
+                        StopActiveEncounter();
+                    if (encStatus == RunStatus.Running || encStatus == RunStatus.Success)
+                        return true;
+                }
+            }
+
+            return false;
+        }
+
+        public WoWPoint ComputeLeaderNextDungeonPoint()
+        {
+            var me = StyxWoW.Me;
+            if (me == null)
+                return WoWPoint.Zero;
+
+            if (BotPoi.Current.Type == PoiType.Hotspot && BotPoi.Current.Location != WoWPoint.Zero)
+            {
+                WoWPoint hs = BotPoi.Current.Location;
+                if (me.Location.DistanceSqr(hs) <= 16f)
+                    BotPoi.Clear("Reached dungeon hotspot");
+                else
+                    return hs;
+            }
+
+            var profile = DbProfileManager.CurrentProfile;
+            if (profile != null && profile.BossEncounters.Count > 0)
+            {
+                var currentBoss = BossManager.CurrentBoss;
+                var liveBoss = ObjectManager.GetObjectsOfType<WoWUnit>()
+                    .Where(u => u != null && u.IsValid && u.IsAlive &&
+                                profile.BossEncounters.Any(b => b.Entry == u.Entry &&
+                                    (!b.Optional || BossManager.KillOptionalBossesEnabled) &&
+                                    (currentBoss == null || b.Entry == currentBoss.Entry || b.KillOrder <=
+                                     (profile.BossEncounters.FirstOrDefault(pb => pb.Entry == currentBoss.Entry)?.KillOrder ?? int.MaxValue))))
+                    .Where(u => Navigator.PathDistance(me.Location, u.Location, 100f) is float pd && pd < 100f)
+                    .OrderBy(u => profile.BossEncounters.FirstOrDefault(b => b.Entry == u.Entry)?.KillOrder ?? int.MaxValue)
+                    .ThenBy(u => u.DistanceSqr)
+                    .FirstOrDefault();
+
+                if (liveBoss != null)
+                    return liveBoss.Location;
+
+                var profileBoss = currentBoss == null
+                    ? null
+                    : profile.BossEncounters.FirstOrDefault(b => b.Entry == currentBoss.Entry);
+
+                if (profileBoss != null && profileBoss.PathBreadCrumbs.Count > 0)
+                {
+                    WoWPoint crumb = profileBoss.PathBreadCrumbs.Peek();
+                    if (crumb != WoWPoint.Zero)
+                    {
+                        if (me.Location.DistanceSqr(crumb) < 25f && profileBoss.PathBreadCrumbs.Count > 1)
+                        {
+                            profileBoss.PathBreadCrumbs.Dequeue();
+                            crumb = profileBoss.PathBreadCrumbs.Peek();
+                        }
+                        return crumb;
+                    }
+                    return profileBoss.Location;
+                }
+
+                if (profileBoss != null && profileBoss.Location != WoWPoint.Zero)
+                    return profileBoss.Location;
+
+                if (profile.HotSpots.Count > 0)
+                {
+                    WoWPoint nearestHs = profile.HotSpots
+                        .OrderBy(h => me.Location.DistanceSqr(h))
+                        .FirstOrDefault();
+                    return nearestHs;
+                }
+            }
+
+            return WoWPoint.Zero;
+        }
+
+        public static bool IsBossPrePullBarrierBlocking(
+            SquadSettings settings,
+            SquadLeaderState? leader,
+            float distanceToBoss)
+        {
+            if (leader == null || distanceToBoss > 35f || leader.InCombat)
+                return false;
+
+            if (leader.Members == null || leader.Members.Count == 0)
+                return false;
+
+            var leaderPos = new WoWPoint(leader.X, leader.Y, leader.Z);
+            foreach (var m in leader.Members)
+            {
+                if (!m.IsConnected)
+                    continue;
+                if (m.IsDead || m.IsGhost || m.NeedsRest || m.MapId != leader.MapId)
+                    return true;
+                if (leaderPos.Distance(new WoWPoint(m.X, m.Y, m.Z)) > Math.Min(25f, settings.MaxPullGatherDistance))
+                    return true;
+                if ((m.Role == SquadRole.Healer || m.Role == SquadRole.HybridOffHeal) &&
+                    m.PowerType == WoWPowerType.Mana &&
+                    m.PowerPercent < Math.Max(45, settings.TriggerRestManaPct + 15))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        public WoWPoint GetGhostDungeonEntranceTarget()
+        {
+            var current = DungeonManager.CurrentDungeon;
+            if (current != null)
+            {
+                var portal = ObjectManager.GetObjectsOfType<WoWGameObject>()
+                    .FirstOrDefault(o => o != null && o.IsValid && (o.Entry == 192507U || o.Entry == 207896U));
+                if (portal != null)
+                    return portal.Location;
+                if (current.Entrance != WoWPoint.Zero)
+                    return current.Entrance;
+            }
+
+            var leader = SquadContext.GetLeaderStateSnapshot();
+            if (leader != null && (leader.DungeonPortalX != 0f || leader.DungeonPortalY != 0f))
+                return new WoWPoint(leader.DungeonPortalX, leader.DungeonPortalY, leader.DungeonPortalZ);
+
+            return WoWPoint.Zero;
+        }
+    }
+}

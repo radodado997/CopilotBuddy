@@ -72,9 +72,14 @@ namespace Bots.DungeonBuddy
         /// Matches HB smethod_9: IsAlive check + Optional/KillOptionalBosses guard.
         /// (Faction guard omitted — inner Boss has no Faction field; all registered bosses default to Both.)
         /// </summary>
+        public static bool KillOptionalBossesEnabled =>
+            Styx.PartyGrind.SquadContext.IsDungeonModeActive
+                ? Styx.PartyGrind.SquadContext.ActiveKillOptionalBosses
+                : DungeonBuddySettings.Instance.KillOptionalBosses;
+
         public static Boss? CurrentBoss =>
             _bosses
-                .Where(b => !b.IsDead && (!b.IsOptional || DungeonBuddySettings.Instance.KillOptionalBosses))
+                .Where(b => !b.IsDead && (!b.IsOptional || KillOptionalBossesEnabled))
                 .FirstOrDefault();
 
         /// <summary>

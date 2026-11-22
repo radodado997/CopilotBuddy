@@ -40,6 +40,7 @@ namespace CopilotBuddy.Bots.PartyGrind
         private readonly SquadCoordinatorService _coordinator = new SquadCoordinatorService();
         private readonly SquadProvisioningService _provisioning = new SquadProvisioningService();
         private readonly SquadTownRunService _townRun = new SquadTownRunService();
+        private readonly SquadDungeonService _dungeon = new SquadDungeonService();
         private readonly SquadPartySyncService _partySync;
 
         private SquadIpcServer? _ipcServer;
@@ -144,9 +145,10 @@ namespace CopilotBuddy.Bots.PartyGrind
         public override string Name => "Party Grind";
 
         public override bool RequiresProfile =>
-            SquadSettings.Instance.IsCoordinator ||
-            !SquadSettings.Instance.AutoLoadCoordinatorProfile ||
-            ProfileManager.CurrentOuterProfile != null;
+            SquadSettings.Instance.BotMode != SquadBotMode.Dungeon &&
+            (SquadSettings.Instance.IsCoordinator ||
+             !SquadSettings.Instance.AutoLoadCoordinatorProfile ||
+             ProfileManager.CurrentOuterProfile != null);
 
         public override PulseFlags PulseFlags => PulseFlags.All;
 
@@ -213,12 +215,13 @@ namespace CopilotBuddy.Bots.PartyGrind
 
                 StartIpc(settings);
                 if (!SquadContext.IsActive) return;
+                _dungeon.InitializeRuntime(settings);
                 if (ProfileManager.CurrentOuterProfile != null)
                     ProfileManager.RefreshProfileForLevel();
                 SquadOverlay.Attach();
 
-                Logging.Write("[PartyGrind] Started as {0} (Coordinator={1}, Team={2}, Port={3}).",
-                    settings.Role, settings.IsCoordinator, settings.TeamId, settings.IpcPort);
+                Logging.Write("[PartyGrind] Started as {0} (Mode={1}, Coordinator={2}, Team={3}, Port={4}).",
+                    settings.Role, settings.BotMode, settings.IsCoordinator, settings.TeamId, settings.IpcPort);
             }
             catch
             {
@@ -251,6 +254,7 @@ namespace CopilotBuddy.Bots.PartyGrind
             Cleanup(() => { StopRoutine(ref _activeCombatRoutine); });
             Cleanup(() => { StopRoutine(ref _activeRestRoutine); });
             Cleanup(() => { SquadHealBridge.StopActiveHealBehavior(); });
+            Cleanup(() => { _dungeon.ShutdownRuntime(); });
             Cleanup(() => { ClearPullCommit(); });
             Cleanup(() => { ResetBacklineState(); });
             Cleanup(() => { _provisioning.Stop(); });
@@ -356,6 +360,8 @@ namespace CopilotBuddy.Bots.PartyGrind
 
             SquadSettings settings = SquadContext.ActiveSettings ?? SquadSettings.Instance;
             long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+            _dungeon.PulseEnvironment(settings, SquadContext.GetLeaderStateSnapshot(), now);
 
             SquadMemberState localState = CaptureLocalMemberState(settings, now);
             SquadContext.UpdateLocalMemberState(localState);
@@ -521,6 +527,11 @@ namespace CopilotBuddy.Bots.PartyGrind
             _partySync.PulseCoordinatorPartySync(settings, snapshots);
 
             SquadProfileSnapshot profileSnap = CaptureProfileSnapshot(now);
+            SquadDungeonSnapshot? dungeonSnap = settings.BotMode == SquadBotMode.Dungeon
+                ? _dungeon.CaptureSnapshot(settings, snapshots, _lastAppliedEffectiveLevel, now)
+                : null;
+            int hourlyResets = settings.BotMode == SquadBotMode.Dungeon ? _dungeon.GetHourlyResetCount(now) : 0;
+            int lockoutRem = settings.BotMode == SquadBotMode.Dungeon ? _dungeon.GetLockoutRemainingSeconds(now, settings.MaxInstancesPerHour) : 0;
 
             SquadLeaderState leaderState = _coordinator.EvaluateTick(
                 settings,
@@ -539,9 +550,15 @@ namespace CopilotBuddy.Bots.PartyGrind
                     {
                         _lastAppliedEffectiveLevel = level;
                         if (ProfileManager.CurrentOuterProfile != null) ProfileManager.RefreshProfileForLevel();
+                        if (settings.BotMode == SquadBotMode.Dungeon)
+                            dungeonSnap = _dungeon.CaptureSnapshot(settings, snapshots, level, now);
                     }
                     return CaptureProfileSnapshot(now);
-                });
+                },
+                dungeon: dungeonSnap,
+                instanceResetGeneration: _dungeon.InstanceResetGeneration,
+                hourlyInstancesRunCount: hourlyResets,
+                lockoutRemainingSeconds: lockoutRem);
 
             UpdateCoordinatorTargets(now, leaderState);
             leaderState.FocusTargetGuid = _currentFocusGuid;
@@ -591,7 +608,9 @@ namespace CopilotBuddy.Bots.PartyGrind
                 if (leaderState.EffectiveSquadMinLevel > 0 && leaderState.EffectiveSquadMinLevel != _lastAppliedEffectiveLevel)
                     Logging.WriteDebug("[PartyGrind Level] Received minimum {0} -> {1} from={2} lowest={3} subProfile={4}",
                         _lastAppliedEffectiveLevel, leaderState.EffectiveSquadMinLevel, leaderState.LeaderName, leaderState.LowestMemberName, leaderState.ActiveSubProfileName);
-                if (settings.AutoLoadCoordinatorProfile && !EnsureLeaderProfile(leaderState))
+                if (leaderState.BotMode != SquadBotMode.Dungeon &&
+                    settings.AutoLoadCoordinatorProfile &&
+                    !EnsureLeaderProfile(leaderState))
                 {
                     SquadContext.UpdateLeaderState(null);
                 }
@@ -705,6 +724,23 @@ namespace CopilotBuddy.Bots.PartyGrind
             if (_pullCommittedGuid != 0 && IsPullCommitReleased(now))
                 ClearPullCommit();
 
+            if (decision.BotMode == SquadBotMode.Dungeon &&
+                decision.HasRandomPartyMembers &&
+                decision.EffectiveTankGuid != 0 &&
+                decision.EffectiveTankGuid != me.Guid)
+            {
+                var pugTank = ObjectManager.GetObjectByGuid<WoWPlayer>(decision.EffectiveTankGuid);
+                if (pugTank != null && pugTank.IsValid && pugTank.Combat && pugTank.CurrentTarget != null &&
+                    !pugTank.CurrentTarget.Dead && !pugTank.CurrentTarget.IsFriendly)
+                {
+                    if (_currentFocusGuid != pugTank.CurrentTargetGuid)
+                        _pullStartedUtcMs = now;
+                    _currentFocusGuid = pugTank.CurrentTargetGuid;
+                    _currentSecondaryGuid = 0UL;
+                    return;
+                }
+            }
+
             WoWUnit? focus = me.CurrentTarget;
             if (focus == null || !focus.IsValid || focus.Dead || focus.IsFriendly)
             {
@@ -726,7 +762,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                 resolvedFocusGuid,
                 focusIdle,
                 localCannotPull,
-                decision.Phase == SquadPhase.Grinding,
+                decision.Phase == SquadPhase.Grinding || decision.Phase == SquadPhase.DungeonClearing,
                 _coordinator.IsWaitingForFollowerDebounced,
                 canInitiatePull,
                 _pullCommittedGuid,
@@ -1070,7 +1106,16 @@ namespace CopilotBuddy.Bots.PartyGrind
                 TownRunRequestedUtcMs = _townRunRequestUtcMs,
                 LoadedProfileHash = _cachedProfileHash,
                 ActiveSubProfileMinLevel = currentSub?.MinLevel ?? 1,
-                ActiveSubProfileMaxLevel = currentSub?.MaxLevel ?? 85
+                ActiveSubProfileMaxLevel = currentSub?.MaxLevel ?? 85,
+                IsInsideDungeon = SquadDungeonService.IsInDungeonMap(me),
+                CurrentLfgDungeonId = SquadContext.IsDungeonModeActive ? Bots.DungeonBuddy.LfgManager.CurrentLfgDungeonId : 0U,
+                LfgMode = SquadContext.IsDungeonModeActive ? SquadDungeonService.SafeGetLfgMode() : string.Empty,
+                LfgRoleCheckPending = SquadContext.IsDungeonModeActive && Bots.DungeonBuddy.LfgManager.RoleCheckPending,
+                LfgProposalPending = SquadContext.IsDungeonModeActive && Bots.DungeonBuddy.LfgManager.ProposalPending,
+                HasDungeonDeserter = SquadContext.IsDungeonModeActive && SquadDungeonService.HasDeserterOrRandomCooldown(),
+                ObservedResetGeneration = !SquadDungeonService.IsInDungeonMap(me)
+                    ? (leader?.InstanceResetGeneration ?? _dungeon.InstanceResetGeneration)
+                    : (SquadContext.GetLocalMemberStateSnapshot()?.ObservedResetGeneration ?? 0)
             };
         }
 
@@ -1112,6 +1157,50 @@ namespace CopilotBuddy.Bots.PartyGrind
                         _townTasksCompleteLocal = false;
                         return RunStatus.Failure;
                     })
+                ),
+
+                new Decorator(
+                    ctx => SquadContext.IsDungeonModeActive && _dungeon.TryRunAvoidanceStep(),
+                    new Action(ctx => RunStatus.Success)
+                ),
+
+                new Decorator(
+                    ctx => SquadContext.IsDungeonModeActive &&
+                           (SquadContext.GetLeaderStateSnapshot()?.Phase == SquadPhase.DungeonCompleteExit ||
+                            SquadContext.GetLeaderStateSnapshot()?.TeleportOutOrder == true) &&
+                           StyxWoW.Me?.Combat != true,
+                    new Action(ctx => _dungeon.RunCompleteExitTick(
+                        SquadContext.ActiveSettings ?? SquadSettings.Instance,
+                        SquadContext.GetLeaderStateSnapshot(),
+                        DateTimeOffset.UtcNow.ToUnixTimeMilliseconds())
+                        ? RunStatus.Success
+                        : RunStatus.Failure)
+                ),
+
+                new Decorator(
+                    ctx => SquadContext.IsDungeonModeActive &&
+                           !SquadDungeonService.IsInDungeonMap(StyxWoW.Me) &&
+                           StyxWoW.Me?.Combat != true &&
+                           (SquadContext.GetLeaderStateSnapshot() == null ||
+                            SquadContext.GetLeaderStateSnapshot()!.Phase == SquadPhase.DungeonQueueing ||
+                            SquadContext.GetLeaderStateSnapshot()!.Phase == SquadPhase.DungeonTravelToPortal ||
+                            SquadContext.GetLeaderStateSnapshot()!.Phase == SquadPhase.DungeonLockoutWait ||
+                            SquadContext.GetLeaderStateSnapshot()!.AcceptLfgProposalOrder),
+                    new Action(ctx => _dungeon.RunQueueingOrEntryTick(
+                        SquadContext.ActiveSettings ?? SquadSettings.Instance,
+                        SquadContext.GetLeaderStateSnapshot(),
+                        DateTimeOffset.UtcNow.ToUnixTimeMilliseconds())
+                        ? RunStatus.Success
+                        : RunStatus.Failure)
+                ),
+
+                new Decorator(
+                    ctx => SquadContext.IsDungeonModeActive &&
+                           SquadDungeonService.IsInDungeonMap(StyxWoW.Me) &&
+                           !(SquadSettings.Instance.Role == SquadRole.Healer &&
+                             SquadHealBridge.HasHealCandidate(SquadContext.GetLeaderStateSnapshot())) &&
+                           _dungeon.TryRunDungeonScriptBehaviors(),
+                    new Action(ctx => RunStatus.Success)
                 ),
 
                 // 4. Combat & Role Bridges (Healing, Tank Peel/Combat, DPS Focus & Positioning)
@@ -1167,7 +1256,8 @@ namespace CopilotBuddy.Bots.PartyGrind
                 ),
 
                 new Decorator(
-                    ctx => SquadContext.GetLeaderStateSnapshot()?.Phase == SquadPhase.Grinding &&
+                    ctx => (SquadContext.GetLeaderStateSnapshot()?.Phase == SquadPhase.Grinding ||
+                            SquadContext.GetLeaderStateSnapshot()?.Phase == SquadPhase.DungeonClearing) &&
                         _provisioning.TryUseSoulwellWhileGrinding(SquadContext.ActiveSettings ?? SquadSettings.Instance),
                     new Action(ctx => RunStatus.Success)
                 ),
@@ -1238,6 +1328,25 @@ namespace CopilotBuddy.Bots.PartyGrind
             }
 
             _deathStartedUtcMs = 0;
+            if (SquadContext.IsDungeonModeActive)
+            {
+                if (SquadDungeonService.IsInDungeonMap(me))
+                {
+                    return RunStatus.Success;
+                }
+
+                WoWPoint dungeonEntrance = _dungeon.GetGhostDungeonEntranceTarget();
+                if (dungeonEntrance != WoWPoint.Zero)
+                {
+                    SquadPartySyncService.LogAction("Dungeon ghost run: moving to entrance portal");
+                    if (me.Location.Distance(dungeonEntrance) > 6f)
+                        Navigator.MoveTo(dungeonEntrance, "Dungeon CorpseRun: returning to portal");
+                    else
+                        WoWMovement.ClickToMove(dungeonEntrance);
+                    return RunStatus.Success;
+                }
+            }
+
             WoWPoint corpsePoint = me.CorpsePoint;
             WoWPoint targetPoint = corpsePoint;
             if (leader != null && leader.SquadCorpseRallyX != 0 && leader.SquadCorpseRallyY != 0)
@@ -1417,15 +1526,18 @@ namespace CopilotBuddy.Bots.PartyGrind
                     WoWPetControl.Attack(focus);
                 }
 
-                // Non-overlapping flank / standoff positioning
                 var (slotIdx, slotCount) = SquadFormationService.ResolveSubRoleSlot(me.Name ?? string.Empty, settings.Role, leader);
                 if (isMelee)
                 {
-                    if (focus.Distance <= 12f)
+                    bool canFlank = !SquadContext.IsDungeonModeActive || Bots.DungeonBuddy.Helpers.ScriptHelpers.MovementEnabled;
+                    if (canFlank && focus.Distance <= 12f)
                     {
                         WoWPoint flankPos = SquadFormationService.ComputeMeleeFlankPosition(
                             focus.Location, focus.Rotation, settings.MeleeFlankRadius, slotIdx, slotCount);
-                        if (me.Location.Distance2D(flankPos) > 1.8f && focus.Distance > 4.5f)
+                        bool safeFlank = !SquadContext.IsDungeonModeActive ||
+                                         (!Bots.DungeonBuddy.Avoidance.AvoidanceManager.IsInAvoidance(flankPos) &&
+                                          Navigator.CanNavigateFully(me.Location, flankPos));
+                        if (safeFlank && me.Location.Distance2D(flankPos) > 1.8f && focus.Distance > 4.5f)
                         {
                             SquadPartySyncService.LogAction("Moving to flank " + focus.Name);
                             Navigator.MoveTo(flankPos, "Flanking " + focus.Name);
@@ -1448,6 +1560,9 @@ namespace CopilotBuddy.Bots.PartyGrind
         private bool PositionBackline(float standoffDistance, SquadLeaderState? leader, LocalPlayer me, WoWUnit? selectedTarget = null)
         {
             if (leader == null || leader.MapId != me.MapId || leader.IsDead || leader.IsGhost)
+                return false;
+
+            if (SquadContext.IsDungeonModeActive && !Bots.DungeonBuddy.Helpers.ScriptHelpers.MovementEnabled)
                 return false;
 
             if (me.IsCasting || me.ChanneledCastingSpellId != 0)
@@ -1502,8 +1617,16 @@ namespace CopilotBuddy.Bots.PartyGrind
             else
             {
                 var (slotIdx, slotCount) = SquadFormationService.ResolveSubRoleSlot(me.Name ?? string.Empty, settings.Role, leader);
-                slotPos = SquadFormationService.ComputeStandoffPosition(
-                    tankPos, leader.Facing, focusPos, standoffDistance, slotIdx, slotCount);
+                if (SquadContext.IsDungeonModeActive && SquadDungeonService.IsInDungeonMap(me))
+                {
+                    slotPos = SquadFormationService.ComputeDungeonStandoffPosition(
+                        tankPos, leader.Facing, focusPos, leader.Breadcrumbs, leader.MapId, standoffDistance, slotIdx, slotCount);
+                }
+                else
+                {
+                    slotPos = SquadFormationService.ComputeStandoffPosition(
+                        tankPos, leader.Facing, focusPos, standoffDistance, slotIdx, slotCount);
+                }
                 _latchedBacklinePos = slotPos;
                 _latchedBacklineTankPos = tankPos;
                 _latchedBacklineTargetGuid = latchGuid;
@@ -1653,7 +1776,10 @@ namespace CopilotBuddy.Bots.PartyGrind
                 return true;
 
             var leader = SquadContext.GetLeaderStateSnapshot();
-            if (leader != null && leader.Phase != SquadPhase.Looting && leader.Phase != SquadPhase.Grinding)
+            if (leader != null &&
+                leader.Phase != SquadPhase.Looting &&
+                leader.Phase != SquadPhase.Grinding &&
+                leader.Phase != SquadPhase.DungeonClearing)
                 return false;
 
             return FindEligibleLoot() != null;
@@ -1664,11 +1790,30 @@ namespace CopilotBuddy.Bots.PartyGrind
         private static WoWObject? FindEligibleLoot()
         {
             var leader = SquadContext.GetLeaderStateSnapshot();
+            var settings = SquadContext.ActiveSettings ?? SquadSettings.Instance;
+            bool bossesOnly = SquadContext.IsDungeonModeActive &&
+                              SquadDungeonService.IsInDungeonMap(StyxWoW.Me) &&
+                              (leader?.DungeonLootMode ?? settings.DungeonLootMode) == SquadDungeonLootMode.BossesOnly;
             long now = Environment.TickCount64;
             foreach (var guid in LootRetry.Where(p => p.Value <= now).Select(p => p.Key).ToList())
                 LootRetry.Remove(guid);
-            return LootTargeting.Instance.LootingList.FirstOrDefault(o => o != null && o.IsValid && !LootRetry.ContainsKey(o.Guid) &&
-                (leader == null || o.Location.Distance(new WoWPoint(leader.X, leader.Y, leader.Z)) <= 25f));
+            return LootTargeting.Instance.LootingList.FirstOrDefault(o =>
+            {
+                if (o == null || !o.IsValid || LootRetry.ContainsKey(o.Guid))
+                    return false;
+                if (leader != null && o.Location.Distance(new WoWPoint(leader.X, leader.Y, leader.Z)) > 25f)
+                    return false;
+                if (!bossesOnly)
+                    return true;
+                if (o is WoWGameObject)
+                    return true;
+                if (o is WoWUnit unit)
+                {
+                    return Bots.DungeonBuddy.BossManager.Bosses.Any(b => b.EntryId == unit.Entry) ||
+                           Bots.DungeonBuddy.Profiles.ProfileManager.CurrentProfile?.BossEncounters.Any(b => b.Entry == unit.Entry) == true;
+                }
+                return false;
+            });
         }
 
         private static RunStatus RunLootBehavior()
@@ -1717,8 +1862,17 @@ namespace CopilotBuddy.Bots.PartyGrind
 
             var settings = SquadContext.ActiveSettings ?? SquadSettings.Instance;
             var leader = SquadContext.GetLeaderStateSnapshot();
+            bool isDungeon = SquadContext.IsDungeonModeActive && SquadDungeonService.IsInDungeonMap(me);
 
-            if (settings.IsCoordinator)
+            if (isDungeon && !Bots.DungeonBuddy.Helpers.ScriptHelpers.MovementEnabled)
+                return RunStatus.Success;
+
+            bool pugIsTank = isDungeon && leader != null &&
+                             leader.HasRandomPartyMembers &&
+                             leader.EffectiveTankGuid != 0 &&
+                             leader.EffectiveTankGuid != me.Guid;
+
+            if (settings.IsCoordinator && !pugIsTank)
             {
                 if (me.GotAlivePet)
                     WoWPetControl.Follow();
@@ -1763,6 +1917,47 @@ namespace CopilotBuddy.Bots.PartyGrind
                 {
                     SquadPartySyncService.LogAction("Waiting for squadmate");
                     if (me.IsMoving) WoWMovement.MoveStop();
+                    return RunStatus.Success;
+                }
+
+                if (isDungeon)
+                {
+                    var currentBossUnit = Bots.DungeonBuddy.BossManager.CurrentBoss?.ToWoWUnit();
+                    float distToBoss = currentBossUnit != null && currentBossUnit.IsValid
+                        ? me.Location.Distance(currentBossUnit.Location)
+                        : float.MaxValue;
+
+                    if (SquadDungeonService.IsBossPrePullBarrierBlocking(settings, leader, distToBoss))
+                    {
+                        SquadPartySyncService.LogAction("Dungeon: holding pre-boss readiness barrier");
+                        if (me.IsMoving)
+                            WoWMovement.MoveStop();
+                        return RunStatus.Success;
+                    }
+
+                    if (SquadTankBridge.CanInitiatePull(leader, settings.MaxPullGatherDistance))
+                    {
+                        WoWUnit? dungeonTarget = Targeting.Instance.FirstUnit;
+                        if (dungeonTarget != null && dungeonTarget.IsValid && !dungeonTarget.Dead &&
+                            dungeonTarget.Attackable && !dungeonTarget.IsFriendly)
+                        {
+                            _currentFocusGuid = dungeonTarget.Guid;
+                            BeginPullCommit(dungeonTarget.Guid, now);
+                            dungeonTarget.Target();
+                            return RunRoutineCombat(dungeonTarget.Guid);
+                        }
+                    }
+
+                    WoWPoint nextDungeonPt = _dungeon.ComputeLeaderNextDungeonPoint();
+                    if (nextDungeonPt != WoWPoint.Zero && me.Location.Distance(nextDungeonPt) > 4.5f)
+                    {
+                        SquadPartySyncService.LogAction("Dungeon: advancing toward " + (leader?.CurrentBossName ?? "next objective"));
+                        Navigator.MoveTo(nextDungeonPt, "Advancing through dungeon");
+                    }
+                    else if (me.IsMoving)
+                    {
+                        WoWMovement.MoveStop();
+                    }
                     return RunStatus.Success;
                 }
 
@@ -1821,12 +2016,35 @@ namespace CopilotBuddy.Bots.PartyGrind
                     WoWMovement.MoveStop();
                     return RunStatus.Success;
                 }
+
+                if (pugIsTank)
+                {
+                    var pugTank = ObjectManager.GetObjectByGuid<WoWPlayer>(leader.EffectiveTankGuid);
+                    if (pugTank != null && pugTank.IsValid && pugTank.IsAlive)
+                    {
+                        float dTank = me.Location.Distance(pugTank.Location);
+                        if (dTank > 10.0f)
+                        {
+                            SquadPartySyncService.LogAction("Dungeon: following LFG tank " + pugTank.Name);
+                            Navigator.MoveTo(pugTank.Location, "Following LFG tank " + pugTank.Name);
+                        }
+                        else if (me.IsMoving && dTank <= 5.5f)
+                        {
+                            WoWMovement.MoveStop();
+                        }
+                        return RunStatus.Success;
+                    }
+                }
+
                 if (leader.MapId != me.MapId)
                     return RunStatus.Success;
 
                 int slotIdx = SquadContext.GetMySlotIndex(me.Name, leader);
-                WoWPoint followPos = SquadFormationService.ComputeTravelFollowPosition(me.Location, leader, slotIdx, _travelProgress);
-                if (me.Location.Distance(followPos) > 4.0f)
+                WoWPoint followPos = isDungeon
+                    ? SquadFormationService.ComputeDungeonFollowPosition(me.Location, leader, slotIdx, _travelProgress)
+                    : SquadFormationService.ComputeTravelFollowPosition(me.Location, leader, slotIdx, _travelProgress);
+                float stopThreshold = isDungeon ? 2.5f : 4.0f;
+                if (me.Location.Distance(followPos) > stopThreshold)
                 {
                     SquadPartySyncService.LogAction("Following " + leader.LeaderName);
                     Navigator.MoveTo(followPos, "Following " + leader.LeaderName);

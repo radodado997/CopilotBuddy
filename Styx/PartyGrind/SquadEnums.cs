@@ -12,9 +12,26 @@ namespace Styx.PartyGrind
         HybridOffHeal = 4
     }
 
-    /// <summary>
-    /// Synchronized squad state machine phase broadcast by the Coordinator.
-    /// </summary>
+    public enum SquadBotMode
+    {
+        OpenWorldGrind = 0,
+        Dungeon = 1
+    }
+
+    public enum SquadDungeonEntryMode
+    {
+        LfgRandomNormal = 0,
+        LfgRandomHeroic = 1,
+        LfgSpecificByBracket = 2,
+        WalkInPortalFarm = 3
+    }
+
+    public enum SquadDungeonLootMode
+    {
+        BossesOnly = 0,
+        AllTrashAndBosses = 1
+    }
+
     public enum SquadPhase
     {
         Initializing = 0,
@@ -26,7 +43,12 @@ namespace Styx.PartyGrind
         TownRun = 6,
         WaitingResurrection = 7,
         CorpseRun = 8,
-        Paused = 9
+        Paused = 9,
+        DungeonQueueing = 10,
+        DungeonTravelToPortal = 11,
+        DungeonClearing = 12,
+        DungeonCompleteExit = 13,
+        DungeonLockoutWait = 14
     }
 
     /// <summary>

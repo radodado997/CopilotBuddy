@@ -51,8 +51,13 @@ namespace Styx.Helpers
         /// </summary>
         public static string? SquadRoster => GetJoinedValues("squadroster");
 
-        /// <summary>Optional explicit coordinator character name (-squadleader).</summary>
         public static string? SquadLeader => GetSingleValue("squadleader");
+
+        public static string? SquadBotMode => GetSingleValue("squadmode");
+
+        public static string? SquadDungeonEntry => GetSingleValue("dungeonentry");
+
+        public static string? SquadDungeonIds => GetJoinedValues("dungeonids");
 
         /// <summary>
         /// Parses an explicit process ID from raw command line args supporting both /pid= and -pid=.

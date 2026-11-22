@@ -29,6 +29,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Forms
         private void PopulateComboBoxes()
         {
             _isLoading = true;
+            CmbBotMode.ItemsSource = Enum.GetValues(typeof(SquadBotMode));
+            CmbDungeonEntryMode.ItemsSource = Enum.GetValues(typeof(SquadDungeonEntryMode));
+            CmbDungeonLootMode.ItemsSource = Enum.GetValues(typeof(SquadDungeonLootMode));
             CmbRole.ItemsSource = Enum.GetValues(typeof(SquadRole));
             CmbLevelAdvanceMode.ItemsSource = Enum.GetValues(typeof(SquadLevelAdvanceMode));
             CmbMountPolicy.ItemsSource = Enum.GetValues(typeof(SquadMountPolicy));
@@ -44,6 +47,14 @@ namespace CopilotBuddy.Bots.PartyGrind.Forms
             _isLoading = true;
             try
             {
+                CmbBotMode.SelectedItem = s.BotMode;
+                CmbDungeonEntryMode.SelectedItem = s.DungeonEntryMode;
+                TxtDungeonIds.Text = s.SelectedDungeonIdsCsv;
+                CmbDungeonLootMode.SelectedItem = s.DungeonLootMode;
+                ChkKillOptionalBosses.IsChecked = s.KillOptionalBosses;
+                ChkAllowPartialLfg.IsChecked = s.AllowPartialSquadLfg;
+                TxtMaxInstancesPerHour.Text = s.MaxInstancesPerHour.ToString(CultureInfo.InvariantCulture);
+
                 TxtTeamId.Text = s.TeamId;
                 TxtIpcPort.Text = s.IpcPort.ToString(CultureInfo.InvariantCulture);
                 CmbRole.SelectedItem = s.Role;
@@ -127,6 +138,17 @@ namespace CopilotBuddy.Bots.PartyGrind.Forms
             float hard = ParseFloat(TxtHardBacktrack.Text, s.HardBacktrackDistance, 20f, 250f);
             if (!(resume < soft && soft < hard))
                 throw new ArgumentException("Require Resume Distance < Soft Wait Distance < Hard Backtrack Distance.");
+            if (CmbBotMode.SelectedItem is SquadBotMode botMode)
+                s.BotMode = botMode;
+            if (CmbDungeonEntryMode.SelectedItem is SquadDungeonEntryMode entryMode)
+                s.DungeonEntryMode = entryMode;
+            s.SelectedDungeonIdsCsv = TxtDungeonIds.Text?.Trim() ?? string.Empty;
+            if (CmbDungeonLootMode.SelectedItem is SquadDungeonLootMode dLoot)
+                s.DungeonLootMode = dLoot;
+            s.KillOptionalBosses = ChkKillOptionalBosses.IsChecked == true;
+            s.AllowPartialSquadLfg = ChkAllowPartialLfg.IsChecked == true;
+            s.MaxInstancesPerHour = ParseInt(TxtMaxInstancesPerHour.Text, s.MaxInstancesPerHour, 1, 20);
+
             s.TeamId = string.IsNullOrWhiteSpace(TxtTeamId.Text) ? "Squad1" : TxtTeamId.Text.Trim();
             s.IpcPort = ParseInt(TxtIpcPort.Text, s.IpcPort, 1024, 65535);
             if (CmbRole.SelectedItem is SquadRole role)
@@ -219,6 +241,20 @@ namespace CopilotBuddy.Bots.PartyGrind.Forms
             }
         }
 
+        private void CmbBotMode_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (_isLoading)
+                return;
+            GenerateScriptPreview();
+        }
+
+        private void CmbDungeonEntryMode_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (_isLoading)
+                return;
+            GenerateScriptPreview();
+        }
+
         private void CmbClientCount_SelectionChanged(object sender, SelectionChangedEventArgs e)
         {
             if (_isLoading || CmbClientCount.SelectedItem is not int count)
@@ -290,10 +326,13 @@ namespace CopilotBuddy.Bots.PartyGrind.Forms
                 .Split(new[] { ',', ';', ' ' }, StringSplitOptions.RemoveEmptyEntries);
             string[] roles = (TxtScriptRoles.Text ?? "")
                 .Split(new[] { ',', ';', ' ' }, StringSplitOptions.RemoveEmptyEntries);
+            SquadBotMode botMode = CmbBotMode.SelectedItem is SquadBotMode bm ? bm : SquadBotMode.OpenWorldGrind;
+            SquadDungeonEntryMode entryMode = CmbDungeonEntryMode.SelectedItem is SquadDungeonEntryMode em ? em : SquadDungeonEntryMode.LfgRandomNormal;
+            string dungeonIds = TxtDungeonIds.Text?.Trim() ?? string.Empty;
 
             try
             {
-                TxtGeneratedScript.Text = BuildLauncherScript(count, teamId, port, profilePath, names, roles);
+                TxtGeneratedScript.Text = BuildLauncherScript(count, teamId, port, profilePath, names, roles, botMode, entryMode, dungeonIds);
                 return true;
             }
             catch (ArgumentException ex)
@@ -309,9 +348,20 @@ namespace CopilotBuddy.Bots.PartyGrind.Forms
             int port,
             string profilePath,
             IReadOnlyList<string> characterNames,
-            IReadOnlyList<string> roleNames)
+            IReadOnlyList<string> roleNames,
+            SquadBotMode botMode = SquadBotMode.OpenWorldGrind,
+            SquadDungeonEntryMode dungeonEntryMode = SquadDungeonEntryMode.LfgRandomNormal,
+            string? dungeonIdsCsv = null)
         {
-            foreach (var value in new[] { teamId, profilePath }.Concat(characterNames).Concat(roleNames))
+            var valuesToValidate = new List<string> { teamId };
+            if (botMode != SquadBotMode.Dungeon)
+                valuesToValidate.Add(profilePath);
+            if (!string.IsNullOrEmpty(dungeonIdsCsv))
+                valuesToValidate.Add(dungeonIdsCsv);
+            valuesToValidate.AddRange(characterNames);
+            valuesToValidate.AddRange(roleNames);
+
+            foreach (var value in valuesToValidate)
                 if (string.IsNullOrEmpty(value) || value.Any(c => char.IsControl(c) || "\"%!=&|<>^()".Contains(c)))
                     throw new ArgumentException("Launcher fields contain unsupported shell characters.");
             if (teamId.Any(char.IsWhiteSpace) || roleNames.Any(r => r.Any(char.IsWhiteSpace)))
@@ -350,7 +400,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Forms
             sb.AppendLine($"REM CopilotBuddy PartyGrind {count}-Client Launcher");
             sb.AppendLine($"set TEAM_ID={teamId}");
             sb.AppendLine($"set IPC_PORT={port}");
-            sb.AppendLine($"set PROFILE=\"{profilePath}\"");
+            if (botMode != SquadBotMode.Dungeon)
+                sb.AppendLine($"set PROFILE=\"{profilePath}\"");
             sb.AppendLine();
 
             for (int i = 0; i < count; i++)
@@ -365,6 +416,11 @@ namespace CopilotBuddy.Bots.PartyGrind.Forms
                     sb.AppendLine($"if \"%PID{i + 1}%\"==\"%PID{j + 1}%\" goto PID_SLOT_{i + 1}");
             }
 
+            string modeArgs = botMode == SquadBotMode.Dungeon
+                ? $"-squadmode=Dungeon -dungeonentry={dungeonEntryMode}" +
+                  (!string.IsNullOrWhiteSpace(dungeonIdsCsv) ? $" -dungeonids=\"{dungeonIdsCsv.Trim()}\"" : string.Empty)
+                : "-loadprofile=%PROFILE% -squadmode=OpenWorldGrind";
+
             for (int i = 0; i < count; i++)
             {
                 bool isCoord = i == 0;
@@ -375,7 +431,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Forms
                     $"-pid=%PID{i + 1}% " +
                     $"-instance=Client{i + 1} " +
                     $"-botname=\"Party Grind\" " +
-                    $"-loadprofile=%PROFILE% " +
+                    $"{modeArgs} " +
                     $"-squadrole={finalRoles[i]} " +
                     $"-squadcoordinator={(isCoord ? "true" : "false")} " +
                     $"-squadteam=%TEAM_ID% " +

@@ -23,6 +23,13 @@ namespace Styx.PartyGrind
 
         public static SquadRole ActiveRole => ActiveSettings?.Role ?? SquadRole.DpsMelee;
         public static bool IsCoordinator => ActiveSettings?.IsCoordinator ?? false;
+        public static bool IsDungeonModeActive =>
+            IsActive &&
+            (LatestLeaderState?.BotMode == SquadBotMode.Dungeon ||
+             ActiveSettings?.BotMode == SquadBotMode.Dungeon);
+        public static bool ActiveKillOptionalBosses =>
+            IsActive &&
+            (LatestLeaderState?.KillOptionalBosses ?? ActiveSettings?.KillOptionalBosses ?? false);
 
         /// <summary>
         /// Returns the effective level used by <c>ProfileManager.LevelOverrideSelector</c>.

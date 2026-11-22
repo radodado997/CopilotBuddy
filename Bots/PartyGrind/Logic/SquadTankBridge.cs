@@ -54,7 +54,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (leader == null)
                 return true;
 
-            if (leader.Phase != SquadPhase.Grinding)
+            if (leader.Phase != SquadPhase.Grinding && leader.Phase != SquadPhase.DungeonClearing)
                 return false;
 
             // Use the coordinator's authoritative loot window instead of a possibly
@@ -70,7 +70,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             {
                 if (!m.IsConnected)
                     continue;
-                if (!m.HasTelemetry || m.IsDead || m.IsGhost || m.NeedsRest || m.NeedsTown && !m.TownTasksComplete)
+                if (!m.HasTelemetry || m.IsDead || m.IsGhost || m.NeedsRest ||
+                    (m.NeedsTown && !m.TownTasksComplete && leader.BotMode != SquadBotMode.Dungeon))
                     return false;
                 if (m.MapId != leader.MapId)
                     return false;
@@ -139,9 +140,49 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
             var leader = SquadContext.GetLeaderStateSnapshot();
             var memberGuids = SquadContext.GetKnownMemberGuids();
+            bool isDungeon = SquadContext.IsDungeonModeActive && SquadDungeonService.IsInDungeonMap(StyxWoW.Me);
+            bool pugIsTank = isDungeon && leader != null && leader.EffectiveTankGuid != 0 &&
+                             leader.EffectiveTankGuid != StyxWoW.Me.Guid &&
+                             leader.HasRandomPartyMembers;
 
-            if (settings.Role == SquadRole.TankLeader)
+            if (settings.Role == SquadRole.TankLeader && !pugIsTank)
             {
+                if (isDungeon)
+                {
+                    WoWPoint meLoc = StyxWoW.Me.Location;
+                    bool canPull = StyxWoW.Me.Combat || CanInitiatePull(leader, settings.MaxPullGatherDistance);
+                    foreach (WoWObject obj in incomingUnits)
+                    {
+                        if (obj is not WoWUnit unit || !unit.IsValid || unit.Dead || !unit.CanSelect || !unit.Attackable)
+                            continue;
+                        if (unit.IsFriendly || unit.IsPlayer || unit.IsCritter || unit.IsNonCombatPet || unit.ControllingPlayer != null)
+                            continue;
+
+                        bool partyThreat = unit.IsTargetingMyPartyMember || unit.IsTargetingMeOrPet ||
+                                           (unit.Combat && unit.CurrentTargetGuid != 0 && memberGuids.Contains(unit.CurrentTargetGuid));
+
+                        if (partyThreat && unit.Location.Distance(meLoc) <= 60f)
+                        {
+                            outgoingUnits.Add(unit);
+                            continue;
+                        }
+
+                        if (!StyxWoW.Me.Combat && canPull)
+                        {
+                            if (!unit.IsHostile || unit.DistanceSqr > 1225.0)
+                                continue;
+                            if (Bots.DungeonBuddy.Profiles.ProfileManager.IsNpcInPullBlackspot(unit))
+                                continue;
+                            if (!unit.InLineOfSight)
+                                continue;
+                            if (!unit.IsFlying && !Navigator.CanNavigateWithinDistance(meLoc, unit.Location, 35f))
+                                continue;
+                            outgoingUnits.Add(unit);
+                        }
+                    }
+                    return;
+                }
+
                 // Include standard LevelBot targets when we're ready to pull or already fighting.
                 if (StyxWoW.Me.Combat || CanInitiatePull(leader, settings.MaxPullGatherDistance))
                 {
@@ -149,14 +190,14 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 }
 
                 // Always include hostile mobs currently attacking any squad member (peel priority).
-                WoWPoint meLoc = StyxWoW.Me.Location;
+                WoWPoint meLocWorld = StyxWoW.Me.Location;
                 foreach (WoWObject obj in incomingUnits)
                 {
                     if (obj is not WoWUnit unit || !unit.IsValid || unit.Dead || !unit.CanSelect || !unit.Attackable)
                         continue;
                     if (unit.IsFriendly || unit.IsPlayer)
                         continue;
-                    if (unit.Location.Distance(meLoc) > 60f)
+                    if (unit.Location.Distance(meLocWorld) > 60f)
                         continue;
 
                     if (unit.IsTargetingMyPartyMember || unit.IsTargetingMeOrPet ||
@@ -168,6 +209,14 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             }
             else
             {
+                ulong pugTankTargetGuid = 0UL;
+                if (pugIsTank && leader != null)
+                {
+                    var pugTank = ObjectManager.GetObjectByGuid<WoWPlayer>(leader.EffectiveTankGuid);
+                    if (pugTank != null && pugTank.IsValid && pugTank.Combat && pugTank.CurrentTarget != null)
+                        pugTankTargetGuid = pugTank.CurrentTargetGuid;
+                }
+
                 // Non-tank members: include the leader's focus/secondary targets and active party threats.
                 foreach (WoWObject obj in incomingUnits)
                 {
@@ -175,6 +224,12 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                         continue;
                     if (unit.IsFriendly || unit.IsPlayer)
                         continue;
+
+                    if (pugTankTargetGuid != 0UL && unit.Guid == pugTankTargetGuid)
+                    {
+                        outgoingUnits.Add(unit);
+                        continue;
+                    }
 
                     if (leader != null &&
                         (unit.Guid == leader.FocusTargetGuid ||

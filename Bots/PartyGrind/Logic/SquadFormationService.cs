@@ -183,6 +183,176 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 baseAnchor.Z);
         }
 
+        public static WoWPoint ComputeDungeonFollowPosition(
+            WoWPoint memberPos,
+            SquadLeaderState leader,
+            int memberSlotIndex,
+            SquadTravelProgress? progress = null)
+        {
+            var leaderPos = new WoWPoint(leader.X, leader.Y, leader.Z);
+            int clampedSlot = Math.Max(0, memberSlotIndex);
+            float desiredTrail = 2.8f + clampedSlot * 1.9f;
+            float lateral = (clampedSlot % 2 == 0 ? 1f : -1f) * Math.Min(1.1f, 0.55f + (clampedSlot / 2) * 0.45f);
+
+            if (leader.Breadcrumbs != null && leader.Breadcrumbs.Count > 0)
+            {
+                var route = leader.Breadcrumbs.Where(b => b.MapId == leader.MapId).ToList();
+                int routeGeneration = route.Count > 0 ? route[^1].RouteGeneration : 0;
+                if (progress != null && (progress.MapId != leader.MapId || progress.LeaderGuid != leader.LeaderGuid ||
+                                         progress.RouteGeneration != routeGeneration))
+                {
+                    progress.LastReachedSequence = 0;
+                    progress.MapId = leader.MapId;
+                    progress.LeaderGuid = leader.LeaderGuid;
+                    progress.RouteGeneration = routeGeneration;
+                }
+
+                int nearest = -1;
+                float bestDist = float.MaxValue;
+                for (int i = 0; i < route.Count; i++)
+                {
+                    var bc = route[i];
+                    if (bc.RouteGeneration != routeGeneration)
+                        continue;
+                    if (progress != null && bc.Sequence <= progress.LastReachedSequence)
+                        continue;
+                    float d = memberPos.Distance(new WoWPoint(bc.X, bc.Y, bc.Z));
+                    if (d <= bestDist)
+                    {
+                        nearest = i;
+                        bestDist = d;
+                    }
+                }
+
+                if (progress != null && nearest >= 0 && bestDist < 4.5f)
+                    progress.LastReachedSequence = route[nearest].Sequence;
+
+                if (memberPos.Distance(leaderPos) > 16f && route.Count > 0)
+                {
+                    int next = bestDist < 4.5f ? nearest + 1 : nearest;
+                    if (next >= 0 && next < route.Count)
+                    {
+                        var chosen = route[next];
+                        return new WoWPoint(chosen.X, chosen.Y, chosen.Z);
+                    }
+                }
+
+                if (route.Count >= 1)
+                {
+                    for (int i = route.Count - 1; i >= 0; i--)
+                    {
+                        var bcPt = new WoWPoint(route[i].X, route[i].Y, route[i].Z);
+                        float dLeader = leaderPos.Distance(bcPt);
+                        if (dLeader >= desiredTrail * 0.7f && dLeader <= desiredTrail + 6.0f)
+                        {
+                            float dx = bcPt.X - leaderPos.X;
+                            float dy = bcPt.Y - leaderPos.Y;
+                            float len = MathF.Sqrt(dx * dx + dy * dy);
+                            if (len > 0.1f)
+                            {
+                                float ux = dx / len;
+                                float uy = dy / len;
+                                float px = -uy;
+                                float py = ux;
+                                return new WoWPoint(
+                                    leaderPos.X + ux * desiredTrail + px * lateral,
+                                    leaderPos.Y + uy * desiredTrail + py * lateral,
+                                    bcPt.Z);
+                            }
+                        }
+                    }
+                }
+            }
+
+            float backAngle = leader.Facing + MathF.PI;
+            float dirX = MathF.Cos(backAngle);
+            float dirY = MathF.Sin(backAngle);
+            float perpX = -dirY;
+            float perpY = dirX;
+
+            return new WoWPoint(
+                leaderPos.X + dirX * desiredTrail + perpX * lateral,
+                leaderPos.Y + dirY * desiredTrail + perpY * lateral,
+                leaderPos.Z);
+        }
+
+        public static WoWPoint ComputeDungeonStandoffPosition(
+            WoWPoint tankPos,
+            float tankFacingRadians,
+            WoWPoint? focusTargetPos,
+            IReadOnlyList<SquadBreadcrumb>? breadcrumbs,
+            uint mapId,
+            float standoffDistance,
+            int backlineSlotIndex,
+            int totalBacklineCount)
+        {
+            float dist = Math.Clamp(standoffDistance, 12f, 20f);
+            float[] lateralOffsets = totalBacklineCount switch
+            {
+                <= 1 => new[] { 0f },
+                2 => new[] { -1.6f, 1.6f },
+                _ => new[] { -1.8f, 1.8f, 0f, -3.2f, 3.2f }
+            };
+            float lateral = lateralOffsets[Math.Abs(backlineSlotIndex) % lateralOffsets.Length];
+
+            if (breadcrumbs != null && breadcrumbs.Count > 0)
+            {
+                for (int i = breadcrumbs.Count - 1; i >= 0; i--)
+                {
+                    var bc = breadcrumbs[i];
+                    if (bc.MapId != mapId)
+                        continue;
+                    var bcPt = new WoWPoint(bc.X, bc.Y, bc.Z);
+                    float dTank = tankPos.Distance(bcPt);
+                    if (dTank < 4.0f || dTank > 26.0f)
+                        continue;
+                    if (focusTargetPos.HasValue && bcPt.Distance(focusTargetPos.Value) < focusTargetPos.Value.Distance(tankPos))
+                        continue;
+
+                    float dx = bcPt.X - tankPos.X;
+                    float dy = bcPt.Y - tankPos.Y;
+                    float len = MathF.Sqrt(dx * dx + dy * dy);
+                    if (len > 0.25f)
+                    {
+                        float ux = dx / len;
+                        float uy = dy / len;
+                        float px = -uy;
+                        float py = ux;
+                        float clampedDist = Math.Min(dist, dTank + 3.0f);
+                        return new WoWPoint(
+                            tankPos.X + ux * clampedDist + px * lateral,
+                            tankPos.Y + uy * clampedDist + py * lateral,
+                            bcPt.Z);
+                    }
+                }
+            }
+
+            float backAngle;
+            if (focusTargetPos.HasValue)
+            {
+                float dx = tankPos.X - focusTargetPos.Value.X;
+                float dy = tankPos.Y - focusTargetPos.Value.Y;
+                backAngle = (dx * dx + dy * dy) > 0.25f
+                    ? MathF.Atan2(dy, dx)
+                    : tankFacingRadians + MathF.PI;
+            }
+            else
+            {
+                backAngle = tankFacingRadians + MathF.PI;
+            }
+
+            float dirX = MathF.Cos(backAngle);
+            float dirY = MathF.Sin(backAngle);
+            float perpX = -dirY;
+            float perpY = dirX;
+            float axial = MathF.Sqrt(MathF.Max(1.0f, dist * dist - lateral * lateral));
+
+            return new WoWPoint(
+                tankPos.X + dirX * axial + perpX * lateral,
+                tankPos.Y + dirY * axial + perpY * lateral,
+                tankPos.Z);
+        }
+
         /// <summary>
         /// Resolves deterministic melee and backline slot indices for the local member.
         /// </summary>
