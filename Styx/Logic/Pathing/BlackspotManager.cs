@@ -447,10 +447,10 @@ namespace Styx.Logic.Pathing
             TileIdentifier min = TileIdentifier.GetByPosition(spot.Location.X - spot.Radius, spot.Location.Y - spot.Radius);
             TileIdentifier max = TileIdentifier.GetByPosition(spot.Location.X + spot.Radius, spot.Location.Y + spot.Radius);
 
-            minX = Math.Min(min.X, max.X);
-            maxX = Math.Max(min.X, max.X);
-            minY = Math.Min(min.Y, max.Y);
-            maxY = Math.Max(min.Y, max.Y);
+            minX = Math.Clamp(Math.Min(min.X, max.X), 0, 63);
+            maxX = Math.Clamp(Math.Max(min.X, max.X), 0, 63);
+            minY = Math.Clamp(Math.Min(min.Y, max.Y), 0, 63);
+            maxY = Math.Clamp(Math.Max(min.Y, max.Y), 0, 63);
         }
 
         private static bool UpdatePendingTilesForBlackspot(Blackspot spot, uint mapId, TileIdentifier? loadedTile = null)
