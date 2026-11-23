@@ -198,7 +198,37 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 healerInRestPhase: inRestPhase,
                 mainHealerUnavailableOrOom: mainHealerDown);
 
-            return candidates.Any(c => c.HealthPercent < threshold);
+            if (!candidates.Any(c => c.HealthPercent < threshold))
+                return false;
+
+            if (!emergencyOnly && me.Level >= 10 && RoutineManager.Current?.HealBehavior != null)
+                return true;
+
+            int injured78 = CountInjuredAllies(candidates, 78.0);
+            int injured82 = CountInjuredAllies(candidates, 82.0);
+            foreach (var c in candidates)
+            {
+                if (c.HealthPercent >= threshold)
+                    continue;
+
+                WoWUnit? targetUnit = c.IsSelf ? me : ObjectManager.GetObjectByGuid<WoWUnit>(c.Guid);
+                if (targetUnit == null || !targetUnit.IsValid || targetUnit.Dead)
+                    continue;
+
+                bool combatActive = anyCombat || targetUnit.Combat;
+                var (spellName, _) = SelectHealSpellForClass(me, targetUnit, injured78, injured82, emergencyOnly, combatActive);
+                if (spellName != null)
+                    return true;
+
+                if (!c.IsSelf)
+                {
+                    var (approachSpell, _) = SelectHealSpellForClass(me, targetUnit, injured78, injured82, emergencyOnly, combatActive, checkRange: false);
+                    if (approachSpell != null)
+                        return true;
+                }
+            }
+
+            return false;
         }
 
         public static bool RunHealerTick(bool emergencyOnly, SquadSettings settings, SquadLeaderState? leader)
@@ -675,7 +705,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             int injured78Count,
             int injured82Count,
             bool emergencyOnly,
-            bool inCombat)
+            bool inCombat,
+            bool checkRange = true)
         {
             bool isTank = SquadContext.IsMemberRole(target.Guid, SquadRole.TankLeader);
             return EvaluateClassHealSpell(
@@ -689,7 +720,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 hasWeakenedSoul: target.HasAura("Weakened Soul") || target.HasAura("Power Word: Shield"),
                 hasAuraFromHealer: aura => HasMyAura(me.Guid, target, aura),
                 hasSpell: SpellManager.HasSpell,
-                canCastSpell: spell => SpellManager.CanCast(spell, target, true, false));
+                canCastSpell: spell => SpellManager.CanCast(spell, target, checkRange, false));
         }
 
         private static bool HasMyAura(ulong myGuid, WoWUnit unit, string auraName)

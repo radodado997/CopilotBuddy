@@ -88,6 +88,8 @@ namespace Singular.ClassSpecific.Paladin
                     Spell.BuffSelf("Divine Shield", ret => StyxWoW.Me.HealthPercent <= 20 && !StyxWoW.Me.HasAura("Forbearance") && (!StyxWoW.Me.HasAura("Horde Flag") || !StyxWoW.Me.HasAura("Alliance Flag"))),
                     Spell.BuffSelf("Divine Protection", ret => StyxWoW.Me.HealthPercent <= SingularSettings.Instance.Paladin.DivineProtectionHealthRet),
 
+                    Common.CreatePaladinCombatSelfHeal(),
+
                     //2	Let's keep up Insight instead of Truth for grinding.  Keep up Righteousness if we need to AoE.  
                      // WotLK: Seal of Vengeance (Alliance) / Seal of Corruption (Horde) for single target
                      Spell.BuffSelf("Seal of Vengeance", ret => Unit.NearbyUnfriendlyUnits.Count(u => u.Distance <= 8) < 4 && !SpellManager.HasSpell("Seal of Corruption")),
@@ -160,6 +162,8 @@ namespace Singular.ClassSpecific.Paladin
                     Spell.BuffSelf("Divine Shield", ret => StyxWoW.Me.HealthPercent <= 20 && !StyxWoW.Me.HasAura("Forbearance") && (!StyxWoW.Me.HasAura("Horde Flag") || !StyxWoW.Me.HasAura("Alliance Flag"))),
                     Spell.BuffSelf("Divine Protection", ret => StyxWoW.Me.HealthPercent <= SingularSettings.Instance.Paladin.DivineProtectionHealthRet),
 
+                    Common.CreatePaladinCombatSelfHeal(),
+
                     //  Buffs
                     Spell.BuffSelf("Retribution Aura"),
                     Spell.BuffSelf("Seal of Vengeance", ret => StyxWoW.Me.CurrentTarget.Entry != 28781 && !StyxWoW.Me.CurrentTarget.HasAura("Horde Flag") && !StyxWoW.Me.CurrentTarget.HasAura("Alliance Flag") && !SpellManager.HasSpell("Seal of Corruption")),
@@ -222,6 +226,8 @@ namespace Singular.ClassSpecific.Paladin
                     Spell.BuffSelf("Divine Shield", ret => StyxWoW.Me.HealthPercent <= 20 && !StyxWoW.Me.HasAura("Forbearance") && (!StyxWoW.Me.HasAura("Horde Flag") || !StyxWoW.Me.HasAura("Alliance Flag"))),
                     Spell.BuffSelf("Divine Protection", ret => StyxWoW.Me.HealthPercent <= SingularSettings.Instance.Paladin.DivineProtectionHealthRet),
 
+                    Common.CreatePaladinCombatSelfHeal(),
+
                     //2	seal_of_truth (WotLK: Seal of Vengeance/Corruption)
                     Spell.BuffSelf("Seal of Vengeance", ret => Unit.NearbyUnfriendlyUnits.Count(u => u.Distance <= 8) < 4 && !SpellManager.HasSpell("Seal of Corruption")),
                     Spell.BuffSelf("Seal of Corruption", ret => Unit.NearbyUnfriendlyUnits.Count(u => u.Distance <= 8) < 4),
@@ -280,9 +286,7 @@ namespace Singular.ClassSpecific.Paladin
                 Helpers.Common.CreateAutoAttack(true),
                 Helpers.Common.CreateInterruptSpellCast(ret => StyxWoW.Me.CurrentTarget),
 
-                // Heals
-                Spell.Heal("Holy Light", ret => StyxWoW.Me, ret => !SpellManager.HasSpell("Flash of Light") && StyxWoW.Me.HealthPercent <= SingularSettings.Instance.Paladin.RetributionHealHealth),
-                Spell.Heal("Flash of Light", ret => StyxWoW.Me, ret => StyxWoW.Me.HealthPercent <= SingularSettings.Instance.Paladin.RetributionHealHealth),
+                Common.CreatePaladinCombatSelfHeal(),
 
                 // Defensive
                 Spell.BuffSelf("Hand of Freedom",

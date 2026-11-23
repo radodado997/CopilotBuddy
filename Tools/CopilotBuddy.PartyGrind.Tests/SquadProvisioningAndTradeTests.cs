@@ -2,8 +2,11 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using CopilotBuddy.Bots.PartyGrind.Logic;
+using Styx;
+using Styx.Combat.CombatRoutine;
 using Styx.Logic.Inventory.Frames.Trade;
 using Styx.PartyGrind;
+using Styx.PartyGrind.IPC;
 using Xunit;
 
 namespace CopilotBuddy.PartyGrind.Tests
@@ -262,6 +265,134 @@ namespace CopilotBuddy.PartyGrind.Tests
 
             Assert.True(withoutMage.NeedsBuy);
             Assert.True(withoutMage.Any);
+        }
+
+        [Fact]
+        public void EvaluateTick_AssignsProvisioning_WhenMemberNeedsWaterEvenIfRestingRequired()
+        {
+            var coordinator = new SquadCoordinatorService();
+            var settings = MakeSettings();
+            settings.TeamId = "TestSquad";
+            settings.IsCoordinator = true;
+            settings.Role = SquadRole.TankLeader;
+            settings.EnableMageProvisioning = true;
+            settings.TriggerRestHealthPct = 50;
+            settings.TriggerRestManaPct = 50;
+            settings.ResumeRestHealthPct = 80;
+            settings.ResumeRestManaPct = 80;
+
+            var leader = new SquadMemberState
+            {
+                CharacterName = "TankA",
+                Guid = 100,
+                Class = WoWClass.Warrior,
+                Role = SquadRole.TankLeader,
+                Level = 20,
+                MapId = 0,
+                X = 100f,
+                Y = 100f,
+                Z = 0f,
+                HealthPercent = 100f,
+                PowerPercent = 0f,
+                PowerType = WoWPowerType.Rage
+            };
+
+            var mage = new SquadConnectedMemberSnapshot
+            {
+                CharacterName = "MageB",
+                SlotIndex = 1,
+                IsConnected = true,
+                LastReceivedUtcMs = 1000,
+                Handshake = new SquadHandshake
+                {
+                    CharacterName = "MageB",
+                    Guid = 201,
+                    Class = WoWClass.Mage,
+                    Role = SquadRole.DpsRanged,
+                    Level = 20
+                },
+                LatestState = new SquadMemberState
+                {
+                    CharacterName = "MageB",
+                    Guid = 201,
+                    Class = WoWClass.Mage,
+                    Role = SquadRole.DpsRanged,
+                    Level = 20,
+                    MapId = 0,
+                    X = 100f,
+                    Y = 100f,
+                    Z = 0f,
+                    HealthPercent = 100f,
+                    PowerPercent = 100f,
+                    PowerType = WoWPowerType.Mana,
+                    FreeBagSlots = 10,
+                    CanProvideMageDrink = true
+                }
+            };
+
+            var priest = new SquadConnectedMemberSnapshot
+            {
+                CharacterName = "PriestC",
+                SlotIndex = 2,
+                IsConnected = true,
+                LastReceivedUtcMs = 1000,
+                Handshake = new SquadHandshake
+                {
+                    CharacterName = "PriestC",
+                    Guid = 202,
+                    Class = WoWClass.Priest,
+                    Role = SquadRole.Healer,
+                    Level = 20
+                },
+                LatestState = new SquadMemberState
+                {
+                    CharacterName = "PriestC",
+                    Guid = 202,
+                    Class = WoWClass.Priest,
+                    Role = SquadRole.Healer,
+                    Level = 20,
+                    MapId = 0,
+                    X = 100f,
+                    Y = 100f,
+                    Z = 0f,
+                    HealthPercent = 100f,
+                    PowerPercent = 20f,
+                    PowerType = WoWPowerType.Mana,
+                    FreeBagSlots = 8,
+                    WantsDrink = true
+                }
+            };
+
+            var profile = new SquadProfileSnapshot();
+            var state = coordinator.EvaluateTick(settings, leader, new[] { mage, priest }, profile, 0, 0, 0, 0, 1000);
+
+            Assert.Equal(SquadPhase.Provisioning, state.Phase);
+            Assert.Equal("MageB", state.ActiveProvisionerName);
+            Assert.Equal("PriestC", state.ActiveTradeTargetName);
+        }
+
+        [Fact]
+        public void CanInitiatePull_ReturnsFalse_WhenActiveProvisionerAssigned()
+        {
+            var leader = new SquadLeaderState
+            {
+                Phase = SquadPhase.Grinding,
+                ActiveProvisionerName = "MageB",
+                ActiveTradeTargetName = "PriestC",
+                X = 100f,
+                Y = 100f,
+                Z = 0f,
+                Members = new List<SquadMemberSummary>
+                {
+                    new SquadMemberSummary { CharacterName = "TankA", IsConnected = true, HasTelemetry = true, X = 100f, Y = 100f, Z = 0f },
+                    new SquadMemberSummary { CharacterName = "MageB", IsConnected = true, HasTelemetry = true, X = 100f, Y = 100f, Z = 0f }
+                }
+            };
+
+            Assert.False(SquadTankBridge.CanInitiatePull(leader, 30f));
+
+            leader.ActiveProvisionerName = string.Empty;
+            Assert.True(SquadTankBridge.CanInitiatePull(leader, 30f));
         }
     }
 }

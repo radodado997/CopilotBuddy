@@ -22,6 +22,7 @@ namespace CopilotBuddy.PartyGrind.Tests
         public void Dispose()
         {
             SquadContext.Reset();
+            global::Bots.DungeonBuddy.BossManager.Reset();
             global::Bots.DungeonBuddy.Helpers.ScriptHelpers.RestoreMovement();
         }
 
@@ -729,6 +730,29 @@ namespace CopilotBuddy.PartyGrind.Tests
                 lfgRunCompletedAwaitingRequeue: false,
                 completedReason: global::Bots.DungeonBuddy.Enums.CompleteReason.None,
                 leaderDungeonComplete: true));
+        }
+
+        [Fact]
+        public void BossManager_RestoreKilledBosses_RestoresKillsAndMarksDead()
+        {
+            global::Bots.DungeonBuddy.BossManager.Reset();
+            global::Bots.DungeonBuddy.BossManager.RegisterBoss(1234, "TestBoss1");
+            global::Bots.DungeonBuddy.BossManager.RegisterBoss(5678, "TestBoss2");
+
+            Assert.Equal(2, global::Bots.DungeonBuddy.BossManager.Bosses.Count);
+            Assert.True(global::Bots.DungeonBuddy.BossManager.Bosses.All(b => !b.IsDead));
+            Assert.Empty(global::Bots.DungeonBuddy.BossManager.KilledBossIds);
+
+            global::Bots.DungeonBuddy.BossManager.RestoreKilledBosses(new uint[] { 1234 });
+
+            Assert.Contains(1234U, global::Bots.DungeonBuddy.BossManager.KilledBossIds);
+            Assert.DoesNotContain(5678U, global::Bots.DungeonBuddy.BossManager.KilledBossIds);
+
+            var boss1 = global::Bots.DungeonBuddy.BossManager.Bosses.First(b => b.EntryId == 1234);
+            var boss2 = global::Bots.DungeonBuddy.BossManager.Bosses.First(b => b.EntryId == 5678);
+            Assert.True(boss1.IsDead);
+            Assert.False(boss2.IsDead);
+            Assert.Equal(5678U, global::Bots.DungeonBuddy.BossManager.CurrentBoss?.EntryId);
         }
     }
 }

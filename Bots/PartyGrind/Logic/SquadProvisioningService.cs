@@ -469,7 +469,11 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                                     retryPlayer.Target();
                                 _lastTradeOfferRetryUtcMs = now;
                                 if (me.CurrentTargetGuid == retryPlayer.Guid)
+                                {
+                                    _tradeItemsPlaced = false;
+                                    _offeredItems.Clear();
                                     TradeFrame.Instance.InitiateTrade("target");
+                                }
                             }
                         }
                     }

@@ -58,7 +58,8 @@ namespace Styx.Logic
         {
             get
             {
-                return ObjectManager.Wow!.Read<int>(NumMapLandmarksOffset);
+                var wow = ObjectManager.Wow;
+                return wow != null ? wow.Read<int>(NumMapLandmarksOffset) : 0;
             }
         }
 
@@ -68,14 +69,17 @@ namespace Styx.Logic
         public void Refresh()
         {
             LandmarkList.Clear();
+            var wow = ObjectManager.Wow;
+            if (wow == null)
+                return;
             
-            int numLandmarks = NumMapLandmarks;
-            uint landmarkArrayBase = ObjectManager.Wow!.Read<uint>(LandmarkArrayOffset);
+            int numLandmarks = wow.Read<int>(NumMapLandmarksOffset);
+            uint landmarkArrayBase = wow.Read<uint>(LandmarkArrayOffset);
 
             for (uint i = 0; i < numLandmarks; i++)
             {
                 uint landmarkPtr = landmarkArrayBase + (LandmarkEntrySize * i);
-                uint entry = ObjectManager.Wow!.Read<uint>(landmarkPtr); // Read entry directly
+                uint entry = wow.Read<uint>(landmarkPtr); // Read entry directly
                 
                 // Check if this is a SotA gate (special handling)
                 if (entry == 2292 || entry == 2117 || entry == 2120 || 

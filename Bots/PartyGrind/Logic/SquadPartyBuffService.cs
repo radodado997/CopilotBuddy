@@ -250,6 +250,20 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             return false;
         }
 
+        public static bool IsNonHolyPaladinAuraOwner(LocalPlayer me, SquadLeaderState? leader)
+        {
+            var nonHolyPaladins = (leader?.Members ?? new List<SquadMemberSummary>())
+                .Where(m => m.Class == WoWClass.Paladin && m.Role != SquadRole.Healer && m.IsConnected && !m.IsDead && !m.IsGhost && m.MapId == me.MapId)
+                .OrderByDescending(m => m.Role == SquadRole.TankLeader)
+                .ThenBy(m => m.CharacterName, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            if (nonHolyPaladins.Count == 0)
+                return true;
+
+            return string.Equals(nonHolyPaladins[0].CharacterName, me.Name, StringComparison.OrdinalIgnoreCase);
+        }
+
         private static bool BuffPaladin(LocalPlayer me, List<WoWUnit> allies, SquadLeaderState? leader)
         {
             // Determine Paladin index among party Paladins so multiple Paladins pick distinct auras & blessings.
@@ -269,15 +283,19 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 _ => new[] { "Concentration Aura", "Shadow Resistance Aura", "Fire Resistance Aura" }
             };
 
-            foreach (string aura in preferredAuras)
+            bool isNonHoly = SquadContext.ActiveRole != SquadRole.Healer;
+            if (!isNonHoly || IsNonHolyPaladinAuraOwner(me, leader))
             {
-                if (!me.HasAura(aura) && TryCastPartyBuff(aura, me, false))
+                foreach (string aura in preferredAuras)
                 {
-                    SquadPartySyncService.LogAction("Buffing aura " + aura);
-                    return true;
+                    if (!me.HasAura(aura) && TryCastPartyBuff(aura, me, false))
+                    {
+                        SquadPartySyncService.LogAction("Buffing aura " + aura);
+                        return true;
+                    }
+                    if (me.GetAllAuras().Any(a => a.Name == aura && a.CreatorGuid == me.Guid))
+                        break;
                 }
-                if (me.GetAllAuras().Any(a => a.Name == aura && a.CreatorGuid == me.Guid))
-                    break;
             }
 
             foreach (var ally in allies)

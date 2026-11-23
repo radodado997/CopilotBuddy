@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using CopilotBuddy.Bots.PartyGrind.Forms;
 using CopilotBuddy.Bots.PartyGrind.Logic;
+using Styx.Combat.CombatRoutine;
 using Styx.Helpers;
 using Styx.Logic.Pathing;
 using Styx.Logic.Relogin;

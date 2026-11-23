@@ -112,6 +112,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private long _lastTeleportInUtcMs;
         private long _lastTeleportOutUtcMs;
         private int _instanceResetGeneration;
+        private int _lastResetGeneration;
+        private readonly HashSet<uint> _currentRunKilledBosses = new();
         internal const float HotspotArrivalDistance = 4.5f;
         private bool _runtimeInitialized;
         private bool _resetPendingOutside;
@@ -180,6 +182,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             try { global::Bots.DungeonBuddy.Helpers.ScriptHelpers.ReleaseScriptMovementBlocks(); } catch { }
             try { DungeonManager.Clear(); } catch { }
             try { BossManager.Reset(); } catch { }
+            _currentRunKilledBosses.Clear();
             try { WorldObstacleManager.Shutdown(); } catch { }
             try { AvoidanceManager.Clear(); } catch { }
             _runtimeInitialized = false;
@@ -248,6 +251,17 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             uint desiredDungeonId = 0;
             if (inDungeonMap)
             {
+                int currentGen = leader?.InstanceResetGeneration ?? _instanceResetGeneration;
+                if (currentGen != _lastResetGeneration)
+                {
+                    BossManager.Reset();
+                    _currentRunKilledBosses.Clear();
+                    _lastResetGeneration = currentGen;
+                }
+
+                foreach (var b in BossManager.Bosses.Where(b => b.IsDead))
+                    _currentRunKilledBosses.Add(b.EntryId);
+
                 if (entryMode != SquadDungeonEntryMode.WalkInPortalFarm && lfgId > 0)
                 {
                     desiredDungeonId = lfgId;
@@ -274,6 +288,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     _breadcrumbBossEntry = 0;
                     _breadcrumbIndex = 0;
                     DungeonManager.SetDungeonById(desiredDungeonId);
+                    BossManager.RestoreKilledBosses(_currentRunKilledBosses);
                     LfgManager.DungeonCompletedReason = CompleteReason.None;
                     _lfgRunCompletedAwaitingRequeue = false;
                     _lastSyncedDungeonId = desiredDungeonId;
@@ -282,13 +297,15 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             }
             else
             {
-                if (_lastSyncedDungeonId != 0)
+                bool isCorpseRun = me != null && (me.Dead || me.IsGhost || leader?.Phase == SquadPhase.CorpseRun);
+                if (!isCorpseRun && _lastSyncedDungeonId != 0)
                 {
                     StopActiveEncounter();
                     DungeonManager.Clear();
                     BossManager.Reset();
                     _lastSyncedDungeonId = 0;
                     _hotspotIndex = 0;
+                    _currentRunKilledBosses.Clear();
                 }
                 _lastSyncedMapId = me.MapId;
             }
@@ -331,9 +348,17 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         public static bool HasDeserterOrRandomCooldown()
         {
             var me = StyxWoW.Me;
-            if (me == null)
-                return false;
-            return me.HasAura(71041) || me.HasAura(26013);
+            if (!StyxWoW.IsInWorld || me is not { IsValid: true, IsAlive: true } || me.IsGhost)
+                return true;
+            try
+            {
+                return me.HasAura(71041) || me.HasAura(26013);
+            }
+            catch (OverflowException)
+            {
+                SquadPartySyncService.LogAction("Dungeon: LFG cooldown unreadable; deferring queue");
+                return true;
+            }
         }
 
         public static uint ResolveTargetDungeonId(
@@ -431,6 +456,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             _hotspotIndex = 0;
             _completedAtUtcMs = 0;
             _countedCurrentWalkInEntry = false;
+            _currentRunKilledBosses.Clear();
             _runParticipants.Clear();
             _participantSnapshots = Array.Empty<SquadConnectedMemberSnapshot>();
         }
@@ -722,7 +748,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             }
 
             string lfgMode = SafeGetLfgMode();
-            if (lfgMode != "lfgparty" && lfgMode != "abandonedindungeon")
+            if (!string.IsNullOrEmpty(lfgMode) && lfgMode != "lfgparty" && lfgMode != "abandonedindungeon")
             {
                 _lfgRunCompletedAwaitingRequeue = false;
                 LfgManager.DungeonCompletedReason = CompleteReason.None;
@@ -1192,7 +1218,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                                     closestIdx = i;
                                 }
                             }
-                            if (closestDist <= 30f)
+                            if (closestDist <= 30f && (closestIdx == 0 || Navigator.CanNavigateFully(me.Location, profileBoss.Path[closestIdx])))
                                 _breadcrumbIndex = closestIdx;
                         }
                     }
@@ -1212,6 +1238,12 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                         ref _breadcrumbIndex);
                     if (bossTarget != WoWPoint.Zero)
                         return bossTarget;
+
+                    if (liveCurrentBoss == null && me.Location.Distance(profileBoss.Location) <= HotspotArrivalDistance)
+                    {
+                        BossManager.MarkBossDead(profileBoss.Entry);
+                        _currentRunKilledBosses.Add(profileBoss.Entry);
+                    }
                 }
 
                 var fallbackBoss = ObjectManager.GetObjectsOfType<WoWUnit>()
@@ -1248,7 +1280,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             SquadLeaderState? leader,
             float distanceToBoss)
         {
-            if (leader == null || distanceToBoss > 35f || leader.InCombat)
+            if (leader == null || distanceToBoss > 40f || leader.InCombat)
                 return false;
 
             if (leader.Members == null || leader.Members.Count == 0)

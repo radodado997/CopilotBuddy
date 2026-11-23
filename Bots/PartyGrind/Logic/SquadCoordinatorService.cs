@@ -409,8 +409,10 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     continue;
                 string key = m.CharacterName?.Trim() ?? string.Empty;
                 bool wasResting = !string.IsNullOrEmpty(key) && _history.TryGetValue(key, out var rec) && rec.NeedsRest;
-                bool usesMana = m.PowerType == WoWPowerType.Mana;
-                bool evaluated = EvaluateRestHysteresis(wasResting, m.HealthPercent, m.PowerPercent, usesMana, settings);
+                bool isDruid = m.Class == WoWClass.Druid;
+                bool usesMana = m.PowerType == WoWPowerType.Mana || isDruid;
+                float powerPct = isDruid ? m.ManaPercent : m.PowerPercent;
+                bool evaluated = EvaluateRestHysteresis(wasResting, m.HealthPercent, powerPct, usesMana, settings);
                 bool combinedRest = evaluated || m.NeedsRest;
                 if (!string.IsNullOrEmpty(key) && _history.TryGetValue(key, out var histRec))
                     histRec.NeedsRest = combinedRest;
@@ -504,7 +506,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             }
 
             // Provisioning arbitration.
-            if (anyInCombat || anyDead || _inTownRun || anyNeedsRest || _migratingZone)
+            if (anyInCombat || anyDead || _inTownRun || _migratingZone)
             {
                 if (!string.IsNullOrEmpty(_activeProvisioner))
                 {
@@ -559,14 +561,14 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 {
                     phase = SquadPhase.Looting;
                 }
-                else if (anyNeedsRest)
-                {
-                    phase = SquadPhase.Resting;
-                }
                 else if (!string.IsNullOrEmpty(_activeProvisioner) &&
                          (_assignedHealthstone || dungeon?.HasRandomPartyMembers != true))
                 {
                     phase = SquadPhase.Provisioning;
+                }
+                else if (anyNeedsRest)
+                {
+                    phase = SquadPhase.Resting;
                 }
                 else if (!anyInsideDungeon && _inTownRun)
                 {
@@ -603,13 +605,13 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 // IsLooting flag must not keep the squad in Looting after its hard cap.
                 phase = SquadPhase.Looting;
             }
-            else if (anyNeedsRest)
-            {
-                phase = SquadPhase.Resting;
-            }
             else if (!string.IsNullOrEmpty(_activeProvisioner))
             {
                 phase = SquadPhase.Provisioning;
+            }
+            else if (anyNeedsRest)
+            {
+                phase = SquadPhase.Resting;
             }
             else if (_inTownRun)
             {
@@ -705,6 +707,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 CurrentBossName = dungeon?.CurrentBossName ?? string.Empty,
                 KilledBossCount = dungeon?.KilledBossCount ?? 0,
                 TotalBossCount = dungeon?.TotalBossCount ?? 0,
+                IsDungeonComplete = _dungeonCompleted,
                 AcceptLfgProposalOrder = isDungeonMode && !_inTownRun && !anyDead && (dungeon?.LfgProposalPending == true || rosterStates.Any(m => m.LfgProposalPending)),
                 DungeonResetPendingOutside = isDungeonMode && dungeon?.ResetPendingOutside == true,
                 TeleportOutOrder = isDungeonMode && phase == SquadPhase.DungeonCompleteExit && settings.DungeonEntryMode != SquadDungeonEntryMode.WalkInPortalFarm,

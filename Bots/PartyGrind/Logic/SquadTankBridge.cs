@@ -57,6 +57,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (leader.Phase != SquadPhase.Grinding && leader.Phase != SquadPhase.DungeonClearing)
                 return false;
 
+            if (!string.IsNullOrEmpty(leader.ActiveProvisionerName))
+                return false;
+
             // Use the coordinator's authoritative loot window instead of a possibly
             // stale follower IsLooting flag; an expired window must not veto pulls.
             if (leader.IsLootWindowActive)
@@ -70,7 +73,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             {
                 if (!m.IsConnected)
                     continue;
-                if (!m.HasTelemetry || m.IsDead || m.IsGhost || m.NeedsRest ||
+                if (!m.HasTelemetry || m.IsDead || m.IsGhost || m.IsInCombat || m.NeedsRest ||
                     (m.NeedsTown && !m.TownTasksComplete && leader.BotMode != SquadBotMode.Dungeon))
                     return false;
                 if (m.MapId != leader.MapId)
@@ -583,6 +586,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
             if (target.Distance > maxRange || !target.InLineOfSpellSight)
             {
+                if (!global::Bots.DungeonBuddy.Helpers.ScriptHelpers.MovementEnabled)
+                    return false;
                 return PullApproach.TryMove(target, "Approaching dungeon pull " + target.Name);
             }
 
