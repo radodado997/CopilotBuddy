@@ -365,6 +365,7 @@ namespace Styx.PartyGrind.IPC
         public int ActiveSubProfileMaxLevel { get; set; }
 
         public bool IsInsideDungeon { get; set; }
+        public bool HasDungeonTelemetry { get; set; }
         public uint CurrentLfgDungeonId { get; set; }
         public string LfgMode { get; set; } = string.Empty;
         public bool LfgRoleCheckPending { get; set; }

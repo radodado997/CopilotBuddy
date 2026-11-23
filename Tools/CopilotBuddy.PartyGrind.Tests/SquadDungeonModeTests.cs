@@ -22,6 +22,7 @@ namespace CopilotBuddy.PartyGrind.Tests
         public void Dispose()
         {
             SquadContext.Reset();
+            global::Bots.DungeonBuddy.Helpers.ScriptHelpers.RestoreMovement();
         }
 
         private static SquadSettings CreateDungeonSettings(
@@ -68,6 +69,7 @@ namespace CopilotBuddy.PartyGrind.Tests
                 LowestDurabilityPct = 100f,
                 MapId = insideDungeon ? 36U : 0U,
                 IsInsideDungeon = insideDungeon,
+                HasDungeonTelemetry = true,
                 IsDead = isDead,
                 CanResurrect = canRes,
                 LfgProposalPending = proposalPending
@@ -373,6 +375,9 @@ namespace CopilotBuddy.PartyGrind.Tests
             Assert.False(SquadDungeonService.HasFreshExitEvidence(2UL, new[] { WrapClient(member, 9_999L) }, 10_000L, 12_000L));
             Assert.True(SquadDungeonService.HasFreshExitEvidence(2UL, new[] { WrapClient(member, 11_000L) }, 10_000L, 12_000L));
             Assert.False(SquadDungeonService.HasFreshExitEvidence(2UL, new[] { WrapClient(member, 11_000L) }, 10_000L, 18_000L));
+            member.HasDungeonTelemetry = false;
+            Assert.False(SquadDungeonService.HasFreshExitEvidence(2UL, new[] { WrapClient(member, 11_000L) }, 10_000L, 12_000L));
+            member.HasDungeonTelemetry = true;
             member.IsInsideDungeon = true;
             Assert.False(SquadDungeonService.HasFreshExitEvidence(2UL, new[] { WrapClient(member, 11_500L) }, 10_000L, 12_000L));
         }
@@ -558,6 +563,73 @@ namespace CopilotBuddy.PartyGrind.Tests
 
             global::Bots.DungeonBuddy.Helpers.ScriptHelpers.RestoreMovement();
             Assert.True(global::Bots.DungeonBuddy.Helpers.ScriptHelpers.MovementEnabled);
+        }
+
+        [Fact]
+        public void WalkInResetWait_ReleasesWhenParticipantLeavesGroupOrExceedsWait_ButHoldsConnectedInsideParticipant()
+        {
+            var participants = new ulong[] { 2UL, 3UL };
+            var insideState = MakeMemberState("HealB", 2UL, SquadRole.Healer, WoWClass.Priest, 30, insideDungeon: true);
+            var insideSnapshot = WrapClient(insideState, 12_000L);
+
+            Assert.False(SquadDungeonService.AreAllWalkInParticipantsClearedForReset(
+                participants,
+                new[] { insideSnapshot },
+                new[] { 1UL, 2UL, 3UL },
+                Array.Empty<ulong>(),
+                completedAtUtcMs: 10_000L,
+                nowUtcMs: 60_000L));
+
+            insideState.IsInsideDungeon = false;
+            var outsideSnapshot = WrapClient(insideState, 12_000L);
+
+            Assert.True(SquadDungeonService.AreAllWalkInParticipantsClearedForReset(
+                participants,
+                new[] { outsideSnapshot },
+                new[] { 1UL, 2UL },
+                Array.Empty<ulong>(),
+                completedAtUtcMs: 10_000L,
+                nowUtcMs: 13_000L));
+
+            Assert.False(SquadDungeonService.AreAllWalkInParticipantsClearedForReset(
+                participants,
+                new[] { outsideSnapshot },
+                new[] { 1UL, 2UL, 3UL },
+                Array.Empty<ulong>(),
+                completedAtUtcMs: 10_000L,
+                nowUtcMs: 13_000L));
+
+            var outsideTimedOut = WrapClient(insideState, 55_500L);
+            Assert.True(SquadDungeonService.AreAllWalkInParticipantsClearedForReset(
+                participants,
+                new[] { outsideTimedOut },
+                new[] { 1UL, 2UL, 3UL },
+                Array.Empty<ulong>(),
+                completedAtUtcMs: 10_000L,
+                nowUtcMs: 56_000L));
+        }
+
+        [Fact]
+        public void WalkInEntryCounting_CountsFirstRunWithoutDoubleCountingReset()
+        {
+            var dungeonService = new SquadDungeonService();
+            long baseTime = 100_000L;
+
+            for (int run = 0; run < 4; run++)
+            {
+                long t = baseTime + run * 60_000L;
+                dungeonService.RecordWalkInEntry(t);
+                dungeonService.RecordInstanceReset(t + 30_000L);
+            }
+
+            long fifthEntryTime = baseTime + 240_000L;
+            Assert.Equal(0, dungeonService.GetLockoutRemainingSeconds(fifthEntryTime, maxInstancesPerHour: 5));
+            dungeonService.RecordWalkInEntry(fifthEntryTime);
+            Assert.Equal(5, dungeonService.GetHourlyResetCount(fifthEntryTime + 1_000L));
+            Assert.True(dungeonService.GetLockoutRemainingSeconds(fifthEntryTime + 1_000L, maxInstancesPerHour: 5) > 0);
+
+            dungeonService.RecordInstanceReset(fifthEntryTime + 30_000L);
+            Assert.Equal(5, dungeonService.GetHourlyResetCount(fifthEntryTime + 31_000L));
         }
     }
 }

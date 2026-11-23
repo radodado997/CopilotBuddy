@@ -1225,6 +1225,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                 ActiveSubProfileMinLevel = currentSub?.MinLevel ?? 1,
                 ActiveSubProfileMaxLevel = currentSub?.MaxLevel ?? 85,
                 IsInsideDungeon = insideDungeon,
+                HasDungeonTelemetry = true,
                 CurrentLfgDungeonId = SquadContext.IsDungeonModeActive ? global::Bots.DungeonBuddy.LfgManager.CurrentLfgDungeonId : 0U,
                 LfgMode = SquadContext.IsDungeonModeActive ? SquadDungeonService.SafeGetLfgMode() : string.Empty,
                 LfgRoleCheckPending = SquadContext.IsDungeonModeActive && global::Bots.DungeonBuddy.LfgManager.RoleCheckPending,
