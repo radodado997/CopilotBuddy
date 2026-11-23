@@ -35,7 +35,8 @@ namespace Styx.PartyGrind.IPC
         /// <summary>
         /// Maximum idle time in milliseconds before the connection is marked disconnected. Defaults to 3000 ms.
         /// </summary>
-        public int DisconnectTimeoutMs { get; set; } = 3000;
+        public int DisconnectTimeoutMs { get; set; } = 10000;
+        public int KeepAliveIntervalMs { get; set; } = 1000;
 
         public SquadLeaderState? LatestLeaderState
         {
@@ -230,6 +231,24 @@ namespace Styx.PartyGrind.IPC
             await writer.WriteLineAsync(auth.Protect(hsLine).AsMemory(), ct).ConfigureAwait(false);
             await writer.FlushAsync(ct).ConfigureAwait(false);
 
+            var writerLock = new SemaphoreSlim(1, 1);
+            async Task WriteProtectedAsync(string plaintextLine)
+            {
+                await writerLock.WaitAsync(ct).ConfigureAwait(false);
+                try
+                {
+                    string frame;
+                    try { frame = auth.Protect(plaintextLine); }
+                    catch (ArgumentException) { return; }
+                    await writer.WriteLineAsync(frame.AsMemory(), ct).ConfigureAwait(false);
+                    await writer.FlushAsync(ct).ConfigureAwait(false);
+                }
+                finally
+                {
+                    writerLock.Release();
+                }
+            }
+
             Task sendTask = Task.Run(async () =>
             {
                 try
@@ -239,11 +258,32 @@ namespace Styx.PartyGrind.IPC
                         var pending = SquadJson.DeserializeEnvelope(line);
                         if (pending == null || _utcNowMs() - pending.TimestampUtcMs > DisconnectTimeoutMs)
                             continue;
-                        string frame;
-                        try { frame = auth.Protect(line); }
-                        catch (ArgumentException) { continue; }
-                        await writer.WriteLineAsync(frame.AsMemory(), ct).ConfigureAwait(false);
-                        await writer.FlushAsync(ct).ConfigureAwait(false);
+                        await WriteProtectedAsync(line).ConfigureAwait(false);
+                    }
+                }
+                catch (OperationCanceledException) { }
+                catch (IOException) { sessionCts.Cancel(); }
+                catch (ObjectDisposedException) { }
+            }, ct);
+
+            Task keepAliveTask = Task.Run(async () =>
+            {
+                try
+                {
+                    while (!ct.IsCancellationRequested)
+                    {
+                        int delay = KeepAliveIntervalMs;
+                        if (delay <= 0)
+                        {
+                            await Task.Delay(250, ct).ConfigureAwait(false);
+                            continue;
+                        }
+                        await Task.Delay(delay, ct).ConfigureAwait(false);
+                        if (ct.IsCancellationRequested || Volatile.Read(ref sessionClosed) != 0)
+                            break;
+                        long pingSeq = Interlocked.Increment(ref _nextSequenceId);
+                        string pingLine = SquadJson.SerializeEnvelope(SquadMessageTypes.Ping, _teamId, pingSeq, string.Empty);
+                        await WriteProtectedAsync(pingLine).ConfigureAwait(false);
                     }
                 }
                 catch (OperationCanceledException) { }
@@ -307,7 +347,9 @@ namespace Styx.PartyGrind.IPC
                 TryCloseSession();
                 try { tcp.Close(); } catch { }
                 try { await sendTask.ConfigureAwait(false); } catch { }
+                try { await keepAliveTask.ConfigureAwait(false); } catch { }
                 try { await watchdogTask.ConfigureAwait(false); } catch { }
+                writerLock.Dispose();
             }
         }
 
@@ -360,6 +402,10 @@ namespace Styx.PartyGrind.IPC
                     _latestLeaderState = leader;
                 }
                 LeaderStateReceived?.Invoke(leader);
+                return true;
+            }
+            if (string.Equals(envelope.MessageType, SquadMessageTypes.Ping, StringComparison.OrdinalIgnoreCase))
+            {
                 return true;
             }
             return false;

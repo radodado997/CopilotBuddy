@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 
@@ -195,9 +195,12 @@ namespace Singular.Managers
 
                         // WotLK QC: GetGlyphSocketInfo returns: enabled(0), glyphType(1), glyphSpellID(2), icon(3)
                         // Cata had an extra return value at index 2 (glyphTooltipIndex), shifting spell ID to index 3
-                        if (glyphInfo != null && glyphInfo[2] != "nil" && !string.IsNullOrEmpty(glyphInfo[2]))
+                        if (glyphInfo != null && glyphInfo.Count > 2 && glyphInfo[2] != "nil" &&
+                            int.TryParse(glyphInfo[2], out int glyphSpellId))
                         {
-                            Glyphs.Add(WoWSpell.FromId(int.Parse(glyphInfo[2])).Name.Replace("Glyph of ", ""));
+                            var glyphSpell = WoWSpell.FromId(glyphSpellId);
+                            if (glyphSpell != null && !string.IsNullOrEmpty(glyphSpell.Name))
+                                Glyphs.Add(glyphSpell.Name.Replace("Glyph of ", ""));
                         }
                     }
                 }

@@ -100,11 +100,18 @@ namespace Singular.ClassSpecific.Priest
                             "Greater Heal",
                             ret => (WoWUnit)ret, 
                             ret => ((WoWUnit)ret).HealthPercent < SingularSettings.Instance.Priest.GreaterHeal),
-                        // WotLK: "Heal" doesn't exist at 80. Using "Greater Heal" (Cata renamed Greater Heal -> Heal)
                         Spell.Heal(
-                             "Greater Heal",
+                            "Greater Heal",
                             ret => (WoWUnit)ret, 
                             ret => ((WoWUnit)ret).HealthPercent < SingularSettings.Instance.Priest.Heal),
+                        Spell.Heal(
+                            "Heal",
+                            ret => (WoWUnit)ret,
+                            ret => !SpellManager.HasSpell("Greater Heal") && ((WoWUnit)ret).HealthPercent < SingularSettings.Instance.Priest.Heal),
+                        Spell.Heal(
+                            "Lesser Heal",
+                            ret => (WoWUnit)ret,
+                            ret => !SpellManager.HasSpell("Greater Heal") && !SpellManager.HasSpell("Heal") && ((WoWUnit)ret).HealthPercent < SingularSettings.Instance.Priest.Heal),
                         Spell.Heal(
                             "Renew",
                             ret => (WoWUnit)ret, 
@@ -126,7 +133,7 @@ namespace Singular.ClassSpecific.Priest
                                 Movement.CreateMoveToTargetBehavior(true, 32f)
                                 )),
                         new Decorator(
-                            ret => moveInRange,
+                            ret => moveInRange && ((WoWUnit)ret).DistanceSqr > 35 * 35,
                             Movement.CreateMoveToTargetBehavior(true, 35f, ret => (WoWUnit)ret))
 
                         // Divine Hymn

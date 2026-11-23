@@ -746,7 +746,12 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 return true;
             }
 
-            if (me.IsMoving) WoWMovement.MoveStop();
+            if (me.IsMoving)
+            {
+                WoWMovement.MoveStop();
+                SquadPartySyncService.LogAction("Provision: stopping to trade " + targetSummary.CharacterName);
+                return true;
+            }
             if (me.CurrentTargetGuid != targetPlayer.Guid)
             {
                 targetPlayer.Target();

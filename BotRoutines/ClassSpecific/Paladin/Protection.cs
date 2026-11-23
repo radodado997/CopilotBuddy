@@ -139,6 +139,7 @@ namespace Singular.ClassSpecific.Paladin
                     Movement.CreateFaceTargetBehavior(),
                     Helpers.Common.CreateAutoAttack(true),
                     Spell.Cast("Avenger's Shield"),
+                    Spell.Cast("Hand of Reckoning", ret => !SpellManager.HasSpell("Avenger's Shield")),
                     Spell.Cast("Judgement of Wisdom"),
                     Spell.Cast("Judgement of Light"),
                     // Use dynamic melee range so we always close into actual weapon swing distance.

@@ -68,6 +68,12 @@ namespace Singular.ClassSpecific.Priest
                         Spell.BuffSelf("Hymn of Hope", ret => StyxWoW.Me.ManaPercent <= SingularSettings.Instance.Priest.HymnofHopeMana && (!SpellManager.HasSpell("Shadowfiend") || SpellManager.Spells["Shadowfiend"].Cooldown)),
                         Spell.BuffSelf("Divine Hymn", ret => Unit.NearbyFriendlyPlayers.Count(p => p.HealthPercent <= SingularSettings.Instance.Priest.DivineHymnHealth) >= SingularSettings.Instance.Priest.DivineHymnCount),
 
+                        Spell.Buff(
+                            "Power Word: Shield",
+                            ret => (WoWUnit)ret,
+                            ret => !((WoWUnit)ret).HasAura("Weakened Soul") && ((WoWUnit)ret).Combat &&
+                                   ((ret is WoWPlayer && Group.Tanks.Contains((WoWPlayer)ret) && ((WoWUnit)ret).HealthPercent < 80) ||
+                                    ((WoWUnit)ret).HealthPercent < 45)),
                         Spell.Cast(
                             "Prayer of Mending",
                             ret => (WoWUnit)ret,
@@ -100,11 +106,22 @@ namespace Singular.ClassSpecific.Priest
                             "Greater Heal",
                             ret => (WoWUnit)ret,
                             ret => ((WoWUnit)ret).HealthPercent < SingularSettings.Instance.Priest.HolyGreaterHeal),
-                        // WotLK: "Heal" doesn't exist at 80. Using "Greater Heal" (Cata renamed Greater Heal -> Heal)
                         Spell.Heal(
                             "Greater Heal",
                             ret => (WoWUnit)ret,
                             ret => ((WoWUnit)ret).HealthPercent < SingularSettings.Instance.Priest.HolyHeal),
+                        Spell.Heal(
+                            "Heal",
+                            ret => (WoWUnit)ret,
+                            ret => !SpellManager.HasSpell("Greater Heal") && ((WoWUnit)ret).HealthPercent < SingularSettings.Instance.Priest.HolyHeal),
+                        Spell.Heal(
+                            "Lesser Heal",
+                            ret => (WoWUnit)ret,
+                            ret => !SpellManager.HasSpell("Greater Heal") && !SpellManager.HasSpell("Heal") && ((WoWUnit)ret).HealthPercent < SingularSettings.Instance.Priest.HolyHeal),
+                        Spell.Heal(
+                            "Renew",
+                            ret => (WoWUnit)ret,
+                            ret => !((WoWUnit)ret).HasMyAura("Renew") && ((WoWUnit)ret).HealthPercent < 90),
                         new Decorator(
                             ret => StyxWoW.Me.Combat && StyxWoW.Me.GotTarget && Unit.NearbyFriendlyPlayers.Count(u => u.IsInMyPartyOrRaid) == 0,
                             new PrioritySelector(
@@ -117,7 +134,7 @@ namespace Singular.ClassSpecific.Priest
                                 Movement.CreateMoveToTargetBehavior(true, 32f)
                                 )),
                         new Decorator(
-                            ret => moveInRange,
+                            ret => moveInRange && ((WoWUnit)ret).DistanceSqr > 35 * 35,
                             Movement.CreateMoveToTargetBehavior(true, 35f, ret => (WoWUnit)ret))
 
                         // Divine Hymn

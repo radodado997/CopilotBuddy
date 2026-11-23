@@ -59,6 +59,13 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             _healDiagRetry[key] = now + 15000;
             Logging.WriteDebug($"[PartyGrind Heal {StyxWoW.Me?.Name}] {message}");
         }
+        private static readonly HashSet<string> RangedAssistSpellSet = new(StringComparer.OrdinalIgnoreCase)
+        {
+            "Smite", "Holy Fire", "Shadow Word: Pain",
+            "Lightning Bolt", "Flame Shock", "Earth Shock",
+            "Wrath", "Moonfire", "Starfire",
+            "Exorcism", "Judgement of Light", "Judgement of Wisdom"
+        };
         private static readonly string[] RangedAssistSpells =
         {
             "Smite", "Holy Fire", "Shadow Word: Pain",
@@ -119,10 +126,21 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (me == null || !me.IsAlive)
                 return false;
 
-            if (me.IsCasting || me.ChanneledCastingSpellId != 0)
-                return true;
-
             var candidates = CollectLiveHealCandidates(leader);
+            if (me.IsCasting || me.ChanneledCastingSpellId != 0)
+            {
+                string? castingName = me.CastingSpell?.Name;
+                if (!string.IsNullOrEmpty(castingName) && RangedAssistSpellSet.Contains(castingName) &&
+                    candidates.Any(c => c.HealthPercent < 75.0))
+                {
+                    SpellManager.StopCasting();
+                }
+                else
+                {
+                    return true;
+                }
+            }
+
             if (candidates.Count == 0 || (!emergencyOnly && me.Level < 10))
                 StopActiveHealBehavior();
             double threshold = emergencyOnly ? 55.0 : 92.0;
@@ -138,6 +156,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             }
 
             var remaining = candidates.ToList();
+            bool triedRoutine = false;
             while (remaining.Count > 0)
             {
                 var priorityCandidate = SelectPriorityHealTarget(
@@ -157,8 +176,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     continue;
 
                 // Stage 1: Try Routine's HealBehavior when level >= 10 and not in Hybrid emergency-only mode.
-                if (!emergencyOnly && me.Level >= 10 && targetUnit.Distance <= 35f && targetUnit.InLineOfSpellSight)
+                if (!triedRoutine && !emergencyOnly && me.Level >= 10 && targetUnit.Distance <= 35f && targetUnit.InLineOfSpellSight)
                 {
+                    triedRoutine = true;
                     var healBehavior = RoutineManager.Current?.HealBehavior;
                     if (healBehavior != null)
                     {
@@ -173,8 +193,6 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                                 _activeHealBehavior = healBehavior;
                             }
                             RunStatus status = healBehavior.Tick(null);
-                            // Running keeps the composite active and handled this tick;
-                            // a cast also wins. Only Failure falls through to explicit healing.
                             if (status == RunStatus.Running || me.IsCasting || me.ChanneledCastingSpellId != 0)
                             {
                                 SquadPartySyncService.LogAction("Running heal routine");
@@ -182,7 +200,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                             }
                             healBehavior.Stop(null);
                             _activeHealBehavior = null;
-                            if (status == RunStatus.Success)
+                            if (status == RunStatus.Success && (SpellManager.GlobalCooldown || me.IsMoving))
                             {
                                 SquadPartySyncService.LogAction("Running heal routine");
                                 return true;
@@ -366,7 +384,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 return false;
 
             var candidates = CollectLiveHealCandidates(leader);
-            if (candidates.Any(c => c.HealthPercent < 88.0))
+            if (candidates.Any(c => c.HealthPercent < 94.0))
                 return false;
 
             ulong targetGuid = leader.FocusTargetGuid != 0 ? leader.FocusTargetGuid : leader.SecondaryTargetGuid;

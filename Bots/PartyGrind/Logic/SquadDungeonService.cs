@@ -117,6 +117,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private uint _walkInRunDungeonId;
         private uint _walkInRunMapId;
         private int _hotspotIndex;
+        private uint _breadcrumbBossEntry;
+        private int _breadcrumbIndex;
         private long _completedAtUtcMs;
         private bool _countedCurrentWalkInEntry;
         private readonly HashSet<ulong> _runParticipants = new();
@@ -159,6 +161,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             _lastProposalAcceptUtcMs = 0;
             _lastTeleportOutUtcMs = 0;
             _hotspotIndex = 0;
+            _breadcrumbBossEntry = 0;
+            _breadcrumbIndex = 0;
             StopActiveEncounter();
         }
 
@@ -179,6 +183,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             _lastSyncedMapId = 0;
             _lastSyncedDungeonId = 0;
             _hotspotIndex = 0;
+            _breadcrumbBossEntry = 0;
+            _breadcrumbIndex = 0;
         }
 
         public void StopActiveEncounter()
@@ -261,6 +267,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 {
                     StopActiveEncounter();
                     _hotspotIndex = 0;
+                    _breadcrumbBossEntry = 0;
+                    _breadcrumbIndex = 0;
                     DungeonManager.SetDungeonById(desiredDungeonId);
                     LfgManager.DungeonCompletedReason = CompleteReason.None;
                     _lastSyncedDungeonId = desiredDungeonId;
@@ -1043,6 +1051,43 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             return false;
         }
 
+        internal static WoWPoint AdvanceBossBreadcrumb(
+            WoWPoint meLocation,
+            IReadOnlyList<WoWPoint> bossPath,
+            WoWPoint bossProfileLocation,
+            WoWPoint? liveBossLocation,
+            float? liveBossPathDistance,
+            ref int breadcrumbIndex)
+        {
+            if (liveBossLocation.HasValue && liveBossLocation.Value != WoWPoint.Zero &&
+                liveBossPathDistance.HasValue && liveBossPathDistance.Value <= 25f)
+            {
+                return liveBossLocation.Value;
+            }
+
+            if (bossPath != null && bossPath.Count > 0)
+            {
+                while (breadcrumbIndex < bossPath.Count)
+                {
+                    WoWPoint crumb = bossPath[breadcrumbIndex];
+                    if (crumb == WoWPoint.Zero || meLocation.Distance(crumb) <= HotspotArrivalDistance)
+                    {
+                        breadcrumbIndex++;
+                        continue;
+                    }
+                    return crumb;
+                }
+            }
+
+            if (liveBossLocation.HasValue && liveBossLocation.Value != WoWPoint.Zero)
+                return liveBossLocation.Value;
+
+            if (bossProfileLocation != WoWPoint.Zero && meLocation.Distance(bossProfileLocation) > HotspotArrivalDistance)
+                return bossProfileLocation;
+
+            return WoWPoint.Zero;
+        }
+
         public WoWPoint ComputeLeaderNextDungeonPoint()
         {
             var me = StyxWoW.Me;
@@ -1062,7 +1107,52 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (profile != null && profile.BossEncounters.Count > 0)
             {
                 var currentBoss = BossManager.CurrentBoss;
-                var liveBoss = ObjectManager.GetObjectsOfType<WoWUnit>()
+                var profileBoss = currentBoss == null
+                    ? null
+                    : profile.BossEncounters.FirstOrDefault(b => b.Entry == currentBoss.Entry);
+
+                if (profileBoss != null)
+                {
+                    if (_breadcrumbBossEntry != profileBoss.Entry)
+                    {
+                        _breadcrumbBossEntry = profileBoss.Entry;
+                        _breadcrumbIndex = 0;
+                        if (profileBoss.Path.Count > 1)
+                        {
+                            int closestIdx = 0;
+                            float closestDist = float.MaxValue;
+                            for (int i = 0; i < profileBoss.Path.Count; i++)
+                            {
+                                float d = me.Location.Distance(profileBoss.Path[i]);
+                                if (d < closestDist)
+                                {
+                                    closestDist = d;
+                                    closestIdx = i;
+                                }
+                            }
+                            if (closestDist <= 30f)
+                                _breadcrumbIndex = closestIdx;
+                        }
+                    }
+
+                    WoWUnit? liveCurrentBoss = ObjectManager.GetObjectsOfType<WoWUnit>()
+                        .FirstOrDefault(u => u != null && u.IsValid && u.IsAlive && u.Entry == profileBoss.Entry);
+                    float? livePathDist = liveCurrentBoss != null
+                        ? Navigator.PathDistance(me.Location, liveCurrentBoss.Location, 100f)
+                        : null;
+
+                    WoWPoint bossTarget = AdvanceBossBreadcrumb(
+                        me.Location,
+                        profileBoss.Path,
+                        profileBoss.Location,
+                        liveCurrentBoss?.Location,
+                        livePathDist,
+                        ref _breadcrumbIndex);
+                    if (bossTarget != WoWPoint.Zero)
+                        return bossTarget;
+                }
+
+                var fallbackBoss = ObjectManager.GetObjectsOfType<WoWUnit>()
                     .Where(u => u != null && u.IsValid && u.IsAlive &&
                                 profile.BossEncounters.Any(b => b.Entry == u.Entry &&
                                     (!b.Optional || BossManager.KillOptionalBossesEnabled) &&
@@ -1073,29 +1163,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     .ThenBy(u => u.DistanceSqr)
                     .FirstOrDefault();
 
-                if (liveBoss != null)
-                    return liveBoss.Location;
-
-                var profileBoss = currentBoss == null
-                    ? null
-                    : profile.BossEncounters.FirstOrDefault(b => b.Entry == currentBoss.Entry);
-
-                if (profileBoss != null && profileBoss.PathBreadCrumbs.Count > 0)
-                {
-                    WoWPoint crumb = profileBoss.PathBreadCrumbs.Peek();
-                    if (crumb != WoWPoint.Zero)
-                    {
-                        if (me.Location.DistanceSqr(crumb) < 25f && profileBoss.PathBreadCrumbs.Count > 1)
-                        {
-                            profileBoss.PathBreadCrumbs.Dequeue();
-                            crumb = profileBoss.PathBreadCrumbs.Peek();
-                        }
-                        return crumb;
-                    }
-                }
-
-                if (profileBoss != null && profileBoss.Location != WoWPoint.Zero)
-                    return profileBoss.Location;
+                if (fallbackBoss != null)
+                    return fallbackBoss.Location;
 
                 while (_hotspotIndex < profile.HotSpots.Count)
                 {

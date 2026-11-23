@@ -272,6 +272,7 @@ namespace CopilotBuddy.Bots.PartyGrind
             Cleanup(() => { StopRoutine(ref _activePreCombatBuffRoutine); });
             Cleanup(() => { StopRoutine(ref _activeRestRoutine); });
             Cleanup(() => { SquadHealBridge.StopActiveHealBehavior(); });
+            Cleanup(() => { SquadPartyBuffService.ResetBuffCastThrottles(); });
             Cleanup(() => { _dungeon.ShutdownRuntime(); });
             Cleanup(() => { ClearPullCommit(); });
             Cleanup(() => { ResetBacklineState(); });
@@ -778,8 +779,9 @@ namespace CopilotBuddy.Bots.PartyGrind
 
             ulong resolvedFocusGuid = (focus != null && focus.IsValid && !focus.Dead && !focus.IsFriendly) ? focus.Guid : 0UL;
             var local = SquadContext.GetLocalMemberStateSnapshot();
+            bool anyFollowerStillInCombat = decision.Members?.Any(m => m.IsConnected && !m.IsDead && !m.IsGhost && m.IsInCombat) == true;
             bool localCannotPull = local == null || local.IsDead || local.IsGhost || local.IsInCombat ||
-                                   local.NeedsRest || local.IsLooting;
+                                   local.NeedsRest || local.IsLooting || anyFollowerStillInCombat;
             bool commitActive = _pullCommittedGuid != 0 && now < _pullCommittedUntilMs;
             bool canInitiatePull = !bossPullBlocked && !anotherTankDrives &&
                 SquadTankBridge.CanInitiatePull(decision, settings.MaxPullGatherDistance);
@@ -1508,6 +1510,16 @@ namespace CopilotBuddy.Bots.PartyGrind
             return RunStatus.Success;
         }
 
+        internal static bool CanFollowerEngageFocus(
+            bool meInCombat,
+            bool leaderInCombat,
+            bool focusInCombat,
+            bool focusTargetingParty,
+            float tankDistanceToFocus)
+        {
+            return meInCombat || leaderInCombat || focusInCombat || focusTargetingParty || tankDistanceToFocus <= 12f;
+        }
+
         private bool IsCombatOrHealNeeded()
         {
             var me = StyxWoW.Me;
@@ -1528,12 +1540,24 @@ namespace CopilotBuddy.Bots.PartyGrind
                                 restSource?.NeedsRest == true;
             if (leader != null && leader.FocusTargetGuid != 0 && !restRequired)
             {
-                if (!IsBossPullBlocked(settings, leader, me))
-                    return true;
                 var focus = ObjectManager.GetObjectByGuid<WoWUnit>(leader.FocusTargetGuid);
-                if (focus is { IsValid: true, IsAlive: true } &&
-                    (focus.Combat || focus.IsTargetingMyPartyMember))
+                if (IsBossPullBlocked(settings, leader, me))
+                {
+                    if (focus is { IsValid: true, IsAlive: true } &&
+                        (focus.Combat || focus.IsTargetingMyPartyMember))
+                        return true;
+                }
+                else if (settings.Role == SquadRole.TankLeader)
+                {
                     return true;
+                }
+                else if (focus is { IsValid: true, IsAlive: true })
+                {
+                    var tankPos = new WoWPoint(leader.X, leader.Y, leader.Z);
+                    float tankDist = leader.MapId == me.MapId ? tankPos.Distance(focus.Location) : 999f;
+                    if (CanFollowerEngageFocus(me.Combat, leader.InCombat, focus.Combat, focus.IsTargetingMyPartyMember, tankDist))
+                        return true;
+                }
             }
 
             if (settings.Role == SquadRole.Healer && SquadHealBridge.HasHealCandidate(leader))
@@ -1565,7 +1589,14 @@ namespace CopilotBuddy.Bots.PartyGrind
                     SquadTankBridge.EnsureTankDefensiveStanceOrAura(settings);
                     if (SquadTankBridge.TryTauntLooseMob())
                         return RunStatus.Success;
-                    return RunRoutineCombat(leader?.FocusTargetGuid ?? 0UL);
+                    ulong tankFocusGuid = leader?.FocusTargetGuid ?? 0UL;
+                    if (!me.Combat && SquadContext.IsDungeonModeActive && SquadDungeonService.IsInDungeonMap(me) &&
+                        (leader == null || leader.EffectiveTankGuid == 0 || leader.EffectiveTankGuid == me.Guid) &&
+                        SquadTankBridge.TryExecuteSafeDungeonPull(tankFocusGuid))
+                    {
+                        return RunStatus.Success;
+                    }
+                    return RunRoutineCombat(tankFocusGuid);
 
                 case SquadRole.Healer:
                     if (SquadHealBridge.RunHealerTick(emergencyOnly: false, settings, leader))
@@ -1661,7 +1692,34 @@ namespace CopilotBuddy.Bots.PartyGrind
 
             if (focus != null && focus.IsValid && !focus.Dead && focus.Attackable && !focus.IsFriendly)
             {
-                if (me.CurrentTargetGuid != focus.Guid)
+                var tankPosForEngage = leader != null ? new WoWPoint(leader.X, leader.Y, leader.Z) : me.Location;
+                float tankDistToFocus = leader != null && leader.MapId == me.MapId
+                    ? tankPosForEngage.Distance(focus.Location)
+                    : 0f;
+                bool targetEngaged = CanFollowerEngageFocus(
+                    me.Combat,
+                    leader?.InCombat == true,
+                    focus.Combat,
+                    focus.IsTargetingMyPartyMember,
+                    tankDistToFocus);
+
+                if (!targetEngaged)
+                {
+                    if (me.GotAlivePet)
+                    {
+                        WoWPetControl.SetStance(WoWPetSpell.PetStance.Passive);
+                        WoWPetControl.Follow();
+                    }
+                    return RunStatus.Failure;
+                }
+
+                bool currentTargetIsValidAdd = me.CurrentTarget != null &&
+                                               me.CurrentTarget.IsValid &&
+                                               !me.CurrentTarget.Dead &&
+                                               me.CurrentTarget.Combat &&
+                                               !me.CurrentTarget.IsFriendly &&
+                                               (me.IsCasting || me.ChanneledCastingSpellId != 0 || _activeCombatRoutine != null);
+                if (me.CurrentTargetGuid != focus.Guid && !currentTargetIsValidAdd)
                     focus.Target();
 
                 if (me.GotAlivePet)
@@ -1673,14 +1731,14 @@ namespace CopilotBuddy.Bots.PartyGrind
                 if (isMelee)
                 {
                     bool canFlank = !SquadContext.IsDungeonModeActive || global::Bots.DungeonBuddy.Helpers.ScriptHelpers.MovementEnabled;
-                    if (canFlank && focus.Distance <= 12f)
+                    if (canFlank && focus.Distance <= 12f && !focus.IsWithinMeleeRange)
                     {
                         WoWPoint flankPos = SquadFormationService.ComputeMeleeFlankPosition(
-                            focus.Location, focus.Rotation, settings.MeleeFlankRadius, slotIdx, slotCount);
+                            focus.Location, focus.Rotation, settings.MeleeFlankRadius, slotIdx, slotCount, focus.CombatReach);
                         bool safeFlank = !SquadContext.IsDungeonModeActive ||
                                          (!global::Bots.DungeonBuddy.Avoidance.AvoidanceManager.IsInAvoidance(flankPos) &&
                                           Navigator.CanNavigateFully(me.Location, flankPos));
-                        if (safeFlank && me.Location.Distance2D(flankPos) > 1.8f && focus.Distance > 4.5f)
+                        if (safeFlank && me.Location.Distance2D(flankPos) > 2.2f)
                         {
                             SquadPartySyncService.LogAction("Moving to flank " + focus.Name);
                             Navigator.MoveTo(flankPos, "Flanking " + focus.Name);
@@ -1865,15 +1923,25 @@ namespace CopilotBuddy.Bots.PartyGrind
 
             if (focusGuid != 0 && (me.CurrentTarget == null || me.CurrentTarget.Dead || me.CurrentTargetGuid != focusGuid))
             {
-                var unit = ObjectManager.GetObjectByGuid<WoWUnit>(focusGuid);
-                if (unit == null || !unit.IsValid || unit.Dead || unit.IsFriendly)
+                bool keepOffTarget = settings.Role != SquadRole.TankLeader &&
+                                     me.CurrentTarget != null &&
+                                     me.CurrentTarget.IsValid &&
+                                     !me.CurrentTarget.Dead &&
+                                     me.CurrentTarget.Combat &&
+                                     !me.CurrentTarget.IsFriendly &&
+                                     (me.IsCasting || me.ChanneledCastingSpellId != 0 || _activeCombatRoutine != null);
+                if (!keepOffTarget)
                 {
-                    if (!me.Combat)
-                        return RunStatus.Failure;
-                }
-                else
-                {
-                    unit.Target();
+                    var unit = ObjectManager.GetObjectByGuid<WoWUnit>(focusGuid);
+                    if (unit == null || !unit.IsValid || unit.Dead || unit.IsFriendly)
+                    {
+                        if (!me.Combat)
+                            return RunStatus.Failure;
+                    }
+                    else
+                    {
+                        unit.Target();
+                    }
                 }
             }
 
@@ -1884,7 +1952,12 @@ namespace CopilotBuddy.Bots.PartyGrind
             if (routine == null)
                 return RunStatus.Failure;
 
-            Composite? buffBehavior = me.Combat ? routine.CombatBuffBehavior : routine.PullBuffBehavior;
+            bool treatAsCombat = me.Combat ||
+                                 (settings.Role != SquadRole.TankLeader &&
+                                  me.CurrentTarget != null &&
+                                  (me.CurrentTarget.Combat || me.CurrentTarget.IsTargetingMyPartyMember || me.CurrentTarget.CurrentTargetGuid != 0));
+
+            Composite? buffBehavior = treatAsCombat ? routine.CombatBuffBehavior : routine.PullBuffBehavior;
             if (buffBehavior != null)
             {
                 _combatBuffTicked = true;
@@ -1893,11 +1966,11 @@ namespace CopilotBuddy.Bots.PartyGrind
                     return RunStatus.Running;
             }
 
-            Composite? behavior = me.Combat ? routine.CombatBehavior : (routine.PullBehavior ?? routine.CombatBehavior);
+            Composite? behavior = treatAsCombat ? routine.CombatBehavior : (routine.PullBehavior ?? routine.CombatBehavior);
             if (behavior == null)
                 return RunStatus.Failure;
 
-            SquadPartySyncService.LogAction((me.Combat ? "Combat routine" : "Pull routine") +
+            SquadPartySyncService.LogAction((treatAsCombat ? "Combat routine" : "Pull routine") +
                 (me.CurrentTarget != null ? ": " + me.CurrentTarget.Name : string.Empty));
             _combatTicked = true;
             RunStatus status = TickRoutine(ref _activeCombatRoutine, behavior);
@@ -2119,6 +2192,11 @@ namespace CopilotBuddy.Bots.PartyGrind
                     {
                         if (me.CurrentTargetGuid != committed.Guid)
                             committed.Target();
+                        if (!me.Combat && isDungeon && !anotherTankDrives &&
+                            SquadTankBridge.TryExecuteSafeDungeonPull(_pullCommittedGuid))
+                        {
+                            return RunStatus.Success;
+                        }
                         return RunRoutineCombat(_pullCommittedGuid);
                     }
                     ClearPullCommit();

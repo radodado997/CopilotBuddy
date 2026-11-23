@@ -82,6 +82,7 @@ namespace Styx.PartyGrind.IPC
         public const string Handshake = "Handshake";
         public const string MemberState = "MemberState";
         public const string LeaderState = "LeaderState";
+        public const string Ping = "Ping";
     }
 
     public class SquadEnvelope

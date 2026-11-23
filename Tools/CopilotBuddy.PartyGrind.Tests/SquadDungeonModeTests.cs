@@ -639,5 +639,43 @@ namespace CopilotBuddy.PartyGrind.Tests
             Assert.Equal(5, dungeonService.GetHourlyResetCount(fifthEntryTime + 31_000L));
             Assert.True(dungeonService.GetWalkInEntryLockoutRemainingSeconds(fifthEntryTime + 31_000L, maxInstancesPerHour: 5) > 0);
         }
+
+        [Fact]
+        public void AdvanceBossBreadcrumb_FollowsCorridorBreadcrumbsBeforeLockingOntoDistantLiveBoss()
+        {
+            var crumbs = new List<WoWPoint>
+            {
+                new(10f, 0f, 0f),
+                new(30f, 0f, 0f),
+                new(60f, 0f, 0f)
+            };
+            var bossLoc = new WoWPoint(85f, 0f, 0f);
+            int idx = 0;
+
+            WoWPoint step1 = SquadDungeonService.AdvanceBossBreadcrumb(
+                new WoWPoint(0f, 0f, 0f), crumbs, bossLoc, bossLoc, 85f, ref idx);
+            Assert.Equal(crumbs[0], step1);
+            Assert.Equal(0, idx);
+
+            WoWPoint step2 = SquadDungeonService.AdvanceBossBreadcrumb(
+                new WoWPoint(9f, 0f, 0f), crumbs, bossLoc, bossLoc, 76f, ref idx);
+            Assert.Equal(crumbs[1], step2);
+            Assert.Equal(1, idx);
+
+            WoWPoint step3 = SquadDungeonService.AdvanceBossBreadcrumb(
+                new WoWPoint(29f, 0f, 0f), crumbs, bossLoc, bossLoc, 56f, ref idx);
+            Assert.Equal(crumbs[2], step3);
+            Assert.Equal(2, idx);
+
+            WoWPoint step4 = SquadDungeonService.AdvanceBossBreadcrumb(
+                new WoWPoint(59f, 0f, 0f), crumbs, bossLoc, bossLoc, 26f, ref idx);
+            Assert.Equal(bossLoc, step4);
+            Assert.Equal(3, idx);
+
+            int closeIdx = 0;
+            WoWPoint closeStep = SquadDungeonService.AdvanceBossBreadcrumb(
+                new WoWPoint(65f, 0f, 0f), crumbs, bossLoc, bossLoc, 20f, ref closeIdx);
+            Assert.Equal(bossLoc, closeStep);
+        }
     }
 }

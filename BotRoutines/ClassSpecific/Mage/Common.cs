@@ -258,6 +258,9 @@ namespace Singular.ClassSpecific.Mage
 
         private static bool IsViableForPolymorph(WoWUnit unit)
         {
+            if (Styx.PartyGrind.SquadContext.IsActive)
+                return false;
+
             if (unit.IsCrowdControlled())
                 return false;
 

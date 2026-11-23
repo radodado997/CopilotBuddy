@@ -58,11 +58,13 @@ namespace Singular.ClassSpecific.Paladin
                 new PrioritySelector(
                 // This won't run, but it's here for changes in the future. We NEVER run this method if we're mounted.
                     Spell.BuffSelf("Crusader Aura", ret => StyxWoW.Me.Mounted),
-                    CreatePaladinBlessBehavior(),
-                    new Decorator(
-                        ret => TalentManager.CurrentSpec == TalentSpec.HolyPaladin,
-                        new PrioritySelector(
-                            Spell.BuffSelf("Concentration Aura", ret => SingularSettings.Instance.Paladin.Aura == PaladinAura.Auto),
+                new Decorator(
+                    ret => !Styx.PartyGrind.SquadContext.IsActive || !(Styx.PartyGrind.SquadContext.ActiveSettings?.EnableCrossPartyBuffs ?? true),
+                    CreatePaladinBlessBehavior()),
+                new Decorator(
+                    ret => TalentManager.CurrentSpec == TalentSpec.HolyPaladin,
+                    new PrioritySelector(
+                        Spell.BuffSelf("Concentration Aura", ret => SingularSettings.Instance.Paladin.Aura == PaladinAura.Auto && (!Styx.PartyGrind.SquadContext.IsActive || !(Styx.PartyGrind.SquadContext.ActiveSettings?.EnableCrossPartyBuffs ?? true))),
                             // WotLK uses Seal of Wisdom for mana regen (renamed to Seal of Insight in Cata 4.0.1)
                             Spell.BuffSelf("Seal of Wisdom"),
                             Spell.BuffSelf("Seal of Righteousness", ret => !SpellManager.HasSpell("Seal of Wisdom"))

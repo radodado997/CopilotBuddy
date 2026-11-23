@@ -177,6 +177,7 @@ namespace Singular.ClassSpecific.Druid
                             CreateFeralLevel2046Pull()),
 
                         Spell.BuffSelf("Cat Form"),
+                        Helpers.Common.CreateAutoAttack(true),
                         Spell.BuffSelf("Prowl", ret => StyxWoW.Me.CurrentTarget != null && StyxWoW.Me.CurrentTarget.DistanceSqr < 30 * 30),
                         Spell.Cast("Feral Charge - Cat"),
                         Spell.Cast("Dash",
@@ -188,6 +189,7 @@ namespace Singular.ClassSpecific.Druid
                         Spell.Cast("Pounce"),
                         Spell.Cast("Shred", ret => StyxWoW.Me.CurrentTarget != null && StyxWoW.Me.CurrentTarget.MeIsBehind),
                         Spell.Cast("Mangle (Cat)"),
+                        Spell.Cast("Claw", ret => !SpellManager.HasSpell("Mangle (Cat)")),
                         Spell.Cast("Moonfire", ret => StyxWoW.Me.CurrentTarget != null && StyxWoW.Me.CurrentTarget.Distance2DSqr < 10 * 10 && Math.Abs(StyxWoW.Me.CurrentTarget.Z - StyxWoW.Me.Z) > 5),
                         Movement.CreateMoveToMeleeBehavior(true)))
                 );
@@ -240,9 +242,14 @@ namespace Singular.ClassSpecific.Druid
                 Spell.Cast("Ferocious Bite",
                     ret => StyxWoW.Me.ComboPoints == 5 ||
                            StyxWoW.Me.ComboPoints > 1 && StyxWoW.Me.CurrentTarget != null && StyxWoW.Me.CurrentTarget.HealthPercent < 20),
+                Spell.Cast("Rip",
+                    ret => StyxWoW.Me.ComboPoints == 5 &&
+                           StyxWoW.Me.CurrentTarget != null &&
+                           !StyxWoW.Me.CurrentTarget.HasMyAura("Rip")),
                 Spell.Cast("Shred", ret => StyxWoW.Me.CurrentTarget != null && StyxWoW.Me.CurrentTarget.MeIsBehind),
 				Spell.Buff("Rake", true, ret => StyxWoW.Me.CurrentTarget),
-                Spell.Cast("Mangle (Cat)"))),
+                Spell.Cast("Mangle (Cat)"),
+                Spell.Cast("Claw", ret => !SpellManager.HasSpell("Mangle (Cat)")))),
                 Movement.CreateMoveToMeleeBehavior(true)
                 );
         }
@@ -250,7 +257,9 @@ namespace Singular.ClassSpecific.Druid
         private static Composite CreateFeralLevel1020Pull()
         {
             return new PrioritySelector(
+                Helpers.Common.CreateAutoAttack(true),
                 Spell.Buff("Moonfire"),
+                Spell.Cast("Wrath"),
                 Movement.CreateMoveToTargetBehavior(true, 30f)
                 );
         }
@@ -258,11 +267,10 @@ namespace Singular.ClassSpecific.Druid
         private static Composite CreateFeralLevel1020Combat()
         {
             return new PrioritySelector(
-                Spell.Cast("Ferocious Bite",
-                    ret => StyxWoW.Me.ComboPoints == 5 ||
-                           StyxWoW.Me.ComboPoints > 1 && StyxWoW.Me.CurrentTarget != null && StyxWoW.Me.CurrentTarget.HealthPercent < 20),
-                Spell.Buff("Rake", true, ret => StyxWoW.Me.CurrentTarget),
-                Spell.Cast("Mangle (Cat)"),
+                Spell.BuffSelf("Bear Form", ret => SpellManager.HasSpell("Bear Form")),
+                Spell.Cast("Maul", ret => StyxWoW.Me.HasAura("Bear Form") && StyxWoW.Me.CurrentRage >= 15),
+                Spell.Buff("Moonfire", ret => !StyxWoW.Me.HasAura("Bear Form")),
+                Spell.Cast("Wrath", ret => !StyxWoW.Me.HasAura("Bear Form")),
                 Movement.CreateMoveToMeleeBehavior(true)
                 );
         }
@@ -271,11 +279,14 @@ namespace Singular.ClassSpecific.Druid
         {
             return new PrioritySelector(
                 Spell.BuffSelf("Cat Form"),
-                Spell.BuffSelf("Prowl", ret => SpellManager.HasSpell("Pounce")),
+                Helpers.Common.CreateAutoAttack(true),
+                Spell.BuffSelf("Prowl", ret => SpellManager.HasSpell("Pounce") && !StyxWoW.Me.IsInParty),
                 Spell.Cast("Feral Charge - Cat"),				
 				Spell.Cast("Pounce"),
+                Spell.Cast("Shred", ret => StyxWoW.Me.CurrentTarget != null && StyxWoW.Me.CurrentTarget.MeIsBehind),
 				Spell.Buff("Rake", true, ret => StyxWoW.Me.CurrentTarget),
                 Spell.Cast("Mangle (Cat)"),
+                Spell.Cast("Claw", ret => !SpellManager.HasSpell("Mangle (Cat)")),
                 Movement.CreateMoveToMeleeBehavior(true)
                 );
         }
@@ -283,11 +294,19 @@ namespace Singular.ClassSpecific.Druid
         private static Composite CreateFeralLevel2046Combat()
         {
             return new PrioritySelector(
+                Spell.BuffSelf("Tiger's Fury", ret => CurrentEnergy <= 35),
                 Spell.Cast("Ferocious Bite",
                     ret => StyxWoW.Me.ComboPoints == 5 ||
                            StyxWoW.Me.ComboPoints > 1 && StyxWoW.Me.CurrentTarget != null && StyxWoW.Me.CurrentTarget.HealthPercent < 20),
+                Spell.Cast("Rip",
+                    ret => StyxWoW.Me.ComboPoints >= 4 &&
+                           StyxWoW.Me.CurrentTarget != null &&
+                           !StyxWoW.Me.CurrentTarget.HasMyAura("Rip") &&
+                           (!SpellManager.HasSpell("Ferocious Bite") || StyxWoW.Me.CurrentTarget.HealthPercent >= 35)),
+                Spell.Cast("Shred", ret => StyxWoW.Me.CurrentTarget != null && StyxWoW.Me.CurrentTarget.MeIsBehind),
                 Spell.Buff("Rake", true, ret => StyxWoW.Me.CurrentTarget),
                 Spell.Cast("Mangle (Cat)"),
+                Spell.Cast("Claw", ret => !SpellManager.HasSpell("Mangle (Cat)")),
                 Movement.CreateMoveToMeleeBehavior(true)
                 );
         }
@@ -872,6 +891,12 @@ return Action.RAKE;*/
                                    ret =>
                                    (!StyxWoW.Me.CurrentTarget.MeIsBehind && !StyxWoW.Me.CurrentTarget.CanShredBoss()) &&
                                    CurrentEnergy >= (EnergyRegen)
+                            ),
+                        Spell.Buff("Rake", true, ret => StyxWoW.Me.CurrentTarget,
+                                   ret => !SpellManager.HasSpell("Mangle (Cat)")),
+                        Spell.Cast("Claw",
+                                   ret => !SpellManager.HasSpell("Mangle (Cat)") &&
+                                          (!SpellManager.HasSpell("Shred") || !StyxWoW.Me.CurrentTarget.MeIsBehind)
                             )
                         )
                     ),
@@ -1428,6 +1453,18 @@ return Action.RAKE;*/
                                    ret =>
                                    (!StyxWoW.Me.CurrentTarget.MeIsBehind && !StyxWoW.Me.CurrentTarget.CanShredBoss()) &&
                                    CurrentEnergy >= (EnergyRegen)
+                            ),
+                        Spell.Cast("Rip",
+                                   ret => !SpellManager.HasSpell("Tiger's Fury") &&
+                                          StyxWoW.Me.ComboPoints >= 4 &&
+                                          !StyxWoW.Me.CurrentTarget.HasMyAura("Rip")
+                            ),
+                        Spell.Buff("Rake", true, ret => StyxWoW.Me.CurrentTarget,
+                                   ret => !SpellManager.HasSpell("Mangle (Cat)")),
+                        Spell.Cast("Claw",
+                                   ret => !SpellManager.HasSpell("Mangle (Cat)") &&
+                                          (!SpellManager.HasSpell("Shred") ||
+                                           (!StyxWoW.Me.CurrentTarget.MeIsBehind && !StyxWoW.Me.CurrentTarget.CanShredBoss()))
                             )
                         )
                     ),

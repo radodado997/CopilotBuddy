@@ -229,7 +229,8 @@ namespace Styx.PartyGrind.IPC
         /// <summary>
         /// Maximum idle silence in milliseconds before a peer is treated as disconnected. Defaults to 3000 ms.
         /// </summary>
-        public int DisconnectTimeoutMs { get; set; } = 3000;
+        public int DisconnectTimeoutMs { get; set; } = 10000;
+        public int KeepAliveIntervalMs { get; set; } = 1000;
 
         public int Port => _actualPort > 0 ? _actualPort : _requestedPort;
         public bool IsListening => _listener != null && _serverCts != null && !_serverCts.IsCancellationRequested;
@@ -433,6 +434,7 @@ namespace Styx.PartyGrind.IPC
             CancellationToken ct = linkedCts.Token;
 
             Task sendTask = Task.CompletedTask;
+            Task keepAliveTask = Task.CompletedTask;
             Task deadline = Task.Run(async () =>
             {
                 try
@@ -452,6 +454,28 @@ namespace Styx.PartyGrind.IPC
                 using var reader = new StreamReader(session.Tcp.GetStream(), new UTF8Encoding(false));
                 session.Authentication = await SquadPeerAuthentication.Server(reader, session.Writer, _memberSecrets, _teamId, ct).ConfigureAwait(false);
                 sendTask = Task.Run(() => SendLoopAsync(session, ct), ct);
+                keepAliveTask = Task.Run(async () =>
+                {
+                    try
+                    {
+                        while (!ct.IsCancellationRequested)
+                        {
+                            int delay = KeepAliveIntervalMs;
+                            if (delay <= 0)
+                            {
+                                await Task.Delay(250, ct).ConfigureAwait(false);
+                                continue;
+                            }
+                            await Task.Delay(delay, ct).ConfigureAwait(false);
+                            if (ct.IsCancellationRequested || session.Closed || string.IsNullOrEmpty(session.CharacterName))
+                                continue;
+                            long seq = Interlocked.Increment(ref _nextSequenceId);
+                            string pingLine = SquadJson.SerializeEnvelope(SquadMessageTypes.Ping, _teamId, seq, string.Empty);
+                            session.EnqueueLine(pingLine);
+                        }
+                    }
+                    catch (OperationCanceledException) { }
+                }, ct);
                 while (!ct.IsCancellationRequested)
                 {
                     string? line = await SquadJson.ReadFrameAsync(reader, ct).ConfigureAwait(false);
@@ -484,6 +508,7 @@ namespace Styx.PartyGrind.IPC
                 try { session.Tcp.Close(); } catch { }
                 RemoveSession(session);
                 try { await sendTask.ConfigureAwait(false); } catch { }
+                try { await keepAliveTask.ConfigureAwait(false); } catch { }
                 try { await deadline.ConfigureAwait(false); } catch { }
                 session.Dispose();
             }
@@ -626,6 +651,16 @@ namespace Styx.PartyGrind.IPC
                 }
 
                 MemberStateReceived?.Invoke(state);
+            }
+            else if (string.Equals(envelope.MessageType, SquadMessageTypes.Ping, StringComparison.OrdinalIgnoreCase))
+            {
+                lock (_sessionsLock)
+                {
+                    if (linkedToken.IsCancellationRequested || session.Closed || string.IsNullOrEmpty(session.CharacterName))
+                        return;
+                    if (_namedSessions.TryGetValue(session.CharacterName, out var current) && ReferenceEquals(current, session))
+                        session.LastReceivedUtcMs = now;
+                }
             }
         }
 

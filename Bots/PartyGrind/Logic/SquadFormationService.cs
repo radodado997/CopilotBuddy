@@ -35,9 +35,11 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             float targetFacingRadians,
             float meleeFlankRadius,
             int meleeSlotIndex,
-            int totalMeleeCount)
+            int totalMeleeCount,
+            float targetCombatReach = 1.5f)
         {
-            float radius = MathF.Max(totalMeleeCount >= 4 ? 3.4f : totalMeleeCount == 3 ? 3.0f : 2.2f, meleeFlankRadius);
+            float minReachRadius = MathF.Max(2.2f, targetCombatReach + 1.2f);
+            float radius = MathF.Max(MathF.Max(totalMeleeCount >= 4 ? 3.4f : totalMeleeCount == 3 ? 3.0f : 2.2f, meleeFlankRadius), minReachRadius);
             float behindAngle = targetFacingRadians + MathF.PI;
 
             float[] offsetsDeg = totalMeleeCount switch

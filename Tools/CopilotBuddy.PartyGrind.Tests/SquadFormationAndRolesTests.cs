@@ -301,5 +301,36 @@ namespace CopilotBuddy.PartyGrind.Tests
             Assert.True(SquadTankBridge.HasAvailableTauntSpell(WoWClass.Druid, s => s == "Growl"));
             Assert.True(SquadTankBridge.HasAvailableTauntSpell(WoWClass.DeathKnight, s => s == "Dark Command"));
         }
+
+        [Fact]
+        public void PartyBuffThrottle_BlocksRepeatedBlessingSpamWithinWindowAndExpiresCleanly()
+        {
+            SquadPartyBuffService.ResetBuffCastThrottles();
+            try
+            {
+                Assert.False(SquadPartyBuffService.IsBuffCastThrottled(42UL, "Blessing of Might", 10_000L));
+                SquadPartyBuffService.RecordBuffCast(42UL, "Blessing of Might", 10_000L);
+                Assert.True(SquadPartyBuffService.IsBuffCastThrottled(42UL, "Blessing of Might", 10_500L));
+                Assert.True(SquadPartyBuffService.IsBuffCastThrottled(42UL, "blessing of might", 13_999L));
+                Assert.False(SquadPartyBuffService.IsBuffCastThrottled(42UL, "Blessing of Kings", 10_500L));
+                Assert.False(SquadPartyBuffService.IsBuffCastThrottled(99UL, "Blessing of Might", 10_500L));
+                Assert.False(SquadPartyBuffService.IsBuffCastThrottled(42UL, "Blessing of Might", 14_001L));
+            }
+            finally
+            {
+                SquadPartyBuffService.ResetBuffCastThrottles();
+            }
+        }
+
+        [Fact]
+        public void MeleeFlankPosition_ScalesRadiusWithLargeTargetCombatReach()
+        {
+            var bossPos = new WoWPoint(100f, 200f, 10f);
+            WoWPoint small = SquadFormationService.ComputeMeleeFlankPosition(bossPos, 0f, 2.8f, 0, 1, targetCombatReach: 1.5f);
+            WoWPoint large = SquadFormationService.ComputeMeleeFlankPosition(bossPos, 0f, 2.8f, 0, 1, targetCombatReach: 6.0f);
+
+            Assert.InRange(small.Distance2D(bossPos), 2.7f, 2.9f);
+            Assert.True(large.Distance2D(bossPos) >= 7.1f);
+        }
     }
 }

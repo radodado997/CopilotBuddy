@@ -25,8 +25,8 @@ namespace Singular.ClassSpecific.Priest
                 Spell.BuffSelf("Shadowform"),
                 Spell.BuffSelf("Vampiric Embrace"),
                 // Simplified: Just buff self if we don't have Fortitude (works for solo and group)
-                Spell.BuffSelf("Power Word: Fortitude", ret => !StyxWoW.Me.HasAura("Power Word: Fortitude")),
-                Spell.BuffSelf("Shadow Protection", ret => SingularSettings.Instance.Priest.UseShadowProtection && !StyxWoW.Me.HasAura("Shadow Protection")),
+                Spell.BuffSelf("Power Word: Fortitude", ret => !StyxWoW.Me.HasAnyAura("Power Word: Fortitude", "Prayer of Fortitude")),
+                Spell.BuffSelf("Shadow Protection", ret => SingularSettings.Instance.Priest.UseShadowProtection && !StyxWoW.Me.HasAnyAura("Shadow Protection", "Prayer of Shadow Protection")),
                 Spell.BuffSelf("Inner Fire", ret => SingularSettings.Instance.Priest.UseInnerFire),
                 Spell.BuffSelf("Fear Ward", ret => SingularSettings.Instance.Priest.UseFearWard)
      

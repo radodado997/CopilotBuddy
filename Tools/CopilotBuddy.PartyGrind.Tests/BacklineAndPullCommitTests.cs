@@ -446,5 +446,37 @@ namespace CopilotBuddy.PartyGrind.Tests
                 profile, 0, 0, 0, 0f, t);
             Assert.True(debounced.IsWaitingForFollower);
         }
+
+        [Fact]
+        public void CanFollowerEngageFocus_PreventsPrematureBodyPullAheadOfTank()
+        {
+            Assert.False(PartyGrindBot.CanFollowerEngageFocus(
+                meInCombat: false,
+                leaderInCombat: false,
+                focusInCombat: false,
+                focusTargetingParty: false,
+                tankDistanceToFocus: 24f));
+
+            Assert.True(PartyGrindBot.CanFollowerEngageFocus(
+                meInCombat: false,
+                leaderInCombat: false,
+                focusInCombat: false,
+                focusTargetingParty: false,
+                tankDistanceToFocus: 10f));
+
+            Assert.True(PartyGrindBot.CanFollowerEngageFocus(
+                meInCombat: false,
+                leaderInCombat: true,
+                focusInCombat: false,
+                focusTargetingParty: false,
+                tankDistanceToFocus: 30f));
+
+            Assert.True(PartyGrindBot.CanFollowerEngageFocus(
+                meInCombat: false,
+                leaderInCombat: false,
+                focusInCombat: true,
+                focusTargetingParty: false,
+                tankDistanceToFocus: 30f));
+        }
     }
 }

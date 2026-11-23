@@ -940,6 +940,9 @@ namespace Styx.Logic.Combat
 
 		#region LuaEvent Auto-Refresh (ported from HB 4.3.4 smethod_0/1/2/3)
 
+		private static readonly LuaEventHandlerDelegate SpellBookChangedHandler = OnSpellBookChanged;
+		private static long _lastSpellBookRebuildTickMs;
+
 		/// <summary>
 		/// HB 6.2.3 smethod_7: Called once during engine initialization.
 		/// Hooks BotEvents.OnBotStart so each bot run re-subscribes the Lua
@@ -948,6 +951,7 @@ namespace Styx.Logic.Combat
 		/// </summary>
 		internal static void Initialize()
 		{
+			BotEvents.OnBotStart -= OnBotStarted_RefreshSpells;
 			BotEvents.OnBotStart += OnBotStarted_RefreshSpells;
 			_knownSpells.Clear();
 			_lastKnownSpellCount = 0;
@@ -964,6 +968,8 @@ namespace Styx.Logic.Combat
 			_knownSpells.Clear();
 			_lastKnownSpellCount = 0;
 			BotEvents.OnBotStart -= OnBotStarted_RefreshSpells;
+			Lua.Events.DetachEvent("LEARNED_SPELL_IN_TAB", SpellBookChangedHandler);
+			Lua.Events.DetachEvent("ACTIVE_TALENT_GROUP_CHANGED", SpellBookChangedHandler);
 			Logging.WriteDebug("[SpellManager] Shutdown \u2014 unsubscribed from BotEvents.OnBotStart");
 		}
 
@@ -978,10 +984,10 @@ namespace Styx.Logic.Combat
 			Refresh();
 
 			// Idempotent: detach first to avoid duplicate subscriptions (HB 4.3.4 pattern)
-			Lua.Events.DetachEvent("LEARNED_SPELL_IN_TAB", new LuaEventHandlerDelegate(OnSpellBookChanged));
-			Lua.Events.DetachEvent("ACTIVE_TALENT_GROUP_CHANGED", new LuaEventHandlerDelegate(OnSpellBookChanged));
-			Lua.Events.AttachEvent("LEARNED_SPELL_IN_TAB", new LuaEventHandlerDelegate(OnSpellBookChanged));
-			Lua.Events.AttachEvent("ACTIVE_TALENT_GROUP_CHANGED", new LuaEventHandlerDelegate(OnSpellBookChanged));
+			Lua.Events.DetachEvent("LEARNED_SPELL_IN_TAB", SpellBookChangedHandler);
+			Lua.Events.DetachEvent("ACTIVE_TALENT_GROUP_CHANGED", SpellBookChangedHandler);
+			Lua.Events.AttachEvent("LEARNED_SPELL_IN_TAB", SpellBookChangedHandler);
+			Lua.Events.AttachEvent("ACTIVE_TALENT_GROUP_CHANGED", SpellBookChangedHandler);
 
 			Logging.WriteDebug("[SpellManager] Subscribed to LEARNED_SPELL_IN_TAB, ACTIVE_TALENT_GROUP_CHANGED");
 		}
@@ -992,6 +998,11 @@ namespace Styx.Logic.Combat
 		/// </summary>
 		private static void OnSpellBookChanged(object sender, LuaEventArgs e)
 		{
+			long now = Environment.TickCount64;
+			if (now - _lastSpellBookRebuildTickMs < 250L && NumKnownSpells == _lastKnownSpellCount && _knownSpells.Count > 0)
+				return;
+
+			_lastSpellBookRebuildTickMs = now;
 			Logging.Write("[SpellManager] Spellbook change detected ({0}) \u2014 rebuilding", e.EventName);
 			_lastKnownSpellCount = 0;
 			Refresh();

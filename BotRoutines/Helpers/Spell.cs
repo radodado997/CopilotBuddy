@@ -262,16 +262,16 @@ namespace Singular.Helpers
                     //Logger.WriteDebug("OnUnit: " + onUnit(ret));
                     //Logger.WriteDebug("CanCast: " + SpellManager.CanCast(name, onUnit(ret), false));
 
-                    var minReqs = requirements != null && onUnit != null && requirements(ret) && onUnit(ret) != null && name != null;
+                    var target = onUnit != null ? onUnit(ret) : null;
+                    var minReqs = requirements != null && target != null && target.IsValid && requirements(ret) && name != null;
                     var canCast = false;
                     var inRange = false;
                     if (minReqs)
                     {
-                        canCast = SpellManager.CanCast(name, onUnit(ret), false, checkMovement(ret));
+                        canCast = SpellManager.CanCast(name, target, false, checkMovement(ret));
 
                         if (canCast)
                         {
-                            var target = onUnit(ret);
                             // We're always in range of ourselves. So just ignore this bit if we're casting it on us
                             if (target.IsMe)
                             {
@@ -414,7 +414,10 @@ namespace Singular.Helpers
         {
             return new Decorator(
                 ret =>
-                requirements != null && requirements(ret) && onUnit != null && onUnit(ret) != null && SpellManager.CanCast(spellId, onUnit(ret), true),
+                {
+                    var target = onUnit != null ? onUnit(ret) : null;
+                    return requirements != null && target != null && target.IsValid && requirements(ret) && SpellManager.CanCast(spellId, target, true);
+                },
                 new Sequence(
                     new DecoratorContinue(
                         ret => Movement.NeedsOffTargetCastSetup(onUnit(ret)),
@@ -571,8 +574,12 @@ namespace Singular.Helpers
 
             return
                 new Decorator(
-                    ret => onUnit(ret) != null && !DoubleCastPreventionDict.ContainsKey(name) &&
-                           buffNames.All(b => myBuff ? !onUnit(ret).HasMyAura(b) : !onUnit(ret).HasAura(b)),
+                    ret =>
+                    {
+                        var target = onUnit != null ? onUnit(ret) : null;
+                        return target != null && target.IsValid && !DoubleCastPreventionDict.ContainsKey(name) &&
+                               buffNames.All(b => myBuff ? !target.HasMyAura(b) : !target.HasAura(b));
+                    },
                     new Sequence(
                 // new Action(ctx => _lastBuffCast = name),
                         Cast(name, onUnit, requirements),
@@ -700,7 +707,11 @@ namespace Singular.Helpers
         {
             return
                 new Decorator(
-                    ret => onUnit(ret) != null && !onUnit(ret).Auras.Values.Any(a => a.SpellId == spellId),
+                    ret =>
+                    {
+                        var target = onUnit != null ? onUnit(ret) : null;
+                        return target != null && target.IsValid && !target.Auras.Values.Any(a => a.SpellId == spellId);
+                    },
                     Cast(spellId, onUnit, requirements));
         }
 
@@ -898,19 +909,27 @@ namespace Singular.Helpers
         /// <returns>.</returns>
         public static Composite CastOnGround(string spell, LocationRetriever onLocation, SimpleBooleanDelegate requirements)
         {
+            WoWPoint cachedLoc = WoWPoint.Zero;
             return new Decorator(
                 ret =>
-                requirements(ret) && onLocation != null && SpellManager.CanCast(spell) &&
-                (StyxWoW.Me.Location.Distance(onLocation(ret)) <= SpellManager.Spells[spell].MaxRange || SpellManager.Spells[spell].MaxRange == 0),
+                {
+                    if (requirements == null || onLocation == null || !requirements(ret) || !SpellManager.CanCast(spell))
+                        return false;
+                    if (!SpellManager.Spells.TryGetValue(spell, out var sp))
+                        return false;
+                    cachedLoc = onLocation(ret);
+                    return cachedLoc != WoWPoint.Zero &&
+                           (StyxWoW.Me.Location.Distance(cachedLoc) <= sp.MaxRange || sp.MaxRange == 0);
+                },
                 new Sequence(
-                    new Action(ret => Logger.Write("Casting {0} at location {1}", spell, onLocation(ret))),
+                    new Action(ret => Logger.Write("Casting {0} at location {1}", spell, cachedLoc)),
                     new Action(ret => SpellManager.Cast(spell)),
                     new WaitContinue(
                         1,
                         ret => StyxWoW.Me.CurrentPendingCursorSpell != null &&
                                StyxWoW.Me.CurrentPendingCursorSpell.Name == spell,
                         new ActionAlwaysSucceed()),
-                    new Action(ret => LegacySpellManager.ClickRemoteLocation(onLocation(ret))))
+                    new Action(ret => LegacySpellManager.ClickRemoteLocation(cachedLoc)))
                 );
         }
 

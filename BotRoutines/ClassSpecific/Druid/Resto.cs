@@ -136,7 +136,7 @@ namespace Singular.ClassSpecific.Druid
                                 Movement.CreateMoveToTargetBehavior(true, 32f)
                                 )),
                         new Decorator(
-                            ret => moveInRange,
+                            ret => moveInRange && ((WoWUnit)ret).DistanceSqr > 35 * 35,
                             Movement.CreateMoveToTargetBehavior(true, 35f, ret => (WoWUnit)ret))
                         )));
         }

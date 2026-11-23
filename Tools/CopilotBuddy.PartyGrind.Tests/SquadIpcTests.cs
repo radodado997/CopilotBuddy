@@ -446,5 +446,31 @@ namespace CopilotBuddy.PartyGrind.Tests
 
             await WaitUntilAsync(() => server.GetMemberSnapshots().Single().LatestTownRunRequest == null);
         }
+
+        [Fact]
+        public async Task KeepAlivePing_SustainsIdleSessionPastTimeoutBoundary()
+        {
+            using var server = new SquadIpcServer(0, "PingTeam", memberSecrets: Secrets)
+            {
+                DisconnectTimeoutMs = 600,
+                KeepAliveIntervalMs = 150
+            };
+            server.Start();
+            using var client = new SquadIpcClient(server.Port, "PingTeam", memberSecret: Secret("Follower"))
+            {
+                DisconnectTimeoutMs = 600,
+                KeepAliveIntervalMs = 150
+            };
+            client.Start(() => new SquadHandshake { CharacterName = "Follower", Guid = 42, Level = 10 });
+            await WaitUntilAsync(() => server.GetMemberSnapshots().Count == 1);
+            server.BroadcastLeaderState(new SquadLeaderState { LeaderName = "Tank" });
+            await WaitUntilAsync(() => client.IsConnected);
+
+            await Task.Delay(950);
+
+            Assert.True(client.IsConnected);
+            Assert.Single(server.GetMemberSnapshots());
+            Assert.True(server.GetMemberSnapshots()[0].IsConnected);
+        }
     }
 }
