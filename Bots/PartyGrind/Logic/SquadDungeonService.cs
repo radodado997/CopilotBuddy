@@ -169,6 +169,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 try { LfgManager.DetachLfgEvents(); } catch { }
                 _lfgEventsAttached = false;
             }
+            try { global::Bots.DungeonBuddy.Helpers.ScriptHelpers.ReleaseScriptMovementBlocks(); } catch { }
             try { DungeonManager.Clear(); } catch { }
             try { BossManager.Reset(); } catch { }
             try { WorldObstacleManager.Shutdown(); } catch { }
@@ -618,7 +619,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (LfgManager.RoleCheckPending || SafeGetLfgMode() == "rolecheck")
             {
                 ApplySquadLfgRole(settings.Role, settings.IsCoordinator);
-                Lua.DoString("if LFDRoleCheckPopupAcceptButton and LFDRoleCheckPopupAcceptButton:IsVisible() then LFDRoleCheckPopupAcceptButton:Click() end; if StaticPopup1Button1 and StaticPopup1Button1:IsVisible() then StaticPopup1Button1:Click() end");
+                Lua.DoString("if LFDRoleCheckPopupAcceptButton and LFDRoleCheckPopupAcceptButton:IsVisible() then LFDRoleCheckPopupAcceptButton:Click() end; if StaticPopup1 and StaticPopup1:IsVisible() and StaticPopup1.which == 'LFG_ROLE_CHECK_CONFIRM' and StaticPopup1Button1 then StaticPopup1Button1:Click() end");
                 LfgManager.RoleCheckPending = false;
                 SquadPartySyncService.LogAction("Dungeon: confirmed LFG role check");
                 return true;
@@ -798,8 +799,12 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 }
 
                 Logging.Write("[PartyGrind Dungeon] Resetting instances for next walk-in run.");
-                Lua.DoString("ResetInstances();");
-                RecordInstanceReset(nowUtcMs);
+                bool resetIssued = Lua.GetReturnVal<bool>(
+                    "if not IsInGroup() or IsPartyLeader() then ResetInstances(); return true end return false", 0);
+                if (resetIssued)
+                {
+                    RecordInstanceReset(nowUtcMs);
+                }
                 return true;
             }
 
@@ -842,13 +847,36 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                         WoWMovement.MoveStop();
                     return true;
                 }
+
+                if (!leader.IsInsideDungeon)
+                {
+                    var leaderPt = new WoWPoint(leader.X, leader.Y, leader.Z);
+                    if (leader.MapId != me.MapId || leaderPt.Distance(portal) > 16f)
+                    {
+                        if (me.IsMoving)
+                            WoWMovement.MoveStop();
+                        SquadPartySyncService.LogAction("Dungeon: waiting at portal for coordinator");
+                        return true;
+                    }
+
+                    bool squadGatheredForFollower = leader.Members == null || leader.Members
+                        .Where(m => m.IsConnected && !m.IsDead && !m.IsGhost)
+                        .All(m => m.MapId == leader.MapId && new WoWPoint(m.X, m.Y, m.Z).Distance(portal) <= 18f);
+                    if (!squadGatheredForFollower)
+                    {
+                        if (me.IsMoving)
+                            WoWMovement.MoveStop();
+                        SquadPartySyncService.LogAction("Dungeon: waiting at portal for squadmates");
+                        return true;
+                    }
+                }
             }
 
             if (settings.IsCoordinator && leader?.Members != null)
             {
                 bool squadGathered = leader.Members
                     .Where(m => m.IsConnected && !m.IsDead && !m.IsGhost)
-                    .All(m => m.MapId != me.MapId || new WoWPoint(m.X, m.Y, m.Z).Distance(portal) <= 18f);
+                    .All(m => m.IsInsideDungeon || (m.MapId == me.MapId && new WoWPoint(m.X, m.Y, m.Z).Distance(portal) <= 18f));
                 if (!squadGathered)
                 {
                     if (me.IsMoving)
@@ -1039,7 +1067,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         }
 
         internal static int GetBossReadinessManaPercent(SquadSettings settings) =>
-            Math.Max(45, settings.TriggerRestManaPct + 15);
+            Math.Min(100, Math.Max(45, settings.TriggerRestManaPct + 15));
 
         public static bool IsBossPrePullBarrierBlocking(
             SquadSettings settings,

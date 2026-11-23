@@ -147,16 +147,23 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
             if (settings.Role == SquadRole.TankLeader && !pugIsTank)
             {
+                ulong committedGuid = SquadContext.ActivePullCommitGuid;
                 if (isDungeon)
                 {
                     WoWPoint meLoc = StyxWoW.Me.Location;
-                    bool canPull = StyxWoW.Me.Combat || CanInitiatePull(leader, settings.MaxPullGatherDistance);
+                    bool canPull = StyxWoW.Me.Combat || committedGuid != 0 || CanInitiatePull(leader, settings.MaxPullGatherDistance);
                     foreach (WoWObject obj in incomingUnits)
                     {
                         if (obj is not WoWUnit unit || !unit.IsValid || unit.Dead || !unit.CanSelect || !unit.Attackable)
                             continue;
                         if (unit.IsFriendly || unit.IsPlayer || unit.IsCritter || unit.IsNonCombatPet || unit.ControllingPlayer != null)
                             continue;
+
+                        if (committedGuid != 0 && unit.Guid == committedGuid)
+                        {
+                            outgoingUnits.Add(unit);
+                            continue;
+                        }
 
                         bool partyThreat = unit.IsTargetingMyPartyMember || unit.IsTargetingMeOrPet ||
                                            (unit.Combat && unit.CurrentTargetGuid != 0 && memberGuids.Contains(unit.CurrentTargetGuid));
@@ -184,7 +191,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 }
 
                 // Include standard LevelBot targets when we're ready to pull or already fighting.
-                if (StyxWoW.Me.Combat || CanInitiatePull(leader, settings.MaxPullGatherDistance))
+                if (StyxWoW.Me.Combat || committedGuid != 0 || CanInitiatePull(leader, settings.MaxPullGatherDistance))
                 {
                     LevelBot.LevelBotIncludeTargetsFilter(incomingUnits, outgoingUnits);
                 }
@@ -197,6 +204,11 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                         continue;
                     if (unit.IsFriendly || unit.IsPlayer)
                         continue;
+                    if (committedGuid != 0 && unit.Guid == committedGuid)
+                    {
+                        outgoingUnits.Add(unit);
+                        continue;
+                    }
                     if (unit.Location.Distance(meLocWorld) > 60f)
                         continue;
 
@@ -379,6 +391,18 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             return false;
         }
 
+        public static bool HasAvailableTauntSpell(WoWClass playerClass, Func<string, bool> hasSpell)
+        {
+            return playerClass switch
+            {
+                WoWClass.Warrior => hasSpell("Taunt") || hasSpell("Challenging Shout") || hasSpell("Mocking Blow"),
+                WoWClass.Druid => hasSpell("Growl") || hasSpell("Challenging Roar"),
+                WoWClass.Paladin => hasSpell("Hand of Reckoning") || hasSpell("Righteous Defense"),
+                WoWClass.DeathKnight => hasSpell("Dark Command") || hasSpell("Death Grip"),
+                _ => false
+            };
+        }
+
         /// <summary>
         /// Scans for hostile mobs attacking non-tank party members and casts a class taunt to peel them.
         /// </summary>
@@ -386,6 +410,19 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         {
             var me = StyxWoW.Me;
             if (me == null || !me.IsAlive)
+                return false;
+
+            var leader = SquadContext.GetLeaderStateSnapshot();
+            if (SquadContext.IsDungeonModeActive &&
+                SquadDungeonService.IsInDungeonMap(me) &&
+                leader != null &&
+                leader.EffectiveTankGuid != 0 &&
+                leader.EffectiveTankGuid != me.Guid)
+            {
+                return false;
+            }
+
+            if (!HasAvailableTauntSpell(me.Class, SpellManager.HasSpell))
                 return false;
 
             var memberGuids = SquadContext.GetKnownMemberGuids();
@@ -404,15 +441,54 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
             foreach (WoWUnit loose in looseMobs)
             {
-                if (me.CurrentTargetGuid != loose.Guid)
-                    loose.Target();
+                if (me.Class == WoWClass.Paladin && !SpellManager.HasSpell("Hand of Reckoning"))
+                {
+                    WoWUnit? attackedAlly = ObjectManager.GetObjectByGuid<WoWUnit>(loose.CurrentTargetGuid);
+                    if (attackedAlly != null && attackedAlly.IsValid && !attackedAlly.Dead &&
+                        SpellManager.CanCast("Righteous Defense", attackedAlly, false, false))
+                    {
+                        if (attackedAlly.Distance > 38f || !attackedAlly.InLineOfSpellSight)
+                        {
+                            if (PeelApproach.TryMove(attackedAlly, "Peeling for " + attackedAlly.Name))
+                                return true;
+                            continue;
+                        }
+                        if (SpellManager.CanCast("Righteous Defense", attackedAlly, true, false))
+                            return SpellManager.Cast("Righteous Defense", attackedAlly);
+                    }
+                    continue;
+                }
 
-                // Approach if outside spell taunt range (typically 30 yd; warrior Taunt 30 yd, Growl 30 yd, HoR 30 yd, Dark Command 30 yd)
+                bool canTauntThisMob = me.Class switch
+                {
+                    WoWClass.Warrior =>
+                        (looseMobs.Count(u => u.Distance <= 9f) >= 2 && SpellManager.CanCast("Challenging Shout", me, false, false)) ||
+                        SpellManager.CanCast("Taunt", loose, false, false) ||
+                        SpellManager.CanCast("Mocking Blow", loose, false, false),
+                    WoWClass.Druid =>
+                        (looseMobs.Count(u => u.Distance <= 9f) >= 2 && SpellManager.CanCast("Challenging Roar", me, false, false)) ||
+                        SpellManager.CanCast("Growl", loose, false, false),
+                    WoWClass.Paladin =>
+                        SpellManager.CanCast("Hand of Reckoning", loose, false, false) ||
+                        (ObjectManager.GetObjectByGuid<WoWUnit>(loose.CurrentTargetGuid) is WoWUnit ally &&
+                         ally.IsValid && !ally.Dead && SpellManager.CanCast("Righteous Defense", ally, true, false)),
+                    WoWClass.DeathKnight =>
+                        SpellManager.CanCast("Dark Command", loose, false, false) ||
+                        SpellManager.CanCast("Death Grip", loose, false, false),
+                    _ => false
+                };
+
+                if (!canTauntThisMob)
+                    continue;
+
                 if (loose.Distance > 28f || !loose.InLineOfSpellSight)
                 {
                     if (PeelApproach.TryMove(loose, "Peeling " + loose.Name)) return true;
                     continue;
                 }
+
+                if (me.CurrentTargetGuid != loose.Guid)
+                    loose.Target();
 
                 if (!me.IsFacing(loose))
                     loose.Face();
@@ -453,7 +529,6 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                             return SpellManager.Cast("Death Grip", loose);
                         break;
                 }
-
             }
             return false;
         }

@@ -564,7 +564,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 {
                     phase = SquadPhase.Resting;
                 }
-                else if (!string.IsNullOrEmpty(_activeProvisioner) && dungeon?.HasRandomPartyMembers != true)
+                else if (!string.IsNullOrEmpty(_activeProvisioner) &&
+                         (_assignedHealthstone || dungeon?.HasRandomPartyMembers != true))
                 {
                     phase = SquadPhase.Provisioning;
                 }
@@ -656,6 +657,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 IsMounted = leaderLocal.IsMounted,
                 IsFlying = false,
                 InCombat = anyInCombat,
+                IsWaitingForFollower = _isWaitingForFollowerDebounced,
+                ResumeDistance = settings.ResumeDistance,
                 IsLootWindowActive = _inLootWindow,
                 IsDead = leaderLocal.IsDead,
                 IsGhost = leaderLocal.IsGhost,
@@ -695,6 +698,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 DungeonEntryMode = settings.DungeonEntryMode,
                 DungeonLootMode = settings.DungeonLootMode,
                 KillOptionalBosses = settings.KillOptionalBosses,
+                IsInsideDungeon = dungeon?.IsInsideDungeon == true || leaderLocal.IsInsideDungeon,
                 ActiveDungeonId = dungeon?.ActiveDungeonId ?? 0U,
                 ActiveDungeonMapId = dungeon?.ActiveDungeonMapId ?? 0U,
                 ActiveDungeonName = dungeon?.ActiveDungeonName ?? string.Empty,
@@ -1160,6 +1164,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 CanProvideMageDrink = m.CanProvideMageDrink,
                 CanProvideHealthstone = m.CanProvideHealthstone,
                 IsProvisioningBusy = m.IsProvisioningBusy,
+                IsInsideDungeon = m.IsInsideDungeon,
                 IsConnected = isConnected,
                 StateLabel = label
             };

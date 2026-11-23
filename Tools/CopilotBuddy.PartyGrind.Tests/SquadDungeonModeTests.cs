@@ -486,5 +486,78 @@ namespace CopilotBuddy.PartyGrind.Tests
             Assert.Contains("-dungeonids=\"6,163\"", script);
             Assert.DoesNotContain("-loadprofile=", script);
         }
+
+        [Fact]
+        public void BossReadinessManaPercent_ClampsBetween45And100()
+        {
+            var lowTrigger = CreateDungeonSettings();
+            lowTrigger.TriggerRestManaPct = 15;
+            Assert.Equal(45, SquadDungeonService.GetBossReadinessManaPercent(lowTrigger));
+
+            var midTrigger = CreateDungeonSettings();
+            midTrigger.TriggerRestManaPct = 60;
+            Assert.Equal(75, SquadDungeonService.GetBossReadinessManaPercent(midTrigger));
+
+            var highTrigger = CreateDungeonSettings();
+            highTrigger.TriggerRestManaPct = 95;
+            Assert.Equal(100, SquadDungeonService.GetBossReadinessManaPercent(highTrigger));
+        }
+
+        [Fact]
+        public void HealthstoneProvisioning_ProceedsInDungeonEvenWithRandomPartyMembers()
+        {
+            var coord = new SquadCoordinatorService();
+            var settings = CreateDungeonSettings(SquadDungeonEntryMode.LfgRandomNormal);
+            settings.EnableWarlockHealthstones = true;
+
+            var warlockLeader = MakeMemberState("TankA", 10UL, SquadRole.TankLeader, WoWClass.Warlock, 30, insideDungeon: true);
+            warlockLeader.CanProvideHealthstone = true;
+            warlockLeader.HealthstoneMinReceiverLevel = 15;
+
+            var healer = WrapClient(MakeMemberState("HealB", 11UL, SquadRole.Healer, WoWClass.Priest, 30, insideDungeon: true));
+            healer.LatestState!.WantsHealthstone = true;
+            healer.LatestState.FreeBagSlots = 5;
+
+            var snapWithPug = new SquadDungeonSnapshot
+            {
+                IsInsideDungeon = true,
+                ActiveDungeonId = 163U,
+                ActiveDungeonMapId = 189U,
+                HasRandomPartyMembers = true,
+                EffectiveTankGuid = 99UL
+            };
+
+            var state = coord.EvaluateTick(
+                settings, warlockLeader, new[] { healer }, new SquadProfileSnapshot(), 0, 0, 0, 0f, 10_000L,
+                dungeon: snapWithPug);
+
+            Assert.Equal("TankA", state.ActiveProvisionerName);
+            Assert.Equal("HealB", state.ActiveTradeTargetName);
+            Assert.Equal(SquadPhase.Provisioning, state.Phase);
+        }
+
+        [Fact]
+        public void ShutdownRuntime_ReleasesScriptMovementBlocks_WhilePreservingUserDisable()
+        {
+            global::Bots.DungeonBuddy.Helpers.ScriptHelpers.RestoreMovement();
+            var initialMover = Navigator.PlayerMover;
+
+            global::Bots.DungeonBuddy.Helpers.ScriptHelpers.DisableMovement(() => true);
+            Assert.False(global::Bots.DungeonBuddy.Helpers.ScriptHelpers.MovementEnabled);
+
+            var dungeonService = new SquadDungeonService();
+            dungeonService.ShutdownRuntime();
+            Assert.True(global::Bots.DungeonBuddy.Helpers.ScriptHelpers.MovementEnabled);
+            Assert.Same(initialMover, Navigator.PlayerMover);
+
+            global::Bots.DungeonBuddy.Helpers.ScriptHelpers.DisableUserMovement();
+            Assert.False(global::Bots.DungeonBuddy.Helpers.ScriptHelpers.MovementEnabled);
+
+            dungeonService.ShutdownRuntime();
+            Assert.False(global::Bots.DungeonBuddy.Helpers.ScriptHelpers.MovementEnabled);
+
+            global::Bots.DungeonBuddy.Helpers.ScriptHelpers.RestoreMovement();
+            Assert.True(global::Bots.DungeonBuddy.Helpers.ScriptHelpers.MovementEnabled);
+        }
     }
 }

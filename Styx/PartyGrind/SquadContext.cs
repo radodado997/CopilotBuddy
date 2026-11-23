@@ -20,6 +20,7 @@ namespace Styx.PartyGrind
         public static int? EffectiveLevelOverride { get; internal set; }
         public static bool IsIpcConnected { get; internal set; }
         public static long LastSyncTimestampUtcMs { get; internal set; }
+        public static ulong ActivePullCommitGuid { get; internal set; }
 
         public static SquadRole ActiveRole => ActiveSettings?.Role ?? SquadRole.DpsMelee;
         public static bool IsCoordinator => ActiveSettings?.IsCoordinator ?? false;
@@ -89,6 +90,21 @@ namespace Styx.PartyGrind
                 if (string.Equals(kv.Key, myName, StringComparison.OrdinalIgnoreCase))
                     return kv.Value;
             }
+
+            if (leader.Members != null && leader.Members.Count > 0)
+            {
+                var followers = leader.Members
+                    .Where(m => !string.IsNullOrWhiteSpace(m.CharacterName) &&
+                                m.Role != SquadRole.TankLeader &&
+                                (leader.LeaderGuid == 0 || m.Guid != leader.LeaderGuid) &&
+                                !string.Equals(m.CharacterName, leader.LeaderName, StringComparison.OrdinalIgnoreCase))
+                    .Select(m => m.CharacterName.Trim())
+                    .OrderBy(n => n, StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+                int idx = followers.FindIndex(n => string.Equals(n, myName, StringComparison.OrdinalIgnoreCase));
+                if (idx >= 0)
+                    return idx;
+            }
             return 0;
         }
 
@@ -152,6 +168,7 @@ namespace Styx.PartyGrind
                 EffectiveLevelOverride = null;
                 IsIpcConnected = false;
                 LastSyncTimestampUtcMs = 0;
+                ActivePullCommitGuid = 0;
             }
         }
     }

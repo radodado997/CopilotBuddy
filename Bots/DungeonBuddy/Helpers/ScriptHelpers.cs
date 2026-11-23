@@ -510,13 +510,46 @@ namespace Bots.DungeonBuddy.Helpers
 
         public static string UnitId(this WoWPartyMember partyMember)
         {
-            WoWPartyMember[] members = DungeonBuddy.PartyMemberInfos;
-            bool inRaid = StyxWoW.Me.IsInRaid;
+            if (partyMember == null || partyMember.Guid == 0 || StyxWoW.Me == null)
+                return "none";
 
+            if (StyxWoW.Me.IsInRaid)
+            {
+                if (!string.IsNullOrEmpty(partyMember.UnitId) &&
+                    partyMember.UnitId.StartsWith("raid", StringComparison.Ordinal) &&
+                    partyMember.UnitId.Length > 4)
+                {
+                    return partyMember.UnitId;
+                }
+
+                ulong[] raidSlots = StyxWoW.Me.GetRaidMemberGUIDs();
+                for (int i = 0; i < raidSlots.Length; i++)
+                {
+                    if (raidSlots[i] == partyMember.Guid)
+                        return "raid" + (i + 1);
+                }
+
+                return "none";
+            }
+
+            if (!string.IsNullOrEmpty(partyMember.UnitId) &&
+                partyMember.UnitId.StartsWith("party", StringComparison.Ordinal) &&
+                partyMember.UnitId.Length > 5)
+            {
+                return partyMember.UnitId;
+            }
+
+            for (int i = 0; i < 4; i++)
+            {
+                if (StyxWoW.Me.GetPartyMemberGuid(i) == partyMember.Guid)
+                    return "party" + (i + 1);
+            }
+
+            WoWPartyMember[] members = DungeonBuddy.PartyMemberInfos;
             for (int i = 0; i < members.Length; i++)
             {
                 if (members[i].Guid == partyMember.Guid)
-                    return inRaid ? members[i].UnitId : "party" + (i + 1);
+                    return "party" + (i + 1);
             }
 
             return "none";
@@ -630,11 +663,22 @@ namespace Bots.DungeonBuddy.Helpers
 
         public static void DisableMovement(Func<bool> whileTrue)
         {
+            DisableMovementInternal(whileTrue, userInitiated: false);
+        }
+
+        internal static void DisableUserMovement()
+        {
+            DisableMovementInternal(() => true, userInitiated: true);
+        }
+
+        private static void DisableMovementInternal(Func<bool> whileTrue, bool userInitiated)
+        {
             if (_movementBlocks.All(block => block.Condition != whileTrue))
-                _movementBlocks.Add(new MovementBlock(whileTrue, MovementBlockType.DisableMovement));
+                _movementBlocks.Add(new MovementBlock(whileTrue, MovementBlockType.DisableMovement, userInitiated));
 
             if (MovementEnabled)
             {
+                _savedPlayerMover = Navigator.PlayerMover;
                 Navigator.PlayerMover = new NoMover();
 
                 if (Navigator.NavigationProvider != null)
@@ -652,12 +696,26 @@ namespace Bots.DungeonBuddy.Helpers
             if (!MovementEnabled)
             {
                 _movementBlocks.Clear();
-                Navigator.PlayerMover = new ClickToMoveMover();
+                Navigator.PlayerMover = _savedPlayerMover ?? new ClickToMoveMover();
+                _savedPlayerMover = null;
 
                 if (Navigator.NavigationProvider != null && _savedStuckHandler != null)
+                {
                     Navigator.NavigationProvider.StuckHandler = _savedStuckHandler;
+                    _savedStuckHandler = null;
+                }
 
                 _controlledDestination = WoWPoint.Zero;
+            }
+        }
+
+        internal static void ReleaseScriptMovementBlocks()
+        {
+            _movementBlocks.RemoveAll(block => !block.IsUserInitiated);
+            _controlledDestination = WoWPoint.Zero;
+            if (_movementBlocks.Count == 0 && !MovementEnabled)
+            {
+                RestoreMovement();
             }
         }
 
@@ -1544,11 +1602,12 @@ namespace Bots.DungeonBuddy.Helpers
         public static MoveResult ControlledMoveTo(WoWPoint location)
         {
             bool sameDestination = location == _controlledDestination;
+            IPlayerMover moverToSave = MovementEnabled ? Navigator.PlayerMover : (_savedPlayerMover ?? new ClickToMoveMover());
 
-            if (MovementEnabled)
+            if (!MovementEnabled)
             {
-                Navigator.PlayerMover = new ClickToMoveMover();
-                if (_savedStuckHandler != null)
+                Navigator.PlayerMover = moverToSave;
+                if (_savedStuckHandler != null && Navigator.NavigationProvider != null)
                     Navigator.NavigationProvider.StuckHandler = _savedStuckHandler;
             }
 
@@ -1562,9 +1621,13 @@ namespace Bots.DungeonBuddy.Helpers
                     MovementBlockType.MoveTo));
             }
 
+            _savedPlayerMover = moverToSave;
             Navigator.PlayerMover = new NoMover();
-            _savedStuckHandler ??= Navigator.NavigationProvider.StuckHandler;
-            Navigator.NavigationProvider.StuckHandler = new NoUnstuck();
+            if (Navigator.NavigationProvider != null)
+            {
+                _savedStuckHandler ??= Navigator.NavigationProvider.StuckHandler;
+                Navigator.NavigationProvider.StuckHandler = new NoUnstuck();
+            }
             _controlledDestination = location;
 
             return moveResult;
@@ -1810,15 +1873,18 @@ namespace Bots.DungeonBuddy.Helpers
 
         private sealed class MovementBlock
         {
-            public MovementBlock(Func<bool> condition, MovementBlockType type)
+            public MovementBlock(Func<bool> condition, MovementBlockType type, bool isUserInitiated = false)
             {
                 Condition = condition;
                 Type = type;
+                IsUserInitiated = isUserInitiated;
             }
 
             public Func<bool> Condition { get; private set; }
 
             public MovementBlockType Type { get; private set; }
+
+            public bool IsUserInitiated { get; private set; }
         }
 
         public class NoMover : IPlayerMover
@@ -1853,6 +1919,7 @@ namespace Bots.DungeonBuddy.Helpers
         }
 
         private static readonly List<MovementBlock> _movementBlocks = new List<MovementBlock>();
+        private static IPlayerMover? _savedPlayerMover;
         private static StuckHandler? _savedStuckHandler;
         private static WoWPoint _controlledDestination = WoWPoint.Zero;
 
@@ -1862,14 +1929,14 @@ namespace Bots.DungeonBuddy.Helpers
         {
             try
             {
-                _movementBlocks.RemoveAll(block => !block.Condition() || !StyxWoW.Me.IsAlive);
+                _movementBlocks.RemoveAll(block => !block.Condition() || (!block.IsUserInitiated && StyxWoW.Me?.IsAlive != true));
 
                 if (_movementBlocks.Any())
                 {
-                    if (_controlledDestination != WoWPoint.Zero)
+                    if (_controlledDestination != WoWPoint.Zero && _movementBlocks.All(block => !block.IsUserInitiated))
                     {
                         if (!MovementEnabled)
-                            Navigator.PlayerMover = new ClickToMoveMover();
+                            Navigator.PlayerMover = _savedPlayerMover ?? new ClickToMoveMover();
 
                         Navigator.MoveTo(_controlledDestination);
                         Navigator.PlayerMover = new NoMover();

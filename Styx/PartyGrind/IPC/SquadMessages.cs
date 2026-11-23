@@ -173,6 +173,7 @@ namespace Styx.PartyGrind.IPC
         public bool CanProvideMageDrink { get; set; }
         public bool CanProvideHealthstone { get; set; }
         public bool IsProvisioningBusy { get; set; }
+        public bool IsInsideDungeon { get; set; }
         public bool IsConnected { get; set; }
         public string StateLabel { get; set; } = string.Empty;
     }
@@ -209,6 +210,8 @@ namespace Styx.PartyGrind.IPC
         public bool IsMounted { get; set; }
         public bool IsFlying { get; set; }
         public bool InCombat { get; set; }
+        public bool IsWaitingForFollower { get; set; }
+        public float ResumeDistance { get; set; } = 20.0f;
         /// <summary>Authoritative bounded loot-window state from the coordinator.</summary>
         public bool IsLootWindowActive { get; set; }
         public bool IsDead { get; set; }
@@ -249,6 +252,7 @@ namespace Styx.PartyGrind.IPC
         public SquadDungeonEntryMode DungeonEntryMode { get; set; } = SquadDungeonEntryMode.LfgRandomNormal;
         public SquadDungeonLootMode DungeonLootMode { get; set; } = SquadDungeonLootMode.BossesOnly;
         public bool KillOptionalBosses { get; set; }
+        public bool IsInsideDungeon { get; set; }
         public uint ActiveDungeonId { get; set; }
         public uint ActiveDungeonMapId { get; set; }
         public string ActiveDungeonName { get; set; } = string.Empty;

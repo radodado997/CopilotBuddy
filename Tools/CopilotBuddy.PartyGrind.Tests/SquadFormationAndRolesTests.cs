@@ -243,5 +243,63 @@ namespace CopilotBuddy.PartyGrind.Tests
             Assert.Contains("-squadteam=%TEAM_ID%", script);
             Assert.Contains("-squadroster=\"TankA,HealB,RogueC,MageD,ShamE\"", script);
         }
+
+        [Theory]
+        [InlineData(5.0f)]
+        [InlineData(10.0f)]
+        [InlineData(15.0f)]
+        [InlineData(20.0f)]
+        [InlineData(40.0f)]
+        public void TravelFollowPositions_AllFourFollowersPlusToleranceStayWithinResumeDistance(float resumeDistance)
+        {
+            string settingsPath = Path.Combine(_tempDir, $"squad_settings_{Guid.NewGuid():N}.xml");
+            var settings = new SquadSettings(settingsPath)
+            {
+                ResumeDistance = resumeDistance
+            };
+            var leader = new SquadLeaderState
+            {
+                LeaderGuid = 1UL,
+                LeaderName = "Bedogie",
+                MapId = 1,
+                X = -1024f,
+                Y = -2750f,
+                Z = 92f,
+                Facing = 1.2f,
+                ResumeDistance = settings.ResumeDistance,
+                Members = new List<SquadMemberSummary>
+                {
+                    new() { CharacterName = "Bedogie", Guid = 1UL, Role = SquadRole.TankLeader },
+                    new() { CharacterName = "Bedoes", Guid = 2UL, Role = SquadRole.DpsRanged },
+                    new() { CharacterName = "Belmondo", Guid = 3UL, Role = SquadRole.DpsMelee },
+                    new() { CharacterName = "Ksionc", Guid = 4UL, Role = SquadRole.Healer },
+                    new() { CharacterName = "Sentino", Guid = 5UL, Role = SquadRole.DpsRanged }
+                }
+            };
+
+            var leaderPos = new WoWPoint(leader.X, leader.Y, leader.Z);
+            foreach (string name in new[] { "Bedoes", "Belmondo", "Ksionc", "Sentino" })
+            {
+                int slot = SquadContext.GetMySlotIndex(name, leader);
+                Assert.InRange(slot, 0, 3);
+                WoWPoint followPos = SquadFormationService.ComputeTravelFollowPosition(leaderPos, leader, slot);
+                float worstCaseWaitingStopDistance = followPos.Distance(leaderPos) + 2.5f;
+                Assert.True(
+                    worstCaseWaitingStopDistance <= settings.ResumeDistance,
+                    $"Follower '{name}' (slot {slot}) waiting stop {worstCaseWaitingStopDistance:F2} yd exceeds ResumeDistance ({settings.ResumeDistance:F1} yd)");
+            }
+        }
+
+        [Fact]
+        public void TauntSpellAvailability_RequiresKnownClassTauntBeforeRetargeting()
+        {
+            Assert.False(SquadTankBridge.HasAvailableTauntSpell(WoWClass.Paladin, _ => false));
+            Assert.True(SquadTankBridge.HasAvailableTauntSpell(WoWClass.Paladin, s => s == "Hand of Reckoning"));
+            Assert.True(SquadTankBridge.HasAvailableTauntSpell(WoWClass.Paladin, s => s == "Righteous Defense"));
+            Assert.False(SquadTankBridge.HasAvailableTauntSpell(WoWClass.Warrior, _ => false));
+            Assert.True(SquadTankBridge.HasAvailableTauntSpell(WoWClass.Warrior, s => s == "Taunt"));
+            Assert.True(SquadTankBridge.HasAvailableTauntSpell(WoWClass.Druid, s => s == "Growl"));
+            Assert.True(SquadTankBridge.HasAvailableTauntSpell(WoWClass.DeathKnight, s => s == "Dark Command"));
+        }
     }
 }

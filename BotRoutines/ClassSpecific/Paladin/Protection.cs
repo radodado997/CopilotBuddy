@@ -90,7 +90,7 @@ namespace Singular.ClassSpecific.Paladin
                 new Decorator(
                     ret => Unit.UnfriendlyUnitsNearTarget(8f).Any(),
                     new PrioritySelector(
-			Spell.Cast("Divine Plea", ret => StyxWoW.Me.ManaPercent < 75),
+			Spell.BuffSelf("Divine Plea", ret => StyxWoW.Me.ManaPercent < 75),
                         Spell.Cast("Hammer of the Righteous"),
                         Spell.Cast("Hammer of Justice", ctx => SingularSettings.Instance.Paladin.StunMobsWhileSolo && !StyxWoW.Me.IsInParty),
                         Spell.Cast("Consecration", ret => Unit.NearbyUnfriendlyUnits.Count(u => u.Distance <= 8) >= SingularSettings.Instance.Paladin.ProtConsecrationCount),
@@ -107,7 +107,7 @@ namespace Singular.ClassSpecific.Paladin
                         Movement.CreateMoveToMeleeBehavior(true)
                         )),
                 //Single target
-		Spell.Cast("Divine Plea", ret => StyxWoW.Me.ManaPercent < 75),
+		Spell.BuffSelf("Divine Plea", ret => StyxWoW.Me.ManaPercent < 75),
                 Safers.EnsureTarget(),
                 Spell.Cast("Shield of Righteousness"), // WotLK: Crusader Strike is Ret-only, Shield of Righteousness is the Prot filler (L75, 6s CD)
                 Spell.Cast("Hammer of Justice", ret => SingularSettings.Instance.Paladin.StunMobsWhileSolo && !StyxWoW.Me.IsInParty),
@@ -117,7 +117,7 @@ namespace Singular.ClassSpecific.Paladin
                 Movement.CreateFaceTargetBehavior(),
                 Helpers.Common.CreateAutoAttack(true),
                 Spell.Cast("Judgement of Light"),
-                Spell.Cast("Hammer of Wrath", ret => ((WoWUnit)ret).HealthPercent <= 20),
+                Spell.Cast("Hammer of Wrath", ret => StyxWoW.Me.CurrentTarget != null && StyxWoW.Me.CurrentTarget.HealthPercent <= 20),
                 Spell.Cast("Avenger's Shield", ret => !SingularSettings.Instance.Paladin.AvengersPullOnly),
                 // Don't waste mana on cons if its not a boss.
                 Spell.Cast("Consecration", ret => Unit.NearbyUnfriendlyUnits.Count(u => u.Distance <= 8) >= SingularSettings.Instance.Paladin.ProtConsecrationCount),

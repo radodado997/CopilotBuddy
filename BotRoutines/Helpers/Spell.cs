@@ -962,7 +962,10 @@ namespace Singular.Helpers
         {
             if (spell.MaxRange == 0)
                 return 0;
-           return unit != null ? spell.MaxRange + unit.CombatReach + 1f : spell.MaxRange;
+            if (unit == null)
+                return spell.MaxRange;
+            float reach = Math.Max(0f, StyxWoW.Me.CombatReach + unit.CombatReach - (unit.IsMoving ? 1.75f : 0.75f));
+            return spell.MaxRange + reach;
         }
 
         public static float ActualMinRange(this WoWSpell spell, WoWUnit unit)

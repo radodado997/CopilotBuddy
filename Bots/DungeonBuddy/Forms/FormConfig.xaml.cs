@@ -323,7 +323,7 @@ namespace Bots.DungeonBuddy.Forms
         {
             if (ScriptHelpers.MovementEnabled)
             {
-                ScriptHelpers.DisableMovement(() => true);
+                ScriptHelpers.DisableUserMovement();
                 if (StyxWoW.Me != null && StyxWoW.Me.IsMoving)
                     WoWMovement.MoveStop();
             }
