@@ -18,12 +18,24 @@ namespace Styx.PartyGrind.IPC
     /// </summary>
     public sealed class SquadConnectedMemberSnapshot
     {
+        private long _lastStateReceivedUtcMs;
+        private bool _hasExplicitStateReceivedUtcMs;
+
         public string CharacterName { get; init; } = string.Empty;
         public int SlotIndex { get; init; }
         public SquadHandshake Handshake { get; init; } = new SquadHandshake();
         public SquadMemberState? LatestState { get; init; }
         public SquadTownRunRequest? LatestTownRunRequest { get; init; }
         public long LastReceivedUtcMs { get; init; }
+        public long LastStateReceivedUtcMs
+        {
+            get => _hasExplicitStateReceivedUtcMs ? _lastStateReceivedUtcMs : (LatestState != null ? LastReceivedUtcMs : 0L);
+            init
+            {
+                _lastStateReceivedUtcMs = value;
+                _hasExplicitStateReceivedUtcMs = true;
+            }
+        }
         public bool IsConnected { get; init; }
     }
 
@@ -104,6 +116,7 @@ namespace Styx.PartyGrind.IPC
             public SquadMemberState? LatestState;
             public SquadTownRunRequest? LatestTownRunRequest;
             public long LastReceivedUtcMs;
+            public long LastStateReceivedUtcMs;
             public int SlotIndex = -1;
             public volatile bool Closed;
             private readonly HashSet<OutboundFrame> _pendingFrames = new HashSet<OutboundFrame>();
@@ -227,10 +240,11 @@ namespace Styx.PartyGrind.IPC
         private bool _disposed;
 
         /// <summary>
-        /// Maximum idle silence in milliseconds before a peer is treated as disconnected. Defaults to 3000 ms.
+        /// Maximum idle silence in milliseconds before a peer is treated as disconnected. Defaults to 10000 ms.
         /// </summary>
         public int DisconnectTimeoutMs { get; set; } = 10000;
         public int KeepAliveIntervalMs { get; set; } = 1000;
+        public int MemberStateStaleTimeoutMs { get; set; } = 5000;
 
         public int Port => _actualPort > 0 ? _actualPort : _requestedPort;
         public bool IsListening => _listener != null && _serverCts != null && !_serverCts.IsCancellationRequested;
@@ -325,14 +339,18 @@ namespace Styx.PartyGrind.IPC
                 foreach (var session in _namedSessions.Values.OrderBy(s => s.SlotIndex).ThenBy(s => s.CharacterName, StringComparer.OrdinalIgnoreCase))
                 {
                     bool alive = !session.Closed && (now - session.LastReceivedUtcMs) <= DisconnectTimeoutMs;
+                    bool stateFresh = session.LatestState != null &&
+                                      session.LastStateReceivedUtcMs > 0 &&
+                                      (MemberStateStaleTimeoutMs <= 0 || (now - session.LastStateReceivedUtcMs) <= MemberStateStaleTimeoutMs);
                     list.Add(new SquadConnectedMemberSnapshot
                     {
                         CharacterName = session.CharacterName,
                         SlotIndex = session.SlotIndex,
                         Handshake = session.Handshake,
-                        LatestState = session.LatestState,
-                        LatestTownRunRequest = session.LatestTownRunRequest,
+                        LatestState = stateFresh ? session.LatestState : null,
+                        LatestTownRunRequest = stateFresh ? session.LatestTownRunRequest : null,
                         LastReceivedUtcMs = session.LastReceivedUtcMs,
+                        LastStateReceivedUtcMs = session.LastStateReceivedUtcMs,
                         IsConnected = alive
                     });
                 }
@@ -634,6 +652,7 @@ namespace Styx.PartyGrind.IPC
                         !_namedSessions.TryGetValue(session.CharacterName, out var current) || !ReferenceEquals(current, session))
                         return;
                     session.LastReceivedUtcMs = now;
+                    session.LastStateReceivedUtcMs = now;
                     session.LatestState = state;
                     // The announcement rides the periodic telemetry on purpose: a one-shot
                     // control frame could be dropped by the bounded outbound queue, while

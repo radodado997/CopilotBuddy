@@ -27,23 +27,48 @@ namespace Styx.PartyGrind.IPC
         private Func<SquadHandshake>? _handshakeProvider;
         private SquadLeaderState? _latestLeaderState;
         private long _lastReceivedUtcMs;
+        private long _lastLeaderStateUtcMs;
         private long _nextSequenceId;
         private volatile bool _socketConnected;
         private string _localCharacterName = string.Empty;
         private bool _disposed;
 
         /// <summary>
-        /// Maximum idle time in milliseconds before the connection is marked disconnected. Defaults to 3000 ms.
+        /// Maximum idle time in milliseconds before the connection is marked disconnected. Defaults to 10000 ms.
         /// </summary>
         public int DisconnectTimeoutMs { get; set; } = 10000;
         public int KeepAliveIntervalMs { get; set; } = 1000;
+        public int LeaderStateStaleTimeoutMs { get; set; } = 5000;
 
         public SquadLeaderState? LatestLeaderState
         {
-            get { lock (_stateLock) return _latestLeaderState; }
+            get
+            {
+                lock (_stateLock)
+                {
+                    if (_latestLeaderState == null)
+                        return null;
+                    long lastState = Interlocked.Read(ref _lastLeaderStateUtcMs);
+                    if (lastState <= 0 || (LeaderStateStaleTimeoutMs > 0 && (_utcNowMs() - lastState) > LeaderStateStaleTimeoutMs))
+                        return null;
+                    return _latestLeaderState;
+                }
+            }
         }
 
         public long LastReceivedUtcMs => Interlocked.Read(ref _lastReceivedUtcMs);
+        public long LastLeaderStateUtcMs => Interlocked.Read(ref _lastLeaderStateUtcMs);
+
+        public bool HasFreshLeaderState
+        {
+            get
+            {
+                long lastState = Interlocked.Read(ref _lastLeaderStateUtcMs);
+                return _socketConnected &&
+                       lastState > 0 &&
+                       (LeaderStateStaleTimeoutMs <= 0 || (_utcNowMs() - lastState) <= LeaderStateStaleTimeoutMs);
+            }
+        }
 
         public bool IsConnected
         {
@@ -121,6 +146,7 @@ namespace Styx.PartyGrind.IPC
                 _socketConnected = false;
                 _latestLeaderState = null;
                 Interlocked.Exchange(ref _lastReceivedUtcMs, 0);
+                Interlocked.Exchange(ref _lastLeaderStateUtcMs, 0);
             }
             try { cts?.Cancel(); } catch { }
             try { _outbound.Writer.TryComplete(); } catch { }
@@ -361,6 +387,7 @@ namespace Styx.PartyGrind.IPC
                 _socketConnected = false;
                 _latestLeaderState = null;
                 Interlocked.Exchange(ref _lastReceivedUtcMs, 0);
+                Interlocked.Exchange(ref _lastLeaderStateUtcMs, 0);
             }
         }
 
@@ -397,7 +424,9 @@ namespace Styx.PartyGrind.IPC
                 lock (_stateLock)
                 {
                     if (!ReferenceEquals(_cts, run) || run.IsCancellationRequested || !isSessionOpen()) return false;
-                    Interlocked.Exchange(ref _lastReceivedUtcMs, _utcNowMs());
+                    long now = _utcNowMs();
+                    Interlocked.Exchange(ref _lastReceivedUtcMs, now);
+                    Interlocked.Exchange(ref _lastLeaderStateUtcMs, now);
                     _socketConnected = true;
                     _latestLeaderState = leader;
                 }

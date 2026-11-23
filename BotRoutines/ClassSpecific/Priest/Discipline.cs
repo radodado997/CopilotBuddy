@@ -133,7 +133,7 @@ namespace Singular.ClassSpecific.Priest
                                 Movement.CreateMoveToTargetBehavior(true, 32f)
                                 )),
                         new Decorator(
-                            ret => moveInRange && ((WoWUnit)ret).DistanceSqr > 35 * 35,
+                            ret => moveInRange && (((WoWUnit)ret).DistanceSqr > 35 * 35 || StyxWoW.Me.IsMoving),
                             Movement.CreateMoveToTargetBehavior(true, 35f, ret => (WoWUnit)ret))
 
                         // Divine Hymn

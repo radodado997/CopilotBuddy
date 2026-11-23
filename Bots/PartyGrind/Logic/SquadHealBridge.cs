@@ -127,22 +127,6 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 return false;
 
             var candidates = CollectLiveHealCandidates(leader);
-            if (me.IsCasting || me.ChanneledCastingSpellId != 0)
-            {
-                string? castingName = me.CastingSpell?.Name;
-                if (!string.IsNullOrEmpty(castingName) && RangedAssistSpellSet.Contains(castingName) &&
-                    candidates.Any(c => c.HealthPercent < 75.0))
-                {
-                    SpellManager.StopCasting();
-                }
-                else
-                {
-                    return true;
-                }
-            }
-
-            if (candidates.Count == 0 || (!emergencyOnly && me.Level < 10))
-                StopActiveHealBehavior();
             double threshold = emergencyOnly ? 55.0 : 92.0;
 
             // Check if a HybridOffHeal should step in aggressively because main healer is dead or < 20% mana.
@@ -154,6 +138,24 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     threshold = 80.0;
                 }
             }
+
+            if (me.IsCasting || me.ChanneledCastingSpellId != 0)
+            {
+                string? castingName = me.CastingSpell?.Name;
+                double cancelThreshold = Math.Min(75.0, threshold);
+                if (!string.IsNullOrEmpty(castingName) && RangedAssistSpellSet.Contains(castingName) &&
+                    SelectPriorityHealTarget(candidates, cancelThreshold, prioritizeSelfCritical: settings.UseEmergencySelfHealBeforeParty) != null)
+                {
+                    SpellManager.StopCasting();
+                }
+                else
+                {
+                    return true;
+                }
+            }
+
+            if (candidates.Count == 0 || (!emergencyOnly && me.Level < 10))
+                StopActiveHealBehavior();
 
             var remaining = candidates.ToList();
             bool triedRoutine = false;

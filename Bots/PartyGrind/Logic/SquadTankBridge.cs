@@ -572,7 +572,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 _ => Array.Empty<string>()
             };
 
-            string? chosenSpell = pullSpells.FirstOrDefault(SpellManager.HasSpell);
+            string? chosenSpell = pullSpells.FirstOrDefault(s =>
+                SpellManager.HasSpell(s) && SpellManager.CanCast(s, target, checkRange: false, checkMovement: false));
             if (string.IsNullOrEmpty(chosenSpell))
                 return false;
 

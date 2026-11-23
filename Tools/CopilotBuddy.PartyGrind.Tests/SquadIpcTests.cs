@@ -448,29 +448,50 @@ namespace CopilotBuddy.PartyGrind.Tests
         }
 
         [Fact]
-        public async Task KeepAlivePing_SustainsIdleSessionPastTimeoutBoundary()
+        public async Task KeepAlivePing_SustainsIdleSessionPastTimeoutBoundary_WhileExpiringStaleTelemetry()
         {
             using var server = new SquadIpcServer(0, "PingTeam", memberSecrets: Secrets)
             {
-                DisconnectTimeoutMs = 600,
-                KeepAliveIntervalMs = 150
+                DisconnectTimeoutMs = 900,
+                KeepAliveIntervalMs = 150,
+                MemberStateStaleTimeoutMs = 400
             };
             server.Start();
             using var client = new SquadIpcClient(server.Port, "PingTeam", memberSecret: Secret("Follower"))
             {
-                DisconnectTimeoutMs = 600,
-                KeepAliveIntervalMs = 150
+                DisconnectTimeoutMs = 900,
+                KeepAliveIntervalMs = 150,
+                LeaderStateStaleTimeoutMs = 400
             };
             client.Start(() => new SquadHandshake { CharacterName = "Follower", Guid = 42, Level = 10 });
             await WaitUntilAsync(() => server.GetMemberSnapshots().Count == 1);
+            client.SendMemberState(new SquadMemberState
+            {
+                CharacterName = "Follower",
+                Guid = 42,
+                Level = 10,
+                MapId = 0,
+                X = 1f,
+                Y = 2f,
+                Z = 3f,
+                CorpseX = 1f,
+                CorpseY = 2f,
+                CorpseZ = 3f
+            });
+            await WaitUntilAsync(() => server.GetMemberSnapshots().Single().LatestState != null);
             server.BroadcastLeaderState(new SquadLeaderState { LeaderName = "Tank" });
-            await WaitUntilAsync(() => client.IsConnected);
+            await WaitUntilAsync(() => client.IsConnected && client.LatestLeaderState != null);
 
-            await Task.Delay(950);
+            await Task.Delay(750);
 
             Assert.True(client.IsConnected);
-            Assert.Single(server.GetMemberSnapshots());
-            Assert.True(server.GetMemberSnapshots()[0].IsConnected);
+            Assert.False(client.HasFreshLeaderState);
+            Assert.Null(client.LatestLeaderState);
+
+            var snap = Assert.Single(server.GetMemberSnapshots());
+            Assert.True(snap.IsConnected);
+            Assert.Null(snap.LatestState);
+            Assert.True(snap.LastReceivedUtcMs > snap.LastStateReceivedUtcMs);
         }
     }
 }

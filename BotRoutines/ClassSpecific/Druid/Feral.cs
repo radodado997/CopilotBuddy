@@ -178,7 +178,7 @@ namespace Singular.ClassSpecific.Druid
 
                         Spell.BuffSelf("Cat Form"),
                         Helpers.Common.CreateAutoAttack(true),
-                        Spell.BuffSelf("Prowl", ret => StyxWoW.Me.CurrentTarget != null && StyxWoW.Me.CurrentTarget.DistanceSqr < 30 * 30),
+                        Spell.BuffSelf("Prowl", ret => !StyxWoW.Me.IsInParty && StyxWoW.Me.CurrentTarget != null && StyxWoW.Me.CurrentTarget.DistanceSqr < 30 * 30),
                         Spell.Cast("Feral Charge - Cat"),
                         Spell.Cast("Dash",
                             ret => StyxWoW.Me.CurrentTarget != null &&
@@ -240,12 +240,13 @@ namespace Singular.ClassSpecific.Druid
                 Movement.CreateMoveBehindTargetBehavior(),
                 Spell.BuffSelf("Tiger's Fury"),
                 Spell.Cast("Ferocious Bite",
-                    ret => StyxWoW.Me.ComboPoints == 5 ||
-                           StyxWoW.Me.ComboPoints > 1 && StyxWoW.Me.CurrentTarget != null && StyxWoW.Me.CurrentTarget.HealthPercent < 20),
+                    ret => StyxWoW.Me.ComboPoints > 1 && StyxWoW.Me.CurrentTarget != null && StyxWoW.Me.CurrentTarget.HealthPercent < 20),
                 Spell.Cast("Rip",
                     ret => StyxWoW.Me.ComboPoints == 5 &&
                            StyxWoW.Me.CurrentTarget != null &&
                            !StyxWoW.Me.CurrentTarget.HasMyAura("Rip")),
+                Spell.Cast("Ferocious Bite",
+                    ret => StyxWoW.Me.ComboPoints == 5),
                 Spell.Cast("Shred", ret => StyxWoW.Me.CurrentTarget != null && StyxWoW.Me.CurrentTarget.MeIsBehind),
 				Spell.Buff("Rake", true, ret => StyxWoW.Me.CurrentTarget),
                 Spell.Cast("Mangle (Cat)"),
@@ -296,13 +297,14 @@ namespace Singular.ClassSpecific.Druid
             return new PrioritySelector(
                 Spell.BuffSelf("Tiger's Fury", ret => CurrentEnergy <= 35),
                 Spell.Cast("Ferocious Bite",
-                    ret => StyxWoW.Me.ComboPoints == 5 ||
-                           StyxWoW.Me.ComboPoints > 1 && StyxWoW.Me.CurrentTarget != null && StyxWoW.Me.CurrentTarget.HealthPercent < 20),
+                    ret => StyxWoW.Me.ComboPoints > 1 && StyxWoW.Me.CurrentTarget != null && StyxWoW.Me.CurrentTarget.HealthPercent < 20),
                 Spell.Cast("Rip",
                     ret => StyxWoW.Me.ComboPoints >= 4 &&
                            StyxWoW.Me.CurrentTarget != null &&
                            !StyxWoW.Me.CurrentTarget.HasMyAura("Rip") &&
                            (!SpellManager.HasSpell("Ferocious Bite") || StyxWoW.Me.CurrentTarget.HealthPercent >= 35)),
+                Spell.Cast("Ferocious Bite",
+                    ret => StyxWoW.Me.ComboPoints == 5),
                 Spell.Cast("Shred", ret => StyxWoW.Me.CurrentTarget != null && StyxWoW.Me.CurrentTarget.MeIsBehind),
                 Spell.Buff("Rake", true, ret => StyxWoW.Me.CurrentTarget),
                 Spell.Cast("Mangle (Cat)"),

@@ -380,6 +380,19 @@ namespace CopilotBuddy.PartyGrind.Tests
             member.HasDungeonTelemetry = true;
             member.IsInsideDungeon = true;
             Assert.False(SquadDungeonService.HasFreshExitEvidence(2UL, new[] { WrapClient(member, 11_500L) }, 10_000L, 12_000L));
+
+            member.IsInsideDungeon = false;
+            var pingRefreshedPreCompletionSample = new SquadConnectedMemberSnapshot
+            {
+                CharacterName = member.CharacterName,
+                SlotIndex = 0,
+                Handshake = new SquadHandshake { CharacterName = member.CharacterName, Guid = member.Guid, Class = member.Class, Role = member.Role, Level = member.Level },
+                LatestState = member,
+                LastReceivedUtcMs = 11_500L,
+                LastStateReceivedUtcMs = 9_500L,
+                IsConnected = true
+            };
+            Assert.False(SquadDungeonService.HasFreshExitEvidence(2UL, new[] { pingRefreshedPreCompletionSample }, 10_000L, 12_000L));
         }
 
         [Fact]
@@ -676,6 +689,12 @@ namespace CopilotBuddy.PartyGrind.Tests
             WoWPoint closeStep = SquadDungeonService.AdvanceBossBreadcrumb(
                 new WoWPoint(65f, 0f, 0f), crumbs, bossLoc, bossLoc, 20f, ref closeIdx);
             Assert.Equal(bossLoc, closeStep);
+
+            int exhaustedIdx = crumbs.Count;
+            var fallbackProfileLoc = new WoWPoint(70f, 0f, 0f);
+            WoWPoint unreachableStep = SquadDungeonService.AdvanceBossBreadcrumb(
+                new WoWPoint(60f, 0f, 0f), crumbs, fallbackProfileLoc, bossLoc, liveBossPathDistance: null, ref exhaustedIdx);
+            Assert.Equal(fallbackProfileLoc, unreachableStep);
         }
     }
 }

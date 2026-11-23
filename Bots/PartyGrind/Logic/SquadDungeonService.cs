@@ -109,6 +109,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private long _lastQueueAttemptUtcMs;
         private long _lastRoleSetUtcMs;
         private long _lastProposalAcceptUtcMs;
+        private long _lastTeleportInUtcMs;
         private long _lastTeleportOutUtcMs;
         private int _instanceResetGeneration;
         internal const float HotspotArrivalDistance = 4.5f;
@@ -433,9 +434,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         internal static bool HasFreshExitEvidence(
             ulong participantGuid, IReadOnlyList<SquadConnectedMemberSnapshot> connected, long completedAtUtcMs, long nowUtcMs)
         {
-            return connected.Any(m => m.LastReceivedUtcMs > completedAtUtcMs &&
-                                      m.LastReceivedUtcMs <= nowUtcMs &&
-                                      nowUtcMs - m.LastReceivedUtcMs <= 5000L &&
+            return connected.Any(m => m.LastStateReceivedUtcMs > completedAtUtcMs &&
+                                      m.LastStateReceivedUtcMs <= nowUtcMs &&
+                                      nowUtcMs - m.LastStateReceivedUtcMs <= 5000L &&
                                       m.LatestState is { HasDungeonTelemetry: true, IsInsideDungeon: false } state &&
                                       state.Guid == participantGuid);
         }
@@ -695,6 +696,25 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 ApplySquadLfgRole(settings.Role, settings.IsCoordinator);
             }
 
+            string lfgMode = SafeGetLfgMode();
+            if (lfgMode == "lfgparty" && !IsInDungeonMap(me))
+            {
+                if (me.IsMoving)
+                    WoWMovement.MoveStop();
+                if (me.Mounted)
+                {
+                    Mount.Dismount("LFG teleport in");
+                    return true;
+                }
+                if (nowUtcMs - _lastTeleportInUtcMs >= 3500L)
+                {
+                    _lastTeleportInUtcMs = nowUtcMs;
+                    LfgManager.TeleportIn();
+                    SquadPartySyncService.LogAction("Dungeon: teleporting into LFG instance");
+                }
+                return true;
+            }
+
             if (!settings.IsCoordinator)
             {
                 if (me.IsMoving)
@@ -703,8 +723,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 return true;
             }
 
-            string lfgMode = SafeGetLfgMode();
-            if (lfgMode == "queued" || lfgMode == "proposal" || lfgMode == "rolecheck" || lfgMode == "lfgparty")
+            if (lfgMode == "queued" || lfgMode == "proposal" || lfgMode == "rolecheck")
             {
                 if (me.IsMoving)
                     WoWMovement.MoveStop();
@@ -1079,8 +1098,11 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 }
             }
 
-            if (liveBossLocation.HasValue && liveBossLocation.Value != WoWPoint.Zero)
+            if (liveBossLocation.HasValue && liveBossLocation.Value != WoWPoint.Zero &&
+                liveBossPathDistance.HasValue)
+            {
                 return liveBossLocation.Value;
+            }
 
             if (bossProfileLocation != WoWPoint.Zero && meLocation.Distance(bossProfileLocation) > HotspotArrivalDistance)
                 return bossProfileLocation;

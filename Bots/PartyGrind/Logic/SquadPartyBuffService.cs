@@ -21,15 +21,29 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
     {
         private const long RecentCastThrottleMs = 4000;
         private static long _lastMarkerCheckUtcMs;
-        private static readonly Dictionary<(ulong TargetGuid, string SpellName), long> _recentBuffCasts = new();
+
+        private sealed class BuffCastKeyComparer : IEqualityComparer<(ulong TargetGuid, string SpellName)>
+        {
+            public static readonly BuffCastKeyComparer Instance = new();
+
+            public bool Equals((ulong TargetGuid, string SpellName) x, (ulong TargetGuid, string SpellName) y) =>
+                x.TargetGuid == y.TargetGuid &&
+                StringComparer.OrdinalIgnoreCase.Equals(x.SpellName, y.SpellName);
+
+            public int GetHashCode((ulong TargetGuid, string SpellName) obj) =>
+                HashCode.Combine(obj.TargetGuid, StringComparer.OrdinalIgnoreCase.GetHashCode(obj.SpellName ?? string.Empty));
+        }
+
+        private static readonly Dictionary<(ulong TargetGuid, string SpellName), long> _recentBuffCasts = new(BuffCastKeyComparer.Instance);
 
         internal static bool IsBuffCastThrottled(ulong targetGuid, string spellName, long nowMs)
         {
-            if (_recentBuffCasts.TryGetValue((targetGuid, spellName), out long untilMs))
+            var key = (targetGuid, spellName ?? string.Empty);
+            if (_recentBuffCasts.TryGetValue(key, out long untilMs))
             {
                 if (nowMs < untilMs)
                     return true;
-                _recentBuffCasts.Remove((targetGuid, spellName));
+                _recentBuffCasts.Remove(key);
             }
             return false;
         }
@@ -38,7 +52,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         {
             if (_recentBuffCasts.Count > 64)
                 _recentBuffCasts.Clear();
-            _recentBuffCasts[(targetGuid, spellName)] = nowMs + RecentCastThrottleMs;
+            _recentBuffCasts[(targetGuid, spellName ?? string.Empty)] = nowMs + RecentCastThrottleMs;
         }
 
         internal static void ResetBuffCastThrottles()

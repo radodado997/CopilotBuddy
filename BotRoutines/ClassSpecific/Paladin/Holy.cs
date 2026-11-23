@@ -172,7 +172,7 @@ namespace Singular.ClassSpecific.Paladin
                                     Movement.CreateMoveToMeleeBehavior(true)
                                     )),
                             new Decorator(
-                                ret => moveInRange && ((WoWUnit)ret).DistanceSqr > 35 * 35,
+                                ret => moveInRange && (((WoWUnit)ret).DistanceSqr > 35 * 35 || StyxWoW.Me.IsMoving),
                 // Get in range
                                 Movement.CreateMoveToTargetBehavior(true, 35f, ret => (WoWUnit)ret))
                             )));

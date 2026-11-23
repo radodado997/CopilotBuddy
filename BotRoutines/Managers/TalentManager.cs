@@ -183,26 +183,45 @@ namespace Singular.Managers
                     }
                 }
 
-                Glyphs.Clear();
-
                 var glyphCount = Lua.GetReturnVal<int>("return GetNumGlyphSockets()", 0);
 
-                if (glyphCount != 0)
+                if (glyphCount > 0)
                 {
+                    var refreshedGlyphs = new HashSet<string>();
+                    bool glyphReadComplete = true;
+
                     for (int i = 1; i <= glyphCount; i++)
                     {
                         List<string> glyphInfo = Lua.GetReturnValues(String.Format("return GetGlyphSocketInfo({0})", i));
 
                         // WotLK QC: GetGlyphSocketInfo returns: enabled(0), glyphType(1), glyphSpellID(2), icon(3)
                         // Cata had an extra return value at index 2 (glyphTooltipIndex), shifting spell ID to index 3
-                        if (glyphInfo != null && glyphInfo.Count > 2 && glyphInfo[2] != "nil" &&
-                            int.TryParse(glyphInfo[2], out int glyphSpellId))
+                        if (glyphInfo == null || glyphInfo.Count < 3)
+                        {
+                            Logger.WriteDebug("[Talents] Incomplete GetGlyphSocketInfo({0}) response ({1} values); retaining previous glyph snapshot.",
+                                i, glyphInfo == null ? 0 : glyphInfo.Count);
+                            glyphReadComplete = false;
+                            break;
+                        }
+
+                        if (glyphInfo[2] != "nil" && int.TryParse(glyphInfo[2], out int glyphSpellId))
                         {
                             var glyphSpell = WoWSpell.FromId(glyphSpellId);
                             if (glyphSpell != null && !string.IsNullOrEmpty(glyphSpell.Name))
-                                Glyphs.Add(glyphSpell.Name.Replace("Glyph of ", ""));
+                                refreshedGlyphs.Add(glyphSpell.Name.Replace("Glyph of ", ""));
                         }
                     }
+
+                    if (glyphReadComplete)
+                    {
+                        Glyphs.Clear();
+                        foreach (var g in refreshedGlyphs)
+                            Glyphs.Add(g);
+                    }
+                }
+                else
+                {
+                    Glyphs.Clear();
                 }
             }
 

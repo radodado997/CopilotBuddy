@@ -1305,9 +1305,9 @@ namespace CopilotBuddy.Bots.PartyGrind
                             SquadContext.GetLeaderStateSnapshot()!.Phase == SquadPhase.DungeonQueueing ||
                             SquadContext.GetLeaderStateSnapshot()!.Phase == SquadPhase.DungeonTravelToPortal ||
                             SquadContext.GetLeaderStateSnapshot()!.Phase == SquadPhase.DungeonLockoutWait ||
-                            (SquadContext.IsCoordinator && _dungeon.CanReenterCurrentWalkInRun &&
-                             SquadContext.GetLeaderStateSnapshot()!.DungeonEntryMode == SquadDungeonEntryMode.WalkInPortalFarm &&
-                             SquadContext.GetLeaderStateSnapshot()!.Phase == SquadPhase.DungeonClearing) ||
+                            (SquadContext.GetLeaderStateSnapshot()!.Phase == SquadPhase.DungeonClearing &&
+                             (SquadContext.GetLeaderStateSnapshot()!.DungeonEntryMode != SquadDungeonEntryMode.WalkInPortalFarm ||
+                              (SquadContext.IsCoordinator && _dungeon.CanReenterCurrentWalkInRun))) ||
                             SquadContext.GetLeaderStateSnapshot()!.AcceptLfgProposalOrder),
                     new Action(ctx => _dungeon.RunQueueingOrEntryTick(
                         SquadContext.ActiveSettings ?? SquadSettings.Instance,
@@ -1419,7 +1419,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                 return true;
 
             var settings = SquadContext.ActiveSettings;
-            if (settings != null && !settings.IsCoordinator && !SquadContext.IsIpcConnected &&
+            if (settings != null && !settings.IsCoordinator && (!SquadContext.IsIpcConnected || leader == null) &&
                 (StyxWoW.Me == null || !StyxWoW.Me.Combat))
             {
                 return true;
@@ -1730,7 +1730,8 @@ namespace CopilotBuddy.Bots.PartyGrind
                 var (slotIdx, slotCount) = SquadFormationService.ResolveSubRoleSlot(me.Name ?? string.Empty, settings.Role, leader);
                 if (isMelee)
                 {
-                    bool canFlank = !SquadContext.IsDungeonModeActive || global::Bots.DungeonBuddy.Helpers.ScriptHelpers.MovementEnabled;
+                    bool canFlank = _activeCombatRoutine == null &&
+                                    (!SquadContext.IsDungeonModeActive || global::Bots.DungeonBuddy.Helpers.ScriptHelpers.MovementEnabled);
                     if (canFlank && focus.Distance <= 12f && !focus.IsWithinMeleeRange)
                     {
                         WoWPoint flankPos = SquadFormationService.ComputeMeleeFlankPosition(
@@ -2248,8 +2249,21 @@ namespace CopilotBuddy.Bots.PartyGrind
                             _currentFocusGuid = dungeonTarget.Guid;
                             BeginPullCommit(dungeonTarget.Guid, now);
                             dungeonTarget.Target();
+                            if (!me.Combat && !anotherTankDrives &&
+                                SquadTankBridge.TryExecuteSafeDungeonPull(dungeonTarget.Guid))
+                            {
+                                return RunStatus.Success;
+                            }
                             return RunRoutineCombat(dungeonTarget.Guid);
                         }
+                    }
+
+                    if (leader != null && !SquadTankBridge.CanInitiatePull(leader, settings.MaxPullGatherDistance))
+                    {
+                        SquadPartySyncService.LogAction("Dungeon: waiting for squadmates to gather");
+                        if (me.IsMoving)
+                            WoWMovement.MoveStop();
+                        return RunStatus.Success;
                     }
 
                     WoWPoint nextDungeonPt = _dungeon.ComputeLeaderNextDungeonPoint();
