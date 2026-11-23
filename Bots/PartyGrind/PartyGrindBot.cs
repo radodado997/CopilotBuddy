@@ -549,7 +549,7 @@ namespace CopilotBuddy.Bots.PartyGrind
 
             SquadProfileSnapshot profileSnap = CaptureProfileSnapshot(now);
             int hourlyResets = settings.BotMode == SquadBotMode.Dungeon ? _dungeon.GetHourlyResetCount(now) : 0;
-            int lockoutRem = settings.BotMode == SquadBotMode.Dungeon ? _dungeon.GetLockoutRemainingSeconds(now, settings.MaxInstancesPerHour) : 0;
+            int lockoutRem = settings.BotMode == SquadBotMode.Dungeon ? _dungeon.GetWalkInEntryLockoutRemainingSeconds(now, settings.MaxInstancesPerHour) : 0;
 
             SquadLeaderState leaderState = _coordinator.EvaluateTick(
                 settings,
@@ -1303,6 +1303,9 @@ namespace CopilotBuddy.Bots.PartyGrind
                             SquadContext.GetLeaderStateSnapshot()!.Phase == SquadPhase.DungeonQueueing ||
                             SquadContext.GetLeaderStateSnapshot()!.Phase == SquadPhase.DungeonTravelToPortal ||
                             SquadContext.GetLeaderStateSnapshot()!.Phase == SquadPhase.DungeonLockoutWait ||
+                            (SquadContext.IsCoordinator && _dungeon.CanReenterCurrentWalkInRun &&
+                             SquadContext.GetLeaderStateSnapshot()!.DungeonEntryMode == SquadDungeonEntryMode.WalkInPortalFarm &&
+                             SquadContext.GetLeaderStateSnapshot()!.Phase == SquadPhase.DungeonClearing) ||
                             SquadContext.GetLeaderStateSnapshot()!.AcceptLfgProposalOrder),
                     new Action(ctx => _dungeon.RunQueueingOrEntryTick(
                         SquadContext.ActiveSettings ?? SquadSettings.Instance,
@@ -1455,17 +1458,21 @@ namespace CopilotBuddy.Bots.PartyGrind
             }
 
             _deathStartedUtcMs = 0;
-            bool instanceGhostOrigin = _diedInsideDungeon ?? (LocalPlayer.InstanceDeathLocation != WoWPoint.Empty);
-            if (SquadContext.IsDungeonModeActive && instanceGhostOrigin)
+            WoWPoint corpsePoint = me.CorpsePoint;
+            if (SquadContext.IsDungeonModeActive && _diedInsideDungeon != false)
             {
+                WoWPoint instanceCorpse = me.InstanceCorpseLocation;
+                bool hasInstanceCorpse = instanceCorpse != WoWPoint.Empty && instanceCorpse != WoWPoint.Zero;
                 if (SquadDungeonService.IsInDungeonMap(me))
                 {
                     return RunStatus.Success;
                 }
 
-                WoWPoint dungeonEntrance = _dungeon.GetGhostDungeonEntranceTarget();
-                if (dungeonEntrance == WoWPoint.Zero && LocalPlayer.InstanceDeathLocation != WoWPoint.Empty)
-                    dungeonEntrance = LocalPlayer.InstanceDeathLocation;
+                WoWPoint dungeonEntrance = _diedInsideDungeon == true
+                    ? _dungeon.GetGhostDungeonEntranceTarget()
+                    : WoWPoint.Zero;
+                if (dungeonEntrance == WoWPoint.Zero && hasInstanceCorpse && instanceCorpse != corpsePoint)
+                    dungeonEntrance = instanceCorpse;
                 if (dungeonEntrance != WoWPoint.Zero)
                 {
                     SquadPartySyncService.LogAction("Dungeon ghost run: moving to entrance portal");
@@ -1477,7 +1484,6 @@ namespace CopilotBuddy.Bots.PartyGrind
                 }
             }
 
-            WoWPoint corpsePoint = me.CorpsePoint;
             WoWPoint targetPoint = corpsePoint;
             if (leader != null && leader.SquadCorpseRallyX != 0 && leader.SquadCorpseRallyY != 0)
             {

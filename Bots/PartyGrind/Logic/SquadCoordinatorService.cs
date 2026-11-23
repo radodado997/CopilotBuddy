@@ -426,10 +426,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             SquadTownRunRequest? townRequest = ResolveTownRunRequest(connectedClients, localTownRunRequest);
             bool anyInsideDungeon = isDungeonMode && (dungeon?.IsInsideDungeon == true || rosterStates.Any(m => m.IsInsideDungeon));
 
-            if (!anyInsideDungeon)
-                _dungeonCompleted = isDungeonMode && dungeon?.ResetPendingOutside == true;
-            else if (dungeon?.IsDungeonComplete == true)
-                _dungeonCompleted = true;
+            _dungeonCompleted = isDungeonMode &&
+                (dungeon?.ResetPendingOutside == true ||
+                 (anyInsideDungeon && (dungeon?.IsDungeonComplete == true || _dungeonCompleted)));
 
             if (!_inTownRun)
             {

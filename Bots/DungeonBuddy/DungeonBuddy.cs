@@ -236,16 +236,25 @@ namespace Bots.DungeonBuddy
             {
                 if (!(TreeRoot.Current is DungeonBuddy))
                 {
-                    if (StyxWoW.Me == null)
-                        return Array.Empty<WoWPartyMember>();
-                    return StyxWoW.Me.IsInRaid
-                        ? StyxWoW.Me.RaidMemberInfos.ToArray()
-                        : StyxWoW.Me.PartyMemberInfos.ToArray();
+                    return CaptureGroupRoster(StyxWoW.Me);
                 }
 
                 return _partyMemberInfos;
             }
         }
+
+        private static WoWPartyMember[] CaptureGroupRoster(LocalPlayer? player)
+        {
+            if (player == null)
+                return Array.Empty<WoWPartyMember>();
+
+            return player.IsInRaid
+                ? CreateRaidRoster(player.GetRaidMemberGUIDs())
+                : player.PartyMemberInfos.ToArray();
+        }
+
+        internal static WoWPartyMember[] CreateRaidRoster(ulong[] raidSlots) =>
+            raidSlots.Select((guid, index) => new WoWPartyMember(guid, true, index + 1)).ToArray();
 
         public Composite CreateFrameUpdateBehavior()
         {
@@ -253,9 +262,7 @@ namespace Bots.DungeonBuddy
             {
                 using (new FrameLock())
                 {
-                    _partyMemberInfos = StyxWoW.Me.IsInRaid
-                        ? StyxWoW.Me.RaidMemberInfos.ToArray()
-                        : StyxWoW.Me.PartyMemberInfos.ToArray();
+                    _partyMemberInfos = CaptureGroupRoster(StyxWoW.Me);
                 }
 
                 return RunStatus.Failure;

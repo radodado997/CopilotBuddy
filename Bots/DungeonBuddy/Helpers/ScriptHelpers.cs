@@ -202,7 +202,8 @@ namespace Bots.DungeonBuddy.Helpers
                 ctx =>
                 {
                     WoWPartyMember tank = DungeonBuddy.PartyMemberInfos
-                        .FirstOrDefault(member => member.HasRole(WoWPartyMember.GroupRole.Tank));
+                        .FirstOrDefault(member => member.Guid != 0 && member.Guid != StyxWoW.Me.Guid &&
+                                                  member.HasRole(WoWPartyMember.GroupRole.Tank));
 
                     if (tank == null)
                         return ctx;

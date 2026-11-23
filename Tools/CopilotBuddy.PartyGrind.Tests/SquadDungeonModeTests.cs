@@ -76,12 +76,12 @@ namespace CopilotBuddy.PartyGrind.Tests
             };
         }
 
-        private static SquadConnectedMemberSnapshot WrapClient(SquadMemberState state, long receivedUtcMs = 10_000L)
+        private static SquadConnectedMemberSnapshot WrapClient(SquadMemberState state, long receivedUtcMs = 10_000L, bool isConnected = true)
         {
             return new SquadConnectedMemberSnapshot
             {
                 CharacterName = state.CharacterName,
-                IsConnected = true,
+                IsConnected = isConnected,
                 LastReceivedUtcMs = receivedUtcMs,
                 Handshake = new SquadHandshake
                 {
@@ -566,47 +566,51 @@ namespace CopilotBuddy.PartyGrind.Tests
         }
 
         [Fact]
-        public void WalkInResetWait_ReleasesWhenParticipantLeavesGroupOrExceedsWait_ButHoldsConnectedInsideParticipant()
+        public void WalkInResetWait_RequiresFreshExitEvidenceUntilParticipantLeavesGameGroup()
         {
-            var participants = new ulong[] { 2UL, 3UL };
-            var insideState = MakeMemberState("HealB", 2UL, SquadRole.Healer, WoWClass.Priest, 30, insideDungeon: true);
-            var insideSnapshot = WrapClient(insideState, 12_000L);
+            ulong[] participants = [2UL, 3UL];
+            ulong[] fullGroup = [1UL, 2UL, 3UL];
+            var heal = MakeMemberState("HealB", 2UL, SquadRole.Healer, WoWClass.Priest, 30);
+            heal.MapId = 1U;
+            var dps = MakeMemberState("DpsC", 3UL, SquadRole.DpsMelee, WoWClass.Rogue, 30, insideDungeon: true);
+            var outside = WrapClient(heal, 59_000L, isConnected: false);
 
             Assert.False(SquadDungeonService.AreAllWalkInParticipantsClearedForReset(
-                participants,
-                new[] { insideSnapshot },
-                new[] { 1UL, 2UL, 3UL },
-                Array.Empty<ulong>(),
-                completedAtUtcMs: 10_000L,
-                nowUtcMs: 60_000L));
-
-            insideState.IsInsideDungeon = false;
-            var outsideSnapshot = WrapClient(insideState, 12_000L);
-
-            Assert.True(SquadDungeonService.AreAllWalkInParticipantsClearedForReset(
-                participants,
-                new[] { outsideSnapshot },
-                new[] { 1UL, 2UL },
-                Array.Empty<ulong>(),
-                completedAtUtcMs: 10_000L,
-                nowUtcMs: 13_000L));
-
+                participants, [outside], fullGroup, 10_000L, 60_000L));
             Assert.False(SquadDungeonService.AreAllWalkInParticipantsClearedForReset(
-                participants,
-                new[] { outsideSnapshot },
-                new[] { 1UL, 2UL, 3UL },
-                Array.Empty<ulong>(),
-                completedAtUtcMs: 10_000L,
-                nowUtcMs: 13_000L));
+                participants, [outside, WrapClient(dps, 59_000L)], fullGroup, 10_000L, 60_000L));
 
-            var outsideTimedOut = WrapClient(insideState, 55_500L);
+            dps.IsInsideDungeon = false;
+            Assert.False(SquadDungeonService.AreAllWalkInParticipantsClearedForReset(
+                participants, [outside, WrapClient(dps, 11_000L)], fullGroup, 10_000L, 60_000L));
             Assert.True(SquadDungeonService.AreAllWalkInParticipantsClearedForReset(
-                participants,
-                new[] { outsideTimedOut },
-                new[] { 1UL, 2UL, 3UL },
-                Array.Empty<ulong>(),
-                completedAtUtcMs: 10_000L,
-                nowUtcMs: 56_000L));
+                participants, [outside, WrapClient(dps, 59_000L)], fullGroup, 10_000L, 60_000L));
+            Assert.True(SquadDungeonService.AreAllWalkInParticipantsClearedForReset(
+                participants, [outside], [1UL, 2UL], 10_000L, 60_000L));
+        }
+
+        [Fact]
+        public void WalkInCompletion_UsesPendingResetToOrderExitAfterCoordinatorLeaves()
+        {
+            var coordinator = new SquadCoordinatorService();
+            var settings = CreateDungeonSettings(SquadDungeonEntryMode.WalkInPortalFarm);
+            var tank = MakeMemberState("TankA", 1UL, SquadRole.TankLeader, WoWClass.Warrior, 30);
+            var healer = MakeMemberState("HealB", 2UL, SquadRole.Healer, WoWClass.Priest, 30, insideDungeon: true);
+            var snapshot = new SquadDungeonSnapshot { ResetPendingOutside = true };
+
+            var state = coordinator.EvaluateTick(settings, tank, [WrapClient(healer)], new SquadProfileSnapshot(),
+                0, 0, 0, 0f, 10_000L, dungeon: snapshot);
+
+            Assert.Equal(SquadPhase.DungeonCompleteExit, state.Phase);
+            Assert.False(state.TeleportOutOrder);
+        }
+
+        [Fact]
+        public void DungeonBuddyRaidRoster_PreservesSelfAndEmptySlotsWithIndexedUnitIds()
+        {
+            var roster = global::Bots.DungeonBuddy.DungeonBuddy.CreateRaidRoster([11UL, 0UL, 22UL]);
+            Assert.Equal(new ulong[] { 11UL, 0UL, 22UL }, roster.Select(member => member.Guid));
+            Assert.Equal(new[] { "raid1", "raid2", "raid3" }, roster.Select(member => member.UnitId));
         }
 
         [Fact]
@@ -627,9 +631,13 @@ namespace CopilotBuddy.PartyGrind.Tests
             dungeonService.RecordWalkInEntry(fifthEntryTime);
             Assert.Equal(5, dungeonService.GetHourlyResetCount(fifthEntryTime + 1_000L));
             Assert.True(dungeonService.GetLockoutRemainingSeconds(fifthEntryTime + 1_000L, maxInstancesPerHour: 5) > 0);
+            Assert.Equal(0, dungeonService.GetWalkInEntryLockoutRemainingSeconds(fifthEntryTime + 1_000L, maxInstancesPerHour: 5));
 
+            dungeonService.MarkResetPendingOutside();
+            Assert.True(dungeonService.GetWalkInEntryLockoutRemainingSeconds(fifthEntryTime + 2_000L, maxInstancesPerHour: 5) > 0);
             dungeonService.RecordInstanceReset(fifthEntryTime + 30_000L);
             Assert.Equal(5, dungeonService.GetHourlyResetCount(fifthEntryTime + 31_000L));
+            Assert.True(dungeonService.GetWalkInEntryLockoutRemainingSeconds(fifthEntryTime + 31_000L, maxInstancesPerHour: 5) > 0);
         }
     }
 }

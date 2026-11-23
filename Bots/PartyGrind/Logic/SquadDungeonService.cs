@@ -119,7 +119,6 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private int _hotspotIndex;
         private long _completedAtUtcMs;
         private bool _countedCurrentWalkInEntry;
-        private const long MaxExitConfirmationWaitMs = 45_000L;
         private readonly HashSet<ulong> _runParticipants = new();
         private IReadOnlyList<SquadConnectedMemberSnapshot> _participantSnapshots = Array.Empty<SquadConnectedMemberSnapshot>();
         private Composite? _activeEncounterBehavior;
@@ -437,46 +436,12 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             IReadOnlyCollection<ulong> runParticipants,
             IReadOnlyList<SquadConnectedMemberSnapshot> connected,
             IReadOnlyCollection<ulong> currentGroupMemberGuids,
-            IReadOnlyCollection<ulong> visibleOutsideGuids,
             long completedAtUtcMs,
             long nowUtcMs)
         {
-            if (completedAtUtcMs <= 0)
-                return false;
-
-            bool waitTimedOut = (nowUtcMs - completedAtUtcMs) >= MaxExitConfirmationWaitMs;
-
-            foreach (ulong guid in runParticipants)
-            {
-                if (HasFreshExitEvidence(guid, connected, completedAtUtcMs, nowUtcMs))
-                    continue;
-
-                var liveSnapshot = connected.FirstOrDefault(m =>
-                    m.IsConnected &&
-                    (m.Handshake.Guid == guid || m.LatestState?.Guid == guid));
-
-                if (liveSnapshot != null)
-                {
-                    if (liveSnapshot.LatestState?.IsInsideDungeon == true)
-                        return false;
-
-                    if (waitTimedOut && liveSnapshot.LatestState is { HasDungeonTelemetry: false } && visibleOutsideGuids.Contains(guid))
-                        continue;
-
-                    return false;
-                }
-
-                if (visibleOutsideGuids.Contains(guid))
-                    continue;
-
-                if (!currentGroupMemberGuids.Contains(guid))
-                    continue;
-
-                if (!waitTimedOut)
-                    return false;
-            }
-
-            return true;
+            return completedAtUtcMs > 0 && runParticipants.All(guid =>
+                !currentGroupMemberGuids.Contains(guid) ||
+                HasFreshExitEvidence(guid, connected, completedAtUtcMs, nowUtcMs));
         }
 
         public void RecordWalkInEntry(long nowUtcMs)
@@ -521,6 +486,11 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             long remMs = Math.Max(0L, unlockAt - nowUtcMs);
             return (int)Math.Ceiling(remMs / 1000.0);
         }
+
+        internal bool CanReenterCurrentWalkInRun => _countedCurrentWalkInEntry && !_resetPendingOutside;
+
+        internal int GetWalkInEntryLockoutRemainingSeconds(long nowUtcMs, int maxInstancesPerHour) =>
+            CanReenterCurrentWalkInRun ? 0 : GetLockoutRemainingSeconds(nowUtcMs, maxInstancesPerHour);
 
         public bool IsResetPendingOutside => _resetPendingOutside;
 
@@ -618,7 +588,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 {
                     foreach (var participant in connected)
                     {
-                        if (participant.LatestState is { IsInsideDungeon: true, Guid: not 0 } state &&
+                        if (participant.LatestState is { HasDungeonTelemetry: true, IsInsideDungeon: true, Guid: not 0 } state &&
                             state.MapId == _walkInRunMapId && state.Guid != me.Guid &&
                             partyList.Any(member => member.Guid == state.Guid))
                             _runParticipants.Add(state.Guid);
@@ -837,22 +807,21 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
             if (settings.IsCoordinator && _resetPendingOutside)
             {
-                var allMembers = me.GroupInfo.AllMembers;
-                var groupGuids = allMembers
+                var group = me.GroupInfo;
+                group.InvalidateCache();
+                var groupGuids = group.AllMembers
                     .Where(m => m.Guid != 0)
                     .Select(m => m.Guid)
                     .ToHashSet();
-                var visibleOutside = allMembers
-                    .Where(m => m.ToPlayer() is { IsValid: true })
-                    .Select(m => m.Guid)
-                    .ToHashSet();
-                bool allOutside = AreAllWalkInParticipantsClearedForReset(
-                    _runParticipants,
-                    _participantSnapshots,
-                    groupGuids,
-                    visibleOutside,
-                    _completedAtUtcMs,
-                    nowUtcMs);
+                int raidCount = group.NumRaidMembers;
+                int expectedGroupCount = raidCount > 0 ? raidCount : group.NumPartyMembers;
+                bool allOutside = groupGuids.Count == expectedGroupCount &&
+                    AreAllWalkInParticipantsClearedForReset(
+                        _runParticipants,
+                        _participantSnapshots,
+                        groupGuids,
+                        _completedAtUtcMs,
+                        nowUtcMs);
                 if (!allOutside)
                 {
                     if (me.IsMoving)
@@ -879,7 +848,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             }
 
             int entryLockoutSeconds = settings.IsCoordinator
-                ? GetLockoutRemainingSeconds(nowUtcMs, settings.MaxInstancesPerHour)
+                ? GetWalkInEntryLockoutRemainingSeconds(nowUtcMs, settings.MaxInstancesPerHour)
                 : (leader?.LockoutRemainingSeconds ?? 0);
             if (entryLockoutSeconds > 0)
             {
