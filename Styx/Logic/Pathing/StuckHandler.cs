@@ -205,7 +205,8 @@ namespace Styx.Logic.Pathing
                 else
                 {
                     Logging.WriteVerbose("Skipping unsafe strafe forward left");
-                    MoveInDirection(WoWMovement.MovementDirection.Backwards, duration);
+                    if (IsSafeStrafe(location, rotation, (float)Math.PI, strafeDistance))
+                        MoveInDirection(WoWMovement.MovementDirection.Backwards, duration);
                 }
             }
             else if (!_triedStrafeForwardRight)
@@ -219,7 +220,8 @@ namespace Styx.Logic.Pathing
                 else
                 {
                     Logging.WriteVerbose("Skipping unsafe strafe forward right");
-                    MoveInDirection(WoWMovement.MovementDirection.Backwards, duration);
+                    if (IsSafeStrafe(location, rotation, (float)Math.PI, strafeDistance))
+                        MoveInDirection(WoWMovement.MovementDirection.Backwards, duration);
                 }
             }
             else if (me.Mounted)
@@ -238,7 +240,8 @@ namespace Styx.Logic.Pathing
                 else
                 {
                     Logging.WriteVerbose("Skipping unsafe strafe left");
-                    MoveInDirection(WoWMovement.MovementDirection.Backwards, duration);
+                    if (IsSafeStrafe(location, rotation, (float)Math.PI, strafeDistance))
+                        MoveInDirection(WoWMovement.MovementDirection.Backwards, duration);
                 }
             }
             else if (!_triedStrafeRight)
@@ -252,7 +255,8 @@ namespace Styx.Logic.Pathing
                 else
                 {
                     Logging.WriteVerbose("Skipping unsafe strafe right");
-                    MoveInDirection(WoWMovement.MovementDirection.Backwards, duration);
+                    if (IsSafeStrafe(location, rotation, (float)Math.PI, strafeDistance))
+                        MoveInDirection(WoWMovement.MovementDirection.Backwards, duration);
                 }
             }
             else
@@ -324,8 +328,9 @@ namespace Styx.Logic.Pathing
                 {
                     try
                     {
-                        var nearest = Navigator.FindNearestPoint(new WoWPoint(target.X, target.Y, location.Z));
-                        if (nearest != WoWPoint.Zero && nearest.IsValid)
+                        var probe = new WoWPoint(target.X, target.Y, location.Z);
+                        var nearest = Navigator.FindNearestPoint(probe);
+                        if (nearest != probe && nearest != WoWPoint.Zero && nearest.IsValid)
                         {
                             targetZ = nearest.Z;
                             foundElevation = true;

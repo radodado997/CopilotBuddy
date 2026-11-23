@@ -250,7 +250,7 @@ namespace Singular.ClassSpecific.Paladin
                         return true;
 
                     var healerPlayer = ObjectManager.GetObjectByGuid<WoWPlayer>(healer.Guid);
-                    if (healerPlayer != null && (!healerPlayer.InLineOfSpellSight || healerPlayer.Distance > 35f))
+                    if (healerPlayer == null || !healerPlayer.InLineOfSpellSight || healerPlayer.Distance > 35f)
                         return true;
 
                     return false;
@@ -261,9 +261,12 @@ namespace Singular.ClassSpecific.Paladin
             if (!me.IsInParty)
                 return true;
 
-            var partyHealer = me.PartyMembers.FirstOrDefault(p =>
-                p.IsAlive && (p.Class == WoWClass.Priest || p.Class == WoWClass.Druid || p.Class == WoWClass.Shaman || (p.Class == WoWClass.Paladin && p.Guid != me.Guid)));
-            if (partyHealer == null || partyHealer.Dead || partyHealer.ManaPercent < 20f || partyHealer.Distance > 35f || !partyHealer.InLineOfSpellSight)
+            var healerMember = me.PartyMemberInfos.FirstOrDefault(p => p.HasRole(WoWPartyMember.GroupRole.Healer));
+            if (healerMember == null || !healerMember.IsOnline)
+                return true;
+
+            var partyHealer = healerMember.ToPlayer();
+            if (partyHealer == null || !partyHealer.IsAlive || partyHealer.ManaPercent < 20f || partyHealer.Distance > 35f || !partyHealer.InLineOfSpellSight)
                 return true;
 
             return false;

@@ -505,7 +505,7 @@ namespace CopilotBuddy.PartyGrind.Tests
         }
 
         [Fact]
-        public void OnSpellBookChanged_SchedulesTrailingRefreshWhenSuppressedWithinDebounceLimit()
+        public void OnSpellBookChanged_RetainsFailedTrailingRefreshUntilShutdown()
         {
             Styx.Logic.Combat.SpellManager.Shutdown();
             var args1 = new Styx.WoWInternals.LuaEventArgs("LEARNED_SPELL_IN_TAB", 0, Array.Empty<object>());
@@ -518,6 +518,9 @@ namespace CopilotBuddy.PartyGrind.Tests
 
             System.Threading.Thread.Sleep(270);
             Styx.Logic.Combat.SpellManager.CheckPendingTrailingRebuild();
+            Assert.True(Styx.Logic.Combat.SpellManager.HasPendingTrailingRebuild);
+
+            Styx.Logic.Combat.SpellManager.Shutdown();
             Assert.False(Styx.Logic.Combat.SpellManager.HasPendingTrailingRebuild);
         }
 

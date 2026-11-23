@@ -251,16 +251,22 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             uint desiredDungeonId = 0;
             if (inDungeonMap)
             {
-                int currentGen = leader?.InstanceResetGeneration ?? _instanceResetGeneration;
-                if (currentGen != _lastResetGeneration)
+                int currentGen = settings.IsCoordinator ? _instanceResetGeneration : leader?.InstanceResetGeneration ?? _instanceResetGeneration;
+                bool generationChanged = currentGen != _lastResetGeneration;
+                if (generationChanged)
                 {
+                    StopActiveEncounter();
+                    DungeonManager.Clear();
                     BossManager.Reset();
                     _currentRunKilledBosses.Clear();
+                    _lastSyncedDungeonId = 0;
                     _lastResetGeneration = currentGen;
                 }
-
-                foreach (var b in BossManager.Bosses.Where(b => b.IsDead))
-                    _currentRunKilledBosses.Add(b.EntryId);
+                else
+                {
+                    foreach (var b in BossManager.Bosses.Where(b => b.IsDead))
+                        _currentRunKilledBosses.Add(b.EntryId);
+                }
 
                 if (entryMode != SquadDungeonEntryMode.WalkInPortalFarm && lfgId > 0)
                 {
@@ -281,7 +287,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     catch { desiredDungeonId = 0; }
                 }
 
-                if (desiredDungeonId > 0 && (_lastSyncedDungeonId != desiredDungeonId || _lastSyncedMapId != me.MapId || DungeonManager.CurrentDungeon == null))
+                if (desiredDungeonId > 0 && (generationChanged || _lastSyncedDungeonId != desiredDungeonId || _lastSyncedMapId != me.MapId || DungeonManager.CurrentDungeon == null))
                 {
                     StopActiveEncounter();
                     _hotspotIndex = 0;

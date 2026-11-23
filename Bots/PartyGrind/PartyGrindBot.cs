@@ -768,7 +768,8 @@ namespace CopilotBuddy.Bots.PartyGrind
             if (me == null)
                 return;
 
-            if (_pullCommittedGuid != 0 && IsPullCommitReleased(now))
+            bool allyInCombat = HasLivingAllyInCombat(decision, me.Guid);
+            if (_pullCommittedGuid != 0 && (allyInCombat || IsPullCommitReleased(now)))
                 ClearPullCommit();
 
             var settings = SquadContext.ActiveSettings ?? SquadSettings.Instance;
@@ -783,7 +784,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                 var pugTank = ObjectManager.GetObjectByGuid<WoWPlayer>(decision.EffectiveTankGuid);
                 if (pugTank != null && pugTank.IsValid && pugTank.Combat && pugTank.CurrentTarget != null &&
                     !pugTank.CurrentTarget.Dead && !pugTank.CurrentTarget.IsFriendly &&
-                    (!bossPullBlocked || pugTank.CurrentTarget.Combat || pugTank.CurrentTarget.IsTargetingMyPartyMember))
+                    ((!bossPullBlocked && !allyInCombat) || pugTank.CurrentTarget.Combat || pugTank.CurrentTarget.IsTargetingMyPartyMember))
                 {
                     if (_currentFocusGuid != pugTank.CurrentTargetGuid)
                         _pullStartedUtcMs = now;
@@ -809,11 +810,10 @@ namespace CopilotBuddy.Bots.PartyGrind
 
             ulong resolvedFocusGuid = (focus != null && focus.IsValid && !focus.Dead && !focus.IsFriendly) ? focus.Guid : 0UL;
             var local = SquadContext.GetLocalMemberStateSnapshot();
-            bool anyFollowerStillInCombat = decision.Members?.Any(m => m.IsConnected && !m.IsDead && !m.IsGhost && m.IsInCombat) == true;
             bool localCannotPull = local == null || local.IsDead || local.IsGhost || local.IsInCombat ||
-                                   local.NeedsRest || local.IsLooting || anyFollowerStillInCombat;
+                                   local.NeedsRest || local.IsLooting || allyInCombat;
             bool commitActive = _pullCommittedGuid != 0 && now < _pullCommittedUntilMs;
-            bool canInitiatePull = !bossPullBlocked && !anotherTankDrives && !anyFollowerStillInCombat &&
+            bool canInitiatePull = !bossPullBlocked && !anotherTankDrives && !allyInCombat &&
                 SquadTankBridge.CanInitiatePull(decision, settings.MaxPullGatherDistance);
             bool focusIdle = focus != null && !focus.Combat && !focus.IsTargetingMyPartyMember;
 
@@ -875,6 +875,11 @@ namespace CopilotBuddy.Bots.PartyGrind
             WoWUnit? secondary = Targeting.Instance.TargetList
                 .FirstOrDefault(u => u != null && u.IsValid && !u.Dead && u.Guid != _currentFocusGuid && (u.Combat || u.IsTargetingMyPartyMember));
             _currentSecondaryGuid = secondary?.Guid ?? 0UL;
+        }
+
+        private static bool HasLivingAllyInCombat(SquadLeaderState? leader, ulong localGuid)
+        {
+            return leader?.Members?.Any(m => m.Guid != localGuid && m.IsConnected && !m.IsDead && !m.IsGhost && m.IsInCombat) == true;
         }
 
         private static bool IsBossPullBlocked(SquadSettings settings, SquadLeaderState? leader, LocalPlayer me)
@@ -1845,6 +1850,8 @@ namespace CopilotBuddy.Bots.PartyGrind
                     if (SquadTankBridge.TryTauntLooseMob())
                         return RunStatus.Success;
                     ulong tankFocusGuid = leader?.FocusTargetGuid ?? 0UL;
+                    if (tankFocusGuid == 0 && !me.Combat && HasLivingAllyInCombat(leader, me.Guid))
+                        return RunStatus.Failure;
                     if (!me.Combat && SquadContext.IsDungeonModeActive && SquadDungeonService.IsInDungeonMap(me) &&
                         (leader == null || leader.EffectiveTankGuid == 0 || leader.EffectiveTankGuid == me.Guid) &&
                         SquadTankBridge.TryExecuteSafeDungeonPull(tankFocusGuid))

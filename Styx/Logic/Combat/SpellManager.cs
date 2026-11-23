@@ -1129,60 +1129,63 @@ namespace Styx.Logic.Combat
 					return;
 				}
 
-				CancelTrailingRebuild();
-				ExecuteRebuild(now, e.EventName);
+				if (_trailingRebuildScheduled)
+					ExecutePendingRebuild(now, e.EventName);
+				else
+					ExecuteRebuild(now, e.EventName);
 			}
 		}
 
 		private static void OnTrailingRebuildTimer(object? state)
 		{
+			lock (_spellBookRebuildLock)
+			{
+				if (!_trailingRebuildScheduled)
+					return;
+
+				long now = Environment.TickCount64;
+				long delay = 250L - (now - _lastSpellBookRebuildTickMs);
+				if (delay > 0)
+				{
+					_trailingRebuildTimer?.Change(delay, Timeout.Infinite);
+					return;
+				}
+
+				ExecutePendingRebuild(now, _lastSuppressedEventName);
+			}
+		}
+
+		internal static void CheckPendingTrailingRebuild()
+		{
+			if (_trailingRebuildScheduled && Environment.TickCount64 - _lastSpellBookRebuildTickMs >= 250L)
+				OnTrailingRebuildTimer(null);
+		}
+
+		private static void ExecutePendingRebuild(long now, string eventName)
+		{
 			try
 			{
-				lock (_spellBookRebuildLock)
+				if (ExecuteRebuild(now, string.IsNullOrEmpty(eventName) ? "trailing" : eventName))
 				{
-					if (!_trailingRebuildScheduled)
-						return;
-
-					string eventName = _lastSuppressedEventName;
 					CancelTrailingRebuild();
-					ExecuteRebuild(Environment.TickCount64, string.IsNullOrEmpty(eventName) ? "trailing" : eventName);
+					return;
 				}
 			}
 			catch (Exception ex)
 			{
 				Logging.WriteException(ex);
 			}
+
+			_lastSpellBookRebuildTickMs = Environment.TickCount64;
+			_trailingRebuildTimer?.Change(250L, Timeout.Infinite);
 		}
 
-		internal static void CheckPendingTrailingRebuild()
-		{
-			if (!_trailingRebuildScheduled)
-				return;
-
-			long now = Environment.TickCount64;
-			if (now - _lastSpellBookRebuildTickMs >= 250L)
-			{
-				lock (_spellBookRebuildLock)
-				{
-					if (!_trailingRebuildScheduled)
-						return;
-
-					if (Environment.TickCount64 - _lastSpellBookRebuildTickMs < 250L)
-						return;
-
-					string eventName = _lastSuppressedEventName;
-					CancelTrailingRebuild();
-					ExecuteRebuild(now, string.IsNullOrEmpty(eventName) ? "trailing" : eventName);
-				}
-			}
-		}
-
-		private static void ExecuteRebuild(long now, string eventName)
+		private static bool ExecuteRebuild(long now, string eventName)
 		{
 			_lastSpellBookRebuildTickMs = now;
 			Logging.Write("[SpellManager] Spellbook change detected ({0}) \u2014 rebuilding", eventName);
 			_lastKnownSpellCount = 0;
-			Refresh();
+			return Refresh();
 		}
 
 		private static void CancelTrailingRebuild()
