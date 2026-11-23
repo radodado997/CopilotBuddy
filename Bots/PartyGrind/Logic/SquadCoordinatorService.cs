@@ -76,6 +76,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private bool _inTownRun;
         private bool _allTownTasksComplete;
         private bool _inLootWindow;
+        private bool _dungeonCompleted;
         private long _lootWindowEndsUtcMs;
         private bool _wasAnyInCombat;
         private long _resWaitStartedUtcMs;
@@ -118,6 +119,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             _isWaitingForFollowerDebounced = false;
             MaxFollowerDistance = 0f;
             _inTownRun = false;
+            _dungeonCompleted = false;
             _allTownTasksComplete = false;
             _inLootWindow = false;
             _lootWindowEndsUtcMs = 0;
@@ -153,11 +155,17 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             long nowUtcMs,
             float? effectiveProfileLevelHint = null,
             Func<int, SquadProfileSnapshot>? resolveProfile = null,
-            SquadTownRunRequest? localTownRunRequest = null)
+            SquadTownRunRequest? localTownRunRequest = null,
+            SquadDungeonSnapshot? dungeon = null,
+            int instanceResetGeneration = 0,
+            int hourlyInstancesRunCount = 0,
+            int lockoutRemainingSeconds = 0,
+            Func<int, SquadDungeonSnapshot>? resolveDungeon = null)
         {
             if (settings == null) throw new ArgumentNullException(nameof(settings));
             if (leaderLocal == null) throw new ArgumentNullException(nameof(leaderLocal));
             profile ??= new SquadProfileSnapshot { HasProfile = false };
+            bool isDungeonMode = settings.BotMode == SquadBotMode.Dungeon;
 
             // 1. Merge coordinator + connected clients into roster and update level history.
             var rosterStates = new List<SquadMemberState>(1 + connectedClients.Count) { leaderLocal };
@@ -233,6 +241,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             telemetryNames.Add(leaderLocal.CharacterName.Trim());
             rosterStates.RemoveAll(m => !telemetryNames.Contains(m.CharacterName.Trim()));
             if (effectiveMinLevel > 0 && resolveProfile != null) profile = resolveProfile(effectiveMinLevel);
+            if (isDungeonMode && resolveDungeon != null) dungeon = resolveDungeon(effectiveMinLevel);
 
             // The squad grinds until its lowest member passes the highest level range of the
             // loaded profile. Any member above that range keeps grinding with the squad
@@ -329,7 +338,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             // the profile maximum and every expected member reported a level. A missing or
             // not-yet-reporting member is unknown, so the cap stays false until all of them
             // are accounted for instead of ending the session on a partial roster.
-            bool levelCapReached = profile.HasProfile && profileMaxLevel > 0 &&
+            bool levelCapReached = !isDungeonMode && profile.HasProfile && profileMaxLevel > 0 &&
                 !rosterIncomplete && !awaitingExpectedMember &&
                 effectiveMinLevel > profileMaxLevel;
 
@@ -415,12 +424,17 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             // apply while SyncTownRuns is enabled.
             var townRally = new WoWPoint(profile.TownRallyX, profile.TownRallyY, profile.TownRallyZ);
             SquadTownRunRequest? townRequest = ResolveTownRunRequest(connectedClients, localTownRunRequest);
+            bool anyInsideDungeon = isDungeonMode && (dungeon?.IsInsideDungeon == true || rosterStates.Any(m => m.IsInsideDungeon));
+
+            _dungeonCompleted = isDungeonMode &&
+                (dungeon?.ResetPendingOutside == true ||
+                 (anyInsideDungeon && (dungeon?.IsDungeonComplete == true || _dungeonCompleted)));
 
             if (!_inTownRun)
             {
                 bool anyNeedsTown = rosterStates.Any(m =>
                     !m.IsDead && !m.IsGhost && HasTownNeed(m));
-                if (!anyInCombat && !anyDead && (townRequest != null || (settings.SyncTownRuns && anyNeedsTown)))
+                if (!anyInCombat && !anyDead && !anyInsideDungeon && (townRequest != null || (settings.SyncTownRuns && anyNeedsTown)))
                 {
                     _inTownRun = true;
                     _allTownTasksComplete = false;
@@ -502,10 +516,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             }
             else
             {
-                EvaluateProvisioningArbitration(settings, rosterStates, nowUtcMs);
+                EvaluateProvisioningArbitration(settings, rosterStates, nowUtcMs, dungeon?.HasRandomPartyMembers != true);
             }
 
-            // 6. Determine authoritative SquadPhase.
             SquadPhase phase;
             string pauseReason = string.Empty;
             if (IsPausedManually)
@@ -513,14 +526,14 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 phase = SquadPhase.Paused;
                 pauseReason = ManualPauseReason;
             }
-            else if (!anyInCombat && !anyDead && rosterStates.Any(m => !string.IsNullOrEmpty(m.TownBlockedReason)))
+            else if (!anyInCombat && !anyDead && !anyInsideDungeon && rosterStates.Any(m => !string.IsNullOrEmpty(m.TownBlockedReason)))
             {
                 // Keep the town block pending, but never let it suppress combat or
                 // death recovery that must be resolved first.
                 phase = SquadPhase.Paused;
                 pauseReason = rosterStates.First(m => !string.IsNullOrEmpty(m.TownBlockedReason)).TownBlockedReason;
             }
-            else if (!profile.HasProfile)
+            else if (!isDungeonMode && !profile.HasProfile)
             {
                 phase = SquadPhase.Initializing;
             }
@@ -531,6 +544,50 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             else if (anyDead && !anyInCombat)
             {
                 phase = SquadPhase.WaitingResurrection;
+            }
+            else if (isDungeonMode)
+            {
+                if (anyInCombat)
+                {
+                    phase = SquadPhase.DungeonClearing;
+                }
+                else if (anyInsideDungeon && _dungeonCompleted && !_inLootWindow)
+                {
+                    phase = SquadPhase.DungeonCompleteExit;
+                }
+                else if (_inLootWindow && (settings.DungeonLootMode == SquadDungeonLootMode.AllTrashAndBosses || _dungeonCompleted))
+                {
+                    phase = SquadPhase.Looting;
+                }
+                else if (anyNeedsRest)
+                {
+                    phase = SquadPhase.Resting;
+                }
+                else if (!string.IsNullOrEmpty(_activeProvisioner) &&
+                         (_assignedHealthstone || dungeon?.HasRandomPartyMembers != true))
+                {
+                    phase = SquadPhase.Provisioning;
+                }
+                else if (!anyInsideDungeon && _inTownRun)
+                {
+                    phase = SquadPhase.TownRun;
+                }
+                else if (!anyInsideDungeon && lockoutRemainingSeconds > 0 && settings.DungeonEntryMode == SquadDungeonEntryMode.WalkInPortalFarm)
+                {
+                    phase = SquadPhase.DungeonLockoutWait;
+                }
+                else if (anyInsideDungeon)
+                {
+                    phase = SquadPhase.DungeonClearing;
+                }
+                else if (settings.DungeonEntryMode == SquadDungeonEntryMode.WalkInPortalFarm)
+                {
+                    phase = SquadPhase.DungeonTravelToPortal;
+                }
+                else
+                {
+                    phase = SquadPhase.DungeonQueueing;
+                }
             }
             else if (anyInCombat)
             {
@@ -636,6 +693,34 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 ReleaseCorpseOrder = !rosterIncomplete && _inCorpseRun && anyDead,
                 ActiveProvisionerName = _activeProvisioner,
                 ActiveTradeTargetName = _activeTradeTarget,
+                BotMode = settings.BotMode,
+                DungeonEntryMode = settings.DungeonEntryMode,
+                DungeonLootMode = settings.DungeonLootMode,
+                KillOptionalBosses = settings.KillOptionalBosses,
+                IsInsideDungeon = dungeon?.IsInsideDungeon == true || leaderLocal.IsInsideDungeon,
+                ActiveDungeonId = dungeon?.ActiveDungeonId ?? 0U,
+                ActiveDungeonMapId = dungeon?.ActiveDungeonMapId ?? 0U,
+                ActiveDungeonName = dungeon?.ActiveDungeonName ?? string.Empty,
+                CurrentBossEntry = dungeon?.CurrentBossEntry ?? 0U,
+                CurrentBossName = dungeon?.CurrentBossName ?? string.Empty,
+                KilledBossCount = dungeon?.KilledBossCount ?? 0,
+                TotalBossCount = dungeon?.TotalBossCount ?? 0,
+                AcceptLfgProposalOrder = isDungeonMode && !_inTownRun && !anyDead && (dungeon?.LfgProposalPending == true || rosterStates.Any(m => m.LfgProposalPending)),
+                DungeonResetPendingOutside = isDungeonMode && dungeon?.ResetPendingOutside == true,
+                TeleportOutOrder = isDungeonMode && phase == SquadPhase.DungeonCompleteExit && settings.DungeonEntryMode != SquadDungeonEntryMode.WalkInPortalFarm,
+                LfgStatusText = dungeon?.LfgMode ?? string.Empty,
+                HasRandomPartyMembers = dungeon?.HasRandomPartyMembers == true,
+                EffectiveTankGuid = dungeon?.EffectiveTankGuid ?? (settings.Role == SquadRole.TankLeader ? leaderLocal.Guid : 0UL),
+                DungeonPortalX = dungeon?.PortalX ?? 0f,
+                DungeonPortalY = dungeon?.PortalY ?? 0f,
+                DungeonPortalZ = dungeon?.PortalZ ?? 0f,
+                DungeonPortalMapId = dungeon?.PortalMapId ?? 0U,
+                DungeonExitX = dungeon?.ExitX ?? 0f,
+                DungeonExitY = dungeon?.ExitY ?? 0f,
+                DungeonExitZ = dungeon?.ExitZ ?? 0f,
+                InstanceResetGeneration = instanceResetGeneration,
+                HourlyInstancesRunCount = hourlyInstancesRunCount,
+                LockoutRemainingSeconds = lockoutRemainingSeconds,
                 MemberAssignments = assignments,
                 MemberRoles = roles,
                 Members = summaries
@@ -847,8 +932,15 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private void EvaluateProvisioningArbitration(
             SquadSettings settings,
             List<SquadMemberState> rosterStates,
-            long nowUtcMs)
+            long nowUtcMs,
+            bool allowFoodAndDrink)
         {
+            if (!allowFoodAndDrink && (_assignedFood || _assignedDrink))
+            {
+                ClearProvisioning();
+                SquadPartySyncService.MarkActivity();
+            }
+
             long timeoutMs = Math.Max(4, settings.TradeOfferTimeoutSeconds + 3) * 1000L;
 
             if (!string.IsNullOrEmpty(_activeProvisioner))
@@ -900,7 +992,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             }
 
             // Pick next provisioner -> target pair (Mage first, then Warlock).
-            if (settings.EnableMageProvisioning)
+            if (allowFoodAndDrink && settings.EnableMageProvisioning)
             {
                 foreach (var mage in rosterStates.Where(m => !m.IsDead && !m.IsGhost && (m.CanProvideMageFood || m.CanProvideMageDrink)))
                 {
@@ -1071,6 +1163,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 CanProvideMageDrink = m.CanProvideMageDrink,
                 CanProvideHealthstone = m.CanProvideHealthstone,
                 IsProvisioningBusy = m.IsProvisioningBusy,
+                IsInsideDungeon = m.IsInsideDungeon,
                 IsConnected = isConnected,
                 StateLabel = label
             };

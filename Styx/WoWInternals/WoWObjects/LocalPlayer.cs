@@ -883,10 +883,12 @@ namespace Styx.WoWInternals.WoWObjects
             get
             {
                 var list = new List<WoWPartyMember>();
-                foreach (ulong guid in PartyMemberGuids)
+                ulong[] slots = GetPartyMemberGUIDs();
+                for (int i = 0; i < slots.Length; i++)
                 {
+                    ulong guid = slots[i];
                     if (guid != Guid && guid != 0)
-                        list.Add(new WoWPartyMember(guid, true));
+                        list.Add(new WoWPartyMember(guid, false, i + 1));
                 }
                 return list;
             }
@@ -1002,10 +1004,12 @@ namespace Styx.WoWInternals.WoWObjects
             get
             {
                 var list = new List<WoWPartyMember>();
-                foreach (ulong guid in RaidMemberGuids)
+                ulong[] slots = GetRaidMemberGUIDs();
+                for (int i = 0; i < slots.Length; i++)
                 {
+                    ulong guid = slots[i];
                     if (guid != Guid && guid != 0)
-                        list.Add(new WoWPartyMember(guid, false));
+                        list.Add(new WoWPartyMember(guid, true, i + 1));
                 }
                 return list;
             }

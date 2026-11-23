@@ -76,44 +76,48 @@
                                     <ColumnDefinition Width="*"/>
                                 </Grid.ColumnDefinitions>
                                 <Grid.RowDefinitions>
-                                    <RowDefinition Height="Auto"/>
-                                    <RowDefinition Height="Auto"/>
-                                    <RowDefinition Height="Auto"/>
-                                    <RowDefinition Height="Auto"/>
-                                    <RowDefinition Height="Auto"/>
-                                    <RowDefinition Height="Auto"/>
-                                    <RowDefinition Height="Auto"/>
-                                    <RowDefinition Height="Auto"/>
-                                </Grid.RowDefinitions>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                            </Grid.RowDefinitions>
 
-                                <Label x:Name="LblTxtTeamId" Grid.Row="0" Grid.Column="0" Content="Team ID:"/>
-                                <TextBox x:Name="TxtTeamId" AutomationProperties.LabeledBy="{Binding ElementName=LblTxtTeamId}" Grid.Row="0" Grid.Column="1"/>
+                            <Label x:Name="LblCmbBotMode" Grid.Row="0" Grid.Column="0" Content="Bot Mode:"/>
+                            <ComboBox x:Name="CmbBotMode" AutomationProperties.LabeledBy="{Binding ElementName=LblCmbBotMode}" Grid.Row="0" Grid.Column="1" SelectionChanged="CmbBotMode_SelectionChanged"/>
 
-                                <Label x:Name="LblTxtIpcPort" Grid.Row="1" Grid.Column="0" Content="IPC Loopback Port:"/>
-                                <TextBox x:Name="TxtIpcPort" AutomationProperties.LabeledBy="{Binding ElementName=LblTxtIpcPort}" Grid.Row="1" Grid.Column="1"/>
+                            <Label x:Name="LblTxtTeamId" Grid.Row="1" Grid.Column="0" Content="Team ID:"/>
+                            <TextBox x:Name="TxtTeamId" AutomationProperties.LabeledBy="{Binding ElementName=LblTxtTeamId}" Grid.Row="1" Grid.Column="1"/>
 
-                                <Label x:Name="LblCmbRole" Grid.Row="2" Grid.Column="0" Content="Squad Role:"/>
-                                <ComboBox x:Name="CmbRole" AutomationProperties.LabeledBy="{Binding ElementName=LblCmbRole}" Grid.Row="2" Grid.Column="1" SelectionChanged="CmbRole_SelectionChanged"/>
+                            <Label x:Name="LblTxtIpcPort" Grid.Row="2" Grid.Column="0" Content="IPC Loopback Port:"/>
+                            <TextBox x:Name="TxtIpcPort" AutomationProperties.LabeledBy="{Binding ElementName=LblTxtIpcPort}" Grid.Row="2" Grid.Column="1"/>
 
-                                <CheckBox x:Name="ChkIsCoordinator" Grid.Row="3" Grid.Column="1"
-                                          Content="Is Coordinator (hosts TCP server, leads route &amp; pulls)"/>
+                            <Label x:Name="LblCmbRole" Grid.Row="3" Grid.Column="0" Content="Squad Role:"/>
+                            <ComboBox x:Name="CmbRole" AutomationProperties.LabeledBy="{Binding ElementName=LblCmbRole}" Grid.Row="3" Grid.Column="1" SelectionChanged="CmbRole_SelectionChanged"/>
 
-                                <Label x:Name="LblTxtCoordinatorName" Grid.Row="4" Grid.Column="0" Content="Coordinator Character Name:"/>
-                                <TextBox x:Name="TxtCoordinatorName" AutomationProperties.LabeledBy="{Binding ElementName=LblTxtCoordinatorName}" Grid.Row="4" Grid.Column="1"/>
+                            <CheckBox x:Name="ChkIsCoordinator" Grid.Row="4" Grid.Column="1"
+                                      Content="Is Coordinator (hosts TCP server, leads route &amp; pulls)"/>
 
-                                <Label x:Name="LblTxtExpectedRoster" Grid.Row="5" Grid.Column="0" Content="Expected Roster (CSV):"/>
-                                <TextBox x:Name="TxtExpectedRoster" AutomationProperties.LabeledBy="{Binding ElementName=LblTxtExpectedRoster}" Grid.Row="5" Grid.Column="1"
-                                         ToolTip="Comma-separated names of squad characters (3–5 clients)"/>
+                            <Label x:Name="LblTxtCoordinatorName" Grid.Row="5" Grid.Column="0" Content="Coordinator Character Name:"/>
+                            <TextBox x:Name="TxtCoordinatorName" AutomationProperties.LabeledBy="{Binding ElementName=LblTxtCoordinatorName}" Grid.Row="5" Grid.Column="1"/>
 
-                                <Label x:Name="LblTxtIpcMemberSecretsPath" Grid.Row="6" Grid.Column="0" Content="IPC Secrets File:"/>
-                                <StackPanel Grid.Row="6" Grid.Column="1" Orientation="Horizontal">
-                                    <TextBox x:Name="TxtIpcMemberSecretsPath" AutomationProperties.LabeledBy="{Binding ElementName=LblTxtIpcMemberSecretsPath}" Width="330"
-                                             ToolTip="JSON file of random per-character IPC secrets. Configure each instance before launch; secret values are never written to the launcher script."/>
-                                    <Button x:Name="BtnBrowseSecrets" Content="Browse..." Click="BtnBrowseSecrets_Click"/>
-                                </StackPanel>
-                                <TextBlock Grid.Row="7" Grid.ColumnSpan="2" TextWrapping="Wrap"
-                                           Text="Run each fresh Client instance once without auto-start flags, configure its secrets file here, and save before using the launcher. Secret values stay out of the generated .bat file."
-                                           Margin="0,2,0,0"/>
+                            <Label x:Name="LblTxtExpectedRoster" Grid.Row="6" Grid.Column="0" Content="Expected Roster (CSV):"/>
+                            <TextBox x:Name="TxtExpectedRoster" AutomationProperties.LabeledBy="{Binding ElementName=LblTxtExpectedRoster}" Grid.Row="6" Grid.Column="1"
+                                     ToolTip="Comma-separated names of squad characters (3–5 clients)"/>
+
+                            <Label x:Name="LblTxtIpcMemberSecretsPath" Grid.Row="7" Grid.Column="0" Content="IPC Secrets File:"/>
+                            <StackPanel Grid.Row="7" Grid.Column="1" Orientation="Horizontal">
+                                <TextBox x:Name="TxtIpcMemberSecretsPath" AutomationProperties.LabeledBy="{Binding ElementName=LblTxtIpcMemberSecretsPath}" Width="330"
+                                         ToolTip="JSON file of random per-character IPC secrets. Configure each instance before launch; secret values are never written to the launcher script."/>
+                                <Button x:Name="BtnBrowseSecrets" Content="Browse..." Click="BtnBrowseSecrets_Click"/>
+                            </StackPanel>
+                            <TextBlock Grid.Row="8" Grid.ColumnSpan="2" TextWrapping="Wrap"
+                                       Text="Run each fresh Client instance once without auto-start flags, configure its secrets file here, and save before using the launcher. Secret values stay out of the generated .bat file."
+                                       Margin="0,2,0,0"/>
                             </Grid>
                         </GroupBox>
 
@@ -150,6 +154,52 @@
 
                                 <Label x:Name="LblTxtDisconnectGrace" Grid.Row="6" Grid.Column="0" Content="Disconnect Grace (sec):"/>
                                 <TextBox x:Name="TxtDisconnectGrace" AutomationProperties.LabeledBy="{Binding ElementName=LblTxtDisconnectGrace}" Grid.Row="6" Grid.Column="1"/>
+                            </Grid>
+                        </GroupBox>
+                    </StackPanel>
+                </ScrollViewer>
+            </TabItem>
+
+            <TabItem Header="Dungeon Mode">
+                <ScrollViewer VerticalScrollBarVisibility="Auto">
+                    <StackPanel Margin="6">
+                        <GroupBox Header="Dungeon Entry &amp; Progression">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="240"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="Auto"/>
+                                </Grid.RowDefinitions>
+
+                                <Label x:Name="LblCmbDungeonEntryMode" Grid.Row="0" Grid.Column="0" Content="Dungeon Entry Mode:"/>
+                                <ComboBox x:Name="CmbDungeonEntryMode" AutomationProperties.LabeledBy="{Binding ElementName=LblCmbDungeonEntryMode}" Grid.Row="0" Grid.Column="1" SelectionChanged="CmbDungeonEntryMode_SelectionChanged"/>
+
+                                <Label x:Name="LblTxtDungeonIds" Grid.Row="1" Grid.Column="0" Content="Specific / Walk-In Dungeon IDs:"/>
+                                <TextBox x:Name="TxtDungeonIds" AutomationProperties.LabeledBy="{Binding ElementName=LblTxtDungeonIds}" Grid.Row="1" Grid.Column="1"
+                                         ToolTip="Comma-separated LFG Dungeon IDs (leave empty to auto-pick by Squad MinLevel bracket, e.g. 6=Deadmines, 163=SM Graveyard, 202=Utgarde Keep)"/>
+
+                                <Label x:Name="LblCmbDungeonLootMode" Grid.Row="2" Grid.Column="0" Content="Dungeon Loot Mode:"/>
+                                <ComboBox x:Name="CmbDungeonLootMode" AutomationProperties.LabeledBy="{Binding ElementName=LblCmbDungeonLootMode}" Grid.Row="2" Grid.Column="1"/>
+
+                                <CheckBox x:Name="ChkKillOptionalBosses" Grid.Row="3" Grid.ColumnSpan="2"
+                                          Content="Kill optional dungeon bosses"/>
+
+                                <CheckBox x:Name="ChkAllowPartialLfg" Grid.Row="4" Grid.ColumnSpan="2"
+                                          Content="Allow queuing LFG with 3–4 bots + random PUG players"/>
+
+                                <Label x:Name="LblTxtMaxInstancesPerHour" Grid.Row="5" Grid.Column="0" Content="Max Walk-In Resets / Hour:"/>
+                                <TextBox x:Name="TxtMaxInstancesPerHour" AutomationProperties.LabeledBy="{Binding ElementName=LblTxtMaxInstancesPerHour}" Grid.Row="5" Grid.Column="1"/>
+
+                                <TextBlock Grid.Row="6" Grid.ColumnSpan="2" TextWrapping="Wrap" Margin="0,6,0,0"
+                                           Text="Dungeon Mode reuses DungeonBuddy's 60+ Classic/TBC/WotLK profiles, encounter scripts, and ground-hazard avoidance while keeping PartyGrind's IPC focus target, tank peels, healer priority, indoor corridor formation, synchronized rests, and TownRuns between runs."/>
                             </Grid>
                         </GroupBox>
                     </StackPanel>

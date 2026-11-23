@@ -173,6 +173,7 @@ namespace Styx.PartyGrind.IPC
         public bool CanProvideMageDrink { get; set; }
         public bool CanProvideHealthstone { get; set; }
         public bool IsProvisioningBusy { get; set; }
+        public bool IsInsideDungeon { get; set; }
         public bool IsConnected { get; set; }
         public string StateLabel { get; set; } = string.Empty;
     }
@@ -246,6 +247,35 @@ namespace Styx.PartyGrind.IPC
         // Provisioning / Trade Arbitration
         public string ActiveProvisionerName { get; set; } = string.Empty;
         public string ActiveTradeTargetName { get; set; } = string.Empty;
+
+        public SquadBotMode BotMode { get; set; } = SquadBotMode.OpenWorldGrind;
+        public SquadDungeonEntryMode DungeonEntryMode { get; set; } = SquadDungeonEntryMode.LfgRandomNormal;
+        public SquadDungeonLootMode DungeonLootMode { get; set; } = SquadDungeonLootMode.BossesOnly;
+        public bool KillOptionalBosses { get; set; }
+        public bool IsInsideDungeon { get; set; }
+        public uint ActiveDungeonId { get; set; }
+        public uint ActiveDungeonMapId { get; set; }
+        public string ActiveDungeonName { get; set; } = string.Empty;
+        public uint CurrentBossEntry { get; set; }
+        public string CurrentBossName { get; set; } = string.Empty;
+        public int KilledBossCount { get; set; }
+        public int TotalBossCount { get; set; }
+        public bool AcceptLfgProposalOrder { get; set; }
+        public bool TeleportOutOrder { get; set; }
+        public bool DungeonResetPendingOutside { get; set; }
+        public string LfgStatusText { get; set; } = string.Empty;
+        public bool HasRandomPartyMembers { get; set; }
+        public ulong EffectiveTankGuid { get; set; }
+        public float DungeonPortalX { get; set; }
+        public float DungeonPortalY { get; set; }
+        public float DungeonPortalZ { get; set; }
+        public uint DungeonPortalMapId { get; set; }
+        public float DungeonExitX { get; set; }
+        public float DungeonExitY { get; set; }
+        public float DungeonExitZ { get; set; }
+        public int InstanceResetGeneration { get; set; }
+        public int HourlyInstancesRunCount { get; set; }
+        public int LockoutRemainingSeconds { get; set; }
 
         // Slot Assignments & Full Roster Snapshot
         public Dictionary<string, int> MemberAssignments { get; set; } = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
@@ -333,5 +363,14 @@ namespace Styx.PartyGrind.IPC
         public string LoadedProfileHash { get; set; } = string.Empty;
         public int ActiveSubProfileMinLevel { get; set; }
         public int ActiveSubProfileMaxLevel { get; set; }
+
+        public bool IsInsideDungeon { get; set; }
+        public bool HasDungeonTelemetry { get; set; }
+        public uint CurrentLfgDungeonId { get; set; }
+        public string LfgMode { get; set; } = string.Empty;
+        public bool LfgRoleCheckPending { get; set; }
+        public bool LfgProposalPending { get; set; }
+        public bool HasDungeonDeserter { get; set; }
+        public int ObservedResetGeneration { get; set; }
     }
 }

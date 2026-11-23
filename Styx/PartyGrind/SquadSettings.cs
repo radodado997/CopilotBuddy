@@ -323,6 +323,53 @@ namespace Styx.PartyGrind
 
         #endregion
 
+        #region 9. Dungeon Mode
+
+        [Setting]
+        [Styx.Helpers.DefaultValueAttribute(SquadBotMode.OpenWorldGrind)]
+        public SquadBotMode BotMode { get; set; } = SquadBotMode.OpenWorldGrind;
+
+        [Setting]
+        [Styx.Helpers.DefaultValueAttribute(SquadDungeonEntryMode.LfgRandomNormal)]
+        public SquadDungeonEntryMode DungeonEntryMode { get; set; } = SquadDungeonEntryMode.LfgRandomNormal;
+
+        [Setting]
+        [Styx.Helpers.DefaultValueAttribute("")]
+        public string SelectedDungeonIdsCsv { get; set; } = "";
+
+        [Setting]
+        [Styx.Helpers.DefaultValueAttribute(false)]
+        public bool KillOptionalBosses { get; set; } = false;
+
+        [Setting]
+        [Styx.Helpers.DefaultValueAttribute(SquadDungeonLootMode.BossesOnly)]
+        public SquadDungeonLootMode DungeonLootMode { get; set; } = SquadDungeonLootMode.BossesOnly;
+
+        [Setting]
+        [Styx.Helpers.DefaultValueAttribute(true)]
+        public bool AllowPartialSquadLfg { get; set; } = true;
+
+        [Setting]
+        [Styx.Helpers.DefaultValueAttribute(5)]
+        public int MaxInstancesPerHour { get; set; } = 5;
+
+        #endregion
+
+        public uint[] GetSelectedDungeonIds()
+        {
+            if (string.IsNullOrWhiteSpace(SelectedDungeonIdsCsv))
+                return Array.Empty<uint>();
+
+            var seen = new HashSet<uint>();
+            var list = new List<uint>();
+            foreach (string part in SelectedDungeonIdsCsv.Split(new[] { ',', ';', ' ', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                if (uint.TryParse(part.Trim(), out uint id) && id > 0 && seen.Add(id))
+                    list.Add(id);
+            }
+            return list.ToArray();
+        }
+
         /// <summary>
         /// Parses <see cref="ExpectedMemberNamesCsv"/> into trimmed, distinct, non-empty character names.
         /// </summary>
@@ -342,10 +389,6 @@ namespace Styx.PartyGrind
             return list.ToArray();
         }
 
-        /// <summary>
-        /// Applies -squad* CLI arguments from <see cref="CommandLine"/> onto this settings instance.
-        /// Returns true if any override was applied.
-        /// </summary>
         public bool ApplyCliOverrides()
         {
             return ApplyCliOverrides(
@@ -354,20 +397,22 @@ namespace Styx.PartyGrind
                 CommandLine.SquadTeam,
                 CommandLine.SquadPort,
                 CommandLine.SquadRoster,
-                CommandLine.SquadLeader);
+                CommandLine.SquadLeader,
+                CommandLine.SquadBotMode,
+                CommandLine.SquadDungeonEntry,
+                CommandLine.SquadDungeonIds);
         }
 
-        /// <summary>
-        /// Applies explicit CLI override values onto this settings instance.
-        /// Returns true if any setting changed or was specified.
-        /// </summary>
         public bool ApplyCliOverrides(
             string? squadRole,
             bool? squadCoordinator,
             string? squadTeam,
             int? squadPort,
             string? squadRoster,
-            string? squadLeader)
+            string? squadLeader,
+            string? squadMode = null,
+            string? dungeonEntry = null,
+            string? dungeonIds = null)
         {
             bool any = false;
 
@@ -406,6 +451,28 @@ namespace Styx.PartyGrind
             if (!string.IsNullOrWhiteSpace(squadLeader))
             {
                 CoordinatorName = squadLeader.Trim();
+                any = true;
+            }
+
+            if (!string.IsNullOrWhiteSpace(squadMode) &&
+                Enum.TryParse<SquadBotMode>(squadMode.Trim(), true, out SquadBotMode parsedMode) &&
+                Enum.IsDefined(parsedMode))
+            {
+                BotMode = parsedMode;
+                any = true;
+            }
+
+            if (!string.IsNullOrWhiteSpace(dungeonEntry) &&
+                Enum.TryParse<SquadDungeonEntryMode>(dungeonEntry.Trim(), true, out SquadDungeonEntryMode parsedEntry) &&
+                Enum.IsDefined(parsedEntry))
+            {
+                DungeonEntryMode = parsedEntry;
+                any = true;
+            }
+
+            if (!string.IsNullOrWhiteSpace(dungeonIds))
+            {
+                SelectedDungeonIdsCsv = dungeonIds.Trim();
                 any = true;
             }
 

@@ -47,6 +47,13 @@ namespace Bots.DungeonBuddy.Helpers
 
         public static bool IsTank(this LocalPlayer me)
         {
+            if (Styx.PartyGrind.SquadContext.IsDungeonModeActive)
+            {
+                var leader = Styx.PartyGrind.SquadContext.GetLeaderStateSnapshot();
+                if (leader != null && leader.EffectiveTankGuid != 0)
+                    return me.Guid == leader.EffectiveTankGuid;
+                return Styx.PartyGrind.SquadContext.ActiveRole == Styx.PartyGrind.SquadRole.TankLeader;
+            }
             if (DungeonBuddySettings.Instance.QueueType == QueueType.SoloFarm) return true;
             if (me.Role != WoWPartyMember.GroupRole.None) return (me.Role & WoWPartyMember.GroupRole.Tank) > WoWPartyMember.GroupRole.None;
             
@@ -62,6 +69,8 @@ namespace Bots.DungeonBuddy.Helpers
 
         public static bool IsHealer(this LocalPlayer me)
         {
+            if (Styx.PartyGrind.SquadContext.IsDungeonModeActive)
+                return Styx.PartyGrind.SquadContext.ActiveRole == Styx.PartyGrind.SquadRole.Healer;
             if (me.Role != WoWPartyMember.GroupRole.None) return (me.Role & WoWPartyMember.GroupRole.Healer) > WoWPartyMember.GroupRole.None;
             
             switch (me.Class)
@@ -76,12 +85,24 @@ namespace Bots.DungeonBuddy.Helpers
 
         public static bool IsDps(this LocalPlayer me)
         {
+            if (Styx.PartyGrind.SquadContext.IsDungeonModeActive)
+            {
+                var r = Styx.PartyGrind.SquadContext.ActiveRole;
+                return r == Styx.PartyGrind.SquadRole.DpsMelee ||
+                       r == Styx.PartyGrind.SquadRole.DpsRanged ||
+                       r == Styx.PartyGrind.SquadRole.HybridOffHeal;
+            }
             if (me.Role != WoWPartyMember.GroupRole.None) return (me.Role & WoWPartyMember.GroupRole.Damage) > WoWPartyMember.GroupRole.None;
             return !me.IsTank() && !me.IsHealer();
         }
 
         public static bool IsMelee(this LocalPlayer me)
         {
+            if (Styx.PartyGrind.SquadContext.IsDungeonModeActive)
+            {
+                var r = Styx.PartyGrind.SquadContext.ActiveRole;
+                return r == Styx.PartyGrind.SquadRole.TankLeader || r == Styx.PartyGrind.SquadRole.DpsMelee;
+            }
             switch (me.Class)
             {
                 case WoWClass.Warrior:
@@ -102,12 +123,21 @@ namespace Bots.DungeonBuddy.Helpers
 
         public static bool IsFollower(this LocalPlayer me)
         {
+            if (Styx.PartyGrind.SquadContext.IsDungeonModeActive)
+                return !me.IsLeader();
             if (DungeonBuddySettings.Instance.PartyMode != PartyMode.Follower) return !me.IsTank();
             return true;
         }
 
         public static bool IsLeader(this LocalPlayer me)
         {
+            if (Styx.PartyGrind.SquadContext.IsDungeonModeActive)
+            {
+                var leader = Styx.PartyGrind.SquadContext.GetLeaderStateSnapshot();
+                if (leader != null && leader.EffectiveTankGuid != 0)
+                    return me.Guid == leader.EffectiveTankGuid;
+                return Styx.PartyGrind.SquadContext.IsCoordinator;
+            }
             if (DungeonBuddySettings.Instance.PartyMode != PartyMode.Leader) return me.IsTank();
             return true;
         }
@@ -172,7 +202,8 @@ namespace Bots.DungeonBuddy.Helpers
                 ctx =>
                 {
                     WoWPartyMember tank = DungeonBuddy.PartyMemberInfos
-                        .FirstOrDefault(member => member.HasRole(WoWPartyMember.GroupRole.Tank));
+                        .FirstOrDefault(member => member.Guid != 0 && member.Guid != StyxWoW.Me.Guid &&
+                                                  member.HasRole(WoWPartyMember.GroupRole.Tank));
 
                     if (tank == null)
                         return ctx;
@@ -480,12 +511,46 @@ namespace Bots.DungeonBuddy.Helpers
 
         public static string UnitId(this WoWPartyMember partyMember)
         {
-            WoWPartyMember[] members = DungeonBuddy.PartyMemberInfos;
+            if (partyMember == null || partyMember.Guid == 0 || StyxWoW.Me == null)
+                return "none";
 
+            if (StyxWoW.Me.IsInRaid)
+            {
+                if (!string.IsNullOrEmpty(partyMember.UnitId) &&
+                    partyMember.UnitId.StartsWith("raid", StringComparison.Ordinal) &&
+                    partyMember.UnitId.Length > 4)
+                {
+                    return partyMember.UnitId;
+                }
+
+                ulong[] raidSlots = StyxWoW.Me.GetRaidMemberGUIDs();
+                for (int i = 0; i < raidSlots.Length; i++)
+                {
+                    if (raidSlots[i] == partyMember.Guid)
+                        return "raid" + (i + 1);
+                }
+
+                return "none";
+            }
+
+            if (!string.IsNullOrEmpty(partyMember.UnitId) &&
+                partyMember.UnitId.StartsWith("party", StringComparison.Ordinal) &&
+                partyMember.UnitId.Length > 5)
+            {
+                return partyMember.UnitId;
+            }
+
+            for (int i = 0; i < 4; i++)
+            {
+                if (StyxWoW.Me.GetPartyMemberGuid(i) == partyMember.Guid)
+                    return "party" + (i + 1);
+            }
+
+            WoWPartyMember[] members = DungeonBuddy.PartyMemberInfos;
             for (int i = 0; i < members.Length; i++)
             {
                 if (members[i].Guid == partyMember.Guid)
-                    return (StyxWoW.Me.IsInRaid ? "raid" : "party") + (i + 1);
+                    return "party" + (i + 1);
             }
 
             return "none";
@@ -551,14 +616,14 @@ namespace Bots.DungeonBuddy.Helpers
         public static bool ShouldKillBoss(string name)
         {
             var boss = BossManager.BossEncounters.FirstOrDefault(b => b.Name == name);
-            if (boss != null) return !boss.Optional || DungeonBuddySettings.Instance.KillOptionalBosses;
+            if (boss != null) return !boss.Optional || BossManager.KillOptionalBossesEnabled;
             return false;
         }
 
         public static bool ShouldKillBoss(uint bossId)
         {
             var boss = BossManager.BossEncounters.FirstOrDefault(b => b.Entry == bossId);
-            if (boss != null) return !boss.Optional || DungeonBuddySettings.Instance.KillOptionalBosses;
+            if (boss != null) return !boss.Optional || BossManager.KillOptionalBossesEnabled;
             return false;
         }
 
@@ -599,11 +664,22 @@ namespace Bots.DungeonBuddy.Helpers
 
         public static void DisableMovement(Func<bool> whileTrue)
         {
+            DisableMovementInternal(whileTrue, userInitiated: false);
+        }
+
+        internal static void DisableUserMovement()
+        {
+            DisableMovementInternal(() => true, userInitiated: true);
+        }
+
+        private static void DisableMovementInternal(Func<bool> whileTrue, bool userInitiated)
+        {
             if (_movementBlocks.All(block => block.Condition != whileTrue))
-                _movementBlocks.Add(new MovementBlock(whileTrue, MovementBlockType.DisableMovement));
+                _movementBlocks.Add(new MovementBlock(whileTrue, MovementBlockType.DisableMovement, userInitiated));
 
             if (MovementEnabled)
             {
+                _savedPlayerMover = Navigator.PlayerMover;
                 Navigator.PlayerMover = new NoMover();
 
                 if (Navigator.NavigationProvider != null)
@@ -621,12 +697,26 @@ namespace Bots.DungeonBuddy.Helpers
             if (!MovementEnabled)
             {
                 _movementBlocks.Clear();
-                Navigator.PlayerMover = new ClickToMoveMover();
+                Navigator.PlayerMover = _savedPlayerMover ?? new ClickToMoveMover();
+                _savedPlayerMover = null;
 
                 if (Navigator.NavigationProvider != null && _savedStuckHandler != null)
+                {
                     Navigator.NavigationProvider.StuckHandler = _savedStuckHandler;
+                    _savedStuckHandler = null;
+                }
 
                 _controlledDestination = WoWPoint.Zero;
+            }
+        }
+
+        internal static void ReleaseScriptMovementBlocks()
+        {
+            _movementBlocks.RemoveAll(block => !block.IsUserInitiated);
+            _controlledDestination = WoWPoint.Zero;
+            if (_movementBlocks.Count == 0 && !MovementEnabled)
+            {
+                RestoreMovement();
             }
         }
 
@@ -1513,11 +1603,12 @@ namespace Bots.DungeonBuddy.Helpers
         public static MoveResult ControlledMoveTo(WoWPoint location)
         {
             bool sameDestination = location == _controlledDestination;
+            IPlayerMover moverToSave = MovementEnabled ? Navigator.PlayerMover : (_savedPlayerMover ?? new ClickToMoveMover());
 
-            if (MovementEnabled)
+            if (!MovementEnabled)
             {
-                Navigator.PlayerMover = new ClickToMoveMover();
-                if (_savedStuckHandler != null)
+                Navigator.PlayerMover = moverToSave;
+                if (_savedStuckHandler != null && Navigator.NavigationProvider != null)
                     Navigator.NavigationProvider.StuckHandler = _savedStuckHandler;
             }
 
@@ -1531,9 +1622,13 @@ namespace Bots.DungeonBuddy.Helpers
                     MovementBlockType.MoveTo));
             }
 
+            _savedPlayerMover = moverToSave;
             Navigator.PlayerMover = new NoMover();
-            _savedStuckHandler ??= Navigator.NavigationProvider.StuckHandler;
-            Navigator.NavigationProvider.StuckHandler = new NoUnstuck();
+            if (Navigator.NavigationProvider != null)
+            {
+                _savedStuckHandler ??= Navigator.NavigationProvider.StuckHandler;
+                Navigator.NavigationProvider.StuckHandler = new NoUnstuck();
+            }
             _controlledDestination = location;
 
             return moveResult;
@@ -1595,25 +1690,52 @@ namespace Bots.DungeonBuddy.Helpers
         // PARTY ROLE DETECTION
         // ═══════════════════════════════════════════════════════════
 
-        /// <summary>
-        /// Le joueur est le tank du groupe
-        /// </summary>
         public static WoWPlayer Tank
         {
             get
             {
+                if (Styx.PartyGrind.SquadContext.IsDungeonModeActive)
+                {
+                    var leader = Styx.PartyGrind.SquadContext.GetLeaderStateSnapshot();
+                    ulong tankGuid = leader?.EffectiveTankGuid ?? 0UL;
+                    if (tankGuid == 0UL)
+                        tankGuid = Styx.PartyGrind.SquadContext.GetMemberByRole(Styx.PartyGrind.SquadRole.TankLeader)?.Guid ?? 0UL;
+                    if (tankGuid != 0UL)
+                    {
+                        if (StyxWoW.Me != null && StyxWoW.Me.Guid == tankGuid)
+                            return StyxWoW.Me;
+                        var byGuid = ObjectManager.GetObjectByGuid<WoWPlayer>(tankGuid);
+                        if (byGuid != null && byGuid.IsValid)
+                            return byGuid;
+                        return null;
+                    }
+                    if (StyxWoW.Me != null && Styx.PartyGrind.SquadContext.ActiveRole == Styx.PartyGrind.SquadRole.TankLeader)
+                        return StyxWoW.Me;
+                    return GetPartyMembersByRole(PartyRole.Tank).FirstOrDefault();
+                }
                 if (DungeonBuddySettings.Instance.QueueType == QueueType.SoloFarm) return StyxWoW.Me;
                 return GetPartyMembersByRole(PartyRole.Tank).FirstOrDefault();
             }
         }
 
-        /// <summary>
-        /// Le joueur est le healer du groupe
-        /// </summary>
         public static WoWPlayer Healer
         {
             get
             {
+                if (Styx.PartyGrind.SquadContext.IsDungeonModeActive)
+                {
+                    ulong healGuid = Styx.PartyGrind.SquadContext.GetMemberByRole(Styx.PartyGrind.SquadRole.Healer)?.Guid ?? 0UL;
+                    if (healGuid != 0UL)
+                    {
+                        if (StyxWoW.Me != null && StyxWoW.Me.Guid == healGuid)
+                            return StyxWoW.Me;
+                        var byGuid = ObjectManager.GetObjectByGuid<WoWPlayer>(healGuid);
+                        if (byGuid != null && byGuid.IsValid)
+                            return byGuid;
+                    }
+                    if (StyxWoW.Me != null && Styx.PartyGrind.SquadContext.ActiveRole == Styx.PartyGrind.SquadRole.Healer)
+                        return StyxWoW.Me;
+                }
                 return GetPartyMembersByRole(PartyRole.Healer).FirstOrDefault();
             }
         }
@@ -1686,13 +1808,18 @@ namespace Bots.DungeonBuddy.Helpers
 
         public static IEnumerable<WoWPlayer> GetPartyMembersByRole(PartyRole role)
         {
-            foreach (var member in StyxWoW.Me.GroupInfo.RaidMembers)
+            bool dungeonMode = Styx.PartyGrind.SquadContext.IsDungeonModeActive;
+            var leader = dungeonMode ? Styx.PartyGrind.SquadContext.GetLeaderStateSnapshot() : null;
+
+            ulong effectiveTankGuid = leader?.EffectiveTankGuid ?? 0UL;
+            var group = StyxWoW.Me.GroupInfo;
+            foreach (var member in dungeonMode ? group.AllMembers : group.RaidMembers)
             {
                 var player = member.ToPlayer();
                 if (player == null) continue;
 
                 string roleStr = Lua.GetReturnVal<string>(
-                    $"return UnitGroupRolesAssigned('{player.Name}')", 0);
+                    $"return UnitGroupRolesAssigned('{member.UnitId}')", 0);
                 
                 var playerRole = roleStr switch
                 {
@@ -1701,6 +1828,29 @@ namespace Bots.DungeonBuddy.Helpers
                     "DAMAGER" => PartyRole.Dps,
                     _ => PartyRole.None
                 };
+
+                if (effectiveTankGuid != 0 && player.Guid == effectiveTankGuid)
+                {
+                    playerRole = PartyRole.Tank;
+                }
+                else
+                {
+                    if (effectiveTankGuid != 0 && playerRole == PartyRole.Tank)
+                        playerRole = PartyRole.None;
+                    if (playerRole == PartyRole.None && dungeonMode)
+                    {
+                        var squadMember = Styx.PartyGrind.SquadContext.GetMemberByGuid(player.Guid);
+                        if (squadMember != null)
+                        {
+                            playerRole = squadMember.Role switch
+                            {
+                                Styx.PartyGrind.SquadRole.TankLeader when effectiveTankGuid == 0 => PartyRole.Tank,
+                                Styx.PartyGrind.SquadRole.Healer => PartyRole.Healer,
+                                _ => PartyRole.Dps
+                            };
+                        }
+                    }
+                }
 
                 if ((playerRole & role) != 0)
                     yield return player;
@@ -1724,15 +1874,18 @@ namespace Bots.DungeonBuddy.Helpers
 
         private sealed class MovementBlock
         {
-            public MovementBlock(Func<bool> condition, MovementBlockType type)
+            public MovementBlock(Func<bool> condition, MovementBlockType type, bool isUserInitiated = false)
             {
                 Condition = condition;
                 Type = type;
+                IsUserInitiated = isUserInitiated;
             }
 
             public Func<bool> Condition { get; private set; }
 
             public MovementBlockType Type { get; private set; }
+
+            public bool IsUserInitiated { get; private set; }
         }
 
         public class NoMover : IPlayerMover
@@ -1767,6 +1920,7 @@ namespace Bots.DungeonBuddy.Helpers
         }
 
         private static readonly List<MovementBlock> _movementBlocks = new List<MovementBlock>();
+        private static IPlayerMover? _savedPlayerMover;
         private static StuckHandler? _savedStuckHandler;
         private static WoWPoint _controlledDestination = WoWPoint.Zero;
 
@@ -1776,14 +1930,14 @@ namespace Bots.DungeonBuddy.Helpers
         {
             try
             {
-                _movementBlocks.RemoveAll(block => !block.Condition() || !StyxWoW.Me.IsAlive);
+                _movementBlocks.RemoveAll(block => !block.Condition() || (!block.IsUserInitiated && StyxWoW.Me?.IsAlive != true));
 
                 if (_movementBlocks.Any())
                 {
-                    if (_controlledDestination != WoWPoint.Zero)
+                    if (_controlledDestination != WoWPoint.Zero && _movementBlocks.All(block => !block.IsUserInitiated))
                     {
                         if (!MovementEnabled)
-                            Navigator.PlayerMover = new ClickToMoveMover();
+                            Navigator.PlayerMover = _savedPlayerMover ?? new ClickToMoveMover();
 
                         Navigator.MoveTo(_controlledDestination);
                         Navigator.PlayerMover = new NoMover();

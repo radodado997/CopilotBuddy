@@ -149,18 +149,42 @@ namespace Styx.PartyGrind
 
             if (leader != null)
             {
-                string subName = string.IsNullOrEmpty(leader.ActiveSubProfileName) ? "-" : leader.ActiveSubProfileName;
-                string lowest = string.IsNullOrEmpty(leader.LowestMemberName) ? "-" : leader.LowestMemberName;
-                _footerText.Text = string.Format(
-                    CultureInfo.InvariantCulture,
-                    "Aktualny SubProfile: [{0}-{1}] {2}  |  Najniższy gracz: {3} (Lvl {4}/{5}, {6:F0}% XP)",
-                    leader.ActiveSubProfileMinLevel,
-                    leader.ActiveSubProfileMaxLevel,
-                    subName,
-                    lowest,
-                    leader.EffectiveSquadMinLevel,
-                    leader.ProfileMaxLevel,
-                    leader.LowestMemberXpPercent);
+                if (leader.BotMode == SquadBotMode.Dungeon)
+                {
+                    string dName = string.IsNullOrEmpty(leader.ActiveDungeonName)
+                        ? (leader.ActiveDungeonId > 0 ? $"Dungeon #{leader.ActiveDungeonId}" : leader.DungeonEntryMode.ToString())
+                        : leader.ActiveDungeonName;
+                    string bossInfo = leader.TotalBossCount > 0
+                        ? $"{leader.KilledBossCount}/{leader.TotalBossCount} ({(string.IsNullOrEmpty(leader.CurrentBossName) ? "Clear" : leader.CurrentBossName)})"
+                        : (string.IsNullOrEmpty(leader.LfgStatusText) ? "-" : leader.LfgStatusText);
+                    string lockoutInfo = leader.DungeonEntryMode == SquadDungeonEntryMode.WalkInPortalFarm
+                        ? $" | Runs/h: {leader.HourlyInstancesRunCount}" + (leader.LockoutRemainingSeconds > 0 ? $" (Lock {leader.LockoutRemainingSeconds}s)" : string.Empty)
+                        : (leader.HasRandomPartyMembers ? " | +PUG" : string.Empty);
+                    string lowest = string.IsNullOrEmpty(leader.LowestMemberName) ? "-" : leader.LowestMemberName;
+                    _footerText.Text = string.Format(
+                        CultureInfo.InvariantCulture,
+                        "Dungeon: {0}  |  Bosses: {1}{2}  |  Min Lvl: {3} ({4})",
+                        dName,
+                        bossInfo,
+                        lockoutInfo,
+                        leader.EffectiveSquadMinLevel,
+                        lowest);
+                }
+                else
+                {
+                    string subName = string.IsNullOrEmpty(leader.ActiveSubProfileName) ? "-" : leader.ActiveSubProfileName;
+                    string lowest = string.IsNullOrEmpty(leader.LowestMemberName) ? "-" : leader.LowestMemberName;
+                    _footerText.Text = string.Format(
+                        CultureInfo.InvariantCulture,
+                        "Aktualny SubProfile: [{0}-{1}] {2}  |  Najniższy gracz: {3} (Lvl {4}/{5}, {6:F0}% XP)",
+                        leader.ActiveSubProfileMinLevel,
+                        leader.ActiveSubProfileMaxLevel,
+                        subName,
+                        lowest,
+                        leader.EffectiveSquadMinLevel,
+                        leader.ProfileMaxLevel,
+                        leader.LowestMemberXpPercent);
+                }
             }
             else
             {
