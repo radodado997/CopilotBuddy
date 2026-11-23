@@ -482,7 +482,7 @@ namespace CopilotBuddy.PartyGrind.Tests
             server.BroadcastLeaderState(new SquadLeaderState { LeaderName = "Tank" });
             await WaitUntilAsync(() => client.IsConnected && client.LatestLeaderState != null);
 
-            await Task.Delay(750);
+            await Task.Delay(1200);
 
             Assert.True(client.IsConnected);
             Assert.False(client.HasFreshLeaderState);

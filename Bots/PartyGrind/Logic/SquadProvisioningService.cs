@@ -468,7 +468,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                                 if (me.CurrentTargetGuid != retryPlayer.Guid)
                                     retryPlayer.Target();
                                 _lastTradeOfferRetryUtcMs = now;
-                                TradeFrame.Instance.InitiateTrade("target");
+                                if (me.CurrentTargetGuid == retryPlayer.Guid)
+                                    TradeFrame.Instance.InitiateTrade("target");
                             }
                         }
                     }

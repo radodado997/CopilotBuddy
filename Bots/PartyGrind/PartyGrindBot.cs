@@ -1320,7 +1320,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                 new Decorator(
                     ctx => SquadContext.IsDungeonModeActive &&
                            SquadDungeonService.IsInDungeonMap(StyxWoW.Me) &&
-                           !(SquadSettings.Instance.Role == SquadRole.Healer &&
+                           !((SquadContext.ActiveSettings ?? SquadSettings.Instance).Role == SquadRole.Healer &&
                              SquadHealBridge.HasHealCandidate(SquadContext.GetLeaderStateSnapshot())),
                     new Action(ctx =>
                     {
@@ -1563,7 +1563,7 @@ namespace CopilotBuddy.Bots.PartyGrind
             if (settings.Role == SquadRole.Healer && SquadHealBridge.HasHealCandidate(leader))
                 return true;
             if (settings.Role == SquadRole.HybridOffHeal &&
-                leader?.Members?.Any(m => m.IsConnected && !m.IsDead && m.HealthPercent < 88f) == true)
+                SquadHealBridge.HasHealCandidate(leader, emergencyOnly: true))
                 return true;
 
             return false;

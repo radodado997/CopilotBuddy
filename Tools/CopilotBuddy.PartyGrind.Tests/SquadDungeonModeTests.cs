@@ -696,5 +696,39 @@ namespace CopilotBuddy.PartyGrind.Tests
                 new WoWPoint(60f, 0f, 0f), crumbs, fallbackProfileLoc, bossLoc, liveBossPathDistance: null, ref exhaustedIdx);
             Assert.Equal(fallbackProfileLoc, unreachableStep);
         }
+
+        [Fact]
+        public void LfgPartyOutsideEntry_SkipsTeleportInAfterCompletedRunSoSquadCanRequeue()
+        {
+            // Normal fresh LFG entry outside dungeon: teleport in
+            Assert.True(SquadDungeonService.ShouldTeleportIntoLfgPartyOutsideDungeon(
+                lfgMode: "lfgparty",
+                isInDungeonMap: false,
+                lfgRunCompletedAwaitingRequeue: false,
+                completedReason: global::Bots.DungeonBuddy.Enums.CompleteReason.None,
+                leaderDungeonComplete: false));
+
+            // Completed run after teleporting out while party stays in 'lfgparty': must NOT re-enter completed instance
+            Assert.False(SquadDungeonService.ShouldTeleportIntoLfgPartyOutsideDungeon(
+                lfgMode: "lfgparty",
+                isInDungeonMap: false,
+                lfgRunCompletedAwaitingRequeue: true,
+                completedReason: global::Bots.DungeonBuddy.Enums.CompleteReason.None,
+                leaderDungeonComplete: false));
+
+            Assert.False(SquadDungeonService.ShouldTeleportIntoLfgPartyOutsideDungeon(
+                lfgMode: "lfgparty",
+                isInDungeonMap: false,
+                lfgRunCompletedAwaitingRequeue: false,
+                completedReason: global::Bots.DungeonBuddy.Enums.CompleteReason.Completed,
+                leaderDungeonComplete: false));
+
+            Assert.False(SquadDungeonService.ShouldTeleportIntoLfgPartyOutsideDungeon(
+                lfgMode: "lfgparty",
+                isInDungeonMap: false,
+                lfgRunCompletedAwaitingRequeue: false,
+                completedReason: global::Bots.DungeonBuddy.Enums.CompleteReason.None,
+                leaderDungeonComplete: true));
+        }
     }
 }

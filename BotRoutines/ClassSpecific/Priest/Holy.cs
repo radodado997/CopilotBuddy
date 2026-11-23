@@ -25,14 +25,18 @@ namespace Singular.ClassSpecific.Priest
         {
             return new PrioritySelector(
                 Spell.WaitForCast(),
-                // Heal self before resting. There is no need to eat while we have 100% mana
-                CreateHolyHealOnlyBehavior(true),
+                // Heal self before resting, unless already eating/drinking.
+                new Decorator(
+                    ret => !StyxWoW.Me.HasAura("Drink") && !StyxWoW.Me.HasAura("Food") && !StyxWoW.Me.HasAura("Refreshment"),
+                    CreateHolyHealOnlyBehavior(true)),
                 // Rest up damnit! Do this first, so we make sure we're fully rested.
                 Rest.CreateDefaultRestBehaviour(),
                 // Can we res people?
                 Spell.Resurrect("Resurrection"),
-                // Make sure we're healing OOC too!
-                CreateHolyHealOnlyBehavior(false, false)
+                // Make sure we're healing OOC too (without breaking active food/drink)!
+                new Decorator(
+                    ret => !StyxWoW.Me.HasAura("Drink") && !StyxWoW.Me.HasAura("Food") && !StyxWoW.Me.HasAura("Refreshment"),
+                    CreateHolyHealOnlyBehavior(false, false))
                 );
         }
 
@@ -77,12 +81,13 @@ namespace Singular.ClassSpecific.Priest
                         Spell.Cast(
                             "Prayer of Mending",
                             ret => (WoWUnit)ret,
-                            ret => ret is WoWPlayer && Group.Tanks.Contains((WoWPlayer)ret) && !((WoWUnit)ret).HasMyAura("Prayer of Mending", 3) && 
+                            ret => ret is WoWPlayer && ((WoWUnit)ret).Combat && Group.Tanks.Contains((WoWPlayer)ret) && !((WoWUnit)ret).HasMyAura("Prayer of Mending", 3) && 
                                    Group.Tanks.Where(t => t != (WoWPlayer)ret).All(p => !p.HasMyAura("Prayer of Mending"))),
                         Spell.Heal(
                             "Renew",
                             ret => (WoWUnit)ret,
-                            ret => ret is WoWPlayer && Group.Tanks.Contains((WoWPlayer)ret) && !((WoWUnit)ret).HasMyAura("Renew")),
+                            ret => ret is WoWPlayer && ((WoWUnit)ret).Combat && ((WoWUnit)ret).HealthPercent < 92 &&
+                                   Group.Tanks.Contains((WoWPlayer)ret) && !((WoWUnit)ret).HasMyAura("Renew")),
                         Spell.Heal("Prayer of Healing",
                             ret => (WoWUnit)ret,
                             ret => StyxWoW.Me.HasAura("Serendipity", 2) && Unit.NearbyFriendlyPlayers.Count(p => p.HealthPercent <= SingularSettings.Instance.Priest.PrayerOfHealingSerendipityHealth) >= SingularSettings.Instance.Priest.PrayerOfHealingSerendipityCount),
@@ -113,15 +118,19 @@ namespace Singular.ClassSpecific.Priest
                         Spell.Heal(
                             "Heal",
                             ret => (WoWUnit)ret,
-                            ret => !SpellManager.HasSpell("Greater Heal") && ((WoWUnit)ret).HealthPercent < SingularSettings.Instance.Priest.HolyHeal),
+                            ret => !Spell.CanCastOnUnit("Greater Heal", (WoWUnit)ret) &&
+                                   ((WoWUnit)ret).HealthPercent < SingularSettings.Instance.Priest.HolyHeal),
                         Spell.Heal(
                             "Lesser Heal",
                             ret => (WoWUnit)ret,
-                            ret => !SpellManager.HasSpell("Greater Heal") && !SpellManager.HasSpell("Heal") && ((WoWUnit)ret).HealthPercent < SingularSettings.Instance.Priest.HolyHeal),
+                            ret => !Spell.CanCastOnUnit("Greater Heal", (WoWUnit)ret) &&
+                                   !Spell.CanCastOnUnit("Heal", (WoWUnit)ret) &&
+                                   ((WoWUnit)ret).HealthPercent < SingularSettings.Instance.Priest.HolyHeal),
                         Spell.Heal(
                             "Renew",
                             ret => (WoWUnit)ret,
-                            ret => !((WoWUnit)ret).HasMyAura("Renew") && ((WoWUnit)ret).HealthPercent < 90),
+                            ret => !((WoWUnit)ret).HasMyAura("Renew") &&
+                                   ((WoWUnit)ret).HealthPercent < (((WoWUnit)ret).Combat || StyxWoW.Me.Combat ? 88 : 78)),
                         new Decorator(
                             ret => StyxWoW.Me.Combat && StyxWoW.Me.GotTarget && Unit.NearbyFriendlyPlayers.Count(u => u.IsInMyPartyOrRaid) == 0,
                             new PrioritySelector(

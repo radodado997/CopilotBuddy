@@ -256,7 +256,7 @@ namespace Singular.Settings
         #region Holy
 
         [Setting]
-        [DefaultValue(95)]
+        [DefaultValue(78)]
         [Category("Holy")]
         [DisplayName("Heal Health")]
         [Description("Heal will be used at this value")]
