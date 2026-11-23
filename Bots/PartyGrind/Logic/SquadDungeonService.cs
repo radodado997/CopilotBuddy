@@ -800,7 +800,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
                 Logging.Write("[PartyGrind Dungeon] Resetting instances for next walk-in run.");
                 bool resetIssued = Lua.GetReturnVal<bool>(
-                    "if not IsInGroup() or IsPartyLeader() then ResetInstances(); return true end return false", 0);
+                    "if (GetNumPartyMembers() == 0 and GetNumRaidMembers() == 0) or IsPartyLeader() then ResetInstances(); return true end return false", 0);
                 if (resetIssued)
                 {
                     RecordInstanceReset(nowUtcMs);
