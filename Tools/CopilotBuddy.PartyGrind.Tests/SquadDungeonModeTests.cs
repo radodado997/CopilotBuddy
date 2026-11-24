@@ -604,12 +604,45 @@ namespace CopilotBuddy.PartyGrind.Tests
         }
 
         [Fact]
+        public void CompletedWalkInRun_PugWithoutIpcTelemetryBlocksResetUntilLeavingParty()
+        {
+            ulong[] tracked = SquadDungeonService.GetTrackedRunParticipants(
+                new[] { 2UL, 3UL, 99UL },
+                new HashSet<ulong> { 1UL, 2UL, 3UL },
+                localGuid: 1UL,
+                includeNonSquadMembers: true).OrderBy(guid => guid).ToArray();
+            Assert.Equal(new ulong[] { 2UL, 3UL, 99UL }, tracked);
+
+            var healer = MakeMemberState("HealB", 2UL, SquadRole.Healer, WoWClass.Priest, 30);
+            var dps = MakeMemberState("DpsC", 3UL, SquadRole.DpsMelee, WoWClass.Rogue, 30);
+            var connected = new[]
+            {
+                WrapClient(healer, 11_000L),
+                WrapClient(dps, 11_000L)
+            };
+
+            Assert.False(SquadDungeonService.AreAllWalkInParticipantsClearedForReset(
+                tracked,
+                connected,
+                new[] { 2UL, 3UL, 99UL },
+                completedAtUtcMs: 10_000L,
+                nowUtcMs: 12_000L));
+            Assert.True(SquadDungeonService.AreAllWalkInParticipantsClearedForReset(
+                tracked,
+                connected,
+                new[] { 2UL, 3UL },
+                completedAtUtcMs: 10_000L,
+                nowUtcMs: 12_000L));
+        }
+
+        [Fact]
         public void CompletedRdfRun_PugWithoutIpcTelemetryDoesNotBlockSquadExitConfirmation()
         {
             ulong[] tracked = SquadDungeonService.GetTrackedRunParticipants(
                 new[] { 2UL, 3UL, 99UL },
                 new HashSet<ulong> { 1UL, 2UL, 3UL },
-                localGuid: 1UL).OrderBy(guid => guid).ToArray();
+                localGuid: 1UL,
+                includeNonSquadMembers: false).OrderBy(guid => guid).ToArray();
             Assert.Equal(new ulong[] { 2UL, 3UL }, tracked);
 
             var healer = MakeMemberState("HealB", 2UL, SquadRole.Healer, WoWClass.Priest, 30);

@@ -498,9 +498,11 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         internal static HashSet<ulong> GetTrackedRunParticipants(
             IEnumerable<ulong> partyMemberGuids,
             IReadOnlyCollection<ulong> squadBotGuids,
-            ulong localGuid) =>
+            ulong localGuid,
+            bool includeNonSquadMembers) =>
             partyMemberGuids
-                .Where(guid => guid != 0 && guid != localGuid && squadBotGuids.Contains(guid))
+                .Where(guid => guid != 0 && guid != localGuid &&
+                               (includeNonSquadMembers || squadBotGuids.Contains(guid)))
                 .ToHashSet();
 
         internal static bool AreAllWalkInParticipantsClearedForReset(
@@ -741,7 +743,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     _runParticipants.UnionWith(GetTrackedRunParticipants(
                         partyList.Select(member => member.Guid),
                         botGuids,
-                        me.Guid));
+                        me.Guid,
+                        includeNonSquadMembers: walkIn));
                     if (complete && _completedAtUtcMs == 0)
                     {
                         _completedAtUtcMs = nowUtcMs;
