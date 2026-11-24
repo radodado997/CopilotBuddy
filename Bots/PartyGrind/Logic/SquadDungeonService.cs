@@ -495,6 +495,14 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                                       state.Guid == participantGuid);
         }
 
+        internal static HashSet<ulong> GetTrackedRunParticipants(
+            IEnumerable<ulong> partyMemberGuids,
+            IReadOnlyCollection<ulong> squadBotGuids,
+            ulong localGuid) =>
+            partyMemberGuids
+                .Where(guid => guid != 0 && guid != localGuid && squadBotGuids.Contains(guid))
+                .ToHashSet();
+
         internal static bool AreAllWalkInParticipantsClearedForReset(
             IReadOnlyCollection<ulong> runParticipants,
             IReadOnlyList<SquadConnectedMemberSnapshot> connected,
@@ -730,7 +738,10 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     }
                     _walkInRunDungeonId = activeId;
                     _walkInRunMapId = me.MapId;
-                    _runParticipants.UnionWith(partyList.Where(p => p.Guid != 0 && p.Guid != me.Guid).Select(p => p.Guid));
+                    _runParticipants.UnionWith(GetTrackedRunParticipants(
+                        partyList.Select(member => member.Guid),
+                        botGuids,
+                        me.Guid));
                     if (complete && _completedAtUtcMs == 0)
                     {
                         _completedAtUtcMs = nowUtcMs;
@@ -753,7 +764,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             {
                 int resetGeneration = settings.IsCoordinator
                     ? _instanceResetGeneration
-                    : leader?.InstanceResetGeneration ?? _instanceResetGeneration;
+                    : SquadContext.GetLeaderStateSnapshot()?.InstanceResetGeneration ?? _instanceResetGeneration;
                 MarkLfgRunCompletedAwaitingRequeue(resetGeneration);
             }
 
