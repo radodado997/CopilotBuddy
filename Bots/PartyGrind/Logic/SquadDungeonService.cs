@@ -109,15 +109,21 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private long _lastQueueAttemptUtcMs;
         private long _lastRoleSetUtcMs;
         private long _lastProposalAcceptUtcMs;
+        private long _lastTeleportInUtcMs;
         private long _lastTeleportOutUtcMs;
         private int _instanceResetGeneration;
+        private int _lastResetGeneration;
+        private readonly HashSet<uint> _currentRunKilledBosses = new();
         internal const float HotspotArrivalDistance = 4.5f;
         private bool _runtimeInitialized;
         private bool _resetPendingOutside;
         private uint _walkInRunDungeonId;
         private uint _walkInRunMapId;
         private int _hotspotIndex;
+        private uint _breadcrumbBossEntry;
+        private int _breadcrumbIndex;
         private long _completedAtUtcMs;
+        private bool _lfgRunCompletedAwaitingRequeue;
         private bool _countedCurrentWalkInEntry;
         private readonly HashSet<ulong> _runParticipants = new();
         private IReadOnlyList<SquadConnectedMemberSnapshot> _participantSnapshots = Array.Empty<SquadConnectedMemberSnapshot>();
@@ -159,6 +165,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             _lastProposalAcceptUtcMs = 0;
             _lastTeleportOutUtcMs = 0;
             _hotspotIndex = 0;
+            _breadcrumbBossEntry = 0;
+            _breadcrumbIndex = 0;
+            _lfgRunCompletedAwaitingRequeue = false;
             StopActiveEncounter();
         }
 
@@ -173,12 +182,16 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             try { global::Bots.DungeonBuddy.Helpers.ScriptHelpers.ReleaseScriptMovementBlocks(); } catch { }
             try { DungeonManager.Clear(); } catch { }
             try { BossManager.Reset(); } catch { }
+            _currentRunKilledBosses.Clear();
             try { WorldObstacleManager.Shutdown(); } catch { }
             try { AvoidanceManager.Clear(); } catch { }
             _runtimeInitialized = false;
             _lastSyncedMapId = 0;
             _lastSyncedDungeonId = 0;
             _hotspotIndex = 0;
+            _breadcrumbBossEntry = 0;
+            _breadcrumbIndex = 0;
+            _lfgRunCompletedAwaitingRequeue = false;
         }
 
         public void StopActiveEncounter()
@@ -238,6 +251,23 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             uint desiredDungeonId = 0;
             if (inDungeonMap)
             {
+                int currentGen = settings.IsCoordinator ? _instanceResetGeneration : leader?.InstanceResetGeneration ?? _instanceResetGeneration;
+                bool generationChanged = currentGen != _lastResetGeneration;
+                if (generationChanged)
+                {
+                    StopActiveEncounter();
+                    DungeonManager.Clear();
+                    BossManager.Reset();
+                    _currentRunKilledBosses.Clear();
+                    _lastSyncedDungeonId = 0;
+                    _lastResetGeneration = currentGen;
+                }
+                else
+                {
+                    foreach (var b in BossManager.Bosses.Where(b => b.IsDead))
+                        _currentRunKilledBosses.Add(b.EntryId);
+                }
+
                 if (entryMode != SquadDungeonEntryMode.WalkInPortalFarm && lfgId > 0)
                 {
                     desiredDungeonId = lfgId;
@@ -257,25 +287,31 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     catch { desiredDungeonId = 0; }
                 }
 
-                if (desiredDungeonId > 0 && (_lastSyncedDungeonId != desiredDungeonId || _lastSyncedMapId != me.MapId || DungeonManager.CurrentDungeon == null))
+                if (desiredDungeonId > 0 && (generationChanged || _lastSyncedDungeonId != desiredDungeonId || _lastSyncedMapId != me.MapId || DungeonManager.CurrentDungeon == null))
                 {
                     StopActiveEncounter();
                     _hotspotIndex = 0;
+                    _breadcrumbBossEntry = 0;
+                    _breadcrumbIndex = 0;
                     DungeonManager.SetDungeonById(desiredDungeonId);
+                    BossManager.RestoreKilledBosses(_currentRunKilledBosses);
                     LfgManager.DungeonCompletedReason = CompleteReason.None;
+                    _lfgRunCompletedAwaitingRequeue = false;
                     _lastSyncedDungeonId = desiredDungeonId;
                     _lastSyncedMapId = me.MapId;
                 }
             }
             else
             {
-                if (_lastSyncedDungeonId != 0)
+                bool isCorpseRun = me != null && (me.Dead || me.IsGhost || leader?.Phase == SquadPhase.CorpseRun);
+                if (!isCorpseRun && _lastSyncedDungeonId != 0)
                 {
                     StopActiveEncounter();
                     DungeonManager.Clear();
                     BossManager.Reset();
                     _lastSyncedDungeonId = 0;
                     _hotspotIndex = 0;
+                    _currentRunKilledBosses.Clear();
                 }
                 _lastSyncedMapId = me.MapId;
             }
@@ -318,9 +354,17 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         public static bool HasDeserterOrRandomCooldown()
         {
             var me = StyxWoW.Me;
-            if (me == null)
-                return false;
-            return me.HasAura(71041) || me.HasAura(26013);
+            if (!StyxWoW.IsInWorld || me is not { IsValid: true, IsAlive: true } || me.IsGhost)
+                return true;
+            try
+            {
+                return me.HasAura(71041) || me.HasAura(26013);
+            }
+            catch (OverflowException)
+            {
+                SquadPartySyncService.LogAction("Dungeon: LFG cooldown unreadable; deferring queue");
+                return true;
+            }
         }
 
         public static uint ResolveTargetDungeonId(
@@ -418,6 +462,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             _hotspotIndex = 0;
             _completedAtUtcMs = 0;
             _countedCurrentWalkInEntry = false;
+            _currentRunKilledBosses.Clear();
             _runParticipants.Clear();
             _participantSnapshots = Array.Empty<SquadConnectedMemberSnapshot>();
         }
@@ -425,9 +470,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         internal static bool HasFreshExitEvidence(
             ulong participantGuid, IReadOnlyList<SquadConnectedMemberSnapshot> connected, long completedAtUtcMs, long nowUtcMs)
         {
-            return connected.Any(m => m.LastReceivedUtcMs > completedAtUtcMs &&
-                                      m.LastReceivedUtcMs <= nowUtcMs &&
-                                      nowUtcMs - m.LastReceivedUtcMs <= 5000L &&
+            return connected.Any(m => m.LastStateReceivedUtcMs > completedAtUtcMs &&
+                                      m.LastStateReceivedUtcMs <= nowUtcMs &&
+                                      nowUtcMs - m.LastStateReceivedUtcMs <= 5000L &&
                                       m.LatestState is { HasDungeonTelemetry: true, IsInsideDungeon: false } state &&
                                       state.Guid == participantGuid);
         }
@@ -596,6 +641,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 }
             }
 
+            if (!walkIn && inDungeon && complete)
+                _lfgRunCompletedAwaitingRequeue = true;
+
             uint instanceMapId = 0;
             if (activeId > 0)
             {
@@ -643,6 +691,22 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             Lua.DoString($"SetLFGRoles({leaderFlag},{(tank ? "true" : "false")},{(healer ? "true" : "false")},{(dps ? "true" : "false")})");
         }
 
+        internal static bool ShouldTeleportIntoLfgPartyOutsideDungeon(
+            string lfgMode,
+            bool isInDungeonMap,
+            bool lfgRunCompletedAwaitingRequeue,
+            CompleteReason completedReason,
+            bool leaderDungeonComplete)
+        {
+            if (isInDungeonMap || !string.Equals(lfgMode, "lfgparty", StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            if (lfgRunCompletedAwaitingRequeue || completedReason != CompleteReason.None || leaderDungeonComplete)
+                return false;
+
+            return true;
+        }
+
         public bool RunQueueingOrEntryTick(SquadSettings settings, SquadLeaderState? leader, long nowUtcMs)
         {
             var me = StyxWoW.Me;
@@ -651,6 +715,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
             if (LfgManager.RoleCheckPending || SafeGetLfgMode() == "rolecheck")
             {
+                _lfgRunCompletedAwaitingRequeue = false;
                 ApplySquadLfgRole(settings.Role, settings.IsCoordinator);
                 Lua.DoString("if LFDRoleCheckPopupAcceptButton and LFDRoleCheckPopupAcceptButton:IsVisible() then LFDRoleCheckPopupAcceptButton:Click() end; if StaticPopup1 and StaticPopup1:IsVisible() and StaticPopup1.which == 'LFG_ROLE_CHECK_CONFIRM' and StaticPopup1Button1 then StaticPopup1Button1:Click() end");
                 LfgManager.RoleCheckPending = false;
@@ -663,6 +728,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (shouldAccept && nowUtcMs - _lastProposalAcceptUtcMs >= 1500L)
             {
                 _lastProposalAcceptUtcMs = nowUtcMs;
+                _lfgRunCompletedAwaitingRequeue = false;
                 LfgManager.AcceptProposal();
                 LfgManager.ProposalPending = false;
                 SquadPartySyncService.LogAction("Dungeon: accepting LFG proposal");
@@ -687,6 +753,38 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 ApplySquadLfgRole(settings.Role, settings.IsCoordinator);
             }
 
+            string lfgMode = SafeGetLfgMode();
+            if (!string.IsNullOrEmpty(lfgMode) && lfgMode != "lfgparty" && lfgMode != "abandonedindungeon")
+            {
+                _lfgRunCompletedAwaitingRequeue = false;
+                LfgManager.DungeonCompletedReason = CompleteReason.None;
+            }
+
+            bool leaderCompletedRun = leader != null &&
+                (leader.IsDungeonComplete || leader.TeleportOutOrder || leader.Phase == SquadPhase.DungeonCompleteExit);
+            if (ShouldTeleportIntoLfgPartyOutsideDungeon(
+                    lfgMode,
+                    IsInDungeonMap(me),
+                    _lfgRunCompletedAwaitingRequeue,
+                    LfgManager.DungeonCompletedReason,
+                    leaderCompletedRun))
+            {
+                if (me.IsMoving)
+                    WoWMovement.MoveStop();
+                if (me.Mounted)
+                {
+                    Mount.Dismount("LFG teleport in");
+                    return true;
+                }
+                if (nowUtcMs - _lastTeleportInUtcMs >= 3500L)
+                {
+                    _lastTeleportInUtcMs = nowUtcMs;
+                    LfgManager.TeleportIn();
+                    SquadPartySyncService.LogAction("Dungeon: teleporting into LFG instance");
+                }
+                return true;
+            }
+
             if (!settings.IsCoordinator)
             {
                 if (me.IsMoving)
@@ -695,8 +793,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 return true;
             }
 
-            string lfgMode = SafeGetLfgMode();
-            if (lfgMode == "queued" || lfgMode == "proposal" || lfgMode == "rolecheck" || lfgMode == "lfgparty")
+            if (lfgMode == "queued" || lfgMode == "proposal" || lfgMode == "rolecheck")
             {
                 if (me.IsMoving)
                     WoWMovement.MoveStop();
@@ -771,6 +868,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     break;
             }
 
+            LfgManager.DungeonCompletedReason = CompleteReason.None;
             return true;
         }
 
@@ -946,6 +1044,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             SquadDungeonEntryMode entryMode = leader?.DungeonEntryMode ?? settings.DungeonEntryMode;
             if (entryMode != SquadDungeonEntryMode.WalkInPortalFarm)
             {
+                _lfgRunCompletedAwaitingRequeue = true;
                 if (nowUtcMs - _lastTeleportOutUtcMs >= 3500L)
                 {
                     _lastTeleportOutUtcMs = nowUtcMs;
@@ -1043,6 +1142,46 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             return false;
         }
 
+        internal static WoWPoint AdvanceBossBreadcrumb(
+            WoWPoint meLocation,
+            IReadOnlyList<WoWPoint> bossPath,
+            WoWPoint bossProfileLocation,
+            WoWPoint? liveBossLocation,
+            float? liveBossPathDistance,
+            ref int breadcrumbIndex)
+        {
+            if (liveBossLocation.HasValue && liveBossLocation.Value != WoWPoint.Zero &&
+                liveBossPathDistance.HasValue && liveBossPathDistance.Value <= 25f)
+            {
+                return liveBossLocation.Value;
+            }
+
+            if (bossPath != null && bossPath.Count > 0)
+            {
+                while (breadcrumbIndex < bossPath.Count)
+                {
+                    WoWPoint crumb = bossPath[breadcrumbIndex];
+                    if (crumb == WoWPoint.Zero || meLocation.Distance(crumb) <= HotspotArrivalDistance)
+                    {
+                        breadcrumbIndex++;
+                        continue;
+                    }
+                    return crumb;
+                }
+            }
+
+            if (liveBossLocation.HasValue && liveBossLocation.Value != WoWPoint.Zero &&
+                liveBossPathDistance.HasValue)
+            {
+                return liveBossLocation.Value;
+            }
+
+            if (bossProfileLocation != WoWPoint.Zero && meLocation.Distance(bossProfileLocation) > HotspotArrivalDistance)
+                return bossProfileLocation;
+
+            return WoWPoint.Zero;
+        }
+
         public WoWPoint ComputeLeaderNextDungeonPoint()
         {
             var me = StyxWoW.Me;
@@ -1062,7 +1201,58 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (profile != null && profile.BossEncounters.Count > 0)
             {
                 var currentBoss = BossManager.CurrentBoss;
-                var liveBoss = ObjectManager.GetObjectsOfType<WoWUnit>()
+                var profileBoss = currentBoss == null
+                    ? null
+                    : profile.BossEncounters.FirstOrDefault(b => b.Entry == currentBoss.Entry);
+
+                if (profileBoss != null)
+                {
+                    if (_breadcrumbBossEntry != profileBoss.Entry)
+                    {
+                        _breadcrumbBossEntry = profileBoss.Entry;
+                        _breadcrumbIndex = 0;
+                        if (profileBoss.Path.Count > 1)
+                        {
+                            int closestIdx = 0;
+                            float closestDist = float.MaxValue;
+                            for (int i = 0; i < profileBoss.Path.Count; i++)
+                            {
+                                float d = me.Location.Distance(profileBoss.Path[i]);
+                                if (d < closestDist)
+                                {
+                                    closestDist = d;
+                                    closestIdx = i;
+                                }
+                            }
+                            if (closestDist <= 30f && (closestIdx == 0 || Navigator.CanNavigateFully(me.Location, profileBoss.Path[closestIdx])))
+                                _breadcrumbIndex = closestIdx;
+                        }
+                    }
+
+                    WoWUnit? liveCurrentBoss = ObjectManager.GetObjectsOfType<WoWUnit>()
+                        .FirstOrDefault(u => u != null && u.IsValid && u.IsAlive && u.Entry == profileBoss.Entry);
+                    float? livePathDist = liveCurrentBoss != null
+                        ? Navigator.PathDistance(me.Location, liveCurrentBoss.Location, 100f)
+                        : null;
+
+                    WoWPoint bossTarget = AdvanceBossBreadcrumb(
+                        me.Location,
+                        profileBoss.Path,
+                        profileBoss.Location,
+                        liveCurrentBoss?.Location,
+                        livePathDist,
+                        ref _breadcrumbIndex);
+                    if (bossTarget != WoWPoint.Zero)
+                        return bossTarget;
+
+                    if (liveCurrentBoss == null && me.Location.Distance(profileBoss.Location) <= HotspotArrivalDistance)
+                    {
+                        BossManager.MarkBossDead(profileBoss.Entry);
+                        _currentRunKilledBosses.Add(profileBoss.Entry);
+                    }
+                }
+
+                var fallbackBoss = ObjectManager.GetObjectsOfType<WoWUnit>()
                     .Where(u => u != null && u.IsValid && u.IsAlive &&
                                 profile.BossEncounters.Any(b => b.Entry == u.Entry &&
                                     (!b.Optional || BossManager.KillOptionalBossesEnabled) &&
@@ -1073,29 +1263,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     .ThenBy(u => u.DistanceSqr)
                     .FirstOrDefault();
 
-                if (liveBoss != null)
-                    return liveBoss.Location;
-
-                var profileBoss = currentBoss == null
-                    ? null
-                    : profile.BossEncounters.FirstOrDefault(b => b.Entry == currentBoss.Entry);
-
-                if (profileBoss != null && profileBoss.PathBreadCrumbs.Count > 0)
-                {
-                    WoWPoint crumb = profileBoss.PathBreadCrumbs.Peek();
-                    if (crumb != WoWPoint.Zero)
-                    {
-                        if (me.Location.DistanceSqr(crumb) < 25f && profileBoss.PathBreadCrumbs.Count > 1)
-                        {
-                            profileBoss.PathBreadCrumbs.Dequeue();
-                            crumb = profileBoss.PathBreadCrumbs.Peek();
-                        }
-                        return crumb;
-                    }
-                }
-
-                if (profileBoss != null && profileBoss.Location != WoWPoint.Zero)
-                    return profileBoss.Location;
+                if (fallbackBoss != null)
+                    return fallbackBoss.Location;
 
                 while (_hotspotIndex < profile.HotSpots.Count)
                 {
@@ -1117,7 +1286,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             SquadLeaderState? leader,
             float distanceToBoss)
         {
-            if (leader == null || distanceToBoss > 35f || leader.InCombat)
+            if (leader == null || distanceToBoss > 40f || leader.InCombat)
                 return false;
 
             if (leader.Members == null || leader.Members.Count == 0)

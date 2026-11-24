@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Threading;
 using GreenMagic;
 using Styx.Helpers;
 using Styx.Logic.BehaviorTree;
@@ -25,12 +26,42 @@ namespace Styx.Logic.Combat
 		private static int _lastKnownSpellCount;
 		private static readonly Dictionary<string, WoWSpell> _knownSpells = new Dictionary<string, WoWSpell>(StringComparer.OrdinalIgnoreCase);
 
-		public static Dictionary<string, WoWSpell> KnownSpells => _knownSpells;
+		public static Dictionary<string, WoWSpell> KnownSpells
+		{
+			get
+			{
+				CheckPendingTrailingRebuild();
+				lock (_spellBookRebuildLock)
+				{
+					return new Dictionary<string, WoWSpell>(_knownSpells, StringComparer.OrdinalIgnoreCase);
+				}
+			}
+		}
 
 		// HB 4.3.4 compatibility aliases
-		public static Dictionary<string, WoWSpell> Spells => _knownSpells;
+		public static Dictionary<string, WoWSpell> Spells
+		{
+			get
+			{
+				CheckPendingTrailingRebuild();
+				lock (_spellBookRebuildLock)
+				{
+					return new Dictionary<string, WoWSpell>(_knownSpells, StringComparer.OrdinalIgnoreCase);
+				}
+			}
+		}
 		// BUG-09 fix: Return defensive copy so callers can't corrupt the internal dictionary
-		public static Dictionary<string, WoWSpell> RawSpells => new Dictionary<string, WoWSpell>(_knownSpells, StringComparer.OrdinalIgnoreCase);
+		public static Dictionary<string, WoWSpell> RawSpells
+		{
+			get
+			{
+				CheckPendingTrailingRebuild();
+				lock (_spellBookRebuildLock)
+				{
+					return new Dictionary<string, WoWSpell>(_knownSpells, StringComparer.OrdinalIgnoreCase);
+				}
+			}
+		}
 
 		public static int NumKnownSpells
 		{
@@ -41,67 +72,75 @@ namespace Styx.Logic.Combat
 			}
 		}
 
-		public static void Refresh()
+		public static bool Refresh()
 		{
 			Logging.WriteDebug("Refresh() called. LastCount={0}, CurrentCount={1}", _lastKnownSpellCount, NumKnownSpells);
 			
 			if (_lastKnownSpellCount == 0 || NumKnownSpells != _lastKnownSpellCount)
 			{
 				Logging.Write("Building spell book");
-				_knownSpells.Clear();
-
-				LocalPlayer? me = StyxWoW.Me;
-				if (me == null)
+				lock (_spellBookRebuildLock)
 				{
-					Logging.WriteDebug("ERROR: LocalPlayer is null!");
-					return;
-				}
-
-				var knownSpells = me.KnownSpells;
-				Logging.WriteDebug("Found {0} spells from LocalPlayer.KnownSpells", knownSpells.Count);
-				
-				foreach (WoWSpell spell in knownSpells)
-				{
-					if (!_knownSpells.ContainsKey(spell.Name))
+					LocalPlayer? me = StyxWoW.Me;
+					if (me == null)
 					{
-						_knownSpells.Add(spell.Name, spell);
-						Logging.Write("Adding {0}", spell.Name);
+						Logging.WriteDebug("ERROR: LocalPlayer is null!");
+						return false;
 					}
-				}
 
-				// Druid form-specific spell aliases (ported from HB 4.3.4 smethod_4).
-				// In WotLK 3.3.5a, bear/cat variants share the same base name from the
-				// client, so only one survives the ContainsKey check above. This second
-				// pass adds form-qualified keys by spell ID so CRs that call e.g.
-				// HasSpell("Swipe (Bear)") or CanCast("Mangle (Cat)") resolve correctly.
-				foreach (WoWSpell spell in knownSpells)
-				{
-					switch (spell.Id)
+					var knownSpells = me.KnownSpells;
+					Logging.WriteDebug("Found {0} spells from LocalPlayer.KnownSpells", knownSpells.Count);
+					if (knownSpells.Count == 0)
 					{
-						case 779:   // Swipe (Bear)
-							_knownSpells["Swipe (Bear)"] = spell;
-							break;
-						case 62078: // Swipe (Cat)
-							_knownSpells["Swipe (Cat)"] = spell;
-							break;
-						case 33876: // Mangle (Cat)
-							_knownSpells["Mangle (Cat)"] = spell;
-							break;
-						case 33878: // Mangle (Bear)
-							_knownSpells["Mangle (Bear)"] = spell;
-							break;
-						case 16979: // Feral Charge (Bear)
-							_knownSpells["Feral Charge (Bear)"] = spell;
-							break;
-						case 49376: // Feral Charge (Cat) — WotLK 3.0.2+
-							_knownSpells["Feral Charge (Cat)"] = spell;
-							break;
+						return false;
 					}
-				}
 
-				_lastKnownSpellCount = NumKnownSpells;
-				Logging.Write("Spell book built");
+					_knownSpells.Clear();
+					foreach (WoWSpell spell in knownSpells)
+					{
+						if (!_knownSpells.ContainsKey(spell.Name))
+						{
+							_knownSpells.Add(spell.Name, spell);
+							Logging.Write("Adding {0}", spell.Name);
+						}
+					}
+
+					// Druid form-specific spell aliases (ported from HB 4.3.4 smethod_4).
+					// In WotLK 3.3.5a, bear/cat variants share the same base name from the
+					// client, so only one survives the ContainsKey check above. This second
+					// pass adds form-qualified keys by spell ID so CRs that call e.g.
+					// HasSpell("Swipe (Bear)") or CanCast("Mangle (Cat)") resolve correctly.
+					foreach (WoWSpell spell in knownSpells)
+					{
+						switch (spell.Id)
+						{
+							case 779:   // Swipe (Bear)
+								_knownSpells["Swipe (Bear)"] = spell;
+								break;
+							case 62078: // Swipe (Cat)
+								_knownSpells["Swipe (Cat)"] = spell;
+								break;
+							case 33876: // Mangle (Cat)
+								_knownSpells["Mangle (Cat)"] = spell;
+								break;
+							case 33878: // Mangle (Bear)
+								_knownSpells["Mangle (Bear)"] = spell;
+								break;
+							case 16979: // Feral Charge (Bear)
+								_knownSpells["Feral Charge (Bear)"] = spell;
+								break;
+							case 49376: // Feral Charge (Cat) — WotLK 3.0.2+
+								_knownSpells["Feral Charge (Cat)"] = spell;
+								break;
+						}
+					}
+
+					_lastKnownSpellCount = NumKnownSpells;
+					Logging.Write("Spell book built");
+					return true;
+				}
 			}
+			return true;
 		}
 
 		public static bool CastBarVisible
@@ -284,17 +323,25 @@ namespace Styx.Logic.Combat
 
 		public static bool HasSpell(string name)
 		{
-			return _knownSpells.ContainsKey(name);
+			CheckPendingTrailingRebuild();
+			lock (_spellBookRebuildLock)
+			{
+				return _knownSpells.ContainsKey(name);
+			}
 		}
 
 		public static bool HasSpell(int id)
 		{
-			foreach (var spell in _knownSpells.Values)
+			CheckPendingTrailingRebuild();
+			lock (_spellBookRebuildLock)
 			{
-				if (spell.Id == id)
-					return true;
+				foreach (var spell in _knownSpells.Values)
+				{
+					if (spell.Id == id)
+						return true;
+				}
+				return false;
 			}
-			return false;
 		}
 
 		public static bool HasSpell(WoWSpell spell)
@@ -304,11 +351,15 @@ namespace Styx.Logic.Combat
 
 		public static WoWSpell? GetSpellByName(string name)
 		{
-			if (_knownSpells.TryGetValue(name, out WoWSpell? spell))
+			CheckPendingTrailingRebuild();
+			lock (_spellBookRebuildLock)
 			{
-				return spell;
+				if (_knownSpells.TryGetValue(name, out WoWSpell? spell))
+				{
+					return spell;
+				}
+				return null;
 			}
-			return null;
 		}
 
 		public static bool CanCastSpell(string name)
@@ -357,7 +408,11 @@ namespace Styx.Logic.Combat
 		public static bool CanCast(int spellId, WoWUnit target, bool checkRange = true, bool checkMovement = false)
 		{
 			// Convert spellId to name and use existing CanCast
-			WoWSpell? spell = Spells.Values.FirstOrDefault(s => s.Id == spellId);
+			WoWSpell? spell;
+			lock (_spellBookRebuildLock)
+			{
+				spell = _knownSpells.Values.FirstOrDefault(s => s.Id == spellId);
+			}
 			if (spell == null)
 				return false;
 			return CanCast(spell.Name, target, checkRange, checkMovement);
@@ -514,7 +569,11 @@ namespace Styx.Logic.Combat
 		/// <summary>Cast a spell by ID on a specific target using GUID-based casting.</summary>
 		public static bool Cast(int spellId, WoWUnit target)
 		{
-			WoWSpell? spell = _knownSpells.Values.FirstOrDefault(s => s.Id == spellId);
+			WoWSpell? spell;
+			lock (_spellBookRebuildLock)
+			{
+				spell = _knownSpells.Values.FirstOrDefault(s => s.Id == spellId);
+			}
 			if (spell == null)
 				return false;
 			return Cast(spell, target);
@@ -536,7 +595,11 @@ namespace Styx.Logic.Combat
 		/// <summary>Check if we can cast a buff by spell ID.</summary>
 		public static bool CanBuff(int spellId, WoWUnit target = null, bool checkRange = false)
 		{
-			WoWSpell? spell = _knownSpells.Values.FirstOrDefault(s => s.Id == spellId);
+			WoWSpell? spell;
+			lock (_spellBookRebuildLock)
+			{
+				spell = _knownSpells.Values.FirstOrDefault(s => s.Id == spellId);
+			}
 			if (spell == null) return false;
 			return CanBuff(spell.Name, target, checkRange);
 		}
@@ -561,7 +624,11 @@ namespace Styx.Logic.Combat
 		public static bool Buff(int spellId, WoWUnit target = null)
 		{
 			target ??= StyxWoW.Me;
-			WoWSpell? spell = _knownSpells.Values.FirstOrDefault(s => s.Id == spellId);
+			WoWSpell? spell;
+			lock (_spellBookRebuildLock)
+			{
+				spell = _knownSpells.Values.FirstOrDefault(s => s.Id == spellId);
+			}
 			if (spell == null) return false;
 			return Cast(spell, target);
 		}
@@ -641,8 +708,13 @@ namespace Styx.Logic.Combat
 		// HB 4.3.4: CastRandom / BuffRandom with int spell IDs
 		public static bool CastRandom(IEnumerable<int> spellIds, WoWUnit target, bool checkRange)
 		{
-			var spells = spellIds.Select(id => _knownSpells.Values.FirstOrDefault(s => s.Id == id))
-			                     .OfType<WoWSpell>();
+			List<WoWSpell> spells;
+			lock (_spellBookRebuildLock)
+			{
+				spells = spellIds.Select(id => _knownSpells.Values.FirstOrDefault(s => s.Id == id))
+				                 .OfType<WoWSpell>()
+				                 .ToList();
+			}
 			return CastRandom(spells, target, checkRange);
 		}
 
@@ -654,8 +726,13 @@ namespace Styx.Logic.Combat
 
 		public static bool BuffRandom(IEnumerable<int> spellIds, WoWUnit target, bool checkRange)
 		{
-			var spells = spellIds.Select(id => _knownSpells.Values.FirstOrDefault(s => s.Id == id))
-			                     .OfType<WoWSpell>();
+			List<WoWSpell> spells;
+			lock (_spellBookRebuildLock)
+			{
+				spells = spellIds.Select(id => _knownSpells.Values.FirstOrDefault(s => s.Id == id))
+				                 .OfType<WoWSpell>()
+				                 .ToList();
+			}
 			return BuffRandom(spells, target, checkRange);
 		}
 
@@ -749,7 +826,12 @@ namespace Styx.Logic.Combat
 				if (me.IsCasting)
 					return false;
 
-				if (!_knownSpells.ContainsKey(spell.Name))
+				bool hasSpell;
+				lock (_spellBookRebuildLock)
+				{
+					hasSpell = _knownSpells.ContainsKey(spell.Name);
+				}
+				if (!hasSpell)
 					return false;
 
 				// Check if spell is on cooldown
@@ -940,6 +1022,24 @@ namespace Styx.Logic.Combat
 
 		#region LuaEvent Auto-Refresh (ported from HB 4.3.4 smethod_0/1/2/3)
 
+		private static readonly LuaEventHandlerDelegate SpellBookChangedHandler = OnSpellBookChanged;
+		private static long _lastSpellBookRebuildTickMs;
+		private static readonly object _spellBookRebuildLock = new object();
+		private static System.Threading.Timer? _trailingRebuildTimer;
+		private static bool _trailingRebuildScheduled;
+		private static string _lastSuppressedEventName = string.Empty;
+
+		internal static bool HasPendingTrailingRebuild
+		{
+			get
+			{
+				lock (_spellBookRebuildLock)
+				{
+					return _trailingRebuildScheduled;
+				}
+			}
+		}
+
 		/// <summary>
 		/// HB 6.2.3 smethod_7: Called once during engine initialization.
 		/// Hooks BotEvents.OnBotStart so each bot run re-subscribes the Lua
@@ -948,9 +1048,14 @@ namespace Styx.Logic.Combat
 		/// </summary>
 		internal static void Initialize()
 		{
+			lock (_spellBookRebuildLock)
+			{
+				CancelTrailingRebuild();
+				_knownSpells.Clear();
+				_lastKnownSpellCount = 0;
+			}
+			BotEvents.OnBotStart -= OnBotStarted_RefreshSpells;
 			BotEvents.OnBotStart += OnBotStarted_RefreshSpells;
-			_knownSpells.Clear();
-			_lastKnownSpellCount = 0;
 			Refresh();
 			Logging.WriteDebug("[SpellManager] Initialize \u2014 subscribed to BotEvents.OnBotStart");
 		}
@@ -961,9 +1066,17 @@ namespace Styx.Logic.Combat
 		/// </summary>
 		internal static void Shutdown()
 		{
-			_knownSpells.Clear();
-			_lastKnownSpellCount = 0;
+			lock (_spellBookRebuildLock)
+			{
+				CancelTrailingRebuild();
+				_trailingRebuildTimer?.Dispose();
+				_trailingRebuildTimer = null;
+				_knownSpells.Clear();
+				_lastKnownSpellCount = 0;
+			}
 			BotEvents.OnBotStart -= OnBotStarted_RefreshSpells;
+			Lua.Events.DetachEvent("LEARNED_SPELL_IN_TAB", SpellBookChangedHandler);
+			Lua.Events.DetachEvent("ACTIVE_TALENT_GROUP_CHANGED", SpellBookChangedHandler);
 			Logging.WriteDebug("[SpellManager] Shutdown \u2014 unsubscribed from BotEvents.OnBotStart");
 		}
 
@@ -974,14 +1087,18 @@ namespace Styx.Logic.Combat
 		/// </summary>
 		private static void OnBotStarted_RefreshSpells(EventArgs args)
 		{
+			lock (_spellBookRebuildLock)
+			{
+				CancelTrailingRebuild();
+			}
 			_lastKnownSpellCount = 0;
 			Refresh();
 
 			// Idempotent: detach first to avoid duplicate subscriptions (HB 4.3.4 pattern)
-			Lua.Events.DetachEvent("LEARNED_SPELL_IN_TAB", new LuaEventHandlerDelegate(OnSpellBookChanged));
-			Lua.Events.DetachEvent("ACTIVE_TALENT_GROUP_CHANGED", new LuaEventHandlerDelegate(OnSpellBookChanged));
-			Lua.Events.AttachEvent("LEARNED_SPELL_IN_TAB", new LuaEventHandlerDelegate(OnSpellBookChanged));
-			Lua.Events.AttachEvent("ACTIVE_TALENT_GROUP_CHANGED", new LuaEventHandlerDelegate(OnSpellBookChanged));
+			Lua.Events.DetachEvent("LEARNED_SPELL_IN_TAB", SpellBookChangedHandler);
+			Lua.Events.DetachEvent("ACTIVE_TALENT_GROUP_CHANGED", SpellBookChangedHandler);
+			Lua.Events.AttachEvent("LEARNED_SPELL_IN_TAB", SpellBookChangedHandler);
+			Lua.Events.AttachEvent("ACTIVE_TALENT_GROUP_CHANGED", SpellBookChangedHandler);
 
 			Logging.WriteDebug("[SpellManager] Subscribed to LEARNED_SPELL_IN_TAB, ACTIVE_TALENT_GROUP_CHANGED");
 		}
@@ -990,11 +1107,101 @@ namespace Styx.Logic.Combat
 		/// HB 4.3.4 smethod_3: Lua event handler. Forces a full spellbook rebuild
 		/// when the player learns a new spell or switches talent spec.
 		/// </summary>
-		private static void OnSpellBookChanged(object sender, LuaEventArgs e)
+		internal static void OnSpellBookChanged(object sender, LuaEventArgs e)
 		{
-			Logging.Write("[SpellManager] Spellbook change detected ({0}) \u2014 rebuilding", e.EventName);
+			lock (_spellBookRebuildLock)
+			{
+				long now = Environment.TickCount64;
+				long elapsed = now - _lastSpellBookRebuildTickMs;
+				if (elapsed < 250L)
+				{
+					_lastSuppressedEventName = e.EventName;
+					_trailingRebuildScheduled = true;
+					long delay = Math.Max(1L, 250L - elapsed);
+					if (_trailingRebuildTimer == null)
+					{
+						_trailingRebuildTimer = new System.Threading.Timer(OnTrailingRebuildTimer, null, delay, Timeout.Infinite);
+					}
+					else
+					{
+						_trailingRebuildTimer.Change(delay, Timeout.Infinite);
+					}
+					return;
+				}
+
+				if (_trailingRebuildScheduled)
+					ExecutePendingRebuild(now, e.EventName);
+				else
+					ExecuteRebuild(now, e.EventName);
+			}
+		}
+
+		private static void OnTrailingRebuildTimer(object? state)
+		{
+			lock (_spellBookRebuildLock)
+			{
+				if (!_trailingRebuildScheduled)
+					return;
+
+				long now = Environment.TickCount64;
+				long delay = 250L - (now - _lastSpellBookRebuildTickMs);
+				if (delay > 0)
+				{
+					_trailingRebuildTimer?.Change(delay, Timeout.Infinite);
+					return;
+				}
+
+				ExecutePendingRebuild(now, _lastSuppressedEventName);
+			}
+		}
+
+		internal static void CheckPendingTrailingRebuild()
+		{
+			if (_trailingRebuildScheduled && Environment.TickCount64 - _lastSpellBookRebuildTickMs >= 250L)
+				OnTrailingRebuildTimer(null);
+		}
+
+		private static void ExecutePendingRebuild(long now, string eventName)
+		{
+			try
+			{
+				if (ExecuteRebuild(now, string.IsNullOrEmpty(eventName) ? "trailing" : eventName))
+				{
+					CancelTrailingRebuild();
+					return;
+				}
+			}
+			catch (Exception ex)
+			{
+				Logging.WriteException(ex);
+			}
+
+			_lastSpellBookRebuildTickMs = Environment.TickCount64;
+			_trailingRebuildTimer?.Change(250L, Timeout.Infinite);
+		}
+
+		private static bool ExecuteRebuild(long now, string eventName)
+		{
+			_lastSpellBookRebuildTickMs = now;
+			Logging.Write("[SpellManager] Spellbook change detected ({0}) \u2014 rebuilding", eventName);
 			_lastKnownSpellCount = 0;
-			Refresh();
+			return Refresh();
+		}
+
+		private static void CancelTrailingRebuild()
+		{
+			_trailingRebuildScheduled = false;
+			_lastSuppressedEventName = string.Empty;
+			if (_trailingRebuildTimer != null)
+			{
+				try
+				{
+					_trailingRebuildTimer.Change(Timeout.Infinite, Timeout.Infinite);
+				}
+				catch
+				{
+				}
+			}
 		}
 
 		#endregion

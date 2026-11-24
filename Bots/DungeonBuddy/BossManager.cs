@@ -125,6 +125,27 @@ namespace Bots.DungeonBuddy
         /// Marque un boss comme tué et fire l'événement OnBossKill.
         /// Also syncs Profile.Boss.MarkAsDead() so PathBreadCrumbs advances to the next boss.
         /// </summary>
+        public static IReadOnlyCollection<uint> KilledBossIds => _killedBossIds;
+
+        public static void RestoreKilledBosses(IEnumerable<uint> killedBossIds)
+        {
+            if (killedBossIds == null)
+                return;
+
+            foreach (uint entryId in killedBossIds)
+            {
+                _killedBossIds.Add(entryId);
+                var boss = _bosses.FirstOrDefault(b => b.EntryId == entryId);
+                if (boss != null)
+                {
+                    boss.IsDead = true;
+                }
+                ProfileManager.CurrentProfile?.BossEncounters
+                    .FirstOrDefault(b => b.Entry == entryId)
+                    ?.MarkAsDead();
+            }
+        }
+
         public static void MarkBossDead(uint entryId)
         {
             _killedBossIds.Add(entryId);

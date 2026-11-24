@@ -6,6 +6,7 @@ using Styx.Combat.CombatRoutine;
 using Styx.Helpers;
 using Styx.Logic.Combat;
 using Styx.Logic.Inventory;
+using Styx.Logic.Inventory.Frames.LootFrame;
 using Styx.Logic.Inventory.Frames.Trade;
 using Styx.Logic.Pathing;
 using Styx.PartyGrind;
@@ -70,6 +71,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private readonly Dictionary<string, long> _cooldownUntilUtcMs = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
         private string _activeTradeTarget = string.Empty;
         private long _tradeStartedUtcMs;
+        private long _lastTradeOfferRetryUtcMs;
         private bool _tradeItemsPlaced;
         private bool _tradeCompletionPending;
         private readonly List<(int Slot, uint Entry, int Count)> _offeredItems = new();
@@ -386,6 +388,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         {
             _activeTradeTarget = string.Empty;
             _tradeStartedUtcMs = 0;
+            _lastTradeOfferRetryUtcMs = 0;
             _tradeItemsPlaced = false;
             _tradeCompletionPending = false;
             _offeredItems.Clear();
@@ -438,6 +441,44 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     OnTradeCancelledOrTimeout(_activeTradeTarget, settings.ProvisionCooldownSeconds);
                     return false;
                 }
+
+                if (now - _lastTradeOfferRetryUtcMs >= 1500L)
+                {
+                    var retrySummary = leader?.Members?.FirstOrDefault(m =>
+                        string.Equals(m.CharacterName, _activeTradeTarget, StringComparison.OrdinalIgnoreCase));
+                    WoWPlayer? retryPlayer = retrySummary != null && retrySummary.Guid != 0
+                        ? ObjectManager.GetObjectByGuid<WoWPlayer>(retrySummary.Guid)
+                        : ObjectManager.GetObjectsOfType<WoWPlayer>(false, false)
+                            .FirstOrDefault(p => string.Equals(p.Name, _activeTradeTarget, StringComparison.OrdinalIgnoreCase));
+
+                    if (retryPlayer != null && retryPlayer.IsValid && !retryPlayer.Dead)
+                    {
+                        if (!retryPlayer.WithinInteractRange)
+                        {
+                            Navigator.MoveTo(retryPlayer.Location, "Moving to trade " + retryPlayer.Name);
+                            return true;
+                        }
+
+                        if (retrySummary?.IsResting != true && retrySummary?.IsMounted != true)
+                        {
+                            if (me.IsMoving)
+                                WoWMovement.MoveStop();
+                            else
+                            {
+                                if (me.CurrentTargetGuid != retryPlayer.Guid)
+                                    retryPlayer.Target();
+                                _lastTradeOfferRetryUtcMs = now;
+                                if (me.CurrentTargetGuid == retryPlayer.Guid)
+                                {
+                                    _tradeItemsPlaced = false;
+                                    _offeredItems.Clear();
+                                    TradeFrame.Instance.InitiateTrade("target");
+                                }
+                            }
+                        }
+                    }
+                }
+
                 SquadPartySyncService.LogAction("Provision: trade offer pending " + _activeTradeTarget);
                 return true;
             }
@@ -475,6 +516,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     {
                         if (me.IsMoving)
                             WoWMovement.MoveStop();
+                        if (LootFrame.Instance.IsVisible)
+                            Lua.DoString("CloseLoot()");
+                        Lua.DoString("if MerchantFrame and MerchantFrame:IsVisible() then CloseMerchant() end if GossipFrame and GossipFrame:IsVisible() then CloseGossip() end");
                         SquadPartySyncService.LogAction("Provision: waiting for offer");
                         return true;
                     }
@@ -746,7 +790,20 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 return true;
             }
 
-            if (me.IsMoving) WoWMovement.MoveStop();
+            if (me.IsMoving)
+            {
+                WoWMovement.MoveStop();
+                SquadPartySyncService.LogAction("Provision: stopping to trade " + targetSummary.CharacterName);
+                return true;
+            }
+            if (targetSummary.IsResting || targetSummary.IsMounted)
+            {
+                if (me.IsMoving)
+                    WoWMovement.MoveStop();
+                SquadPartySyncService.LogAction("Provision: waiting for " + targetSummary.CharacterName + " to be ready");
+                return true;
+            }
+
             if (me.CurrentTargetGuid != targetPlayer.Guid)
             {
                 targetPlayer.Target();
@@ -759,6 +816,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
             _activeTradeTarget = targetSummary.CharacterName;
             _tradeStartedUtcMs = now;
+            _lastTradeOfferRetryUtcMs = now;
             _tradeItemsPlaced = false;
             _offeredItems.Clear();
             SquadPartySyncService.LogAction("Provision: offering trade to " + targetSummary.CharacterName);

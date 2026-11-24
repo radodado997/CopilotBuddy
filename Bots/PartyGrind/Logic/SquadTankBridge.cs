@@ -57,6 +57,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (leader.Phase != SquadPhase.Grinding && leader.Phase != SquadPhase.DungeonClearing)
                 return false;
 
+            if (!string.IsNullOrEmpty(leader.ActiveProvisionerName))
+                return false;
+
             // Use the coordinator's authoritative loot window instead of a possibly
             // stale follower IsLooting flag; an expired window must not veto pulls.
             if (leader.IsLootWindowActive)
@@ -70,7 +73,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             {
                 if (!m.IsConnected)
                     continue;
-                if (!m.HasTelemetry || m.IsDead || m.IsGhost || m.NeedsRest ||
+                if (!m.HasTelemetry || m.IsDead || m.IsGhost || m.IsInCombat || m.NeedsRest ||
                     (m.NeedsTown && !m.TownTasksComplete && leader.BotMode != SquadBotMode.Dungeon))
                     return false;
                 if (m.MapId != leader.MapId)
@@ -318,6 +321,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
             var leader = SquadContext.GetLeaderStateSnapshot();
             var memberGuids = SquadContext.GetKnownMemberGuids();
+            bool isDungeon = SquadContext.IsDungeonModeActive && SquadDungeonService.IsInDungeonMap(StyxWoW.Me);
 
             if (settings.Role == SquadRole.TankLeader)
             {
@@ -334,6 +338,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     bool inCombatWithSquad = unit.Combat && (unit.IsTargetingMeOrPet || unit.IsTargetingMyPartyMember || unit.TaggedByMe);
 
                     tp.Score += ComputeTankTargetBonus(targetingOtherParty, targetingHealer, inCombatWithSquad);
+                    if (isDungeon && !StyxWoW.Me.Combat)
+                        tp.Score -= unit.Distance * 2.0;
                 }
             }
             else if (leader != null)
@@ -530,6 +536,78 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                         break;
                 }
             }
+            return false;
+        }
+
+        private static long _lastDungeonPullCastUtcMs;
+        private static ulong _lastDungeonPullTargetGuid;
+        private static readonly SquadApproach PullApproach = new();
+
+        public static bool TryExecuteSafeDungeonPull(ulong targetGuid)
+        {
+            var me = StyxWoW.Me;
+            if (me == null || !me.IsAlive || me.Combat || targetGuid == 0)
+                return false;
+
+            WoWUnit? target = ObjectManager.GetObjectByGuid<WoWUnit>(targetGuid);
+            if (target == null || !target.IsValid || target.Dead || target.IsFriendly || !target.Attackable)
+                return false;
+
+            if (target.Combat || target.IsTargetingMyPartyMember || target.IsTargetingMeOrPet)
+                return false;
+
+            long now = Environment.TickCount64;
+            if (_lastDungeonPullTargetGuid == targetGuid && now - _lastDungeonPullCastUtcMs < 3500L)
+            {
+                if (me.IsMoving)
+                    WoWMovement.MoveStop();
+                if (!me.IsFacing(target))
+                    target.Face();
+                return true;
+            }
+
+            string[] pullSpells = me.Class switch
+            {
+                WoWClass.Paladin => new[] { "Avenger's Shield", "Hand of Reckoning", "Exorcism" },
+                WoWClass.Warrior => new[] { "Heroic Throw", "Taunt", "Shoot", "Throw" },
+                WoWClass.Druid => new[] { "Faerie Fire (Feral)", "Growl", "Moonfire" },
+                WoWClass.DeathKnight => new[] { "Dark Command", "Icy Touch", "Death Coil" },
+                _ => Array.Empty<string>()
+            };
+
+            string? chosenSpell = pullSpells.FirstOrDefault(s =>
+                SpellManager.HasSpell(s) && SpellManager.CanCast(s, target, checkRange: false, checkMovement: false));
+            if (string.IsNullOrEmpty(chosenSpell))
+                return false;
+
+            float maxRange = 28f;
+            if (SpellManager.Spells.TryGetValue(chosenSpell, out WoWSpell? info) && info.MaxRange > 5f)
+                maxRange = Math.Max(8f, info.MaxRange - 1.5f);
+
+            if (target.Distance > maxRange || !target.InLineOfSpellSight)
+            {
+                if (!global::Bots.DungeonBuddy.Helpers.ScriptHelpers.MovementEnabled)
+                    return false;
+                return PullApproach.TryMove(target, "Approaching dungeon pull " + target.Name);
+            }
+
+            if (me.IsMoving)
+                WoWMovement.MoveStop();
+
+            if (me.CurrentTargetGuid != target.Guid)
+                target.Target();
+
+            if (!me.IsFacing(target))
+                target.Face();
+
+            if (SpellManager.CanCast(chosenSpell, target, true, false) && SpellManager.Cast(chosenSpell, target))
+            {
+                _lastDungeonPullTargetGuid = targetGuid;
+                _lastDungeonPullCastUtcMs = now;
+                SquadPartySyncService.LogAction("Pulling " + target.Name + " with " + chosenSpell);
+                return true;
+            }
+
             return false;
         }
     }

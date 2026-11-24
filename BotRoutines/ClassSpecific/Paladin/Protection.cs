@@ -86,6 +86,8 @@ namespace Singular.ClassSpecific.Paladin
                     ret => TankManager.Instance.NeedToTaunt.FirstOrDefault(),
                     ret => SingularSettings.Instance.EnableTaunting && StyxWoW.Me.IsInInstance),
 
+                Common.CreatePaladinCombatSelfHeal(),
+
                 //Multi target
                 new Decorator(
                     ret => Unit.UnfriendlyUnitsNearTarget(8f).Any(),
@@ -139,6 +141,7 @@ namespace Singular.ClassSpecific.Paladin
                     Movement.CreateFaceTargetBehavior(),
                     Helpers.Common.CreateAutoAttack(true),
                     Spell.Cast("Avenger's Shield"),
+                    Spell.Cast("Hand of Reckoning", ret => !SpellManager.HasSpell("Avenger's Shield")),
                     Spell.Cast("Judgement of Wisdom"),
                     Spell.Cast("Judgement of Light"),
                     // Use dynamic melee range so we always close into actual weapon swing distance.

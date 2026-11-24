@@ -22,6 +22,7 @@ namespace CopilotBuddy.PartyGrind.Tests
         public void Dispose()
         {
             SquadContext.Reset();
+            global::Bots.DungeonBuddy.BossManager.Reset();
             global::Bots.DungeonBuddy.Helpers.ScriptHelpers.RestoreMovement();
         }
 
@@ -380,6 +381,19 @@ namespace CopilotBuddy.PartyGrind.Tests
             member.HasDungeonTelemetry = true;
             member.IsInsideDungeon = true;
             Assert.False(SquadDungeonService.HasFreshExitEvidence(2UL, new[] { WrapClient(member, 11_500L) }, 10_000L, 12_000L));
+
+            member.IsInsideDungeon = false;
+            var pingRefreshedPreCompletionSample = new SquadConnectedMemberSnapshot
+            {
+                CharacterName = member.CharacterName,
+                SlotIndex = 0,
+                Handshake = new SquadHandshake { CharacterName = member.CharacterName, Guid = member.Guid, Class = member.Class, Role = member.Role, Level = member.Level },
+                LatestState = member,
+                LastReceivedUtcMs = 11_500L,
+                LastStateReceivedUtcMs = 9_500L,
+                IsConnected = true
+            };
+            Assert.False(SquadDungeonService.HasFreshExitEvidence(2UL, new[] { pingRefreshedPreCompletionSample }, 10_000L, 12_000L));
         }
 
         [Fact]
@@ -638,6 +652,107 @@ namespace CopilotBuddy.PartyGrind.Tests
             dungeonService.RecordInstanceReset(fifthEntryTime + 30_000L);
             Assert.Equal(5, dungeonService.GetHourlyResetCount(fifthEntryTime + 31_000L));
             Assert.True(dungeonService.GetWalkInEntryLockoutRemainingSeconds(fifthEntryTime + 31_000L, maxInstancesPerHour: 5) > 0);
+        }
+
+        [Fact]
+        public void AdvanceBossBreadcrumb_FollowsCorridorBreadcrumbsBeforeLockingOntoDistantLiveBoss()
+        {
+            var crumbs = new List<WoWPoint>
+            {
+                new(10f, 0f, 0f),
+                new(30f, 0f, 0f),
+                new(60f, 0f, 0f)
+            };
+            var bossLoc = new WoWPoint(85f, 0f, 0f);
+            int idx = 0;
+
+            WoWPoint step1 = SquadDungeonService.AdvanceBossBreadcrumb(
+                new WoWPoint(0f, 0f, 0f), crumbs, bossLoc, bossLoc, 85f, ref idx);
+            Assert.Equal(crumbs[0], step1);
+            Assert.Equal(0, idx);
+
+            WoWPoint step2 = SquadDungeonService.AdvanceBossBreadcrumb(
+                new WoWPoint(9f, 0f, 0f), crumbs, bossLoc, bossLoc, 76f, ref idx);
+            Assert.Equal(crumbs[1], step2);
+            Assert.Equal(1, idx);
+
+            WoWPoint step3 = SquadDungeonService.AdvanceBossBreadcrumb(
+                new WoWPoint(29f, 0f, 0f), crumbs, bossLoc, bossLoc, 56f, ref idx);
+            Assert.Equal(crumbs[2], step3);
+            Assert.Equal(2, idx);
+
+            WoWPoint step4 = SquadDungeonService.AdvanceBossBreadcrumb(
+                new WoWPoint(59f, 0f, 0f), crumbs, bossLoc, bossLoc, 26f, ref idx);
+            Assert.Equal(bossLoc, step4);
+            Assert.Equal(3, idx);
+
+            int closeIdx = 0;
+            WoWPoint closeStep = SquadDungeonService.AdvanceBossBreadcrumb(
+                new WoWPoint(65f, 0f, 0f), crumbs, bossLoc, bossLoc, 20f, ref closeIdx);
+            Assert.Equal(bossLoc, closeStep);
+
+            int exhaustedIdx = crumbs.Count;
+            var fallbackProfileLoc = new WoWPoint(70f, 0f, 0f);
+            WoWPoint unreachableStep = SquadDungeonService.AdvanceBossBreadcrumb(
+                new WoWPoint(60f, 0f, 0f), crumbs, fallbackProfileLoc, bossLoc, liveBossPathDistance: null, ref exhaustedIdx);
+            Assert.Equal(fallbackProfileLoc, unreachableStep);
+        }
+
+        [Fact]
+        public void LfgPartyOutsideEntry_SkipsTeleportInAfterCompletedRunSoSquadCanRequeue()
+        {
+            // Normal fresh LFG entry outside dungeon: teleport in
+            Assert.True(SquadDungeonService.ShouldTeleportIntoLfgPartyOutsideDungeon(
+                lfgMode: "lfgparty",
+                isInDungeonMap: false,
+                lfgRunCompletedAwaitingRequeue: false,
+                completedReason: global::Bots.DungeonBuddy.Enums.CompleteReason.None,
+                leaderDungeonComplete: false));
+
+            // Completed run after teleporting out while party stays in 'lfgparty': must NOT re-enter completed instance
+            Assert.False(SquadDungeonService.ShouldTeleportIntoLfgPartyOutsideDungeon(
+                lfgMode: "lfgparty",
+                isInDungeonMap: false,
+                lfgRunCompletedAwaitingRequeue: true,
+                completedReason: global::Bots.DungeonBuddy.Enums.CompleteReason.None,
+                leaderDungeonComplete: false));
+
+            Assert.False(SquadDungeonService.ShouldTeleportIntoLfgPartyOutsideDungeon(
+                lfgMode: "lfgparty",
+                isInDungeonMap: false,
+                lfgRunCompletedAwaitingRequeue: false,
+                completedReason: global::Bots.DungeonBuddy.Enums.CompleteReason.Completed,
+                leaderDungeonComplete: false));
+
+            Assert.False(SquadDungeonService.ShouldTeleportIntoLfgPartyOutsideDungeon(
+                lfgMode: "lfgparty",
+                isInDungeonMap: false,
+                lfgRunCompletedAwaitingRequeue: false,
+                completedReason: global::Bots.DungeonBuddy.Enums.CompleteReason.None,
+                leaderDungeonComplete: true));
+        }
+
+        [Fact]
+        public void BossManager_RestoreKilledBosses_RestoresKillsAndMarksDead()
+        {
+            global::Bots.DungeonBuddy.BossManager.Reset();
+            global::Bots.DungeonBuddy.BossManager.RegisterBoss(1234, "TestBoss1");
+            global::Bots.DungeonBuddy.BossManager.RegisterBoss(5678, "TestBoss2");
+
+            Assert.Equal(2, global::Bots.DungeonBuddy.BossManager.Bosses.Count);
+            Assert.True(global::Bots.DungeonBuddy.BossManager.Bosses.All(b => !b.IsDead));
+            Assert.Empty(global::Bots.DungeonBuddy.BossManager.KilledBossIds);
+
+            global::Bots.DungeonBuddy.BossManager.RestoreKilledBosses(new uint[] { 1234 });
+
+            Assert.Contains(1234U, global::Bots.DungeonBuddy.BossManager.KilledBossIds);
+            Assert.DoesNotContain(5678U, global::Bots.DungeonBuddy.BossManager.KilledBossIds);
+
+            var boss1 = global::Bots.DungeonBuddy.BossManager.Bosses.First(b => b.EntryId == 1234);
+            var boss2 = global::Bots.DungeonBuddy.BossManager.Bosses.First(b => b.EntryId == 5678);
+            Assert.True(boss1.IsDead);
+            Assert.False(boss2.IsDead);
+            Assert.Equal(5678U, global::Bots.DungeonBuddy.BossManager.CurrentBoss?.EntryId);
         }
     }
 }

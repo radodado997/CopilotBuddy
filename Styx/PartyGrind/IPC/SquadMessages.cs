@@ -82,6 +82,7 @@ namespace Styx.PartyGrind.IPC
         public const string Handshake = "Handshake";
         public const string MemberState = "MemberState";
         public const string LeaderState = "LeaderState";
+        public const string Ping = "Ping";
     }
 
     public class SquadEnvelope
@@ -148,6 +149,7 @@ namespace Styx.PartyGrind.IPC
         public float XpPerHour { get; set; }
         public float HealthPercent { get; set; }
         public float PowerPercent { get; set; }
+        public float ManaPercent { get; set; }
         public WoWPowerType PowerType { get; set; }
         public uint MapId { get; set; }
         public float X { get; set; }
@@ -260,6 +262,7 @@ namespace Styx.PartyGrind.IPC
         public string CurrentBossName { get; set; } = string.Empty;
         public int KilledBossCount { get; set; }
         public int TotalBossCount { get; set; }
+        public bool IsDungeonComplete { get; set; }
         public bool AcceptLfgProposalOrder { get; set; }
         public bool TeleportOutOrder { get; set; }
         public bool DungeonResetPendingOutside { get; set; }
@@ -306,6 +309,7 @@ namespace Styx.PartyGrind.IPC
         public float Z { get; set; }
         public float HealthPercent { get; set; }
         public float PowerPercent { get; set; }
+        public float ManaPercent { get; set; }
         public WoWPowerType PowerType { get; set; }
         public bool IsDead { get; set; }
         public bool IsGhost { get; set; }

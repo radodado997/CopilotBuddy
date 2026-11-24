@@ -8,6 +8,7 @@ using Singular.Settings;
 using Styx;
 using Styx.Combat.CombatRoutine;
 using Styx.Logic.Combat;
+using Styx.WoWInternals;
 using Styx.WoWInternals.WoWObjects;
 using TreeSharp;
 
@@ -58,11 +59,13 @@ namespace Singular.ClassSpecific.Paladin
                 new PrioritySelector(
                 // This won't run, but it's here for changes in the future. We NEVER run this method if we're mounted.
                     Spell.BuffSelf("Crusader Aura", ret => StyxWoW.Me.Mounted),
-                    CreatePaladinBlessBehavior(),
-                    new Decorator(
-                        ret => TalentManager.CurrentSpec == TalentSpec.HolyPaladin,
-                        new PrioritySelector(
-                            Spell.BuffSelf("Concentration Aura", ret => SingularSettings.Instance.Paladin.Aura == PaladinAura.Auto),
+                new Decorator(
+                    ret => !Styx.PartyGrind.SquadContext.IsActive || !(Styx.PartyGrind.SquadContext.ActiveSettings?.EnableCrossPartyBuffs ?? true),
+                    CreatePaladinBlessBehavior()),
+                new Decorator(
+                    ret => TalentManager.CurrentSpec == TalentSpec.HolyPaladin,
+                    new PrioritySelector(
+                        Spell.BuffSelf("Concentration Aura", ret => SingularSettings.Instance.Paladin.Aura == PaladinAura.Auto && (!Styx.PartyGrind.SquadContext.IsActive || !(Styx.PartyGrind.SquadContext.ActiveSettings?.EnableCrossPartyBuffs ?? true))),
                             // WotLK uses Seal of Wisdom for mana regen (renamed to Seal of Insight in Cata 4.0.1)
                             Spell.BuffSelf("Seal of Wisdom"),
                             Spell.BuffSelf("Seal of Righteousness", ret => !SpellManager.HasSpell("Seal of Wisdom"))
@@ -71,23 +74,27 @@ namespace Singular.ClassSpecific.Paladin
                         ret => TalentManager.CurrentSpec != TalentSpec.HolyPaladin,
                         new PrioritySelector(
                             Spell.BuffSelf("Righteous Fury", ret => TalentManager.CurrentSpec == TalentSpec.ProtectionPaladin && StyxWoW.Me.IsInParty),
-                            Spell.BuffSelf(
-                                "Devotion Aura",
-                                ret =>
-                                SingularSettings.Instance.Paladin.Aura == PaladinAura.Auto &&
-                                (StyxWoW.Me.IsInParty && TalentManager.CurrentSpec == TalentSpec.ProtectionPaladin ||
-                                 TalentManager.CurrentSpec == TalentSpec.Lowbie && !SpellManager.HasSpell("Retribution Aura"))),
-                            Spell.BuffSelf(
-                                "Retribution Aura",
-                                ret =>
-                                SingularSettings.Instance.Paladin.Aura == PaladinAura.Auto &&
-                                ((!StyxWoW.Me.IsInParty && TalentManager.CurrentSpec == TalentSpec.ProtectionPaladin) ||
-                                 TalentManager.CurrentSpec == TalentSpec.Lowbie)),
-                            Spell.BuffSelf(
-                                "Retribution Aura",
-                                ret =>
-                                SingularSettings.Instance.Paladin.Aura == PaladinAura.Auto &&
-                                TalentManager.CurrentSpec == TalentSpec.RetributionPaladin),
+                            new Decorator(
+                                ret => !Styx.PartyGrind.SquadContext.IsActive || !(Styx.PartyGrind.SquadContext.ActiveSettings?.EnableCrossPartyBuffs ?? true) ||
+                                       CopilotBuddy.Bots.PartyGrind.Logic.SquadPartyBuffService.IsNonHolyPaladinAuraOwner(StyxWoW.Me, Styx.PartyGrind.SquadContext.GetLeaderStateSnapshot()),
+                                new PrioritySelector(
+                                    Spell.BuffSelf(
+                                        "Devotion Aura",
+                                        ret =>
+                                        SingularSettings.Instance.Paladin.Aura == PaladinAura.Auto &&
+                                        (StyxWoW.Me.IsInParty && TalentManager.CurrentSpec == TalentSpec.ProtectionPaladin ||
+                                         TalentManager.CurrentSpec == TalentSpec.Lowbie && !SpellManager.HasSpell("Retribution Aura"))),
+                                    Spell.BuffSelf(
+                                        "Retribution Aura",
+                                        ret =>
+                                        SingularSettings.Instance.Paladin.Aura == PaladinAura.Auto &&
+                                        ((!StyxWoW.Me.IsInParty && TalentManager.CurrentSpec == TalentSpec.ProtectionPaladin) ||
+                                         TalentManager.CurrentSpec == TalentSpec.Lowbie)),
+                                    Spell.BuffSelf(
+                                        "Retribution Aura",
+                                        ret =>
+                                        SingularSettings.Instance.Paladin.Aura == PaladinAura.Auto &&
+                                        TalentManager.CurrentSpec == TalentSpec.RetributionPaladin))),
                             // Select seal added by xyFaded
                             new Decorator(
                                 ret => SingularSettings.Instance.Paladin.Seal != PaladinSeal.Auto,
@@ -216,6 +223,75 @@ namespace Singular.ClassSpecific.Paladin
                         ret => FindBlessTarget(NeedsMight),
                         ret => CanBlessMight()))
                     );
+        }
+
+        internal static bool HasHealingProblems()
+        {
+            var me = StyxWoW.Me;
+            if (me == null)
+                return false;
+
+            if (Styx.PartyGrind.SquadContext.IsActive)
+            {
+                var leader = Styx.PartyGrind.SquadContext.GetLeaderStateSnapshot();
+                if (leader?.Members != null)
+                {
+                    var healer = leader.Members.FirstOrDefault(m => m.Role == Styx.PartyGrind.IPC.SquadRole.Healer);
+                    if (healer == null)
+                        return true;
+
+                    if (healer.IsDead || healer.IsGhost || !healer.IsConnected)
+                        return true;
+
+                    if (healer.PowerType == WoWPowerType.Mana && (healer.PowerPercent < 20f || healer.NeedsRest))
+                        return true;
+
+                    if (healer.DistanceToLeader > 35f)
+                        return true;
+
+                    var healerPlayer = ObjectManager.GetObjectByGuid<WoWPlayer>(healer.Guid);
+                    if (healerPlayer == null || !healerPlayer.InLineOfSpellSight || healerPlayer.Distance > 35f)
+                        return true;
+
+                    return false;
+                }
+                return true;
+            }
+
+            if (!me.IsInParty)
+                return true;
+
+            var healerMember = me.PartyMemberInfos.FirstOrDefault(p => p.HasRole(WoWPartyMember.GroupRole.Healer));
+            if (healerMember == null || !healerMember.IsOnline)
+                return true;
+
+            var partyHealer = healerMember.ToPlayer();
+            if (partyHealer == null || !partyHealer.IsAlive || partyHealer.ManaPercent < 20f || partyHealer.Distance > 35f || !partyHealer.InLineOfSpellSight)
+                return true;
+
+            return false;
+        }
+
+        internal static Composite CreatePaladinCombatSelfHeal()
+        {
+            return new PrioritySelector(
+                Spell.Cast("Lay on Hands", ret => StyxWoW.Me,
+                    ret => StyxWoW.Me.HealthPercent <= SingularSettings.Instance.Paladin.LayOnHandsHealth &&
+                           !StyxWoW.Me.HasAura("Forbearance")),
+                Spell.Cast("Flash of Light", ret => StyxWoW.Me,
+                    ret => StyxWoW.Me.HasAura("The Art of War") &&
+                           StyxWoW.Me.HealthPercent <= 80f),
+                new Decorator(
+                    ret => HasHealingProblems(),
+                    new PrioritySelector(
+                        Spell.Heal("Holy Light", ret => StyxWoW.Me,
+                            ret => !SpellManager.HasSpell("Flash of Light") &&
+                                   StyxWoW.Me.HealthPercent <= SingularSettings.Instance.Paladin.HolyLightHealth),
+                        Spell.Heal("Flash of Light", ret => StyxWoW.Me,
+                            ret => StyxWoW.Me.HealthPercent <= SingularSettings.Instance.Paladin.FlashOfLightHealth)
+                    )
+                )
+            );
         }
     }
 }

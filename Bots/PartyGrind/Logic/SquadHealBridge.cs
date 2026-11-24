@@ -24,6 +24,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         public string Name { get; init; } = string.Empty;
         public double HealthPercent { get; init; }
         public double Distance { get; init; }
+        public bool InCombat { get; init; }
         public bool IsTankLeader { get; init; }
         public bool IsSelf { get; init; }
     }
@@ -59,6 +60,13 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             _healDiagRetry[key] = now + 15000;
             Logging.WriteDebug($"[PartyGrind Heal {StyxWoW.Me?.Name}] {message}");
         }
+        private static readonly HashSet<string> RangedAssistSpellSet = new(StringComparer.OrdinalIgnoreCase)
+        {
+            "Smite", "Holy Fire", "Shadow Word: Pain",
+            "Lightning Bolt", "Flame Shock", "Earth Shock",
+            "Wrath", "Moonfire", "Starfire",
+            "Exorcism", "Judgement of Light", "Judgement of Wisdom"
+        };
         private static readonly string[] RangedAssistSpells =
         {
             "Smite", "Holy Fire", "Shadow Word: Pain",
@@ -108,10 +116,120 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         }
 
         /// <summary>
-        /// Runs one healing tick. Returns true if healing/positioning/resurrection work was handled this tick.
+        /// Computes the maximum health percentage at which a healer or off-healer should act,
+        /// conserving mana out of combat and avoiding interrupting active drinking/eating
+        /// unless a squadmate is in combat or critically injured.
         /// </summary>
-        public static bool HasHealCandidate(SquadLeaderState? leader) =>
-            CollectLiveHealCandidates(leader).Any(c => c.HealthPercent < 92.0);
+        public static double ComputeEffectiveHealThreshold(
+            bool emergencyOnly,
+            bool anyCombat,
+            bool healerActivelyDrinkingOrEating,
+            bool healerInRestPhase,
+            bool mainHealerUnavailableOrOom = false)
+        {
+            if (emergencyOnly)
+            {
+                if (healerActivelyDrinkingOrEating && !anyCombat)
+                    return 45.0;
+                if (mainHealerUnavailableOrOom)
+                    return anyCombat ? 80.0 : 68.0;
+                return anyCombat ? 55.0 : 48.0;
+            }
+
+            if (anyCombat)
+                return 90.0;
+
+            if (healerActivelyDrinkingOrEating)
+                return 45.0;
+
+            if (healerInRestPhase)
+                return 60.0;
+
+            return 78.0;
+        }
+
+        private static bool IsSquadCombatActive(LocalPlayer me, SquadLeaderState? leader, IReadOnlyCollection<SquadHealCandidate> candidates)
+        {
+            if (me.Combat)
+                return true;
+            if (leader != null && (leader.InCombat || leader.Members?.Any(m => m.IsConnected && !m.IsDead && m.IsInCombat) == true))
+                return true;
+            return candidates.Any(c => c.InCombat);
+        }
+
+        private static bool IsActivelyConsumingRestAura(LocalPlayer me)
+        {
+            bool drinking = (me.HasAura("Drink") || me.HasAura("Refreshment")) &&
+                            (me.PowerType != WoWPowerType.Mana || me.PowerPercent < 95.0);
+            bool eating = (me.HasAura("Food") || me.HasAura("Refreshment")) &&
+                          me.HealthPercent < 95.0;
+            return drinking || eating;
+        }
+
+        /// <summary>
+        /// Checks whether any nearby squadmate meets the current combat/OOC/rest heal threshold.
+        /// </summary>
+        public static bool HasHealCandidate(SquadLeaderState? leader, bool emergencyOnly = false)
+        {
+            var me = StyxWoW.Me;
+            if (me == null || !me.IsAlive)
+                return false;
+
+            var candidates = CollectLiveHealCandidates(leader);
+            if (candidates.Count == 0)
+                return false;
+
+            bool anyCombat = IsSquadCombatActive(me, leader, candidates);
+            bool activelyDrinking = !anyCombat && IsActivelyConsumingRestAura(me);
+            bool inRestPhase = !anyCombat &&
+                ((leader != null && leader.Phase == SquadPhase.Resting) ||
+                 SquadContext.GetLocalMemberStateSnapshot()?.NeedsRest == true);
+            bool mainHealerDown = false;
+            if (emergencyOnly && leader?.Members != null)
+            {
+                var mainHealer = leader.Members.FirstOrDefault(m => m.Role == SquadRole.Healer);
+                mainHealerDown = mainHealer != null &&
+                    (mainHealer.IsDead || mainHealer.IsGhost || !mainHealer.IsConnected || mainHealer.PowerPercent < 20f);
+            }
+            double threshold = ComputeEffectiveHealThreshold(
+                emergencyOnly: emergencyOnly,
+                anyCombat: anyCombat,
+                healerActivelyDrinkingOrEating: activelyDrinking,
+                healerInRestPhase: inRestPhase,
+                mainHealerUnavailableOrOom: mainHealerDown);
+
+            if (!candidates.Any(c => c.HealthPercent < threshold))
+                return false;
+
+            if (!emergencyOnly && me.Level >= 10 && RoutineManager.Current?.HealBehavior != null)
+                return true;
+
+            int injured78 = CountInjuredAllies(candidates, 78.0);
+            int injured82 = CountInjuredAllies(candidates, 82.0);
+            foreach (var c in candidates)
+            {
+                if (c.HealthPercent >= threshold)
+                    continue;
+
+                WoWUnit? targetUnit = c.IsSelf ? me : ObjectManager.GetObjectByGuid<WoWUnit>(c.Guid);
+                if (targetUnit == null || !targetUnit.IsValid || targetUnit.Dead)
+                    continue;
+
+                bool combatActive = anyCombat || targetUnit.Combat;
+                var (spellName, _) = SelectHealSpellForClass(me, targetUnit, injured78, injured82, emergencyOnly, combatActive);
+                if (spellName != null)
+                    return true;
+
+                if (!c.IsSelf)
+                {
+                    var (approachSpell, _) = SelectHealSpellForClass(me, targetUnit, injured78, injured82, emergencyOnly, combatActive, checkRange: false);
+                    if (approachSpell != null)
+                        return true;
+                }
+            }
+
+            return false;
+        }
 
         public static bool RunHealerTick(bool emergencyOnly, SquadSettings settings, SquadLeaderState? leader)
         {
@@ -119,25 +237,49 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (me == null || !me.IsAlive)
                 return false;
 
-            if (me.IsCasting || me.ChanneledCastingSpellId != 0)
-                return true;
-
             var candidates = CollectLiveHealCandidates(leader);
-            if (candidates.Count == 0 || (!emergencyOnly && me.Level < 10))
-                StopActiveHealBehavior();
-            double threshold = emergencyOnly ? 55.0 : 92.0;
+            bool anyCombat = IsSquadCombatActive(me, leader, candidates);
+            bool activelyDrinking = !anyCombat && IsActivelyConsumingRestAura(me);
+            bool inRestPhase = !anyCombat &&
+                ((leader != null && leader.Phase == SquadPhase.Resting) ||
+                 SquadContext.GetLocalMemberStateSnapshot()?.NeedsRest == true);
 
             // Check if a HybridOffHeal should step in aggressively because main healer is dead or < 20% mana.
+            bool mainHealerDown = false;
             if (emergencyOnly && leader?.Members != null)
             {
                 var mainHealer = leader.Members.FirstOrDefault(m => m.Role == SquadRole.Healer);
-                if (mainHealer != null && (mainHealer.IsDead || mainHealer.IsGhost || !mainHealer.IsConnected || mainHealer.PowerPercent < 20f))
+                mainHealerDown = mainHealer != null &&
+                    (mainHealer.IsDead || mainHealer.IsGhost || !mainHealer.IsConnected || mainHealer.PowerPercent < 20f);
+            }
+
+            double threshold = ComputeEffectiveHealThreshold(
+                emergencyOnly: emergencyOnly,
+                anyCombat: anyCombat,
+                healerActivelyDrinkingOrEating: activelyDrinking,
+                healerInRestPhase: inRestPhase,
+                mainHealerUnavailableOrOom: mainHealerDown);
+
+            if (me.IsCasting || me.ChanneledCastingSpellId != 0)
+            {
+                string? castingName = me.CastingSpell?.Name;
+                double cancelThreshold = Math.Min(75.0, threshold);
+                if (!string.IsNullOrEmpty(castingName) && RangedAssistSpellSet.Contains(castingName) &&
+                    SelectPriorityHealTarget(candidates, cancelThreshold, prioritizeSelfCritical: settings.UseEmergencySelfHealBeforeParty) != null)
                 {
-                    threshold = 80.0;
+                    SpellManager.StopCasting();
+                }
+                else
+                {
+                    return true;
                 }
             }
 
+            if (candidates.Count == 0 || (!emergencyOnly && me.Level < 10))
+                StopActiveHealBehavior();
+
             var remaining = candidates.ToList();
+            bool triedRoutine = false;
             while (remaining.Count > 0)
             {
                 var priorityCandidate = SelectPriorityHealTarget(
@@ -157,8 +299,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     continue;
 
                 // Stage 1: Try Routine's HealBehavior when level >= 10 and not in Hybrid emergency-only mode.
-                if (!emergencyOnly && me.Level >= 10 && targetUnit.Distance <= 35f && targetUnit.InLineOfSpellSight)
+                if (!triedRoutine && !emergencyOnly && me.Level >= 10 && targetUnit.Distance <= 35f && targetUnit.InLineOfSpellSight)
                 {
+                    triedRoutine = true;
                     var healBehavior = RoutineManager.Current?.HealBehavior;
                     if (healBehavior != null)
                     {
@@ -173,8 +316,6 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                                 _activeHealBehavior = healBehavior;
                             }
                             RunStatus status = healBehavior.Tick(null);
-                            // Running keeps the composite active and handled this tick;
-                            // a cast also wins. Only Failure falls through to explicit healing.
                             if (status == RunStatus.Running || me.IsCasting || me.ChanneledCastingSpellId != 0)
                             {
                                 SquadPartySyncService.LogAction("Running heal routine");
@@ -182,7 +323,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                             }
                             healBehavior.Stop(null);
                             _activeHealBehavior = null;
-                            if (status == RunStatus.Success)
+                            if (status == RunStatus.Success && (SpellManager.GlobalCooldown || me.IsMoving))
                             {
                                 SquadPartySyncService.LogAction("Running heal routine");
                                 return true;
@@ -207,8 +348,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
                 int injured78 = CountInjuredAllies(candidates, 78.0);
                 int injured82 = CountInjuredAllies(candidates, 82.0);
+                bool combatActive = anyCombat || targetUnit.Combat;
 
-                var (spellName, blockedSpell) = SelectHealSpellForClass(me, targetUnit, injured78, injured82, emergencyOnly);
+                var (spellName, blockedSpell) = SelectHealSpellForClass(me, targetUnit, injured78, injured82, emergencyOnly, combatActive);
                 if (spellName == null)
                 {
                     if (blockedSpell != null)
@@ -366,7 +508,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 return false;
 
             var candidates = CollectLiveHealCandidates(leader);
-            if (candidates.Any(c => c.HealthPercent < 88.0))
+            if (candidates.Any(c => c.HealthPercent < 94.0))
                 return false;
 
             ulong targetGuid = leader.FocusTargetGuid != 0 ? leader.FocusTargetGuid : leader.SecondaryTargetGuid;
@@ -415,6 +557,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 Name = me.Name ?? "Me",
                 HealthPercent = me.HealthPercent,
                 Distance = 0,
+                InCombat = me.Combat,
                 IsTankLeader = me.Guid == tankGuid || SquadContext.ActiveRole == SquadRole.TankLeader,
                 IsSelf = true
             });
@@ -440,6 +583,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     Name = unit.Name ?? string.Empty,
                     HealthPercent = unit.HealthPercent,
                     Distance = dist,
+                    InCombat = unit.Combat,
                     IsTankLeader = isTank,
                     IsSelf = false
                 });
@@ -448,101 +592,135 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             return result;
         }
 
-        private static (string? SpellName, string? BlockedSpell) SelectHealSpellForClass(
-            LocalPlayer me,
-            WoWUnit target,
+        internal static (string? SpellName, string? BlockedSpell) EvaluateClassHealSpell(
+            WoWClass healerClass,
+            double hp,
+            bool isTank,
+            bool inCombat,
+            bool emergencyOnly,
             int injured78Count,
             int injured82Count,
-            bool emergencyOnly)
+            bool hasWeakenedSoul,
+            Func<string, bool> hasAuraFromHealer,
+            Func<string, bool> hasSpell,
+            Func<string, bool> canCastSpell)
         {
-            double hp = target.HealthPercent;
-            bool isTank = SquadContext.IsMemberRole(target.Guid, SquadRole.TankLeader);
-
             string? blockedSpell = null;
 
             bool CanCastHeal(string spellName)
             {
-                if (!SpellManager.HasSpell(spellName))
+                if (!hasSpell(spellName))
                     return false;
-                if (SpellManager.CanCast(spellName, target, true, false))
+                if (canCastSpell(spellName))
                     return true;
 
                 blockedSpell ??= spellName;
                 return false;
             }
 
-            switch (me.Class)
+            switch (healerClass)
             {
                 case WoWClass.Priest:
                     if (!emergencyOnly && injured78Count >= 3 && CanCastHeal("Prayer of Healing"))
                         return ("Prayer of Healing", null);
                     if (!emergencyOnly && injured78Count >= 2 && CanCastHeal("Circle of Healing"))
                         return ("Circle of Healing", null);
-                    if (hp < 85.0 && !target.HasAura("Weakened Soul") && !target.HasAura("Power Word: Shield") &&
+                    if (inCombat &&
+                        hp < (isTank ? 80.0 : 50.0) &&
+                        !hasWeakenedSoul &&
+                        !hasAuraFromHealer("Power Word: Shield") &&
                         CanCastHeal("Power Word: Shield"))
                         return ("Power Word: Shield", null);
-                    if (!emergencyOnly && hp < 90.0 && !HasMyAura(me.Guid, target, "Renew") &&
+                    if (!emergencyOnly &&
+                        hp < (inCombat ? 88.0 : 78.0) &&
+                        !hasAuraFromHealer("Renew") &&
                         CanCastHeal("Renew"))
                         return ("Renew", null);
-                    if (hp < 60.0 && CanCastHeal("Flash Heal"))
+                    if (hp < 55.0 && CanCastHeal("Flash Heal"))
                         return ("Flash Heal", null);
-                    if (CanCastHeal("Greater Heal"))
+                    if (hp < 55.0 && CanCastHeal("Greater Heal"))
                         return ("Greater Heal", null);
-                    if (CanCastHeal("Heal"))
+                    if (hp < (inCombat ? 75.0 : 68.0) && CanCastHeal("Heal"))
                         return ("Heal", null);
-                    if (CanCastHeal("Lesser Heal"))
+                    if (hp < (inCombat ? 75.0 : 68.0) && CanCastHeal("Greater Heal"))
+                        return ("Greater Heal", null);
+                    if (hp < (inCombat ? 82.0 : 75.0) && CanCastHeal("Lesser Heal"))
                         return ("Lesser Heal", null);
                     break;
 
                 case WoWClass.Paladin:
-                    if (!emergencyOnly && isTank && !HasMyAura(me.Guid, target, "Beacon of Light") &&
+                    if (!emergencyOnly && inCombat && isTank && !hasAuraFromHealer("Beacon of Light") &&
                         CanCastHeal("Beacon of Light"))
                         return ("Beacon of Light", null);
-                    if (!emergencyOnly && isTank && !HasMyAura(me.Guid, target, "Sacred Shield") &&
+                    if (!emergencyOnly && inCombat && isTank && !hasAuraFromHealer("Sacred Shield") &&
                         CanCastHeal("Sacred Shield"))
                         return ("Sacred Shield", null);
                     if (hp < 70.0 && CanCastHeal("Holy Shock"))
                         return ("Holy Shock", null);
-                    if (hp < 80.0 && CanCastHeal("Flash of Light"))
+                    if (hp < (inCombat ? 82.0 : 76.0) && CanCastHeal("Flash of Light"))
                         return ("Flash of Light", null);
-                    if (CanCastHeal("Holy Light"))
+                    if (hp < (inCombat ? 72.0 : 65.0) && CanCastHeal("Holy Light"))
                         return ("Holy Light", null);
                     break;
 
                 case WoWClass.Druid:
                     if (!emergencyOnly && injured78Count >= 2 && CanCastHeal("Wild Growth"))
                         return ("Wild Growth", null);
-                    if (!emergencyOnly && isTank && hp < 95.0 && !HasMyAura(me.Guid, target, "Lifebloom") &&
+                    if (!emergencyOnly && inCombat && isTank && hp < 92.0 && !hasAuraFromHealer("Lifebloom") &&
                         CanCastHeal("Lifebloom"))
                         return ("Lifebloom", null);
-                    if (!emergencyOnly && hp < 90.0 && !HasMyAura(me.Guid, target, "Rejuvenation") &&
+                    if (!emergencyOnly && hp < (inCombat ? 88.0 : 78.0) && !hasAuraFromHealer("Rejuvenation") &&
                         CanCastHeal("Rejuvenation"))
                         return ("Rejuvenation", null);
-                    if (hp < 75.0 && !HasMyAura(me.Guid, target, "Regrowth") &&
+                    if (hp < (inCombat ? 72.0 : 65.0) && !hasAuraFromHealer("Regrowth") &&
                         CanCastHeal("Regrowth"))
                         return ("Regrowth", null);
-                    if (hp < 70.0 && CanCastHeal("Nourish"))
+                    if (hp < (inCombat ? 75.0 : 68.0) && CanCastHeal("Nourish"))
                         return ("Nourish", null);
-                    if (CanCastHeal("Healing Touch"))
+                    if (hp < (inCombat ? 72.0 : 65.0) && CanCastHeal("Healing Touch"))
                         return ("Healing Touch", null);
                     break;
 
                 case WoWClass.Shaman:
-                    if (!emergencyOnly && isTank && !HasMyAura(me.Guid, target, "Earth Shield") &&
+                    if (!emergencyOnly && (inCombat || hp < 85.0) && isTank && !hasAuraFromHealer("Earth Shield") &&
                         CanCastHeal("Earth Shield"))
                         return ("Earth Shield", null);
                     if (!emergencyOnly && injured82Count >= 2 && CanCastHeal("Chain Heal"))
                         return ("Chain Heal", null);
-                    if (hp < 85.0 && CanCastHeal("Riptide"))
+                    if (hp < (inCombat ? 86.0 : 78.0) && CanCastHeal("Riptide"))
                         return ("Riptide", null);
-                    if (hp < 65.0 && CanCastHeal("Lesser Healing Wave"))
+                    if (hp < (inCombat ? 78.0 : 72.0) && CanCastHeal("Lesser Healing Wave"))
                         return ("Lesser Healing Wave", null);
-                    if (CanCastHeal("Healing Wave"))
+                    if (hp < (inCombat ? 70.0 : 65.0) && CanCastHeal("Healing Wave"))
                         return ("Healing Wave", null);
                     break;
             }
 
             return (null, blockedSpell);
+        }
+
+        private static (string? SpellName, string? BlockedSpell) SelectHealSpellForClass(
+            LocalPlayer me,
+            WoWUnit target,
+            int injured78Count,
+            int injured82Count,
+            bool emergencyOnly,
+            bool inCombat,
+            bool checkRange = true)
+        {
+            bool isTank = SquadContext.IsMemberRole(target.Guid, SquadRole.TankLeader);
+            return EvaluateClassHealSpell(
+                healerClass: me.Class,
+                hp: target.HealthPercent,
+                isTank: isTank,
+                inCombat: inCombat,
+                emergencyOnly: emergencyOnly,
+                injured78Count: injured78Count,
+                injured82Count: injured82Count,
+                hasWeakenedSoul: target.HasAura("Weakened Soul") || target.HasAura("Power Word: Shield"),
+                hasAuraFromHealer: aura => HasMyAura(me.Guid, target, aura),
+                hasSpell: SpellManager.HasSpell,
+                canCastSpell: spell => SpellManager.CanCast(spell, target, checkRange, false));
         }
 
         private static bool HasMyAura(ulong myGuid, WoWUnit unit, string auraName)

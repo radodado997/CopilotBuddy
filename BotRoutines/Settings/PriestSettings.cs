@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.ComponentModel;
 
 using Styx.Helpers;
@@ -174,7 +174,7 @@ namespace Singular.Settings
         public int Penance { get; set; }
 
         [Setting]
-        [DefaultValue(40)]
+        [DefaultValue(60)]
         [Category("Discipline")]
         [DisplayName("Flash Heal Health")]
         [Description("Flash Heal will be used at this value")]
@@ -256,7 +256,7 @@ namespace Singular.Settings
         #region Holy
 
         [Setting]
-        [DefaultValue(95)]
+        [DefaultValue(78)]
         [Category("Holy")]
         [DisplayName("Heal Health")]
         [Description("Heal will be used at this value")]
@@ -270,7 +270,7 @@ namespace Singular.Settings
         public int HolyGreaterHeal { get; set; }
 
         [Setting]
-        [DefaultValue(25)]
+        [DefaultValue(60)]
         [Category("Holy")]
         [DisplayName("Flash Heal Health")]
         [Description("Flash Heal will be used at this value")]

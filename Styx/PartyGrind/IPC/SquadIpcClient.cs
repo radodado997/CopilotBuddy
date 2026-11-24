@@ -27,22 +27,48 @@ namespace Styx.PartyGrind.IPC
         private Func<SquadHandshake>? _handshakeProvider;
         private SquadLeaderState? _latestLeaderState;
         private long _lastReceivedUtcMs;
+        private long _lastLeaderStateUtcMs;
         private long _nextSequenceId;
         private volatile bool _socketConnected;
         private string _localCharacterName = string.Empty;
         private bool _disposed;
 
         /// <summary>
-        /// Maximum idle time in milliseconds before the connection is marked disconnected. Defaults to 3000 ms.
+        /// Maximum idle time in milliseconds before the connection is marked disconnected. Defaults to 10000 ms.
         /// </summary>
-        public int DisconnectTimeoutMs { get; set; } = 3000;
+        public int DisconnectTimeoutMs { get; set; } = 10000;
+        public int KeepAliveIntervalMs { get; set; } = 1000;
+        public int LeaderStateStaleTimeoutMs { get; set; } = 5000;
 
         public SquadLeaderState? LatestLeaderState
         {
-            get { lock (_stateLock) return _latestLeaderState; }
+            get
+            {
+                lock (_stateLock)
+                {
+                    if (_latestLeaderState == null)
+                        return null;
+                    long lastState = Interlocked.Read(ref _lastLeaderStateUtcMs);
+                    if (lastState <= 0 || (LeaderStateStaleTimeoutMs > 0 && (_utcNowMs() - lastState) > LeaderStateStaleTimeoutMs))
+                        return null;
+                    return _latestLeaderState;
+                }
+            }
         }
 
         public long LastReceivedUtcMs => Interlocked.Read(ref _lastReceivedUtcMs);
+        public long LastLeaderStateUtcMs => Interlocked.Read(ref _lastLeaderStateUtcMs);
+
+        public bool HasFreshLeaderState
+        {
+            get
+            {
+                long lastState = Interlocked.Read(ref _lastLeaderStateUtcMs);
+                return _socketConnected &&
+                       lastState > 0 &&
+                       (LeaderStateStaleTimeoutMs <= 0 || (_utcNowMs() - lastState) <= LeaderStateStaleTimeoutMs);
+            }
+        }
 
         public bool IsConnected
         {
@@ -120,6 +146,7 @@ namespace Styx.PartyGrind.IPC
                 _socketConnected = false;
                 _latestLeaderState = null;
                 Interlocked.Exchange(ref _lastReceivedUtcMs, 0);
+                Interlocked.Exchange(ref _lastLeaderStateUtcMs, 0);
             }
             try { cts?.Cancel(); } catch { }
             try { _outbound.Writer.TryComplete(); } catch { }
@@ -230,6 +257,24 @@ namespace Styx.PartyGrind.IPC
             await writer.WriteLineAsync(auth.Protect(hsLine).AsMemory(), ct).ConfigureAwait(false);
             await writer.FlushAsync(ct).ConfigureAwait(false);
 
+            var writerLock = new SemaphoreSlim(1, 1);
+            async Task WriteProtectedAsync(string plaintextLine)
+            {
+                await writerLock.WaitAsync(ct).ConfigureAwait(false);
+                try
+                {
+                    string frame;
+                    try { frame = auth.Protect(plaintextLine); }
+                    catch (ArgumentException) { return; }
+                    await writer.WriteLineAsync(frame.AsMemory(), ct).ConfigureAwait(false);
+                    await writer.FlushAsync(ct).ConfigureAwait(false);
+                }
+                finally
+                {
+                    writerLock.Release();
+                }
+            }
+
             Task sendTask = Task.Run(async () =>
             {
                 try
@@ -239,11 +284,32 @@ namespace Styx.PartyGrind.IPC
                         var pending = SquadJson.DeserializeEnvelope(line);
                         if (pending == null || _utcNowMs() - pending.TimestampUtcMs > DisconnectTimeoutMs)
                             continue;
-                        string frame;
-                        try { frame = auth.Protect(line); }
-                        catch (ArgumentException) { continue; }
-                        await writer.WriteLineAsync(frame.AsMemory(), ct).ConfigureAwait(false);
-                        await writer.FlushAsync(ct).ConfigureAwait(false);
+                        await WriteProtectedAsync(line).ConfigureAwait(false);
+                    }
+                }
+                catch (OperationCanceledException) { }
+                catch (IOException) { sessionCts.Cancel(); }
+                catch (ObjectDisposedException) { }
+            }, ct);
+
+            Task keepAliveTask = Task.Run(async () =>
+            {
+                try
+                {
+                    while (!ct.IsCancellationRequested)
+                    {
+                        int delay = KeepAliveIntervalMs;
+                        if (delay <= 0)
+                        {
+                            await Task.Delay(250, ct).ConfigureAwait(false);
+                            continue;
+                        }
+                        await Task.Delay(delay, ct).ConfigureAwait(false);
+                        if (ct.IsCancellationRequested || Volatile.Read(ref sessionClosed) != 0)
+                            break;
+                        long pingSeq = Interlocked.Increment(ref _nextSequenceId);
+                        string pingLine = SquadJson.SerializeEnvelope(SquadMessageTypes.Ping, _teamId, pingSeq, string.Empty);
+                        await WriteProtectedAsync(pingLine).ConfigureAwait(false);
                     }
                 }
                 catch (OperationCanceledException) { }
@@ -307,7 +373,9 @@ namespace Styx.PartyGrind.IPC
                 TryCloseSession();
                 try { tcp.Close(); } catch { }
                 try { await sendTask.ConfigureAwait(false); } catch { }
+                try { await keepAliveTask.ConfigureAwait(false); } catch { }
                 try { await watchdogTask.ConfigureAwait(false); } catch { }
+                writerLock.Dispose();
             }
         }
 
@@ -319,6 +387,7 @@ namespace Styx.PartyGrind.IPC
                 _socketConnected = false;
                 _latestLeaderState = null;
                 Interlocked.Exchange(ref _lastReceivedUtcMs, 0);
+                Interlocked.Exchange(ref _lastLeaderStateUtcMs, 0);
             }
         }
 
@@ -355,11 +424,17 @@ namespace Styx.PartyGrind.IPC
                 lock (_stateLock)
                 {
                     if (!ReferenceEquals(_cts, run) || run.IsCancellationRequested || !isSessionOpen()) return false;
-                    Interlocked.Exchange(ref _lastReceivedUtcMs, _utcNowMs());
+                    long now = _utcNowMs();
+                    Interlocked.Exchange(ref _lastReceivedUtcMs, now);
+                    Interlocked.Exchange(ref _lastLeaderStateUtcMs, now);
                     _socketConnected = true;
                     _latestLeaderState = leader;
                 }
                 LeaderStateReceived?.Invoke(leader);
+                return true;
+            }
+            if (string.Equals(envelope.MessageType, SquadMessageTypes.Ping, StringComparison.OrdinalIgnoreCase))
+            {
                 return true;
             }
             return false;

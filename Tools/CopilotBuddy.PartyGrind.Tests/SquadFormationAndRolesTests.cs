@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using CopilotBuddy.Bots.PartyGrind.Forms;
 using CopilotBuddy.Bots.PartyGrind.Logic;
+using Styx.Combat.CombatRoutine;
 using Styx.Helpers;
 using Styx.Logic.Pathing;
 using Styx.Logic.Relogin;
@@ -206,6 +207,82 @@ namespace CopilotBuddy.PartyGrind.Tests
         }
 
         [Fact]
+        public void HealBridge_ConservesManaOutOfCombatAndPreservesActiveDrinking()
+        {
+            // Combat heals up to 90%, OOC idle heals only below 78%, resting phase below 60%, active drink below 45%
+            Assert.Equal(90.0, SquadHealBridge.ComputeEffectiveHealThreshold(false, anyCombat: true, healerActivelyDrinkingOrEating: false, healerInRestPhase: false));
+            Assert.Equal(78.0, SquadHealBridge.ComputeEffectiveHealThreshold(false, anyCombat: false, healerActivelyDrinkingOrEating: false, healerInRestPhase: false));
+            Assert.Equal(60.0, SquadHealBridge.ComputeEffectiveHealThreshold(false, anyCombat: false, healerActivelyDrinkingOrEating: false, healerInRestPhase: true));
+            Assert.Equal(45.0, SquadHealBridge.ComputeEffectiveHealThreshold(false, anyCombat: false, healerActivelyDrinkingOrEating: true, healerInRestPhase: true));
+
+            var knownPriestSpells = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                "Power Word: Shield", "Renew", "Flash Heal", "Heal", "Lesser Heal"
+            };
+
+            // Out of combat at 84% HP: must NOT spend mana on PW:S, Renew, or Heal
+            var oocMinor = SquadHealBridge.EvaluateClassHealSpell(
+                WoWClass.Priest,
+                hp: 84.0,
+                isTank: true,
+                inCombat: false,
+                emergencyOnly: false,
+                injured78Count: 0,
+                injured82Count: 0,
+                hasWeakenedSoul: false,
+                hasAuraFromHealer: _ => false,
+                hasSpell: knownPriestSpells.Contains,
+                canCastSpell: knownPriestSpells.Contains);
+            Assert.Null(oocMinor.SpellName);
+
+            // In combat at 86% HP with Renew already active: must NOT cast full Heal/Lesser Heal on minor scratch
+            var combatMinorWithRenew = SquadHealBridge.EvaluateClassHealSpell(
+                WoWClass.Priest,
+                hp: 86.0,
+                isTank: true,
+                inCombat: true,
+                emergencyOnly: false,
+                injured78Count: 0,
+                injured82Count: 0,
+                hasWeakenedSoul: true,
+                hasAuraFromHealer: aura => aura == "Renew",
+                hasSpell: knownPriestSpells.Contains,
+                canCastSpell: knownPriestSpells.Contains);
+            Assert.Null(combatMinorWithRenew.SpellName);
+
+            // In combat at 70% HP with Renew & Weakened Soul: chooses efficient Heal
+            var combatModerate = SquadHealBridge.EvaluateClassHealSpell(
+                WoWClass.Priest,
+                hp: 70.0,
+                isTank: true,
+                inCombat: true,
+                emergencyOnly: false,
+                injured78Count: 1,
+                injured82Count: 1,
+                hasWeakenedSoul: true,
+                hasAuraFromHealer: aura => aura == "Renew",
+                hasSpell: knownPriestSpells.Contains,
+                canCastSpell: knownPriestSpells.Contains);
+            Assert.Equal("Heal", combatModerate.SpellName);
+
+            // Low-mana fallback: knows Greater Heal & Heal & Lesser Heal, but only Lesser Heal is affordable
+            var allPriestHeals = new HashSet<string>(knownPriestSpells, StringComparer.OrdinalIgnoreCase) { "Greater Heal" };
+            var lowManaFallback = SquadHealBridge.EvaluateClassHealSpell(
+                WoWClass.Priest,
+                hp: 48.0,
+                isTank: true,
+                inCombat: true,
+                emergencyOnly: false,
+                injured78Count: 1,
+                injured82Count: 1,
+                hasWeakenedSoul: true,
+                hasAuraFromHealer: aura => aura == "Renew",
+                hasSpell: allPriestHeals.Contains,
+                canCastSpell: spell => spell == "Lesser Heal");
+            Assert.Equal("Lesser Heal", lowManaFallback.SpellName);
+        }
+
+        [Fact]
         public void Infrastructure_InstanceIsolationPidParsingStrictReloginAndLauncherScript()
         {
             Assert.Equal(4321, CommandLine.ParseProcessId(new[] { "CopilotBuddy.exe", "-pid=4321" }));
@@ -300,6 +377,37 @@ namespace CopilotBuddy.PartyGrind.Tests
             Assert.True(SquadTankBridge.HasAvailableTauntSpell(WoWClass.Warrior, s => s == "Taunt"));
             Assert.True(SquadTankBridge.HasAvailableTauntSpell(WoWClass.Druid, s => s == "Growl"));
             Assert.True(SquadTankBridge.HasAvailableTauntSpell(WoWClass.DeathKnight, s => s == "Dark Command"));
+        }
+
+        [Fact]
+        public void PartyBuffThrottle_BlocksRepeatedBlessingSpamWithinWindowAndExpiresCleanly()
+        {
+            SquadPartyBuffService.ResetBuffCastThrottles();
+            try
+            {
+                Assert.False(SquadPartyBuffService.IsBuffCastThrottled(42UL, "Blessing of Might", 10_000L));
+                SquadPartyBuffService.RecordBuffCast(42UL, "Blessing of Might", 10_000L);
+                Assert.True(SquadPartyBuffService.IsBuffCastThrottled(42UL, "Blessing of Might", 10_500L));
+                Assert.True(SquadPartyBuffService.IsBuffCastThrottled(42UL, "blessing of might", 13_999L));
+                Assert.False(SquadPartyBuffService.IsBuffCastThrottled(42UL, "Blessing of Kings", 10_500L));
+                Assert.False(SquadPartyBuffService.IsBuffCastThrottled(99UL, "Blessing of Might", 10_500L));
+                Assert.False(SquadPartyBuffService.IsBuffCastThrottled(42UL, "Blessing of Might", 14_001L));
+            }
+            finally
+            {
+                SquadPartyBuffService.ResetBuffCastThrottles();
+            }
+        }
+
+        [Fact]
+        public void MeleeFlankPosition_ScalesRadiusWithLargeTargetCombatReach()
+        {
+            var bossPos = new WoWPoint(100f, 200f, 10f);
+            WoWPoint small = SquadFormationService.ComputeMeleeFlankPosition(bossPos, 0f, 2.8f, 0, 1, targetCombatReach: 1.5f);
+            WoWPoint large = SquadFormationService.ComputeMeleeFlankPosition(bossPos, 0f, 2.8f, 0, 1, targetCombatReach: 6.0f);
+
+            Assert.InRange(small.Distance2D(bossPos), 2.7f, 2.9f);
+            Assert.True(large.Distance2D(bossPos) >= 7.1f);
         }
     }
 }

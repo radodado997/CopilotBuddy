@@ -26,6 +26,13 @@ namespace CopilotBuddy.PartyGrind.Tests
         {
             try
             {
+                Styx.Logic.Combat.SpellManager.Shutdown();
+            }
+            catch
+            {
+            }
+            try
+            {
                 if (Directory.Exists(_tempDir))
                     Directory.Delete(_tempDir, recursive: true);
             }
@@ -445,6 +452,114 @@ namespace CopilotBuddy.PartyGrind.Tests
                 new[] { MakeFollower("FollowerB", 140f, 100f, t) },
                 profile, 0, 0, 0, 0f, t);
             Assert.True(debounced.IsWaitingForFollower);
+        }
+
+        [Fact]
+        public void PortalStepThrough_ContinuesPastEntranceAlongApproachHeading()
+        {
+            WoWPoint step = PartyGrindBot.ComputePortalStepThrough(new WoWPoint(0f, 0f, 3f), new WoWPoint(10f, 0f, 5f));
+
+            Assert.Equal(14f, step.X, 3);
+            Assert.Equal(0f, step.Y, 3);
+            Assert.Equal(5f, step.Z, 3);
+        }
+
+        [Fact]
+        public void PortalStepThrough_KeepsEntranceWhenAlreadyStandingOnIt()
+        {
+            var entrance = new WoWPoint(4247.842f, 750.6f, -22.4f);
+
+            Assert.Equal(entrance, PartyGrindBot.ComputePortalStepThrough(entrance, entrance));
+        }
+
+        [Fact]
+        public void CanFollowerEngageFocus_PreventsPrematureBodyPullAheadOfTank()
+        {
+            Assert.False(PartyGrindBot.CanFollowerEngageFocus(
+                meInCombat: false,
+                leaderInCombat: false,
+                focusInCombat: false,
+                focusTargetingParty: false,
+                tankDistanceToFocus: 24f));
+
+            Assert.True(PartyGrindBot.CanFollowerEngageFocus(
+                meInCombat: false,
+                leaderInCombat: false,
+                focusInCombat: false,
+                focusTargetingParty: false,
+                tankDistanceToFocus: 10f));
+
+            Assert.True(PartyGrindBot.CanFollowerEngageFocus(
+                meInCombat: false,
+                leaderInCombat: true,
+                focusInCombat: false,
+                focusTargetingParty: false,
+                tankDistanceToFocus: 30f));
+
+            Assert.True(PartyGrindBot.CanFollowerEngageFocus(
+                meInCombat: false,
+                leaderInCombat: false,
+                focusInCombat: true,
+                focusTargetingParty: false,
+                tankDistanceToFocus: 30f));
+        }
+
+        [Fact]
+        public void OnSpellBookChanged_RetainsFailedTrailingRefreshUntilShutdown()
+        {
+            Styx.Logic.Combat.SpellManager.Shutdown();
+            var args1 = new Styx.WoWInternals.LuaEventArgs("LEARNED_SPELL_IN_TAB", 0, Array.Empty<object>());
+            Styx.Logic.Combat.SpellManager.OnSpellBookChanged(null!, args1);
+            Assert.False(Styx.Logic.Combat.SpellManager.HasPendingTrailingRebuild);
+
+            var args2 = new Styx.WoWInternals.LuaEventArgs("LEARNED_SPELL_IN_TAB", 0, Array.Empty<object>());
+            Styx.Logic.Combat.SpellManager.OnSpellBookChanged(null!, args2);
+            Assert.True(Styx.Logic.Combat.SpellManager.HasPendingTrailingRebuild);
+
+            System.Threading.Thread.Sleep(270);
+            Styx.Logic.Combat.SpellManager.CheckPendingTrailingRebuild();
+            Assert.True(Styx.Logic.Combat.SpellManager.HasPendingTrailingRebuild);
+
+            Styx.Logic.Combat.SpellManager.Shutdown();
+            Assert.False(Styx.Logic.Combat.SpellManager.HasPendingTrailingRebuild);
+        }
+
+        [Fact]
+        public void TryGetEffectiveTankPosition_DoesNotFallbackToDesignatedTankWhenEffectiveTankGuidNonZero()
+        {
+            var leader = new SquadLeaderState
+            {
+                LeaderGuid = 100UL,
+                EffectiveTankGuid = 999UL,
+                MapId = 1,
+                X = 10f,
+                Y = 10f,
+                Z = 10f,
+                Members = new List<SquadMemberSummary>
+                {
+                    new SquadMemberSummary
+                    {
+                        Guid = 200UL,
+                        Role = SquadRole.TankLeader,
+                        MapId = 1,
+                        X = 20f,
+                        Y = 20f,
+                        Z = 20f,
+                        IsConnected = true,
+                        IsDead = false,
+                        IsGhost = false
+                    }
+                }
+            };
+
+            var (known, pos) = PartyGrindBot.TryGetEffectiveTankPosition(leader, myMapId: 1);
+            Assert.False(known);
+            Assert.Equal(WoWPoint.Zero, pos);
+
+            leader.EffectiveTankGuid = 0UL;
+            var (knownFallback, posFallback) = PartyGrindBot.TryGetEffectiveTankPosition(leader, myMapId: 1);
+            Assert.True(knownFallback);
+            Assert.Equal(new WoWPoint(20f, 20f, 20f), posFallback);
         }
     }
 }

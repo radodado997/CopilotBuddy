@@ -154,6 +154,14 @@ namespace Styx.Logic.Pathing
             _unstickAttemptCount++;
 
             float rotation = me.Rotation;
+            float speed = me.Mounted ? 11.2f : 7.0f;
+            try
+            {
+                if (me.MovementInfo != null && me.MovementInfo.RunSpeed > 0f)
+                    speed = me.MovementInfo.RunSpeed;
+            }
+            catch { }
+            float strafeDistance = Math.Max(2.5f, speed * (duration / 1000f));
 
             // HB pattern: Dismount → Jump → Strafe sides → Blackspot
             if (!_triedDismount && me.Mounted)
@@ -188,15 +196,33 @@ namespace Styx.Logic.Pathing
             }
             else if (!_triedStrafeForwardLeft)
             {
-                Logging.WriteVerbose("Trying strafe forward left for {0}ms", duration);
-                MoveInDirection(WoWMovement.MovementDirection.Forward | WoWMovement.MovementDirection.StrafeLeft, duration);
                 _triedStrafeForwardLeft = true;
+                if (IsSafeStrafe(location, rotation, (float)(Math.PI / 4), strafeDistance))
+                {
+                    Logging.WriteVerbose("Trying strafe forward left for {0}ms", duration);
+                    MoveInDirection(WoWMovement.MovementDirection.Forward | WoWMovement.MovementDirection.StrafeLeft, duration);
+                }
+                else
+                {
+                    Logging.WriteVerbose("Skipping unsafe strafe forward left");
+                    if (IsSafeStrafe(location, rotation, (float)Math.PI, strafeDistance))
+                        MoveInDirection(WoWMovement.MovementDirection.Backwards, duration);
+                }
             }
             else if (!_triedStrafeForwardRight)
             {
-                Logging.WriteVerbose("Trying strafe forward right for {0}ms", duration);
-                MoveInDirection(WoWMovement.MovementDirection.Forward | WoWMovement.MovementDirection.StrafeRight, duration);
                 _triedStrafeForwardRight = true;
+                if (IsSafeStrafe(location, rotation, -(float)(Math.PI / 4), strafeDistance))
+                {
+                    Logging.WriteVerbose("Trying strafe forward right for {0}ms", duration);
+                    MoveInDirection(WoWMovement.MovementDirection.Forward | WoWMovement.MovementDirection.StrafeRight, duration);
+                }
+                else
+                {
+                    Logging.WriteVerbose("Skipping unsafe strafe forward right");
+                    if (IsSafeStrafe(location, rotation, (float)Math.PI, strafeDistance))
+                        MoveInDirection(WoWMovement.MovementDirection.Backwards, duration);
+                }
             }
             else if (me.Mounted)
             {
@@ -205,15 +231,33 @@ namespace Styx.Logic.Pathing
             }
             else if (!_triedStrafeLeft)
             {
-                Logging.WriteVerbose("Trying strafe left for {0}ms", duration);
-                MoveInDirection(WoWMovement.MovementDirection.StrafeLeft, duration);
                 _triedStrafeLeft = true;
+                if (IsSafeStrafe(location, rotation, (float)(Math.PI / 2), strafeDistance))
+                {
+                    Logging.WriteVerbose("Trying strafe left for {0}ms", duration);
+                    MoveInDirection(WoWMovement.MovementDirection.StrafeLeft, duration);
+                }
+                else
+                {
+                    Logging.WriteVerbose("Skipping unsafe strafe left");
+                    if (IsSafeStrafe(location, rotation, (float)Math.PI, strafeDistance))
+                        MoveInDirection(WoWMovement.MovementDirection.Backwards, duration);
+                }
             }
             else if (!_triedStrafeRight)
             {
-                Logging.WriteVerbose("Trying strafe right for {0}ms", duration);
-                MoveInDirection(WoWMovement.MovementDirection.StrafeRight, duration);
                 _triedStrafeRight = true;
+                if (IsSafeStrafe(location, rotation, -(float)(Math.PI / 2), strafeDistance))
+                {
+                    Logging.WriteVerbose("Trying strafe right for {0}ms", duration);
+                    MoveInDirection(WoWMovement.MovementDirection.StrafeRight, duration);
+                }
+                else
+                {
+                    Logging.WriteVerbose("Skipping unsafe strafe right");
+                    if (IsSafeStrafe(location, rotation, (float)Math.PI, strafeDistance))
+                        MoveInDirection(WoWMovement.MovementDirection.Backwards, duration);
+                }
             }
             else
             {
@@ -239,6 +283,71 @@ namespace Styx.Logic.Pathing
             _triedStrafeForwardRight = false;
             _triedStrafeLeft = false;
             _triedStrafeRight = false;
+        }
+
+        private static bool IsSafeStrafe(WoWPoint location, float rotation, float angleOffset, float distance = 2.5f)
+        {
+            try
+            {
+                if (!Navigator.IsNavigatorLoaded)
+                    return true;
+
+                WoWPoint target = location.RayCast(rotation + angleOffset, distance);
+                if (Navigator.Raycast(location, target, out _))
+                    return false;
+                if (!Navigator.CanNavigateFully(location, target))
+                    return false;
+
+                float targetZ = location.Z;
+                bool foundElevation = false;
+                try
+                {
+                    var heights = Navigator.FindHeights(target.X, target.Y);
+                    if (heights != null && heights.Count > 0)
+                    {
+                        targetZ = heights.OrderBy(h => Math.Abs(h - location.Z)).First();
+                        foundElevation = true;
+                    }
+                }
+                catch { }
+
+                if (!foundElevation)
+                {
+                    try
+                    {
+                        if (Navigator.FindHeight(target.X, target.Y, out float h))
+                        {
+                            targetZ = h;
+                            foundElevation = true;
+                        }
+                    }
+                    catch { }
+                }
+
+                if (!foundElevation)
+                {
+                    try
+                    {
+                        var probe = new WoWPoint(target.X, target.Y, location.Z);
+                        var nearest = Navigator.FindNearestPoint(probe);
+                        if (nearest != probe && nearest != WoWPoint.Zero && nearest.IsValid)
+                        {
+                            targetZ = nearest.Z;
+                            foundElevation = true;
+                        }
+                    }
+                    catch { }
+                }
+
+                if (!foundElevation || Math.Abs(targetZ - location.Z) > 3.0f)
+                    return false;
+
+                return true;
+            }
+            catch
+            {
+                return true;
+            }
         }
 
         private void MoveInDirection(WoWMovement.MovementDirection direction, int milliseconds)
