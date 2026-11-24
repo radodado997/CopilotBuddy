@@ -236,7 +236,7 @@ namespace Singular.ClassSpecific.Paladin
                 var leader = Styx.PartyGrind.SquadContext.GetLeaderStateSnapshot();
                 if (leader?.Members != null)
                 {
-                    var healer = leader.Members.FirstOrDefault(m => m.Role == Styx.PartyGrind.IPC.SquadRole.Healer);
+                    var healer = leader.Members.FirstOrDefault(m => m.Role == Styx.PartyGrind.SquadRole.Healer);
                     if (healer == null)
                         return true;
 

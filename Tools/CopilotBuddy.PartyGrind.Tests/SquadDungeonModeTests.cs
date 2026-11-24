@@ -699,6 +699,55 @@ namespace CopilotBuddy.PartyGrind.Tests
         }
 
         [Fact]
+        public void DungeonPullGatherDistance_ClampsBossAdvancementUntilSquadIsNearby()
+        {
+            Assert.Equal(20f, SquadTankBridge.GetEffectivePullGatherDistance(28f, isDungeon: true));
+            Assert.Equal(18f, SquadTankBridge.GetEffectivePullGatherDistance(18f, isDungeon: true));
+            Assert.Equal(40f, SquadTankBridge.GetEffectivePullGatherDistance(40f, isDungeon: false));
+
+            var leader = new SquadLeaderState
+            {
+                Phase = SquadPhase.DungeonClearing,
+                BotMode = SquadBotMode.Dungeon,
+                MapId = 34,
+                X = 100f,
+                Members = new List<SquadMemberSummary>
+                {
+                    new()
+                    {
+                        IsConnected = true,
+                        HasTelemetry = true,
+                        MapId = 34,
+                        X = 121f
+                    }
+                }
+            };
+
+            Assert.False(SquadTankBridge.CanInitiatePull(
+                leader,
+                SquadTankBridge.GetEffectivePullGatherDistance(28f, isDungeon: true)));
+            Assert.True(SquadTankBridge.CanInitiatePull(leader, 28f));
+        }
+
+        [Fact]
+        public void DungeonTrashRouteCorridor_RecognizesOnlyNearbyForwardMobsOnSameFloor()
+        {
+            var start = new WoWPoint(0f, 0f, 0f);
+            var destination = new WoWPoint(100f, 0f, 0f);
+
+            Assert.True(SquadTankBridge.IsWithinDungeonRouteCorridor(
+                start, destination, new WoWPoint(24f, 8f, 0f), 12f, 45f, 8f));
+            Assert.False(SquadTankBridge.IsWithinDungeonRouteCorridor(
+                start, destination, new WoWPoint(24f, 13f, 0f), 12f, 45f, 8f));
+            Assert.False(SquadTankBridge.IsWithinDungeonRouteCorridor(
+                start, destination, new WoWPoint(-2f, 0f, 0f), 12f, 45f, 8f));
+            Assert.False(SquadTankBridge.IsWithinDungeonRouteCorridor(
+                start, destination, new WoWPoint(46f, 0f, 0f), 12f, 45f, 8f));
+            Assert.False(SquadTankBridge.IsWithinDungeonRouteCorridor(
+                start, destination, new WoWPoint(24f, 0f, 12f), 12f, 45f, 8f));
+        }
+
+        [Fact]
         public void LfgPartyOutsideEntry_SkipsTeleportInAfterCompletedRunSoSquadCanRequeue()
         {
             // Normal fresh LFG entry outside dungeon: teleport in

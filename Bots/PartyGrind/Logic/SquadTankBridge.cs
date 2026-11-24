@@ -22,6 +22,10 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
     public static class SquadTankBridge
     {
         private static bool _filtersAttached;
+        private const float DungeonPullGatherDistance = 20f;
+        private const float DungeonRouteTrashCorridorRadius = 12f;
+        private const float DungeonRouteTrashScanDistance = 45f;
+        private const float DungeonRouteTrashMaxVerticalDelta = 8f;
         private static readonly SquadApproach PeelApproach = new();
 
         public static void AttachTargetingFilters()
@@ -44,6 +48,67 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             Targeting.Instance.RemoveTargetsFilter -= SquadRemoveTargetsFilter;
             Targeting.Instance.WeighTargetsFilter -= SquadWeighTargetsFilter;
             _filtersAttached = false;
+        }
+
+        internal static float GetEffectivePullGatherDistance(float configuredDistance, bool isDungeon)
+        {
+            return isDungeon ? Math.Min(configuredDistance, DungeonPullGatherDistance) : configuredDistance;
+        }
+
+        internal static bool IsWithinDungeonRouteCorridor(
+            WoWPoint start,
+            WoWPoint destination,
+            WoWPoint candidate,
+            float corridorRadius,
+            float maxForwardDistance,
+            float maxVerticalDelta)
+        {
+            float dx = destination.X - start.X;
+            float dy = destination.Y - start.Y;
+            float routeLength = (float)Math.Sqrt(dx * dx + dy * dy);
+            if (routeLength <= 0.01f)
+                return false;
+
+            float nx = dx / routeLength;
+            float ny = dy / routeLength;
+            float candidateX = candidate.X - start.X;
+            float candidateY = candidate.Y - start.Y;
+            float alongRoute = candidateX * nx + candidateY * ny;
+            if (alongRoute < 0f || alongRoute > maxForwardDistance || alongRoute > routeLength)
+                return false;
+
+            float lateral = Math.Abs(candidateX * ny - candidateY * nx);
+            if (lateral > corridorRadius)
+                return false;
+
+            float expectedZ = start.Z + (destination.Z - start.Z) * (alongRoute / routeLength);
+            return Math.Abs(candidate.Z - expectedZ) <= maxVerticalDelta;
+        }
+
+        internal static WoWUnit? FindDungeonRouteTrashTarget(WoWPoint start, WoWPoint destination)
+        {
+            var me = StyxWoW.Me;
+            if (me == null || destination == WoWPoint.Zero)
+                return null;
+
+            var bossEntries = new HashSet<uint>(
+                global::Bots.DungeonBuddy.BossManager.Bosses
+                    .Where(b => !b.IsDead)
+                    .Select(b => b.EntryId));
+
+            return ObjectManager.CachedUnits
+                .Where(unit => unit != null && unit.IsValid && !unit.Dead && unit.CanSelect && unit.Attackable &&
+                               unit.IsHostile && !unit.IsFriendly && !unit.IsPlayer && !unit.IsCritter &&
+                               !unit.IsNonCombatPet && unit.ControllingPlayer == null && !unit.Combat &&
+                               !unit.IsTargetingMyPartyMember && !unit.IsTargetingMeOrPet &&
+                               !bossEntries.Contains(unit.Entry) && unit.Distance <= DungeonRouteTrashScanDistance &&
+                               unit.InLineOfSight &&
+                               !global::Bots.DungeonBuddy.Profiles.ProfileManager.IsNpcInPullBlackspot(unit) &&
+                               IsWithinDungeonRouteCorridor(start, destination, unit.Location,
+                                   DungeonRouteTrashCorridorRadius, DungeonRouteTrashScanDistance,
+                                   DungeonRouteTrashMaxVerticalDelta))
+                .OrderBy(unit => unit.Distance)
+                .FirstOrDefault();
         }
 
         /// <summary>
@@ -154,7 +219,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 if (isDungeon)
                 {
                     WoWPoint meLoc = StyxWoW.Me.Location;
-                    bool canPull = StyxWoW.Me.Combat || committedGuid != 0 || CanInitiatePull(leader, settings.MaxPullGatherDistance);
+                    float pullGatherDistance = GetEffectivePullGatherDistance(settings.MaxPullGatherDistance, isDungeon);
+                    bool canPull = StyxWoW.Me.Combat || committedGuid != 0 || CanInitiatePull(leader, pullGatherDistance);
                     foreach (WoWObject obj in incomingUnits)
                     {
                         if (obj is not WoWUnit unit || !unit.IsValid || unit.Dead || !unit.CanSelect || !unit.Attackable)
@@ -194,7 +260,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 }
 
                 // Include standard LevelBot targets when we're ready to pull or already fighting.
-                if (StyxWoW.Me.Combat || committedGuid != 0 || CanInitiatePull(leader, settings.MaxPullGatherDistance))
+                if (StyxWoW.Me.Combat || committedGuid != 0 ||
+                    CanInitiatePull(leader, GetEffectivePullGatherDistance(settings.MaxPullGatherDistance, isDungeon)))
                 {
                     LevelBot.LevelBotIncludeTargetsFilter(incomingUnits, outgoingUnits);
                 }
