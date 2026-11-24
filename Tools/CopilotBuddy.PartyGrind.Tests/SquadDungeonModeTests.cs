@@ -699,6 +699,54 @@ namespace CopilotBuddy.PartyGrind.Tests
         }
 
         [Fact]
+        public void RdfPartyReform_RequiresEveryConnectedSquadMemberToBeBackInParty()
+        {
+            Assert.True(SquadDungeonService.ContainsAllRequiredPartyMembers(
+                new[] { "TankA", "HealB", "DpsC", "DpsD", "DpsE" },
+                new[] { "tankA", "HealB", "DpsC", "DpsD", "DpsE" }));
+            Assert.False(SquadDungeonService.ContainsAllRequiredPartyMembers(
+                new[] { "TankA", "HealB", "DpsC", "DpsD", "DpsE" },
+                new[] { "TankA", "HealB", "DpsC", "DpsD" }));
+        }
+
+        [Fact]
+        public void CompletedRdfRun_WaitsForExitAndUsesLfgGenerationWithoutClassicResetCount()
+        {
+            Assert.True(SquadDungeonService.IsLfgResetBarrierPending(
+                SquadDungeonEntryMode.LfgRandomNormal,
+                localResetPending: false,
+                leaderResetPending: false,
+                lfgRunCompletedAwaitingRequeue: true));
+            Assert.True(SquadDungeonService.IsLfgResetBarrierPending(
+                SquadDungeonEntryMode.LfgSpecificByBracket,
+                localResetPending: false,
+                leaderResetPending: true,
+                lfgRunCompletedAwaitingRequeue: false));
+            Assert.False(SquadDungeonService.IsLfgResetBarrierPending(
+                SquadDungeonEntryMode.LfgRandomNormal,
+                localResetPending: false,
+                leaderResetPending: false,
+                lfgRunCompletedAwaitingRequeue: false));
+            Assert.False(SquadDungeonService.IsLfgResetBarrierPending(
+                SquadDungeonEntryMode.WalkInPortalFarm,
+                localResetPending: true,
+                leaderResetPending: true,
+                lfgRunCompletedAwaitingRequeue: true));
+
+            Assert.False(SquadDungeonService.ShouldUseClassicInstanceReset(SquadDungeonEntryMode.LfgRandomNormal));
+            Assert.False(SquadDungeonService.ShouldUseClassicInstanceReset(SquadDungeonEntryMode.LfgSpecificByBracket));
+            Assert.True(SquadDungeonService.ShouldUseClassicInstanceReset(SquadDungeonEntryMode.WalkInPortalFarm));
+
+            var dungeonService = new SquadDungeonService();
+            dungeonService.MarkResetPendingOutside();
+            dungeonService.RecordLfgRunCompleted();
+
+            Assert.Equal(1, dungeonService.InstanceResetGeneration);
+            Assert.Equal(0, dungeonService.GetHourlyResetCount(100_000L));
+            Assert.False(dungeonService.IsResetPendingOutside);
+        }
+
+        [Fact]
         public void LfgPartyOutsideEntry_SkipsTeleportInAfterCompletedRunSoSquadCanRequeue()
         {
             // Normal fresh LFG entry outside dungeon: teleport in

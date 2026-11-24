@@ -66,6 +66,13 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
     public sealed class SquadDungeonService
     {
+        private enum LfgPartyReformState
+        {
+            None,
+            WaitingForDisband,
+            WaitingForReinvite
+        }
+
         private static readonly DungeonBracketEntry[] DefaultBracketPlaylist =
         {
             new DungeonBracketEntry(4, 13, 18, false, true),
@@ -124,6 +131,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private int _breadcrumbIndex;
         private long _completedAtUtcMs;
         private bool _lfgRunCompletedAwaitingRequeue;
+        private int _lfgRunResetGenerationAtCompletion;
+        private LfgPartyReformState _lfgPartyReformState;
         private bool _countedCurrentWalkInEntry;
         private readonly HashSet<ulong> _runParticipants = new();
         private IReadOnlyList<SquadConnectedMemberSnapshot> _participantSnapshots = Array.Empty<SquadConnectedMemberSnapshot>();
@@ -131,6 +140,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private WoWUnit? _activeEncounterTarget;
 
         public int InstanceResetGeneration => _instanceResetGeneration;
+        internal bool ShouldSuppressAutomaticPartyInvites =>
+            _lfgPartyReformState == LfgPartyReformState.WaitingForDisband;
 
         public void InitializeRuntime(SquadSettings settings)
         {
@@ -168,6 +179,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             _breadcrumbBossEntry = 0;
             _breadcrumbIndex = 0;
             _lfgRunCompletedAwaitingRequeue = false;
+            _lfgRunResetGenerationAtCompletion = 0;
+            _lfgPartyReformState = LfgPartyReformState.None;
             StopActiveEncounter();
         }
 
@@ -192,6 +205,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             _breadcrumbBossEntry = 0;
             _breadcrumbIndex = 0;
             _lfgRunCompletedAwaitingRequeue = false;
+            _lfgRunResetGenerationAtCompletion = 0;
+            _lfgPartyReformState = LfgPartyReformState.None;
         }
 
         public void StopActiveEncounter()
@@ -463,6 +478,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             _completedAtUtcMs = 0;
             _countedCurrentWalkInEntry = false;
             _lfgRunCompletedAwaitingRequeue = false;
+            _lfgRunResetGenerationAtCompletion = 0;
+            _lfgPartyReformState = LfgPartyReformState.None;
             _currentRunKilledBosses.Clear();
             _runParticipants.Clear();
             _participantSnapshots = Array.Empty<SquadConnectedMemberSnapshot>();
@@ -507,6 +524,96 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             _instanceResetGeneration++;
             ClearWalkInRun();
         }
+
+        internal void RecordLfgRunCompleted()
+        {
+            LfgManager.ProposalPending = false;
+            LfgManager.RoleCheckPending = false;
+            LfgManager.BootProposalActive = false;
+            LfgManager.DungeonCompletedReason = CompleteReason.None;
+            _instanceResetGeneration++;
+            ClearWalkInRun();
+        }
+
+        private void MarkLfgRunCompletedAwaitingRequeue(int resetGeneration)
+        {
+            if (!_lfgRunCompletedAwaitingRequeue)
+                _lfgRunResetGenerationAtCompletion = resetGeneration;
+            _lfgRunCompletedAwaitingRequeue = true;
+        }
+
+        private void ObserveLfgRunResetGeneration(SquadLeaderState? leader)
+        {
+            if (_lfgRunCompletedAwaitingRequeue && leader != null &&
+                leader.InstanceResetGeneration > _lfgRunResetGenerationAtCompletion)
+            {
+                _lfgRunCompletedAwaitingRequeue = false;
+            }
+        }
+
+        private bool AreConnectedSquadMembersReformed(
+            SquadSettings settings,
+            SquadLeaderState? leader,
+            LocalPlayer me)
+        {
+            var requiredNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (!settings.AllowPartialSquadLfg)
+            {
+                foreach (string name in settings.GetExpectedMemberNames())
+                    requiredNames.Add(name.Trim());
+            }
+            else if (leader?.Members != null)
+            {
+                foreach (var member in leader.Members.Where(member => member.IsConnected))
+                {
+                    if (!string.IsNullOrWhiteSpace(member.CharacterName))
+                        requiredNames.Add(member.CharacterName.Trim());
+                }
+            }
+            else
+            {
+                foreach (var member in _participantSnapshots.Where(member => member.IsConnected))
+                {
+                    if (!string.IsNullOrWhiteSpace(member.CharacterName))
+                        requiredNames.Add(member.CharacterName.Trim());
+                }
+            }
+
+            if (!string.IsNullOrWhiteSpace(me.Name))
+                requiredNames.Add(me.Name.Trim());
+
+            var group = me.GroupInfo;
+            group.InvalidateCache();
+            var currentNames = group.AllMembers
+                .Where(member => !string.IsNullOrWhiteSpace(member.Name))
+                .Select(member => member.Name.Trim())
+                .ToList();
+            if (!string.IsNullOrWhiteSpace(me.Name))
+                currentNames.Add(me.Name.Trim());
+            return ContainsAllRequiredPartyMembers(requiredNames, currentNames);
+        }
+
+        internal static bool ContainsAllRequiredPartyMembers(
+            IEnumerable<string> requiredNames,
+            IEnumerable<string> currentPartyNames)
+        {
+            var current = new HashSet<string>(
+                currentPartyNames.Where(name => !string.IsNullOrWhiteSpace(name)).Select(name => name.Trim()),
+                StringComparer.OrdinalIgnoreCase);
+            return requiredNames.Where(name => !string.IsNullOrWhiteSpace(name))
+                .All(name => current.Contains(name.Trim()));
+        }
+
+        internal static bool IsLfgResetBarrierPending(
+            SquadDungeonEntryMode entryMode,
+            bool localResetPending,
+            bool leaderResetPending,
+            bool lfgRunCompletedAwaitingRequeue) =>
+            entryMode != SquadDungeonEntryMode.WalkInPortalFarm &&
+            (localResetPending || leaderResetPending || lfgRunCompletedAwaitingRequeue);
+
+        internal static bool ShouldUseClassicInstanceReset(SquadDungeonEntryMode entryMode) =>
+            entryMode == SquadDungeonEntryMode.WalkInPortalFarm;
 
         public void PruneResetHistory(long nowUtcMs)
         {
@@ -643,7 +750,12 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             }
 
             if (!walkIn && inDungeon && complete)
-                _lfgRunCompletedAwaitingRequeue = true;
+            {
+                int resetGeneration = settings.IsCoordinator
+                    ? _instanceResetGeneration
+                    : leader?.InstanceResetGeneration ?? _instanceResetGeneration;
+                MarkLfgRunCompletedAwaitingRequeue(resetGeneration);
+            }
 
             uint instanceMapId = 0;
             if (activeId > 0)
@@ -714,41 +826,16 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (me == null || me.Dead || me.IsGhost)
                 return false;
 
-            if (LfgManager.RoleCheckPending || SafeGetLfgMode() == "rolecheck")
-            {
-                _lfgRunCompletedAwaitingRequeue = false;
-                ApplySquadLfgRole(settings.Role, settings.IsCoordinator);
-                Lua.DoString("if LFDRoleCheckPopupAcceptButton and LFDRoleCheckPopupAcceptButton:IsVisible() then LFDRoleCheckPopupAcceptButton:Click() end; if StaticPopup1 and StaticPopup1:IsVisible() and StaticPopup1.which == 'LFG_ROLE_CHECK_CONFIRM' and StaticPopup1Button1 then StaticPopup1Button1:Click() end");
-                LfgManager.RoleCheckPending = false;
-                SquadPartySyncService.LogAction("Dungeon: confirmed LFG role check");
-                return true;
-            }
-
-            bool proposalActive = LfgManager.ProposalPending || SafeGetLfgMode() == "proposal";
-            bool shouldAccept = proposalActive && (settings.IsCoordinator || leader?.AcceptLfgProposalOrder == true || leader == null);
-            if (shouldAccept && nowUtcMs - _lastProposalAcceptUtcMs >= 1500L)
-            {
-                _lastProposalAcceptUtcMs = nowUtcMs;
-                _lfgRunCompletedAwaitingRequeue = false;
-                LfgManager.AcceptProposal();
-                LfgManager.ProposalPending = false;
-                SquadPartySyncService.LogAction("Dungeon: accepting LFG proposal");
-                return true;
-            }
-
-            if (LfgManager.BootProposalActive)
-            {
-                LfgManager.BootProposalActive = false;
-                return true;
-            }
-
             SquadDungeonEntryMode entryMode = leader?.DungeonEntryMode ?? settings.DungeonEntryMode;
-            if (entryMode == SquadDungeonEntryMode.WalkInPortalFarm)
-            {
-                return RunWalkInPortalEntryTick(settings, leader, nowUtcMs);
-            }
+            if (!settings.IsCoordinator)
+                ObserveLfgRunResetGeneration(leader);
 
-            if (_resetPendingOutside)
+            bool lfgResetPending = IsLfgResetBarrierPending(
+                entryMode,
+                _resetPendingOutside || (settings.IsCoordinator && _lfgRunCompletedAwaitingRequeue),
+                leader?.DungeonResetPendingOutside == true,
+                _lfgRunCompletedAwaitingRequeue);
+            if (_resetPendingOutside || lfgResetPending)
             {
                 if (settings.IsCoordinator)
                 {
@@ -778,23 +865,103 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                         return true;
                     }
 
-                    Logging.Write("[PartyGrind Dungeon] Resetting instances for next run.");
-                    bool resetIssued = Lua.GetReturnVal<bool>(
-                        "if (GetNumPartyMembers() == 0 and GetNumRaidMembers() == 0) or IsPartyLeader() then ResetInstances(); return true end return false", 0);
-                    if (resetIssued)
+                    if (ShouldUseClassicInstanceReset(entryMode))
                     {
-                        RecordInstanceReset(nowUtcMs);
-                        _lfgRunCompletedAwaitingRequeue = false;
+                        Logging.Write("[PartyGrind Dungeon] Resetting instances for next walk-in run.");
+                        bool resetIssued = Lua.GetReturnVal<bool>(
+                            "if (GetNumPartyMembers() == 0 and GetNumRaidMembers() == 0) or IsPartyLeader() then ResetInstances(); return true end return false", 0);
+                        if (resetIssued)
+                            RecordInstanceReset(nowUtcMs);
+                    }
+                    else
+                    {
+                        if (_lfgPartyReformState == LfgPartyReformState.None)
+                        {
+                            string result = Lua.GetReturnVal<string>(@"
+                                local count = GetNumPartyMembers()
+                                if count > 0 and not IsPartyLeader() then return 'notleader' end
+                                for i = count, 1, -1 do
+                                    local name = UnitName('party' .. i)
+                                    if name then UninviteUnit(name) end
+                                end
+                                LeaveParty()
+                                return 'disbanding'
+                            ", 0U) ?? string.Empty;
+                            if (result == "notleader")
+                            {
+                                SquadPartySyncService.LogAction("Dungeon: cannot reform RDF party until coordinator is party leader");
+                                return true;
+                            }
+                            if (result != "disbanding")
+                            {
+                                SquadPartySyncService.LogAction("Dungeon: RDF party disband request failed; waiting before requeue");
+                                return true;
+                            }
+
+                            _lfgPartyReformState = LfgPartyReformState.WaitingForDisband;
+                            Logging.Write("[PartyGrind Dungeon] Leaving the completed RDF party before forming a fresh squad.");
+                            return true;
+                        }
+
+                        if (_lfgPartyReformState == LfgPartyReformState.WaitingForDisband)
+                        {
+                            if (groupGuids.Count > 0)
+                            {
+                                SquadPartySyncService.LogAction("Dungeon: waiting for RDF party to disband");
+                                return true;
+                            }
+
+                            _lfgPartyReformState = LfgPartyReformState.WaitingForReinvite;
+                            return true;
+                        }
+
+                        if (!AreConnectedSquadMembersReformed(settings, leader, me))
+                        {
+                            SquadPartySyncService.LogAction("Dungeon: waiting for squad to reform after RDF run");
+                            return true;
+                        }
+
+                        Logging.Write("[PartyGrind Dungeon] RDF party reformed; enabling the next LFG queue.");
+                        RecordLfgRunCompleted();
                     }
                     return true;
                 }
 
-                if (leader?.DungeonResetPendingOutside == true)
-                {
-                    if (me.IsMoving)
-                        WoWMovement.MoveStop();
-                    return true;
-                }
+                if (me.IsMoving)
+                    WoWMovement.MoveStop();
+                SquadPartySyncService.LogAction("Dungeon: waiting for coordinator to finish the instance exit");
+                return true;
+            }
+
+            if (LfgManager.RoleCheckPending || SafeGetLfgMode() == "rolecheck")
+            {
+                ApplySquadLfgRole(settings.Role, settings.IsCoordinator);
+                Lua.DoString("if LFDRoleCheckPopupAcceptButton and LFDRoleCheckPopupAcceptButton:IsVisible() then LFDRoleCheckPopupAcceptButton:Click() end; if StaticPopup1 and StaticPopup1:IsVisible() and StaticPopup1.which == 'LFG_ROLE_CHECK_CONFIRM' and StaticPopup1Button1 then StaticPopup1Button1:Click() end");
+                LfgManager.RoleCheckPending = false;
+                SquadPartySyncService.LogAction("Dungeon: confirmed LFG role check");
+                return true;
+            }
+
+            bool proposalActive = LfgManager.ProposalPending || SafeGetLfgMode() == "proposal";
+            bool shouldAccept = proposalActive && (settings.IsCoordinator || leader?.AcceptLfgProposalOrder == true || leader == null);
+            if (shouldAccept && nowUtcMs - _lastProposalAcceptUtcMs >= 1500L)
+            {
+                _lastProposalAcceptUtcMs = nowUtcMs;
+                LfgManager.AcceptProposal();
+                LfgManager.ProposalPending = false;
+                SquadPartySyncService.LogAction("Dungeon: accepting LFG proposal");
+                return true;
+            }
+
+            if (LfgManager.BootProposalActive)
+            {
+                LfgManager.BootProposalActive = false;
+                return true;
+            }
+
+            if (entryMode == SquadDungeonEntryMode.WalkInPortalFarm)
+            {
+                return RunWalkInPortalEntryTick(settings, leader, nowUtcMs);
             }
 
             if (nowUtcMs - _lastRoleSetUtcMs >= 20000L)
@@ -805,10 +972,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
             string lfgMode = SafeGetLfgMode();
             if (!string.IsNullOrEmpty(lfgMode) && lfgMode != "lfgparty" && lfgMode != "abandonedindungeon")
-            {
-                _lfgRunCompletedAwaitingRequeue = false;
                 LfgManager.DungeonCompletedReason = CompleteReason.None;
-            }
 
             bool leaderCompletedRun = leader != null &&
                 (leader.IsDungeonComplete || leader.TeleportOutOrder || leader.Phase == SquadPhase.DungeonCompleteExit);
@@ -1094,12 +1258,19 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             SquadDungeonEntryMode entryMode = leader?.DungeonEntryMode ?? settings.DungeonEntryMode;
             if (entryMode != SquadDungeonEntryMode.WalkInPortalFarm)
             {
-                _lfgRunCompletedAwaitingRequeue = true;
+                if (settings.IsCoordinator && _completedAtUtcMs == 0)
+                {
+                    _completedAtUtcMs = nowUtcMs;
+                    MarkResetPendingOutside();
+                }
+                int resetGeneration = settings.IsCoordinator
+                    ? _instanceResetGeneration
+                    : leader?.InstanceResetGeneration ?? _instanceResetGeneration;
+                MarkLfgRunCompletedAwaitingRequeue(resetGeneration);
                 if (nowUtcMs - _lastTeleportOutUtcMs >= 3500L)
                 {
                     _lastTeleportOutUtcMs = nowUtcMs;
-                    bool leaveParty = leader?.HasRandomPartyMembers == true && settings.ExpectedMemberNamesCsv.Trim().Length == 0;
-                    Lua.DoString(leaveParty ? "LeaveParty(); LFGTeleport(true);" : "LFGTeleport(true);");
+                    Lua.DoString("LFGTeleport(true);");
                     LfgManager.DungeonCompletedReason = CompleteReason.None;
                     SquadPartySyncService.LogAction("Dungeon: teleporting out of completed LFG instance");
                 }

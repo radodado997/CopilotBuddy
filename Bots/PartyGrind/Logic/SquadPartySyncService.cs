@@ -130,7 +130,10 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         /// <summary>
         /// Coordinator periodically invites missing squadmates and enforces the configured LootMethod.
         /// </summary>
-        public void PulseCoordinatorPartySync(SquadSettings settings, IReadOnlyList<SquadConnectedMemberSnapshot> connected)
+        public void PulseCoordinatorPartySync(
+            SquadSettings settings,
+            IReadOnlyList<SquadConnectedMemberSnapshot> connected,
+            bool suppressInvites = false)
         {
             var me = StyxWoW.Me;
             if (me == null || !settings.IsCoordinator)
@@ -141,7 +144,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             // Serialize overlapping pulses as well as each player's pending-invite window.
             lock (_invitePulseLock)
             {
-                if (settings.AutoInviteMembers &&
+                if (settings.AutoInviteMembers && !suppressInvites &&
                     (now - _lastInviteUtcMs) >= Math.Max(3, settings.InviteIntervalSeconds) * 1000L)
                 {
                     _lastInviteUtcMs = now;

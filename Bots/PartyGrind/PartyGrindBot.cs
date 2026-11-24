@@ -576,7 +576,10 @@ namespace CopilotBuddy.Bots.PartyGrind
         private void PulseCoordinator(SquadSettings settings, SquadMemberState localState, long now)
         {
             var snapshots = _ipcServer?.GetMemberSnapshots() ?? new List<SquadConnectedMemberSnapshot>();
-            _partySync.PulseCoordinatorPartySync(settings, snapshots);
+            _partySync.PulseCoordinatorPartySync(
+                settings,
+                snapshots,
+                suppressInvites: _dungeon.ShouldSuppressAutomaticPartyInvites);
 
             SquadProfileSnapshot profileSnap = CaptureProfileSnapshot(now);
             int hourlyResets = settings.BotMode == SquadBotMode.Dungeon ? _dungeon.GetHourlyResetCount(now) : 0;
