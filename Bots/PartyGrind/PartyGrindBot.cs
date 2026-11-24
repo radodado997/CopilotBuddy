@@ -808,15 +808,36 @@ namespace CopilotBuddy.Bots.PartyGrind
                     (u.Combat || u.IsTargetingMyPartyMember || IsEligiblePullCandidateDistance(me.Location.Distance(u.Location))));
             }
 
-            ulong resolvedFocusGuid = (focus != null && focus.IsValid && !focus.Dead && !focus.IsFriendly) ? focus.Guid : 0UL;
             var local = SquadContext.GetLocalMemberStateSnapshot();
             bool localCannotPull = local == null || local.IsDead || local.IsGhost || local.IsInCombat ||
                                    local.NeedsRest || local.IsLooting || allyInCombat;
-            bool commitActive = _pullCommittedGuid != 0 && now < _pullCommittedUntilMs;
             bool isDungeonMap = decision.BotMode == SquadBotMode.Dungeon && SquadDungeonService.IsInDungeonMap(me);
             float pullGatherDistance = SquadTankBridge.GetEffectivePullGatherDistance(settings.MaxPullGatherDistance, isDungeonMap);
             bool canInitiatePull = !bossPullBlocked && !anotherTankDrives && !allyInCombat &&
                 SquadTankBridge.CanInitiatePull(decision, pullGatherDistance);
+
+            WoWUnit? committedUnit = _pullCommittedGuid != 0
+                ? ObjectManager.GetObjectByGuid<WoWUnit>(_pullCommittedGuid)
+                : null;
+            bool pendingBossPull = SquadTankBridge.IsIdleDungeonBossTarget(focus) ||
+                                   SquadTankBridge.IsIdleDungeonBossTarget(committedUnit);
+            if (isDungeonMap && settings.Role == SquadRole.TankLeader && pendingBossPull &&
+                canInitiatePull && !localCannotPull && !_coordinator.IsWaitingForFollowerDebounced)
+            {
+                WoWPoint nextDungeonPt = _dungeon.ComputeLeaderNextDungeonPoint();
+                WoWUnit? routeTrash = nextDungeonPt != WoWPoint.Zero
+                    ? SquadTankBridge.FindDungeonRouteTrashTarget(me.Location, nextDungeonPt)
+                    : null;
+                if (routeTrash != null)
+                {
+                    if (SquadTankBridge.IsIdleDungeonBossTarget(committedUnit))
+                        ClearPullCommit();
+                    focus = routeTrash;
+                }
+            }
+
+            ulong resolvedFocusGuid = (focus != null && focus.IsValid && !focus.Dead && !focus.IsFriendly) ? focus.Guid : 0UL;
+            bool commitActive = _pullCommittedGuid != 0 && now < _pullCommittedUntilMs;
             bool focusIdle = focus != null && !focus.Combat && !focus.IsTargetingMyPartyMember;
 
             ulong newFocusGuid = ResolveCoordinatorFocusGuid(
@@ -2474,6 +2495,39 @@ namespace CopilotBuddy.Bots.PartyGrind
                 if (bossPullBlocked)
                     ClearIdlePullCommit();
 
+                WoWPoint nextDungeonPt = WoWPoint.Zero;
+                WoWUnit? routeTrashTarget = null;
+                bool dungeonFollowerCombat = leader?.Members?.Any(m => m.IsConnected && !m.IsDead && !m.IsGhost && m.IsInCombat) == true;
+                float dungeonPullGatherDistance = SquadTankBridge.GetEffectivePullGatherDistance(
+                    settings.MaxPullGatherDistance, isDungeon);
+                bool dungeonSquadReadyToPull = !isDungeon ||
+                    SquadTankBridge.CanInitiatePull(leader, dungeonPullGatherDistance);
+
+                if (_pullCommittedGuid != 0 && isDungeon &&
+                    SquadTankBridge.IsDungeonPullTargetRetrying(_pullCommittedGuid))
+                {
+                    ClearPullCommit();
+                }
+
+                WoWUnit? committedTarget = _pullCommittedGuid != 0
+                    ? ObjectManager.GetObjectByGuid<WoWUnit>(_pullCommittedGuid)
+                    : null;
+                if (isDungeon && !bossPullBlocked && !anotherTankDrives && !dungeonFollowerCombat &&
+                    dungeonSquadReadyToPull && SquadTankBridge.IsIdleDungeonBossTarget(committedTarget))
+                {
+                    nextDungeonPt = _dungeon.ComputeLeaderNextDungeonPoint();
+                    routeTrashTarget = nextDungeonPt != WoWPoint.Zero
+                        ? SquadTankBridge.FindDungeonRouteTrashTarget(me.Location, nextDungeonPt)
+                        : null;
+                    if (routeTrashTarget != null)
+                        ClearPullCommit();
+                }
+                else if (isDungeon && !me.Combat && !dungeonSquadReadyToPull &&
+                         SquadTankBridge.IsIdleDungeonBossTarget(committedTarget))
+                {
+                    ClearPullCommit();
+                }
+
                 if (_pullCommittedGuid != 0)
                 {
                     bool followerCombat = leader?.Members?.Any(m => m.IsConnected && !m.IsDead && !m.IsGhost && m.IsInCombat) == true;
@@ -2536,16 +2590,16 @@ namespace CopilotBuddy.Bots.PartyGrind
                         return RunStatus.Success;
                     }
 
-                    bool followerCombat = leader?.Members?.Any(m => m.IsConnected && !m.IsDead && !m.IsGhost && m.IsInCombat) == true;
-                    float dungeonPullGatherDistance = SquadTankBridge.GetEffectivePullGatherDistance(
-                        settings.MaxPullGatherDistance, isDungeon: true);
-                    bool squadReadyToPull = SquadTankBridge.CanInitiatePull(leader, dungeonPullGatherDistance);
-                    WoWPoint nextDungeonPt = _dungeon.ComputeLeaderNextDungeonPoint();
-
-                    if (!followerCombat && squadReadyToPull)
+                    bool squadReadyToPull = dungeonSquadReadyToPull;
+                    if (!dungeonFollowerCombat && squadReadyToPull)
                     {
-                        WoWUnit? routeTrash = nextDungeonPt != WoWPoint.Zero
+                        if (nextDungeonPt == WoWPoint.Zero)
+                            nextDungeonPt = _dungeon.ComputeLeaderNextDungeonPoint();
+                        routeTrashTarget ??= nextDungeonPt != WoWPoint.Zero
                             ? SquadTankBridge.FindDungeonRouteTrashTarget(me.Location, nextDungeonPt)
+                            : null;
+                        WoWUnit? routeTrash = routeTrashTarget is { IsValid: true, IsAlive: true }
+                            ? routeTrashTarget
                             : null;
                         WoWUnit? dungeonTarget = routeTrash ?? Targeting.Instance.FirstUnit;
                         if (dungeonTarget != null && dungeonTarget.IsValid && !dungeonTarget.Dead &&

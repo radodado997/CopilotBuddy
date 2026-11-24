@@ -85,6 +85,22 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             return Math.Abs(candidate.Z - expectedZ) <= maxVerticalDelta;
         }
 
+        internal static bool IsDungeonBossTarget(WoWUnit? unit)
+        {
+            return unit != null && global::Bots.DungeonBuddy.BossManager.Bosses.Any(b => b.EntryId == unit.Entry);
+        }
+
+        internal static bool IsIdleDungeonBossTarget(WoWUnit? unit)
+        {
+            return IsDungeonBossTarget(unit) && unit is { IsValid: true, IsAlive: true } &&
+                   !unit.Combat && !unit.IsTargetingMyPartyMember && !unit.IsTargetingMeOrPet;
+        }
+
+        internal static bool IsDungeonPullTargetRetrying(ulong targetGuid)
+        {
+            return PullApproach.IsRetrying(targetGuid);
+        }
+
         internal static WoWUnit? FindDungeonRouteTrashTarget(WoWPoint start, WoWPoint destination)
         {
             var me = StyxWoW.Me;
@@ -102,7 +118,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                                !unit.IsNonCombatPet && unit.ControllingPlayer == null && !unit.Combat &&
                                !unit.IsTargetingMyPartyMember && !unit.IsTargetingMeOrPet &&
                                !bossEntries.Contains(unit.Entry) && unit.Distance <= DungeonRouteTrashScanDistance &&
-                               unit.InLineOfSight &&
+                               unit.InLineOfSight && !PullApproach.IsRetrying(unit.Guid) &&
                                !global::Bots.DungeonBuddy.Profiles.ProfileManager.IsNpcInPullBlackspot(unit) &&
                                IsWithinDungeonRouteCorridor(start, destination, unit.Location,
                                    DungeonRouteTrashCorridorRadius, DungeonRouteTrashScanDistance,

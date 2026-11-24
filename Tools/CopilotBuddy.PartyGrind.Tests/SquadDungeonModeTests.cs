@@ -748,6 +748,14 @@ namespace CopilotBuddy.PartyGrind.Tests
         }
 
         [Fact]
+        public void DungeonPullApproachRetry_ExcludesTargetsUntilBackoffExpires()
+        {
+            Assert.True(SquadApproach.IsRetryPending(15_000, 14_999));
+            Assert.False(SquadApproach.IsRetryPending(15_000, 15_000));
+            Assert.False(SquadApproach.IsRetryPending(15_000, 15_001));
+        }
+
+        [Fact]
         public void LfgPartyOutsideEntry_SkipsTeleportInAfterCompletedRunSoSquadCanRequeue()
         {
             // Normal fresh LFG entry outside dungeon: teleport in

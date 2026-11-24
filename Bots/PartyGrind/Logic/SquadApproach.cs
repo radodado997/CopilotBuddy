@@ -10,6 +10,17 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
     internal sealed class SquadApproach
     {
         private readonly Dictionary<ulong, (float Distance, long Progress, long Retry, long Attempt)> _progress = new();
+
+        internal static bool IsRetryPending(long retryUntil, long now)
+        {
+            return now < retryUntil;
+        }
+
+        internal bool IsRetrying(ulong targetGuid)
+        {
+            return _progress.TryGetValue(targetGuid, out var state) && IsRetryPending(state.Retry, Environment.TickCount64);
+        }
+
         public bool TryMove(WoWUnit target, string reason)
         {
             long now = Environment.TickCount64;
