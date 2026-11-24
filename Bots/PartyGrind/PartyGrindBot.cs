@@ -1746,7 +1746,7 @@ namespace CopilotBuddy.Bots.PartyGrind
 
             if (leader.EffectiveTankGuid != 0)
             {
-                if (leader.LeaderGuid == leader.EffectiveTankGuid && leader.MapId == myMapId)
+                if (leader.LeaderGuid == leader.EffectiveTankGuid && leader.MapId == myMapId && !leader.IsDead && !leader.IsGhost)
                     return (true, new WoWPoint(leader.X, leader.Y, leader.Z));
 
                 var tankMember = leader.Members?.FirstOrDefault(m => m.Guid == leader.EffectiveTankGuid);
@@ -1764,7 +1764,7 @@ namespace CopilotBuddy.Bots.PartyGrind
             if (designatedTank != null && designatedTank.IsConnected && !designatedTank.IsDead && !designatedTank.IsGhost && designatedTank.MapId == myMapId)
                 return (true, new WoWPoint(designatedTank.X, designatedTank.Y, designatedTank.Z));
 
-            if (leader.MapId == myMapId && leader.EffectiveTankGuid == 0)
+            if (leader.MapId == myMapId && leader.EffectiveTankGuid == 0 && !leader.IsDead && !leader.IsGhost)
                 return (true, new WoWPoint(leader.X, leader.Y, leader.Z));
 
             return (false, WoWPoint.Zero);
