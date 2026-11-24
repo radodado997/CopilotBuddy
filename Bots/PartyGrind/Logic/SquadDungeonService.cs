@@ -462,6 +462,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             _hotspotIndex = 0;
             _completedAtUtcMs = 0;
             _countedCurrentWalkInEntry = false;
+            _lfgRunCompletedAwaitingRequeue = false;
             _currentRunKilledBosses.Clear();
             _runParticipants.Clear();
             _participantSnapshots = Array.Empty<SquadConnectedMemberSnapshot>();
@@ -611,12 +612,12 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 LfgManager.DungeonCompletedReason != CompleteReason.None ||
                 (totalBosses > 0 && currentBoss == null));
 
-            if (walkIn && settings.IsCoordinator && me != null)
+            if (settings.IsCoordinator && me != null)
             {
                 _participantSnapshots = connected;
                 if (inDungeon)
                 {
-                    if (!_countedCurrentWalkInEntry)
+                    if (walkIn && !_countedCurrentWalkInEntry)
                     {
                         RecordWalkInEntry(nowUtcMs);
                     }
@@ -745,6 +746,55 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (entryMode == SquadDungeonEntryMode.WalkInPortalFarm)
             {
                 return RunWalkInPortalEntryTick(settings, leader, nowUtcMs);
+            }
+
+            if (_resetPendingOutside)
+            {
+                if (settings.IsCoordinator)
+                {
+                    if (IsInDungeonMap(me))
+                        return false;
+
+                    var group = me.GroupInfo;
+                    group.InvalidateCache();
+                    var groupGuids = group.AllMembers
+                        .Where(m => m.Guid != 0)
+                        .Select(m => m.Guid)
+                        .ToHashSet();
+                    int raidCount = group.NumRaidMembers;
+                    int expectedGroupCount = raidCount > 0 ? raidCount : group.NumPartyMembers;
+                    bool allOutside = groupGuids.Count == expectedGroupCount &&
+                        AreAllWalkInParticipantsClearedForReset(
+                            _runParticipants,
+                            _participantSnapshots,
+                            groupGuids,
+                            _completedAtUtcMs,
+                            nowUtcMs);
+                    if (!allOutside)
+                    {
+                        if (me.IsMoving)
+                            WoWMovement.MoveStop();
+                        SquadPartySyncService.LogAction("Dungeon: waiting for exit confirmation from all run participants");
+                        return true;
+                    }
+
+                    Logging.Write("[PartyGrind Dungeon] Resetting instances for next run.");
+                    bool resetIssued = Lua.GetReturnVal<bool>(
+                        "if (GetNumPartyMembers() == 0 and GetNumRaidMembers() == 0) or IsPartyLeader() then ResetInstances(); return true end return false", 0);
+                    if (resetIssued)
+                    {
+                        RecordInstanceReset(nowUtcMs);
+                        _lfgRunCompletedAwaitingRequeue = false;
+                    }
+                    return true;
+                }
+
+                if (leader?.DungeonResetPendingOutside == true)
+                {
+                    if (me.IsMoving)
+                        WoWMovement.MoveStop();
+                    return true;
+                }
             }
 
             if (nowUtcMs - _lastRoleSetUtcMs >= 20000L)
