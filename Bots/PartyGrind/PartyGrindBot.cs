@@ -768,8 +768,10 @@ namespace CopilotBuddy.Bots.PartyGrind
             if (me == null)
                 return;
 
+            bool isDungeonMap = decision.BotMode == SquadBotMode.Dungeon && SquadDungeonService.IsInDungeonMap(me);
             bool allyInCombat = HasLivingAllyInCombat(decision, me.Guid);
-            if (_pullCommittedGuid != 0 && (allyInCombat || IsPullCommitReleased(now)))
+            if (_pullCommittedGuid != 0 && (allyInCombat || IsPullCommitReleased(now) ||
+                (isDungeonMap && SquadTankBridge.IsDungeonPullTargetRetrying(_pullCommittedGuid))))
                 ClearPullCommit();
 
             var settings = SquadContext.ActiveSettings ?? SquadSettings.Instance;
@@ -811,7 +813,6 @@ namespace CopilotBuddy.Bots.PartyGrind
             var local = SquadContext.GetLocalMemberStateSnapshot();
             bool localCannotPull = local == null || local.IsDead || local.IsGhost || local.IsInCombat ||
                                    local.NeedsRest || local.IsLooting || allyInCombat;
-            bool isDungeonMap = decision.BotMode == SquadBotMode.Dungeon && SquadDungeonService.IsInDungeonMap(me);
             float pullGatherDistance = SquadTankBridge.GetEffectivePullGatherDistance(settings.MaxPullGatherDistance, isDungeonMap);
             bool canInitiatePull = !bossPullBlocked && !anotherTankDrives && !allyInCombat &&
                 SquadTankBridge.CanInitiatePull(decision, pullGatherDistance);
@@ -835,6 +836,9 @@ namespace CopilotBuddy.Bots.PartyGrind
                     focus = routeTrash;
                 }
             }
+
+            if (isDungeonMap && IsIdleDungeonPullTargetRetrying(focus))
+                focus = null;
 
             ulong resolvedFocusGuid = (focus != null && focus.IsValid && !focus.Dead && !focus.IsFriendly) ? focus.Guid : 0UL;
             bool commitActive = _pullCommittedGuid != 0 && now < _pullCommittedUntilMs;
@@ -1875,12 +1879,8 @@ namespace CopilotBuddy.Bots.PartyGrind
                     ulong tankFocusGuid = leader?.FocusTargetGuid ?? 0UL;
                     if (tankFocusGuid == 0 && !me.Combat && HasLivingAllyInCombat(leader, me.Guid))
                         return RunStatus.Failure;
-                    if (!me.Combat && SquadContext.IsDungeonModeActive && SquadDungeonService.IsInDungeonMap(me) &&
-                        (leader == null || leader.EffectiveTankGuid == 0 || leader.EffectiveTankGuid == me.Guid) &&
-                        SquadTankBridge.TryExecuteSafeDungeonPull(tankFocusGuid))
-                    {
-                        return RunStatus.Success;
-                    }
+                    if (!me.Combat && SquadContext.IsDungeonModeActive && SquadDungeonService.IsInDungeonMap(me))
+                        return RunDungeonPullOrRoutine(tankFocusGuid, settings, leader, me);
                     return RunRoutineCombat(tankFocusGuid);
 
                 case SquadRole.Healer:
@@ -2197,6 +2197,40 @@ namespace CopilotBuddy.Bots.PartyGrind
             return status != RunStatus.Failure;
         }
 
+        private static bool IsDungeonSquadReadyToPull(SquadSettings settings, SquadLeaderState? leader)
+        {
+            return SquadTankBridge.CanInitiatePull(leader,
+                SquadTankBridge.GetEffectivePullGatherDistance(settings.MaxPullGatherDistance, isDungeon: true));
+        }
+
+        private static bool IsIdleDungeonPullTargetRetrying(WoWUnit? target)
+        {
+            return target is { IsValid: true, IsAlive: true } &&
+                   !target.Combat && !target.IsTargetingMyPartyMember && !target.IsTargetingMeOrPet &&
+                   SquadTankBridge.IsDungeonPullTargetRetrying(target.Guid);
+        }
+
+        private RunStatus RunDungeonPullOrRoutine(ulong focusGuid, SquadSettings settings, SquadLeaderState? leader, LocalPlayer me)
+        {
+            var target = focusGuid == 0 ? me.CurrentTarget : ObjectManager.GetObjectByGuid<WoWUnit>(focusGuid);
+            bool bossNotReady = SquadTankBridge.IsIdleDungeonBossTarget(target) && !IsDungeonSquadReadyToPull(settings, leader);
+            if (!bossNotReady && !IsIdleDungeonPullTargetRetrying(target) &&
+                (leader == null || leader.EffectiveTankGuid == 0 || leader.EffectiveTankGuid == me.Guid) &&
+                SquadTankBridge.TryExecuteSafeDungeonPull(focusGuid))
+            {
+                return RunStatus.Success;
+            }
+
+            if (bossNotReady || IsIdleDungeonPullTargetRetrying(target))
+            {
+                if (target?.Guid == _pullCommittedGuid)
+                    ClearPullCommit();
+                return RunStatus.Failure;
+            }
+
+            return RunRoutineCombat(focusGuid);
+        }
+
         private static RunStatus RunRoutineCombat(ulong focusGuid)
         {
             var me = StyxWoW.Me;
@@ -2498,10 +2532,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                 WoWPoint nextDungeonPt = WoWPoint.Zero;
                 WoWUnit? routeTrashTarget = null;
                 bool dungeonFollowerCombat = leader?.Members?.Any(m => m.IsConnected && !m.IsDead && !m.IsGhost && m.IsInCombat) == true;
-                float dungeonPullGatherDistance = SquadTankBridge.GetEffectivePullGatherDistance(
-                    settings.MaxPullGatherDistance, isDungeon);
-                bool dungeonSquadReadyToPull = !isDungeon ||
-                    SquadTankBridge.CanInitiatePull(leader, dungeonPullGatherDistance);
+                bool dungeonSquadReadyToPull = !isDungeon || IsDungeonSquadReadyToPull(settings, leader);
 
                 if (_pullCommittedGuid != 0 && isDungeon &&
                     SquadTankBridge.IsDungeonPullTargetRetrying(_pullCommittedGuid))
@@ -2542,11 +2573,8 @@ namespace CopilotBuddy.Bots.PartyGrind
                         {
                             if (me.CurrentTargetGuid != committed.Guid)
                                 committed.Target();
-                            if (!me.Combat && isDungeon && !anotherTankDrives &&
-                                SquadTankBridge.TryExecuteSafeDungeonPull(_pullCommittedGuid))
-                            {
-                                return RunStatus.Success;
-                            }
+                            if (!me.Combat && isDungeon)
+                                return RunDungeonPullOrRoutine(_pullCommittedGuid, settings, leader, me);
                             return RunRoutineCombat(_pullCommittedGuid);
                         }
                         ClearPullCommit();
@@ -2603,18 +2631,15 @@ namespace CopilotBuddy.Bots.PartyGrind
                             : null;
                         WoWUnit? dungeonTarget = routeTrash ?? Targeting.Instance.FirstUnit;
                         if (dungeonTarget != null && dungeonTarget.IsValid && !dungeonTarget.Dead &&
-                            dungeonTarget.Attackable && !dungeonTarget.IsFriendly)
+                            dungeonTarget.Attackable && !dungeonTarget.IsFriendly && !IsIdleDungeonPullTargetRetrying(dungeonTarget))
                         {
                             if (routeTrash != null)
                                 SquadPartySyncService.LogAction("Dungeon: clearing route trash " + routeTrash.Name);
                             _currentFocusGuid = dungeonTarget.Guid;
                             BeginPullCommit(dungeonTarget.Guid, now);
                             dungeonTarget.Target();
-                            if (!me.Combat && !anotherTankDrives &&
-                                SquadTankBridge.TryExecuteSafeDungeonPull(dungeonTarget.Guid))
-                            {
-                                return RunStatus.Success;
-                            }
+                            if (!me.Combat)
+                                return RunDungeonPullOrRoutine(dungeonTarget.Guid, settings, leader, me);
                             return RunRoutineCombat(dungeonTarget.Guid);
                         }
                     }
