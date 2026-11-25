@@ -339,6 +339,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 // only takes over during combat and only when a target is genuinely low.
                 bool routineHandoffAllowed = anyCombat &&
                     priorityCandidate.HealthPercent < Math.Min(threshold, RoutineHealHandoffThreshold);
+                if (!routineHandoffAllowed)
+                    StopActiveHealBehavior();
                 if (!triedRoutine && routineHandoffAllowed && !emergencyOnly && me.Level >= 10 &&
                     targetUnit.Distance <= 35f && targetUnit.InLineOfSpellSight)
                 {

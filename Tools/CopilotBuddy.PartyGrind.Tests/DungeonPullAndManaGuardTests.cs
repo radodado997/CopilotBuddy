@@ -10,25 +10,27 @@ namespace CopilotBuddy.PartyGrind.Tests
 {
     public sealed class DungeonPullAndManaGuardTests
     {
+        private static readonly WoWPoint Origin = new WoWPoint(100f, 200f, 30f);
+
         [Fact]
         public void DungeonAdvanceStep_ClampsDistantBossApproachToASingleBreadcrumb()
         {
-            var from = new WoWPoint(0f, 0f, 0f);
-            var boss = new WoWPoint(90f, 0f, 0f);
+            var from = Origin;
+            var boss = new WoWPoint(190f, 200f, 30f);
 
             WoWPoint step = SquadDungeonService.ResolveDungeonAdvanceStep(from, boss, Array.Empty<WoWPoint>());
 
             Assert.NotEqual(WoWPoint.Zero, step);
             Assert.Equal(SquadDungeonService.DungeonAdvanceStepDistance, step.Distance(from), 2);
-            Assert.True(step.X > 0f && step.X < boss.X);
-            Assert.Equal(0f, step.Y, 3);
+            Assert.True(step.X > from.X && step.X < boss.X);
+            Assert.Equal(from.Y, step.Y, 3);
         }
 
         [Fact]
         public void DungeonAdvanceStep_KeepsTheFinalCrumbWhenItIsCloserThanOneStep()
         {
-            var from = new WoWPoint(0f, 0f, 0f);
-            var crumb = new WoWPoint(6f, 8f, 0f);
+            var from = Origin;
+            var crumb = new WoWPoint(106f, 208f, 30f);
 
             WoWPoint step = SquadDungeonService.ResolveDungeonAdvanceStep(from, crumb, new List<WoWPoint>());
 
@@ -38,9 +40,9 @@ namespace CopilotBuddy.PartyGrind.Tests
         [Fact]
         public void DungeonAdvanceStep_RefusesCorridorThatStillHoldsLiveTrash()
         {
-            var from = new WoWPoint(0f, 0f, 0f);
-            var objective = new WoWPoint(60f, 0f, 0f);
-            var trash = new[] { new WoWPoint(10f, 4f, 0f) };
+            var from = Origin;
+            var objective = new WoWPoint(160f, 200f, 30f);
+            var trash = new[] { new WoWPoint(110f, 204f, 30f) };
 
             Assert.Equal(WoWPoint.Zero, SquadDungeonService.ResolveDungeonAdvanceStep(from, objective, trash));
         }
@@ -48,22 +50,22 @@ namespace CopilotBuddy.PartyGrind.Tests
         [Fact]
         public void DungeonAdvanceStep_IgnoresTrashBesideTheCorridorAndOnAnotherFloor()
         {
-            var from = new WoWPoint(0f, 0f, 0f);
-            var objective = new WoWPoint(60f, 0f, 0f);
+            var from = Origin;
+            var objective = new WoWPoint(160f, 200f, 30f);
 
-            var beside = new[] { new WoWPoint(10f, 30f, 0f) };
+            var beside = new[] { new WoWPoint(110f, 230f, 30f) };
             Assert.NotEqual(WoWPoint.Zero, SquadDungeonService.ResolveDungeonAdvanceStep(from, objective, beside));
 
-            var upstairs = new[] { new WoWPoint(10f, 0f, 40f) };
+            var upstairs = new[] { new WoWPoint(110f, 200f, 70f) };
             Assert.NotEqual(WoWPoint.Zero, SquadDungeonService.ResolveDungeonAdvanceStep(from, objective, upstairs));
         }
 
         [Fact]
         public void DungeonAdvanceStep_IgnoresTrashTrailingBehindTheLeader()
         {
-            var from = new WoWPoint(0f, 0f, 0f);
-            var objective = new WoWPoint(60f, 0f, 0f);
-            var trailing = new[] { new WoWPoint(-5f, 0f, 0f) };
+            var from = Origin;
+            var objective = new WoWPoint(160f, 200f, 30f);
+            var trailing = new[] { new WoWPoint(95f, 200f, 30f) };
 
             Assert.NotEqual(WoWPoint.Zero, SquadDungeonService.ResolveDungeonAdvanceStep(from, objective, trailing));
         }
@@ -71,9 +73,9 @@ namespace CopilotBuddy.PartyGrind.Tests
         [Fact]
         public void DungeonAdvanceStep_CanBeForcedForwardWhenTheCorridorStaysBlocked()
         {
-            var from = new WoWPoint(0f, 0f, 0f);
-            var objective = new WoWPoint(60f, 0f, 0f);
-            var trash = new[] { new WoWPoint(10f, 4f, 0f) };
+            var from = Origin;
+            var objective = new WoWPoint(160f, 200f, 30f);
+            var trash = new[] { new WoWPoint(110f, 204f, 30f) };
 
             Assert.Equal(WoWPoint.Zero, SquadDungeonService.ResolveDungeonAdvanceStep(from, objective, trash));
             Assert.NotEqual(WoWPoint.Zero, SquadDungeonService.ResolveDungeonAdvanceStep(from, objective, trash, clearance: 0f));
@@ -82,19 +84,19 @@ namespace CopilotBuddy.PartyGrind.Tests
         [Fact]
         public void DungeonAdvanceStep_ReturnsZeroWithoutAnObjective()
         {
-            Assert.Equal(WoWPoint.Zero, SquadDungeonService.ResolveDungeonAdvanceStep(WoWPoint.Zero, new WoWPoint(10f, 0f, 0f), null));
-            Assert.Equal(WoWPoint.Zero, SquadDungeonService.ResolveDungeonAdvanceStep(new WoWPoint(0f, 0f, 0f), WoWPoint.Zero, null));
+            Assert.Equal(WoWPoint.Zero, SquadDungeonService.ResolveDungeonAdvanceStep(WoWPoint.Zero, new WoWPoint(110f, 200f, 30f), null));
+            Assert.Equal(WoWPoint.Zero, SquadDungeonService.ResolveDungeonAdvanceStep(Origin, WoWPoint.Zero, null));
         }
 
         [Fact]
         public void CorridorSegmentDistance_MeasuresPerpendicularOffsetAndEndpoints()
         {
-            var from = new WoWPoint(0f, 0f, 0f);
-            var to = new WoWPoint(10f, 0f, 0f);
+            var from = Origin;
+            var to = new WoWPoint(110f, 200f, 30f);
 
-            Assert.Equal(0f, SquadDungeonService.DistanceToCorridorSegment(new WoWPoint(5f, 0f, 0f), from, to), 3);
-            Assert.Equal(5f, SquadDungeonService.DistanceToCorridorSegment(new WoWPoint(5f, 5f, 0f), from, to), 3);
-            Assert.Equal(10f, SquadDungeonService.DistanceToCorridorSegment(new WoWPoint(-10f, 0f, 0f), from, to), 3);
+            Assert.Equal(0f, SquadDungeonService.DistanceToCorridorSegment(new WoWPoint(105f, 200f, 30f), from, to), 3);
+            Assert.Equal(5f, SquadDungeonService.DistanceToCorridorSegment(new WoWPoint(105f, 205f, 30f), from, to), 3);
+            Assert.Equal(10f, SquadDungeonService.DistanceToCorridorSegment(new WoWPoint(90f, 200f, 30f), from, to), 3);
         }
 
         [Theory]
@@ -182,6 +184,12 @@ namespace CopilotBuddy.PartyGrind.Tests
             Assert.Equal("Hand of Reckoning", packed[0]);
             Assert.Equal("Avenger's Shield", packed[1]);
             Assert.Equal("Exorcism", packed[2]);
+
+            string[] packedUndead = SquadTankBridge.GetPullSpellPriority(
+                WoWClass.Paladin, isolatedTarget: false, targetIsUndeadOrDemon: true);
+            Assert.Equal("Hand of Reckoning", packedUndead[0]);
+            Assert.Equal("Exorcism", packedUndead[1]);
+            Assert.Equal("Avenger's Shield", packedUndead[2]);
 
             string[] isolated = SquadTankBridge.GetPullSpellPriority(WoWClass.Paladin, isolatedTarget: true);
             Assert.Equal("Avenger's Shield", isolated[0]);

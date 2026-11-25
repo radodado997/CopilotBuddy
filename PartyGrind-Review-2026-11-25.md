@@ -158,3 +158,56 @@ The sandbox has no .NET SDK / Windows and the project targets `net10.0-windows7.
 `dotnet build` / `dotnet test` could not be executed here. The changes are pure-logic additions next
 to existing patterns plus threshold constants; the behavioural parts (dungeon movement, pull, heal,
 buff) still require the mandatory in-game test with a log per `CONTRIBUTING.md`.
+
+## Round 2 — review comments and the "no combat routine" breakage (build 1.6.7.6, logs 14:43)
+
+The second log set (five clients started 14:43) shows **every** client failing to load the class
+routine:
+
+```
+Compiling Singular wotlk
+Could not compile routine from: Singular wotlk
+File: Common.cs Line: 239 Error: The type or namespace name 'SquadRole' does not exist in the
+namespace 'Styx.PartyGrind.IPC' (are you missing an assembly reference?)
+Loaded 0 combat routine(s)
+Could not find a routine fitting for your class ... Using default.
+```
+
+`BotRoutines/ClassSpecific/Paladin/Common.cs` (added by PR #26) qualified `SquadRole` as
+`Styx.PartyGrind.IPC.SquadRole`, but the enum lives in `Styx/PartyGrind/SquadEnums.cs` under
+`Styx.PartyGrind`. The whole `Singular wotlk` folder is compiled **at runtime** (the csproj excludes
+`BotRoutines/**` from the assembly and only copies it to `Routines\Singular wotlk\`), so `dotnet
+build` cannot catch it — the bot silently fell back to `DefaultCombatRoutine`, nobody ran a rotation,
+and the group stood in front of a focused `Defias Prisoner` for minutes while the healer cast
+whatever the PartyGrind bridge told it to. Fixed with the one-line namespace correction.
+
+### Review comments handled
+
+* `SquadHealBridge`: the retained routine `HealBehavior` is now stopped through the existing
+  `StopActiveHealBehavior()` lifecycle helper as soon as `routineHandoffAllowed` turns false, instead
+  of being carried into the explicit-heal fallback with a live iterator.
+* `SquadPartyBuffService`: blessing ownership is now resolved against the **reachable** Paladins only
+  (`RestrictBlessingOwnersToReachable`), using the same 30 yd rule as `CollectBuffableAllies`
+  (`PartyBuffRange`). Roster order is preserved, so an assignment whose owner can reach the target is
+  unchanged; a remote owner no longer swallows the target's blessing.
+* `SquadTankBridge`: packed pulls open with `Hand of Reckoning` → `Exorcism` → `Avenger's Shield`
+  when the target is undead/demon, and keep `Hand of Reckoning` → `Avenger's Shield` → `Exorcism`
+  otherwise. Exorcism is single-target but cannot land on humanoids, and `SpellManager.CanCast` only
+  checks `IsUsableSpell`, so putting it second unconditionally made the opener fail silently and the
+  tank never pulled. Isolated targets keep `Avenger's Shield` first.
+* `PartyGrindBot`: the issued `Navigator.MoveTo` breadcrumb is now tracked
+  (`_dungeonForcedStep` + objective + leader guid + timestamp) and the dungeon-advance `MoveStop`
+  calls go through `StopMovementUnlessDungeonForcedStep()`. The forced step is cleared on arrival
+  (≤2 yd), when the objective changes, when the leader changes, or after 4 s without a refresh, so
+  "waiting for squadmates to gather" and the blocked-corridor branch no longer cancel the walk.
+* `DungeonPullAndManaGuardTests`: movement fixtures use a non-zero origin `(100, 200, 30)` with all
+  destinations/hostiles translated consistently and assertions updated (`step.Y == from.Y`,
+  `from.X < step.X < boss.X`); the zero-sentinel test keeps using `WoWPoint.Zero` explicitly.
+
+### Still open
+
+* `dotnet build` cannot validate `BotRoutines/**` (runtime-compiled, copied as content). A Roslyn
+  compile check of that folder in the test project would have caught this regression before shipping.
+* The squads run at level 29–30 while the loaded profile's top sub-profile is `Field of Giants Grind`
+  (L23-26); dungeon mode ignores `LevelCapReached` (`levelCapReached = !isDungeonMode && …`), so the
+  run continues, but the profile no longer matches the characters' level.

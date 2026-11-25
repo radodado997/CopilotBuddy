@@ -151,6 +151,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 $"if GetRaidTargetIndex(u) ~= {icon} then SetRaidTarget(u, {icon}) end break end end");
         }
 
+        internal const float PartyBuffRange = 30f;
+
         private static List<WoWUnit> CollectBuffableAllies(LocalPlayer me, SquadLeaderState? leader)
         {
             var list = new List<WoWUnit> { me };
@@ -163,13 +165,55 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
                 WoWUnit? unit = ObjectManager.GetObjectByGuid<WoWUnit>(guid);
                 if (unit != null && unit.IsValid && unit.IsAlive && !unit.Dead && !unit.IsGhost &&
-                    unit.Location.Distance(me.Location) <= 30f)
+                    unit.Location.Distance(me.Location) <= PartyBuffRange)
                 {
                     list.Add(unit);
                 }
             }
 
             return list;
+        }
+
+        private static bool PaladinCanReachTarget(LocalPlayer me, WoWUnit ally, string paladinName)
+        {
+            if (string.IsNullOrEmpty(paladinName))
+                return false;
+            if (string.Equals(paladinName, me.Name, StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            foreach (ulong guid in SquadContext.GetKnownMemberGuids())
+            {
+                WoWUnit? unit = ObjectManager.GetObjectByGuid<WoWUnit>(guid);
+                if (unit == null || !unit.IsValid || unit.Dead || unit.IsGhost)
+                    continue;
+                if (!string.Equals(unit.Name, paladinName, StringComparison.OrdinalIgnoreCase))
+                    continue;
+                return unit.Location.Distance(ally.Location) <= PartyBuffRange;
+            }
+
+            return false;
+        }
+
+        private static List<IReadOnlyList<string>> RestrictBlessingOwnersToReachable(
+            LocalPlayer me,
+            WoWUnit ally,
+            List<string> paladinNames,
+            List<IReadOnlyList<string>> knownByPaladin,
+            int selfIndex,
+            out int selfOwnerIndex)
+        {
+            selfOwnerIndex = -1;
+            var reachable = new List<IReadOnlyList<string>>(paladinNames.Count);
+            for (int i = 0; i < paladinNames.Count && i < knownByPaladin.Count; i++)
+            {
+                if (i != selfIndex && !PaladinCanReachTarget(me, ally, paladinNames[i]))
+                    continue;
+                if (i == selfIndex)
+                    selfOwnerIndex = reachable.Count;
+                reachable.Add(knownByPaladin[i]);
+            }
+
+            return reachable;
         }
 
         private static bool BuffMage(LocalPlayer me, List<WoWUnit> allies)
@@ -420,8 +464,18 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 var role = SquadContext.GetMemberByGuid(ally.Guid)?.Role ??
                            (ally.Guid == me.Guid ? SquadContext.ActiveRole : SquadRole.DpsMelee);
 
-                var (casterIndex, desiredBlessing) = SelectBlessingAssignment(role, ally.Class, knownByPaladin);
-                if (string.IsNullOrEmpty(desiredBlessing) || casterIndex != paladinIndex)
+                var reachableOwners = RestrictBlessingOwnersToReachable(
+                    me,
+                    ally,
+                    paladinNames,
+                    knownByPaladin,
+                    paladinIndex,
+                    out int selfOwnerIndex);
+                if (selfOwnerIndex < 0)
+                    continue;
+
+                var (casterIndex, desiredBlessing) = SelectBlessingAssignment(role, ally.Class, reachableOwners);
+                if (string.IsNullOrEmpty(desiredBlessing) || casterIndex != selfOwnerIndex)
                     continue;
 
                 // Never take the buff slot away from another Paladin: that is the mutual

@@ -552,15 +552,19 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         /// tool, while a packed target must be opened with a single-target spell so the pull stays
         /// one pack and never chains the next group behind it.
         /// </summary>
-        public static string[] GetPullSpellPriority(WoWClass playerClass, bool isolatedTarget)
+        public static string[] GetPullSpellPriority(
+            WoWClass playerClass, bool isolatedTarget, bool targetIsUndeadOrDemon = false)
         {
             switch (playerClass)
             {
                 case WoWClass.Paladin:
-                    // Exorcism stays last: it only applies to undead/demons and would silently
-                    // fail as an opener against the usual humanoid trash.
-                    return isolatedTarget
-                        ? new[] { "Avenger's Shield", "Hand of Reckoning", "Exorcism" }
+                    // Exorcism is single-target but only lands on undead/demons: it must not be
+                    // queued ahead of a usable tool for the usual humanoid trash, or the opener
+                    // silently fails and the tank never pulls.
+                    if (isolatedTarget)
+                        return new[] { "Avenger's Shield", "Hand of Reckoning", "Exorcism" };
+                    return targetIsUndeadOrDemon
+                        ? new[] { "Hand of Reckoning", "Exorcism", "Avenger's Shield" }
                         : new[] { "Hand of Reckoning", "Avenger's Shield", "Exorcism" };
                 case WoWClass.Warrior:
                     return new[] { "Heroic Throw", "Taunt", "Shoot", "Throw" };
@@ -611,7 +615,10 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 return true;
             }
 
-            string[] pullSpells = GetPullSpellPriority(me.Class, isolatedTarget: !TargetHasCloseNeighbours(target));
+            string[] pullSpells = GetPullSpellPriority(
+                me.Class,
+                isolatedTarget: !TargetHasCloseNeighbours(target),
+                targetIsUndeadOrDemon: target.IsUndead || target.IsDemon);
 
             string? chosenSpell = pullSpells.FirstOrDefault(s =>
                 SpellManager.HasSpell(s) && SpellManager.CanCast(s, target, checkRange: false, checkMovement: false));
