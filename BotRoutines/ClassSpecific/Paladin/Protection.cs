@@ -86,6 +86,8 @@ namespace Singular.ClassSpecific.Paladin
                     ret => TankManager.Instance.NeedToTaunt.FirstOrDefault(),
                     ret => SingularSettings.Instance.EnableTaunting && StyxWoW.Me.IsInInstance),
 
+                Common.CreatePaladinCombatSelfHeal(),
+
                 //Multi target
                 new Decorator(
                     ret => Unit.UnfriendlyUnitsNearTarget(8f).Any(),

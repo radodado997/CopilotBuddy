@@ -24,14 +24,18 @@ namespace Singular.ClassSpecific.Priest
         {
             return new PrioritySelector(
                 Spell.WaitForCast(),
-                // Heal self before resting. There is no need to eat while we have 100% mana
-                CreateDiscHealOnlyBehavior(true),
+                // Heal self before resting, unless already eating/drinking.
+                new Decorator(
+                    ret => !StyxWoW.Me.HasAura("Drink") && !StyxWoW.Me.HasAura("Food") && !StyxWoW.Me.HasAura("Refreshment"),
+                    CreateDiscHealOnlyBehavior(true)),
                 // Rest up damnit! Do this first, so we make sure we're fully rested.
                 Rest.CreateDefaultRestBehaviour(),
                 // Can we res people?
                 Spell.Resurrect("Resurrection"),
-                // Make sure we're healing OOC too!
-                CreateDiscHealOnlyBehavior(false, false)
+                // Make sure we're healing OOC too (without breaking active food/drink)!
+                new Decorator(
+                    ret => !StyxWoW.Me.HasAura("Drink") && !StyxWoW.Me.HasAura("Food") && !StyxWoW.Me.HasAura("Refreshment"),
+                    CreateDiscHealOnlyBehavior(false, false))
                 );
         }
 
@@ -107,11 +111,14 @@ namespace Singular.ClassSpecific.Priest
                         Spell.Heal(
                             "Heal",
                             ret => (WoWUnit)ret,
-                            ret => !SpellManager.HasSpell("Greater Heal") && ((WoWUnit)ret).HealthPercent < SingularSettings.Instance.Priest.Heal),
+                            ret => !Spell.CanCastOnUnit("Greater Heal", (WoWUnit)ret) &&
+                                   ((WoWUnit)ret).HealthPercent < SingularSettings.Instance.Priest.Heal),
                         Spell.Heal(
                             "Lesser Heal",
                             ret => (WoWUnit)ret,
-                            ret => !SpellManager.HasSpell("Greater Heal") && !SpellManager.HasSpell("Heal") && ((WoWUnit)ret).HealthPercent < SingularSettings.Instance.Priest.Heal),
+                            ret => !Spell.CanCastOnUnit("Greater Heal", (WoWUnit)ret) &&
+                                   !Spell.CanCastOnUnit("Heal", (WoWUnit)ret) &&
+                                   ((WoWUnit)ret).HealthPercent < SingularSettings.Instance.Priest.Heal),
                         Spell.Heal(
                             "Renew",
                             ret => (WoWUnit)ret, 
@@ -119,7 +126,8 @@ namespace Singular.ClassSpecific.Priest
                         Spell.Heal(
                             "Prayer of Mending",
                             ret => (WoWUnit)ret,
-                            ret => !((WoWUnit)ret).HasMyAura("Prayer of Mending") && ((WoWUnit)ret).HealthPercent < 90),
+                            ret => (((WoWUnit)ret).Combat || StyxWoW.Me.Combat) &&
+                                   !((WoWUnit)ret).HasMyAura("Prayer of Mending") && ((WoWUnit)ret).HealthPercent < 90),
                         new Decorator(
                             ret => StyxWoW.Me.Combat && StyxWoW.Me.GotTarget && Unit.NearbyFriendlyPlayers.Count(u => u.IsInMyPartyOrRaid) == 0,
                             new PrioritySelector(

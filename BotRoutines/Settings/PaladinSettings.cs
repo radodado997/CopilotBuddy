@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.ComponentModel;
 
 using Singular.ClassSpecific.Paladin;
@@ -33,7 +33,7 @@ namespace Singular.Settings
         public PaladinAura Aura { get; set; }
 
         [Setting]
-        [DefaultValue(90)]
+        [DefaultValue(78)]
         [Category("Common")]
         [DisplayName("Holy Light Health")]
         [Description("Holy Light will be used at this value")]
