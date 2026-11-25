@@ -546,6 +546,10 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         // Pulling a mob that already stands next to its pack with a multi-target opener
         // (Avenger's Shield bounces to three targets) drags the whole pack in one go.
         internal const float PullPackNeighbourRadius = 10f;
+        internal const int MaxComfortablePackSize = 3;
+        internal const int MaxBlockedPackSize = 5;
+        internal const float PackPullManaFloor = 55f;
+        internal const long MaxPackPullHoldMs = 15000L;
 
         /// <summary>
         /// Pull opener priority per class. An isolated target may be opened with the strongest
@@ -575,6 +579,39 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 default:
                     return Array.Empty<string>();
             }
+        }
+
+        internal static int CountPullPackSize(WoWUnit target)
+        {
+            if (target == null)
+                return 0;
+
+            int count = 1;
+            foreach (var unit in ObjectManager.CachedUnits)
+            {
+                if (unit == null || !unit.IsValid || unit.Dead || unit.Guid == target.Guid)
+                    continue;
+                if (!unit.Attackable || unit.IsFriendly || unit.IsPlayer || unit.IsCritter || unit.IsNonCombatPet)
+                    continue;
+                if (unit.ControllingPlayer != null)
+                    continue;
+                if (unit.Location.Distance(target.Location) > PullPackNeighbourRadius)
+                    continue;
+                count++;
+            }
+
+            return count;
+        }
+
+        internal static bool IsPackPullTooRisky(int packSize, float lowestPartyManaPercent, long holdElapsedMs)
+        {
+            if (packSize <= MaxComfortablePackSize)
+                return false;
+            if (packSize > MaxBlockedPackSize)
+                return false;
+            if (holdElapsedMs >= MaxPackPullHoldMs)
+                return false;
+            return lowestPartyManaPercent < PackPullManaFloor;
         }
 
         private static bool TargetHasCloseNeighbours(WoWUnit target)
