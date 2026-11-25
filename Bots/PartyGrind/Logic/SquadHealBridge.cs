@@ -125,6 +125,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         // The routine healer owns its own (much greedier) targeting, so the bridge hands over
         // control only when somebody actually needs a heal right now, never for top-ups.
         internal const double RoutineHealHandoffThreshold = 70.0;
+        internal const double LowManaSpellSwapPercent = 45.0;
+        internal const long HealDuplicateWindowMs = 1500L;
+        private static readonly Dictionary<ulong, (string Spell, long AtUtcMs)> _recentHealCasts = new();
 
         /// <summary>
         /// Computes the maximum health percentage at which a healer or off-healer should act,
@@ -174,6 +177,37 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             return Math.Min(threshold, reserveCap);
         }
 
+        internal static void RecordHealCast(ulong targetGuid, string? spellName, long nowUtcMs)
+        {
+            if (targetGuid == 0 || string.IsNullOrEmpty(spellName))
+                return;
+
+            if (_recentHealCasts.Count > 32)
+            {
+                var stale = _recentHealCasts
+                    .Where(kv => nowUtcMs - kv.Value.AtUtcMs > HealDuplicateWindowMs)
+                    .Select(kv => kv.Key)
+                    .ToList();
+                foreach (ulong guid in stale)
+                    _recentHealCasts.Remove(guid);
+            }
+
+            _recentHealCasts[targetGuid] = (spellName!, nowUtcMs);
+        }
+
+        internal static bool IsHealCastDuplicate(ulong targetGuid, string? spellName, long nowUtcMs)
+        {
+            if (targetGuid == 0 || string.IsNullOrEmpty(spellName))
+                return false;
+            if (!_recentHealCasts.TryGetValue(targetGuid, out var last))
+                return false;
+            if (nowUtcMs - last.AtUtcMs > HealDuplicateWindowMs)
+                return false;
+            return string.Equals(last.Spell, spellName, StringComparison.OrdinalIgnoreCase);
+        }
+
+        internal static void ResetHealCastHistory() => _recentHealCasts.Clear();
+
         private static double ReadManaPercent(LocalPlayer me)
         {
             if (me.MaxMana <= 0)
@@ -191,6 +225,32 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (leader != null && (leader.InCombat || leader.Members?.Any(m => m.IsConnected && !m.IsDead && m.IsInCombat) == true))
                 return true;
             return candidates.Any(c => c.InCombat);
+        }
+
+        internal static bool IsSquadMidWipe(SquadLeaderState? leader)
+        {
+            if (leader?.Members == null)
+                return false;
+
+            int alive = 0;
+            int down = 0;
+            float lowestAliveHealth = 100f;
+            foreach (var member in leader.Members)
+            {
+                if (!member.IsConnected)
+                    continue;
+                if (member.IsDead || member.IsGhost)
+                {
+                    down++;
+                    continue;
+                }
+
+                alive++;
+                if (member.HealthPercent < lowestAliveHealth)
+                    lowestAliveHealth = member.HealthPercent;
+            }
+
+            return down > 0 && alive >= 2 && lowestAliveHealth < 80f;
         }
 
         private static bool IsActivelyConsumingRestAura(LocalPlayer me)
@@ -215,7 +275,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (candidates.Count == 0)
                 return false;
 
-            bool anyCombat = IsSquadCombatActive(me, leader, candidates);
+            bool squadCombat = IsSquadCombatActive(me, leader, candidates);
+            bool midWipe = IsSquadMidWipe(leader);
+            bool anyCombat = squadCombat || midWipe;
             bool activelyDrinking = !anyCombat && IsActivelyConsumingRestAura(me);
             bool inRestPhase = !anyCombat &&
                 ((leader != null && leader.Phase == SquadPhase.Resting) ||
@@ -273,8 +335,11 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (me == null || !me.IsAlive)
                 return false;
 
+            long nowUtcMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             var candidates = CollectLiveHealCandidates(leader);
-            bool anyCombat = IsSquadCombatActive(me, leader, candidates);
+            bool squadCombat = IsSquadCombatActive(me, leader, candidates);
+            bool midWipe = IsSquadMidWipe(leader);
+            bool anyCombat = squadCombat || midWipe;
             bool activelyDrinking = !anyCombat && IsActivelyConsumingRestAura(me);
             bool inRestPhase = !anyCombat &&
                 ((leader != null && leader.Phase == SquadPhase.Resting) ||
@@ -361,6 +426,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                             RunStatus status = healBehavior.Tick(null);
                             if (status == RunStatus.Running || me.IsCasting || me.ChanneledCastingSpellId != 0)
                             {
+                                RecordHealCast(targetUnit.Guid, me.CastingSpell?.Name, nowUtcMs);
                                 SquadPartySyncService.LogAction("Running heal routine");
                                 return true;
                             }
@@ -394,6 +460,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 bool combatActive = anyCombat || targetUnit.Combat;
 
                 var (spellName, blockedSpell) = SelectHealSpellForClass(me, targetUnit, injured78, injured82, emergencyOnly, combatActive);
+                if (spellName != null && IsHealCastDuplicate(targetUnit.Guid, spellName, nowUtcMs))
+                    continue;
                 if (spellName == null)
                 {
                     if (blockedSpell != null)
@@ -415,6 +483,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 {
                     if (SpellManager.Cast(spellName, targetUnit))
                     {
+                        RecordHealCast(targetUnit.Guid, spellName, nowUtcMs);
                         SquadPartySyncService.LogAction("Healing " + targetUnit.Name + " with " + spellName);
                         return true;
                     }
@@ -649,9 +718,11 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             bool hasWeakenedSoul,
             Func<string, bool> hasAuraFromHealer,
             Func<string, bool> hasSpell,
-            Func<string, bool> canCastSpell)
+            Func<string, bool> canCastSpell,
+            double healerManaPercent = 100.0)
         {
             string? blockedSpell = null;
+            bool lowMana = healerManaPercent < LowManaSpellSwapPercent;
 
             bool CanCastHeal(string spellName)
             {
@@ -667,6 +738,18 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             switch (healerClass)
             {
                 case WoWClass.Priest:
+                    if (lowMana)
+                    {
+                        if (hp < 30.0 && CanCastHeal("Flash Heal"))
+                            return ("Flash Heal", null);
+                        if (hp < (inCombat ? 70.0 : 60.0) && !hasAuraFromHealer("Renew") && CanCastHeal("Renew"))
+                            return ("Renew", null);
+                        if (hp < (inCombat ? 62.0 : 52.0) && CanCastHeal("Heal"))
+                            return ("Heal", null);
+                        if (hp < (inCombat ? 62.0 : 52.0) && CanCastHeal("Lesser Heal"))
+                            return ("Lesser Heal", null);
+                        break;
+                    }
                     // Critical health first: a shield does not stop lethal damage on a 20% target.
                     if (hp < 35.0 && CanCastHeal("Flash Heal"))
                         return ("Flash Heal", null);
@@ -700,6 +783,14 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     break;
 
                 case WoWClass.Paladin:
+                    if (lowMana)
+                    {
+                        if (hp < 35.0 && CanCastHeal("Holy Shock"))
+                            return ("Holy Shock", null);
+                        if (hp < (inCombat ? 70.0 : 55.0) && CanCastHeal("Flash of Light"))
+                            return ("Flash of Light", null);
+                        break;
+                    }
                     if (!emergencyOnly && inCombat && isTank && !hasAuraFromHealer("Beacon of Light") &&
                         CanCastHeal("Beacon of Light"))
                         return ("Beacon of Light", null);
@@ -715,6 +806,16 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     break;
 
                 case WoWClass.Druid:
+                    if (lowMana)
+                    {
+                        if (hp < (inCombat ? 70.0 : 60.0) && !hasAuraFromHealer("Rejuvenation") && CanCastHeal("Rejuvenation"))
+                            return ("Rejuvenation", null);
+                        if (hp < (inCombat ? 60.0 : 50.0) && CanCastHeal("Nourish"))
+                            return ("Nourish", null);
+                        if (hp < (inCombat ? 60.0 : 50.0) && CanCastHeal("Healing Touch"))
+                            return ("Healing Touch", null);
+                        break;
+                    }
                     if (!emergencyOnly && injured78Count >= 2 && CanCastHeal("Wild Growth"))
                         return ("Wild Growth", null);
                     if (!emergencyOnly && inCombat && isTank && hp < 92.0 && !hasAuraFromHealer("Lifebloom") &&
@@ -733,6 +834,16 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     break;
 
                 case WoWClass.Shaman:
+                    if (lowMana)
+                    {
+                        if (hp < 35.0 && CanCastHeal("Riptide"))
+                            return ("Riptide", null);
+                        if (hp < (inCombat ? 68.0 : 58.0) && CanCastHeal("Lesser Healing Wave"))
+                            return ("Lesser Healing Wave", null);
+                        if (hp < (inCombat ? 58.0 : 48.0) && CanCastHeal("Healing Wave"))
+                            return ("Healing Wave", null);
+                        break;
+                    }
                     if (!emergencyOnly && (inCombat || hp < 85.0) && isTank && !hasAuraFromHealer("Earth Shield") &&
                         CanCastHeal("Earth Shield"))
                         return ("Earth Shield", null);
@@ -771,7 +882,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 hasWeakenedSoul: target.HasAura("Weakened Soul") || target.HasAura("Power Word: Shield"),
                 hasAuraFromHealer: aura => HasMyAura(me.Guid, target, aura),
                 hasSpell: SpellManager.HasSpell,
-                canCastSpell: spell => SpellManager.CanCast(spell, target, checkRange, false));
+                canCastSpell: spell => SpellManager.CanCast(spell, target, checkRange, false),
+                healerManaPercent: ReadManaPercent(me));
         }
 
         private static bool HasMyAura(ulong myGuid, WoWUnit unit, string auraName)

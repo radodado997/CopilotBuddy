@@ -115,6 +115,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private int _lastResetGeneration;
         private readonly HashSet<uint> _currentRunKilledBosses = new();
         internal const float HotspotArrivalDistance = 4.5f;
+        internal const long ResetPendingOutsideTimeoutMs = 20000L;
+        internal const long ResetPendingOutsideLogThrottleMs = 5000L;
         // Trash is cleared one breadcrumb at a time: the leader never advances more than a
         // single step and refuses any step whose corridor still holds live hostile trash.
         internal const float DungeonAdvanceStepDistance = 18f;
@@ -125,6 +127,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         internal const float BossFallbackApproachDistance = 40f;
         private bool _runtimeInitialized;
         private bool _resetPendingOutside;
+        private long _resetPendingOutsideSinceUtcMs;
+        private long _lastResetPendingOutsideLogUtcMs;
         private uint _walkInRunDungeonId;
         private uint _walkInRunMapId;
         private int _hotspotIndex;
@@ -551,6 +555,20 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         public void MarkResetPendingOutside()
         {
             _resetPendingOutside = true;
+            _resetPendingOutsideSinceUtcMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            _lastResetPendingOutsideLogUtcMs = 0;
+        }
+
+        internal static bool ShouldAbandonResetPendingOutside(bool resetIssued, long pendingSinceUtcMs, long nowUtcMs) =>
+            !resetIssued &&
+            pendingSinceUtcMs > 0 &&
+            nowUtcMs - pendingSinceUtcMs >= ResetPendingOutsideTimeoutMs;
+
+        private void ClearResetPendingOutside()
+        {
+            _resetPendingOutside = false;
+            _resetPendingOutsideSinceUtcMs = 0;
+            _lastResetPendingOutsideLogUtcMs = 0;
         }
 
         public SquadDungeonSnapshot CaptureSnapshot(SquadSettings settings, IReadOnlyList<SquadConnectedMemberSnapshot> connected, int effectiveMinLevel, long nowUtcMs)
@@ -786,14 +804,35 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                         return true;
                     }
 
-                    Logging.Write("[PartyGrind Dungeon] Resetting instances for next run.");
+                    if (_resetPendingOutsideSinceUtcMs == 0)
+                        _resetPendingOutsideSinceUtcMs = nowUtcMs;
+
+                    if (nowUtcMs - _lastResetPendingOutsideLogUtcMs >= ResetPendingOutsideLogThrottleMs)
+                    {
+                        _lastResetPendingOutsideLogUtcMs = nowUtcMs;
+                        Logging.Write("[PartyGrind Dungeon] Resetting instances for next run.");
+                    }
+
                     bool resetIssued = Lua.GetReturnVal<bool>(
                         "if (GetNumPartyMembers() == 0 and GetNumRaidMembers() == 0) or IsPartyLeader() then ResetInstances(); return true end return false", 0);
                     if (resetIssued)
                     {
                         RecordInstanceReset(nowUtcMs);
                         _lfgRunCompletedAwaitingRequeue = false;
+                        ClearResetPendingOutside();
+                        return true;
                     }
+
+                    if (ShouldAbandonResetPendingOutside(resetIssued, _resetPendingOutsideSinceUtcMs, nowUtcMs))
+                    {
+                        Logging.Write("[PartyGrind Dungeon] Instance reset could not be issued within {0}s ({1}); re-queueing without a reset.",
+                            ResetPendingOutsideTimeoutMs / 1000, me.IsInParty ? "not the party leader" : "no group");
+                        ClearResetPendingOutside();
+                        _lfgRunCompletedAwaitingRequeue = false;
+                        LfgManager.DungeonCompletedReason = CompleteReason.None;
+                        return false;
+                    }
+
                     return true;
                 }
 

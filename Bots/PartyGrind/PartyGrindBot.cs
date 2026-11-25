@@ -85,6 +85,9 @@ namespace CopilotBuddy.Bots.PartyGrind
         private const float DungeonTrashScanRadius = 40f;
         private const long DungeonAdvanceBlockMaxMs = 8000L;
         private const long DungeonForcedStepMaxMs = 4000L;
+        private const float RestThreatRadius = 15f;
+        private const float RestMeleeThreatRadius = 10f;
+        private const long WorldTransitionGraceMs = 3000L;
         private const float DungeonForcedStepArrivalDistance = 2f;
         private const long IdleSnapshotIntervalMs = 5000L;
         private const int TerminalStateDeliveryTimeoutMs = 1000;
@@ -119,6 +122,9 @@ namespace CopilotBuddy.Bots.PartyGrind
         private WoWPoint _dungeonForcedStepObjective = WoWPoint.Zero;
         private ulong _dungeonForcedStepLeaderGuid;
         private long _dungeonForcedStepIssuedUtcMs;
+        private long _packPullHoldSinceUtcMs;
+        private uint _lastObservedMapId;
+        private long _lastMapChangeUtcMs;
         private bool _lootFilterAttached;
         private bool _levelCapStopRequested;
         private SquadLeaderStateDelivery? _terminalStateDelivery;
@@ -248,6 +254,9 @@ namespace CopilotBuddy.Bots.PartyGrind
             _localWasNeedingRest = false;
             _dungeonAdvanceBlockedSinceUtcMs = 0;
             ClearDungeonForcedStep();
+            _packPullHoldSinceUtcMs = 0;
+            _lastObservedMapId = 0;
+            _lastMapChangeUtcMs = 0;
 
             try
             {
@@ -958,6 +967,73 @@ namespace CopilotBuddy.Bots.PartyGrind
             return false;
         }
 
+        internal static bool IsTransientWorldTransition(bool isInWorld, long mapChangeUtcMs, long nowUtcMs) =>
+            !isInWorld || (mapChangeUtcMs > 0 && nowUtcMs - mapChangeUtcMs < WorldTransitionGraceMs);
+
+        internal static bool ShouldDeferRest(bool hostileAggroNearby, bool hostileInMeleeRange, bool partyMemberInCombat) =>
+            partyMemberInCombat || hostileAggroNearby || hostileInMeleeRange;
+
+        private static float LowestPartyManaPercent(SquadLeaderState? leader)
+        {
+            if (leader?.Members == null)
+                return 100f;
+
+            float healerLowest = 100f;
+            float anyLowest = 100f;
+            bool sawHealer = false;
+
+            foreach (var member in leader.Members)
+            {
+                if (!member.IsConnected || member.IsDead || member.IsGhost)
+                    continue;
+                bool usesMana = member.PowerType == WoWPowerType.Mana || member.Class == WoWClass.Druid;
+                if (!usesMana)
+                    continue;
+
+                float percent = member.Class == WoWClass.Druid && member.ManaPercent > 0f ? member.ManaPercent : member.PowerPercent;
+                if (percent < anyLowest)
+                    anyLowest = percent;
+
+                if (member.Role == SquadRole.Healer || member.Role == SquadRole.HybridOffHeal)
+                {
+                    sawHealer = true;
+                    if (percent < healerLowest)
+                        healerLowest = percent;
+                }
+            }
+
+            return sawHealer ? healerLowest : anyLowest;
+        }
+
+        private static bool HostilesNearbyForRest(out bool aggro, out bool inMeleeRange)
+        {
+            aggro = false;
+            inMeleeRange = false;
+            var me = StyxWoW.Me;
+            if (me == null)
+                return false;
+
+            foreach (var unit in ObjectManager.CachedUnits)
+            {
+                if (unit == null || !unit.IsValid || unit.Dead)
+                    continue;
+                if (!unit.Attackable || unit.IsFriendly || unit.IsPlayer || unit.IsCritter || unit.IsNonCombatPet)
+                    continue;
+                if (unit.ControllingPlayer != null)
+                    continue;
+
+                float distance = unit.Location.Distance(me.Location);
+                if (distance > RestThreatRadius)
+                    continue;
+                if (distance <= RestMeleeThreatRadius)
+                    inMeleeRange = true;
+                if (unit.IsTargetingMyPartyMember || (unit.Combat && unit.CurrentTargetGuid == me.Guid))
+                    aggro = true;
+            }
+
+            return aggro || inMeleeRange;
+        }
+
         private void StopMovementUnlessDungeonForcedStep(ulong leaderGuid, long nowUtcMs)
         {
             if (DungeonForcedStepActive(leaderGuid, nowUtcMs))
@@ -1187,8 +1263,14 @@ namespace CopilotBuddy.Bots.PartyGrind
             var me = StyxWoW.Me!;
             var leader = SquadContext.GetLeaderStateSnapshot();
 
-            bool isDead = me.Dead && !me.IsGhost;
-            bool isGhost = me.IsGhost;
+            if (me.MapId != _lastObservedMapId)
+            {
+                _lastObservedMapId = me.MapId;
+                _lastMapChangeUtcMs = now;
+            }
+            bool inWorldTransition = IsTransientWorldTransition(StyxWoW.IsInWorld, _lastMapChangeUtcMs, now);
+            bool isDead = me.Dead && !me.IsGhost && !inWorldTransition;
+            bool isGhost = me.IsGhost && !inWorldTransition;
             bool insideDungeon = SquadDungeonService.IsInDungeonMap(me);
             if (isDead)
                 _diedInsideDungeon ??= insideDungeon;
@@ -1585,6 +1667,9 @@ namespace CopilotBuddy.Bots.PartyGrind
         {
             var me = StyxWoW.Me;
             if (me == null)
+                return RunStatus.Failure;
+
+            if (IsTransientWorldTransition(StyxWoW.IsInWorld, _lastMapChangeUtcMs, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()))
                 return RunStatus.Failure;
 
             var settings = SquadContext.ActiveSettings ?? SquadSettings.Instance;
@@ -2342,6 +2427,11 @@ namespace CopilotBuddy.Bots.PartyGrind
                 return false;
 
             var leader = SquadContext.GetLeaderStateSnapshot();
+            bool partyMemberInCombat = leader?.Members?.Any(m => m.Guid != me.Guid && m.IsConnected && !m.IsDead && !m.IsGhost && m.IsInCombat) == true;
+            if (HostilesNearbyForRest(out bool hostileAggroNearby, out bool hostileInMeleeRange) &&
+                ShouldDeferRest(hostileAggroNearby, hostileInMeleeRange, partyMemberInCombat))
+                return false;
+
             if (leader != null && leader.Phase == SquadPhase.Resting)
                 return true;
 
@@ -2627,6 +2717,36 @@ namespace CopilotBuddy.Bots.PartyGrind
                         if (dungeonTarget != null && dungeonTarget.IsValid && !dungeonTarget.Dead &&
                             dungeonTarget.Attackable && !dungeonTarget.IsFriendly)
                         {
+                            WoWUnit? isolatedTarget = SquadTankBridge.SelectIsolatedPullTarget(
+                                dungeonTarget, me.Location, SquadTankBridge.MaxPullCandidateScanRadius);
+                            if (isolatedTarget != null && isolatedTarget.Guid != dungeonTarget.Guid)
+                            {
+                                SquadPartySyncService.LogAction("Dungeon: pulling " + isolatedTarget.Name +
+                                    " instead of " + dungeonTarget.Name + " to keep the pack small");
+                                dungeonTarget = isolatedTarget;
+                            }
+
+                            bool startingPackHold = _packPullHoldSinceUtcMs == 0;
+                            if (startingPackHold)
+                                _packPullHoldSinceUtcMs = now;
+
+                            int packSize = SquadTankBridge.CountPullPackSize(dungeonTarget);
+                            if (SquadTankBridge.IsPackPullTooRisky(
+                                    packSize,
+                                    LowestPartyManaPercent(leader),
+                                    now - _packPullHoldSinceUtcMs))
+                            {
+                                if (startingPackHold)
+                                {
+                                    SquadPartySyncService.LogAction("Dungeon: holding pull of " + dungeonTarget.Name +
+                                        " (pack of " + packSize + " while the group recovers mana)");
+                                }
+
+                                StopMovementUnlessDungeonForcedStep(leader?.LeaderGuid ?? 0UL, now);
+                                return RunStatus.Success;
+                            }
+
+                            _packPullHoldSinceUtcMs = 0;
                             _currentFocusGuid = dungeonTarget.Guid;
                             BeginPullCommit(dungeonTarget.Guid, now);
                             dungeonTarget.Target();
