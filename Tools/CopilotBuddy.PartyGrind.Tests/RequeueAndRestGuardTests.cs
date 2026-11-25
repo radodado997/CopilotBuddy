@@ -100,6 +100,75 @@ namespace CopilotBuddy.PartyGrind.Tests
         }
 
         [Fact]
+        public void ResetDance_KicksOnlyWhileSomeoneElseIsInTheParty()
+        {
+            Assert.False(SquadDungeonService.ShouldKickPartyMembers(false, 4));
+            Assert.False(SquadDungeonService.ShouldKickPartyMembers(true, 0));
+            Assert.True(SquadDungeonService.ShouldKickPartyMembers(true, 4));
+        }
+
+        [Fact]
+        public void ResetDance_GetsALongerBudgetThanAPlainReset()
+        {
+            Assert.Equal(SquadDungeonService.ResetPendingOutsideTimeoutMs, SquadDungeonService.ResolveResetAbandonTimeoutMs(grouped: false));
+            Assert.Equal(SquadDungeonService.ResetDanceTimeoutMs, SquadDungeonService.ResolveResetAbandonTimeoutMs(grouped: true));
+            Assert.True(SquadDungeonService.ResetDanceTimeoutMs > SquadDungeonService.ResetPendingOutsideTimeoutMs);
+
+            long now = 4_000_000L;
+            long pendingSince = now - SquadDungeonService.ResetPendingOutsideTimeoutMs - 1000L;
+            Assert.True(SquadDungeonService.ShouldAbandonResetPendingOutside(false, pendingSince, now));
+            Assert.False(SquadDungeonService.ShouldAbandonResetPendingOutside(
+                false, pendingSince, now, SquadDungeonService.ResetDanceTimeoutMs));
+        }
+
+        [Fact]
+        public void PullManaGate_WaitsForTheHealerAndThenReleasesThePull()
+        {
+            var leader = new SquadLeaderState();
+            leader.Members.Add(new SquadMemberSummary { Guid = 1, CharacterName = "Tank", IsConnected = true, Role = SquadRole.TankLeader, Class = WoWClass.Paladin, PowerType = WoWPowerType.Mana, PowerPercent = 90f, HealthPercent = 100f });
+            leader.Members.Add(new SquadMemberSummary { Guid = 2, CharacterName = "Healer", IsConnected = true, Role = SquadRole.Healer, Class = WoWClass.Priest, PowerType = WoWPowerType.Mana, PowerPercent = 22f, HealthPercent = 100f });
+            leader.Members.Add(new SquadMemberSummary { Guid = 3, CharacterName = "Mage", IsConnected = true, Role = SquadRole.DpsRanged, Class = WoWClass.Mage, PowerType = WoWPowerType.Mana, PowerPercent = 80f, HealthPercent = 100f });
+
+            Assert.Equal(22f, SquadTankBridge.LowestHealerManaPercent(leader), 3);
+            Assert.True(SquadTankBridge.IsManaHoldBlockingPull(22f, manaHoldExpired: false));
+            Assert.False(SquadTankBridge.IsManaHoldBlockingPull(22f, manaHoldExpired: true));
+            Assert.False(SquadTankBridge.IsManaHoldBlockingPull(SquadTankBridge.PullHealerManaFloor, manaHoldExpired: false));
+        }
+
+        [Fact]
+        public void PullManaGate_FallsBackToEveryManaUserWithoutAHealerRole()
+        {
+            var leader = new SquadLeaderState();
+            leader.Members.Add(new SquadMemberSummary { Guid = 1, CharacterName = "Druid", IsConnected = true, Role = SquadRole.DpsMelee, Class = WoWClass.Druid, PowerType = WoWPowerType.Energy, ManaPercent = 31f, PowerPercent = 100f, HealthPercent = 100f });
+            leader.Members.Add(new SquadMemberSummary { Guid = 2, CharacterName = "Warlock", IsConnected = true, Role = SquadRole.DpsRanged, Class = WoWClass.Warlock, PowerType = WoWPowerType.Mana, PowerPercent = 74f, HealthPercent = 100f });
+
+            Assert.Equal(31f, SquadTankBridge.LowestHealerManaPercent(leader), 3);
+            Assert.Equal(100f, SquadTankBridge.LowestHealerManaPercent(null), 3);
+        }
+
+        [Fact]
+        public void DeathDetection_NeedsAPersistentFlagOutsideTransitions()
+        {
+            long now = 7_000_000L;
+
+            Assert.False(PartyGrindBot.ShouldConfirmDeath(rawDead: false, transientTransition: false, firstObservedUtcMs: now - 5000L, nowUtcMs: now));
+            Assert.False(PartyGrindBot.ShouldConfirmDeath(rawDead: true, transientTransition: true, firstObservedUtcMs: now - 5000L, nowUtcMs: now));
+            Assert.False(PartyGrindBot.ShouldConfirmDeath(rawDead: true, transientTransition: false, firstObservedUtcMs: 0L, nowUtcMs: now));
+            Assert.False(PartyGrindBot.ShouldConfirmDeath(rawDead: true, transientTransition: false, firstObservedUtcMs: now, nowUtcMs: now + 300L));
+            Assert.True(PartyGrindBot.ShouldConfirmDeath(rawDead: true, transientTransition: false, firstObservedUtcMs: now, nowUtcMs: now + 2000L));
+        }
+
+        [Fact]
+        public void WorldReentry_AlsoCountsAsATransition()
+        {
+            long now = 8_000_000L;
+
+            Assert.True(PartyGrindBot.IsTransientWorldTransition(isInWorld: true, mapChangeUtcMs: 0L, reentryGraceUntilUtcMs: now + 2000L, nowUtcMs: now));
+            Assert.False(PartyGrindBot.IsTransientWorldTransition(isInWorld: true, mapChangeUtcMs: 0L, reentryGraceUntilUtcMs: now - 2000L, nowUtcMs: now));
+            Assert.True(PartyGrindBot.IsTransientWorldTransition(isInWorld: false, mapChangeUtcMs: 0L, reentryGraceUntilUtcMs: 0L, nowUtcMs: now));
+        }
+
+        [Fact]
         public void MidWipe_OnlyTripsWhileSomeoneIsLeftToSave()
         {
             Assert.False(SquadHealBridge.IsSquadMidWipe(null));
