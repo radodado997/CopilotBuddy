@@ -717,6 +717,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 IsDungeonComplete = _dungeonCompleted,
                 AcceptLfgProposalOrder = isDungeonMode && !_inTownRun && !anyDead && (dungeon?.LfgProposalPending == true || rosterStates.Any(m => m.LfgProposalPending)),
                 DungeonResetPendingOutside = isDungeonMode && dungeon?.ResetPendingOutside == true,
+                DungeonResetExitConfirmedGuids = dungeon?.ResetExitConfirmedGuids ?? Array.Empty<ulong>(),
+                DungeonResetExitEvidenceValidUntilUtcMs = dungeon?.ResetExitEvidenceValidUntilUtcMs ?? 0L,
                 TeleportOutOrder = isDungeonMode && phase == SquadPhase.DungeonCompleteExit && settings.DungeonEntryMode != SquadDungeonEntryMode.WalkInPortalFarm,
                 LfgStatusText = dungeon?.LfgMode ?? string.Empty,
                 HasRandomPartyMembers = dungeon?.HasRandomPartyMembers == true,
@@ -946,6 +948,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         internal static bool SquadWantsDrink(SquadMemberSummary member, SquadSettings settings) =>
             SquadProvisioningService.SquadWantsDrink(member, settings);
 
+        private static bool SquadWantsDrink(SquadMemberState member, SquadSettings settings) =>
+            SquadProvisioningService.SquadWantsDrink(member.WantsDrink, member.FreeBagSlots, member.Class, member.DrinkCount, settings);
+
         /// <summary>
         /// Picks a squad healer that is out of mana and out of drink while everyone is idle enough
         /// for a mage to hand water over. Returns null when no such window exists.
@@ -957,8 +962,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (rosterStates == null || !settings.EnableMageProvisioning)
                 return null;
 
-            bool mageReady = rosterStates.Any(m =>
-                !m.IsDead && !m.IsGhost && !m.IsInCombat && m.CanProvideMageDrink);
+            bool mageReady = rosterStates.Any(CanProvideInWaterOnlyMode);
             if (!mageReady)
                 return null;
 
@@ -989,7 +993,10 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             // A water emergency outranks whatever pair is in flight: drop food assignments and
             // pending healthstone rituals so a mage is free for the dry healer, but never the
             // water hand-off itself.
-            if (waterOnlyRecipient != null && !IsWaterOnlyEmergencyAssignment(waterOnlyRecipient))
+            var assignedProvider = string.IsNullOrEmpty(_activeProvisioner) ? null :
+                rosterStates.FirstOrDefault(m => string.Equals(m.CharacterName, _activeProvisioner, StringComparison.OrdinalIgnoreCase));
+            if (waterOnlyRecipient != null &&
+                (!IsWaterOnlyEmergencyAssignment(waterOnlyRecipient) || !CanProvideInWaterOnlyMode(assignedProvider)))
             {
                 if (!string.IsNullOrEmpty(_activeProvisioner))
                 {
@@ -1002,7 +1009,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
             if (!string.IsNullOrEmpty(_activeProvisioner))
             {
-                var prov = rosterStates.FirstOrDefault(m => string.Equals(m.CharacterName, _activeProvisioner, StringComparison.OrdinalIgnoreCase));
+                var prov = assignedProvider;
                 var recv = string.IsNullOrEmpty(_activeTradeTarget)
                     ? null
                     : rosterStates.FirstOrDefault(m => string.Equals(m.CharacterName, _activeTradeTarget, StringComparison.OrdinalIgnoreCase));
@@ -1124,7 +1131,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         /// In water-only mode the provider has to be able to conjure water and be idle enough to
         /// trade; a food-only or fighting mage cannot serve the emergency.
         /// </summary>
-        internal static bool CanProvideInWaterOnlyMode(SquadMemberState mage) =>
+        internal static bool CanProvideInWaterOnlyMode(SquadMemberState? mage) =>
             mage != null && !mage.IsDead && !mage.IsGhost && !mage.IsInCombat && mage.CanProvideMageDrink;
 
         /// <summary>
@@ -1224,6 +1231,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 XpPerHour = m.XpPerHour,
                 HealthPercent = m.HealthPercent,
                 PowerPercent = m.PowerPercent,
+                ManaPercent = m.ManaPercent,
                 PowerType = m.PowerType,
                 MapId = m.MapId,
                 X = m.X,
@@ -1245,6 +1253,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 FreeBagSlots = m.FreeBagSlots,
                 WantsFood = m.WantsFood,
                 WantsDrink = m.WantsDrink,
+                DrinkCount = m.DrinkCount,
                 WantsHealthstone = m.WantsHealthstone,
                 CanProvideMageFood = m.CanProvideMageFood,
                 CanProvideMageDrink = m.CanProvideMageDrink,

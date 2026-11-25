@@ -127,12 +127,13 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (leader.Members == null || leader.Members.Count == 0)
                 return true;
 
+            float healerMana = LowestHealerManaPercent(leader);
             var leaderPos = new WoWPoint(leader.X, leader.Y, leader.Z);
             foreach (var m in leader.Members)
             {
                 if (!m.IsConnected)
                     continue;
-                bool restBlocksPull = m.NeedsRest && !(holdExpired && m.HealthPercent >= 80f);
+                bool restBlocksPull = m.NeedsRest && !(holdExpired && healerMana < PullManaEmergencyFloor && m.HealthPercent >= 80f);
                 if (!m.HasTelemetry || m.IsDead || m.IsGhost || m.IsInCombat || restBlocksPull ||
                     (m.NeedsTown && !m.TownTasksComplete && leader.BotMode != SquadBotMode.Dungeon))
                     return false;
@@ -144,7 +145,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             }
 
             // A dry healer turns every pull into a corpse run; hold until the pool is back.
-            return !IsManaHoldBlockingPull(LowestHealerManaPercent(leader), holdExpired);
+            return !IsManaHoldBlockingPull(healerMana, holdExpired);
         }
 
         /// <summary>
@@ -614,6 +615,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         internal const int MaxBlockedPackSize = 5;
         internal const float PackPullManaFloor = 55f;
         internal const float PullHealerManaFloor = 55f;
+        internal const float PullManaEmergencyFloor = 25f;
         internal const long MaxPackPullHoldMs = 15000L;
 
         /// <summary>

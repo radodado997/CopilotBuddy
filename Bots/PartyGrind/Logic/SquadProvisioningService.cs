@@ -120,13 +120,14 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         /// </summary>
         public static bool SquadWantsDrink(SquadMemberSummary? member, SquadSettings settings)
         {
-            if (member == null)
-                return false;
-            if (member.WantsDrink)
-                return true;
-            return member.FreeBagSlots >= 2 &&
-                ClassUsesDrinks(member.Class) &&
-                member.DrinkCount < settings.MinMemberDrinkStack;
+            return member != null &&
+                SquadWantsDrink(member.WantsDrink, member.FreeBagSlots, member.Class, member.DrinkCount, settings);
+        }
+
+        internal static bool SquadWantsDrink(bool wantsDrink, int freeBagSlots, WoWClass memberClass, int drinkCount, SquadSettings settings)
+        {
+            return wantsDrink ||
+                (freeBagSlots >= 2 && ClassUsesDrinks(memberClass) && drinkCount < settings.MinMemberDrinkStack);
         }
 
         /// <summary>

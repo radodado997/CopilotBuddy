@@ -33,6 +33,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         public int TotalBossCount { get; set; }
         public bool IsDungeonComplete { get; set; }
         public bool ResetPendingOutside { get; set; }
+        public ulong[] ResetExitConfirmedGuids { get; set; } = Array.Empty<ulong>();
+        public long ResetExitEvidenceValidUntilUtcMs { get; set; }
         public bool LfgProposalPending { get; set; }
         public string LfgMode { get; set; } = string.Empty;
         public bool HasRandomPartyMembers { get; set; }
@@ -134,6 +136,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private long _lastResetPendingOutsideLogUtcMs;
         private ResetDancePhase _resetDancePhase;
         private bool _followerResetHandledForBroadcast;
+        private long _followerResetDanceRequestedUtcMs;
         private long _resetDanceStartedUtcMs;
         private long _resetDanceNextActionUtcMs;
         private int _resetDanceIndex;
@@ -195,6 +198,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
         public void ShutdownRuntime()
         {
+            ResetDanceState();
+            _followerResetHandledForBroadcast = false;
             StopActiveEncounter();
             if (_lfgEventsAttached)
             {
@@ -238,6 +243,23 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             }
 
             InitializeDungeonRuntime();
+
+            if (!settings.IsCoordinator)
+            {
+                if (leader?.DungeonResetPendingOutside != true)
+                {
+                    _followerResetHandledForBroadcast = false;
+                    if (ResetDanceInProgress)
+                        ResetDanceState();
+                }
+                else if (ResetDanceInProgress &&
+                         (StyxWoW.Me is not { Dead: false, IsGhost: false } ||
+                          nowUtcMs - _followerResetDanceRequestedUtcMs > ResetDanceTimeoutMs))
+                {
+                    ResetDanceState();
+                    _followerResetHandledForBroadcast = true;
+                }
+            }
 
             global::Bots.DungeonBuddy.Helpers.ScriptHelpers.UpdateMovementBlocks();
             AvoidanceManager.Update();
@@ -493,12 +515,15 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         internal static bool HasFreshExitEvidence(
             ulong participantGuid, IReadOnlyList<SquadConnectedMemberSnapshot> connected, long completedAtUtcMs, long nowUtcMs)
         {
-            return connected.Any(m => m.LastStateReceivedUtcMs > completedAtUtcMs &&
-                                      m.LastStateReceivedUtcMs <= nowUtcMs &&
-                                      nowUtcMs - m.LastStateReceivedUtcMs <= 5000L &&
-                                      m.LatestState is { HasDungeonTelemetry: true, IsInsideDungeon: false } state &&
-                                      state.Guid == participantGuid);
+            return connected.Any(m => HasFreshExitEvidence(m, completedAtUtcMs, nowUtcMs) &&
+                                      m.LatestState!.Guid == participantGuid);
         }
+
+        private static bool HasFreshExitEvidence(SquadConnectedMemberSnapshot member, long completedAtUtcMs, long nowUtcMs) =>
+            member.LastStateReceivedUtcMs > completedAtUtcMs &&
+            member.LastStateReceivedUtcMs <= nowUtcMs &&
+            nowUtcMs - member.LastStateReceivedUtcMs <= 5000L &&
+            member.LatestState is { HasDungeonTelemetry: true, IsInsideDungeon: false };
 
         internal static bool AreAllWalkInParticipantsClearedForReset(
             IReadOnlyCollection<ulong> runParticipants,
@@ -507,10 +532,16 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             long completedAtUtcMs,
             long nowUtcMs)
         {
-            return completedAtUtcMs > 0 && runParticipants.All(guid =>
-                !currentGroupMemberGuids.Contains(guid) ||
-                HasFreshExitEvidence(guid, connected, completedAtUtcMs, nowUtcMs));
+            return completedAtUtcMs > 0 && AreAllWalkInParticipantsClearedForReset(
+                runParticipants, currentGroupMemberGuids,
+                guid => HasFreshExitEvidence(guid, connected, completedAtUtcMs, nowUtcMs));
         }
+
+        private static bool AreAllWalkInParticipantsClearedForReset(
+            IReadOnlyCollection<ulong> runParticipants,
+            IReadOnlyCollection<ulong> currentGroupMemberGuids,
+            Func<ulong, bool> isConfirmedOutside) =>
+            runParticipants.All(guid => !currentGroupMemberGuids.Contains(guid) || isConfirmedOutside(guid));
 
         public void RecordWalkInEntry(long nowUtcMs)
         {
@@ -619,7 +650,18 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         /// True while the kick/reset/invite dance is running, so the periodic auto-invite pulse does
         /// not re-add a member the dance just removed (that would break the ungrouped reset).
         /// </summary>
-        internal static bool ResetDanceInProgress { get; private set; }
+        internal bool ResetDanceInProgress => _resetDancePhase != ResetDancePhase.None || _followerResetDanceRequestedUtcMs != 0;
+
+        internal static ulong GetFollowerResetDanceOwner(IReadOnlyList<SquadConnectedMemberSnapshot> connected) =>
+            connected.FirstOrDefault(m => m.LatestState is
+                { DungeonResetDanceInProgress: true, IsInsideDungeon: false, IsDead: false, IsGhost: false, Guid: not 0 })
+                ?.LatestState?.Guid ?? 0;
+
+        internal static bool HasConfirmedFollowerGroupExit(
+            SquadLeaderState leader, IReadOnlyCollection<ulong> groupGuids, ulong localGuid, long nowUtcMs) =>
+            nowUtcMs <= leader.DungeonResetExitEvidenceValidUntilUtcMs &&
+            AreAllWalkInParticipantsClearedForReset(groupGuids, groupGuids,
+                guid => guid == localGuid || leader.DungeonResetExitConfirmedGuids.Contains(guid));
 
         internal static bool IsLocalPartyLeader() =>
             Lua.GetReturnVal<bool>("return (IsPartyLeader() and true) or false", 0);
@@ -633,14 +675,24 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         {
             var me = StyxWoW.Me;
             if (me == null)
+            {
+                ResetDanceState();
                 return ResetDanceResult.Failed;
-
-            if (!IsLocalPartyLeader())
-                return ResetDanceResult.Idle;
+            }
 
             var group = me.GroupInfo;
             group.InvalidateCache();
             int others = group.NumPartyMembers > 0 ? group.NumPartyMembers : group.NumRaidMembers;
+            if (!IsLocalPartyLeader())
+            {
+                if (_resetDancePhase == ResetDancePhase.None)
+                    return ResetDanceResult.Idle;
+                if (others > 0)
+                {
+                    ResetDanceState();
+                    return ResetDanceResult.Failed;
+                }
+            }
             string[] expected = settings.GetExpectedMemberNames();
             int expectedOthers = Math.Max(0, expected.Length - 1);
 
@@ -649,7 +701,6 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 _resetDancePhase = ShouldKickPartyMembers(true, others)
                     ? ResetDancePhase.Kick
                     : ResetDancePhase.Reset;
-                ResetDanceInProgress = true;
 
                 _resetDanceStartedUtcMs = nowUtcMs;
                 _resetDanceNextActionUtcMs = nowUtcMs;
@@ -764,7 +815,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
         private void ResetDanceState()
         {
-            ResetDanceInProgress = false;
+            _followerResetDanceRequestedUtcMs = 0;
             _resetDancePhase = ResetDancePhase.None;
             _resetDanceStartedUtcMs = 0;
             _resetDanceNextActionUtcMs = 0;
@@ -885,6 +936,25 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 catch { }
             }
 
+            var confirmedOutside = new List<ulong>();
+            long exitEvidenceValidUntilUtcMs = 0;
+            if (!walkIn && settings.IsCoordinator && _resetPendingOutside && _completedAtUtcMs > 0)
+            {
+                exitEvidenceValidUntilUtcMs = nowUtcMs + 5000L;
+                if (!inDungeon && me != null)
+                    confirmedOutside.Add(me.Guid);
+                foreach (var participant in connected)
+                {
+                    long received = participant.LastStateReceivedUtcMs;
+                    if (HasFreshExitEvidence(participant, _completedAtUtcMs, nowUtcMs) &&
+                        participant.LatestState is { Guid: not 0 } state)
+                    {
+                        confirmedOutside.Add(state.Guid);
+                        exitEvidenceValidUntilUtcMs = Math.Min(exitEvidenceValidUntilUtcMs, received + 5000L);
+                    }
+                }
+            }
+
             return new SquadDungeonSnapshot
             {
                 IsInsideDungeon = inDungeon,
@@ -897,6 +967,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 TotalBossCount = totalBosses,
                 IsDungeonComplete = complete,
                 ResetPendingOutside = _resetPendingOutside,
+                ResetExitConfirmedGuids = confirmedOutside.ToArray(),
+                ResetExitEvidenceValidUntilUtcMs = exitEvidenceValidUntilUtcMs,
                 LfgProposalPending = LfgManager.ProposalPending || SafeGetLfgMode() == "proposal",
                 LfgMode = SafeGetLfgMode(),
                 HasRandomPartyMembers = hasRandom,
@@ -977,37 +1049,39 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             }
 
             bool leaderResetRequested = leader?.DungeonResetPendingOutside == true;
-            if (!leaderResetRequested)
-                _followerResetHandledForBroadcast = false;
-
             bool resetGateOpen = ShouldEnterResetDance(
                 _resetPendingOutside,
                 settings.IsCoordinator,
                 leaderResetRequested,
-                IsLocalPartyLeader(),
+                ResetDanceInProgress || IsLocalPartyLeader(),
                 _followerResetHandledForBroadcast);
             if (resetGateOpen)
             {
-                if (settings.IsCoordinator)
-                {
-                    if (IsInDungeonMap(me))
-                        return false;
+                if (IsInDungeonMap(me))
+                    return false;
 
-                    var group = me.GroupInfo;
-                    group.InvalidateCache();
-                    var groupGuids = group.AllMembers
-                        .Where(m => m.Guid != 0)
-                        .Select(m => m.Guid)
-                        .ToHashSet();
+                if (settings.IsCoordinator && leader is { DungeonResetDanceOwnerGuid: not 0 } &&
+                    leader.DungeonResetDanceOwnerGuid != me.Guid)
+                {
+                    if (me.GroupInfo.NumPartyMembers == 0 && me.GroupInfo.NumRaidMembers == 0)
+                        _sawGroupDisbandedForReset = true;
+                    if (me.IsMoving)
+                        WoWMovement.MoveStop();
+                    return true;
+                }
+
+                var group = me.GroupInfo;
+                group.InvalidateCache();
+                if (_resetDancePhase == ResetDancePhase.None)
+                {
+                    var groupGuids = group.AllMembers.Where(m => m.Guid != 0).Select(m => m.Guid).ToHashSet();
                     int raidCount = group.NumRaidMembers;
                     int expectedGroupCount = raidCount > 0 ? raidCount : group.NumPartyMembers;
                     bool allOutside = groupGuids.Count == expectedGroupCount &&
-                        AreAllWalkInParticipantsClearedForReset(
-                            _runParticipants,
-                            _participantSnapshots,
-                            groupGuids,
-                            _completedAtUtcMs,
-                            nowUtcMs);
+                        (settings.IsCoordinator
+                            ? AreAllWalkInParticipantsClearedForReset(
+                                _runParticipants, _participantSnapshots, groupGuids, _completedAtUtcMs, nowUtcMs)
+                            : leader != null && HasConfirmedFollowerGroupExit(leader, groupGuids, me.Guid, nowUtcMs));
                     if (!allOutside)
                     {
                         if (me.IsMoving)
@@ -1015,7 +1089,10 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                         SquadPartySyncService.LogAction("Dungeon: waiting for exit confirmation from all run participants");
                         return true;
                     }
+                }
 
+                if (settings.IsCoordinator)
+                {
                     if (_resetPendingOutsideSinceUtcMs == 0)
                         _resetPendingOutsideSinceUtcMs = nowUtcMs;
 
@@ -1086,6 +1163,17 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 {
                     if (me.IsMoving)
                         WoWMovement.MoveStop();
+
+                    if (_resetDancePhase == ResetDancePhase.None && !IsLocalPartyLeader())
+                    {
+                        ResetDanceState();
+                        return true;
+                    }
+
+                    if (_followerResetDanceRequestedUtcMs == 0)
+                        _followerResetDanceRequestedUtcMs = nowUtcMs;
+                    if (leader?.DungeonResetDanceOwnerGuid != me.Guid)
+                        return true;
 
                     switch (RunInstanceResetDance(settings, nowUtcMs))
                     {

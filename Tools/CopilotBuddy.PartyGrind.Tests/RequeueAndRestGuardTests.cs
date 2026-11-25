@@ -2,7 +2,9 @@ using System;
 using System.Collections.Generic;
 using CopilotBuddy.Bots.PartyGrind;
 using CopilotBuddy.Bots.PartyGrind.Logic;
+using Styx;
 using Styx.Combat.CombatRoutine;
+using Styx.PartyGrind;
 using Styx.PartyGrind.IPC;
 using Xunit;
 
@@ -361,6 +363,20 @@ namespace CopilotBuddy.PartyGrind.Tests
         }
 
         [Fact]
+        public void FollowerResetDance_RequiresFreshExitEvidenceForEveryOtherGroupMember()
+        {
+            var leader = new SquadLeaderState
+            {
+                DungeonResetExitConfirmedGuids = new[] { 1UL, 2UL },
+                DungeonResetExitEvidenceValidUntilUtcMs = 5000L
+            };
+
+            Assert.True(SquadDungeonService.HasConfirmedFollowerGroupExit(leader, new[] { 1UL, 2UL, 3UL }, 3UL, 5000L));
+            Assert.False(SquadDungeonService.HasConfirmedFollowerGroupExit(leader, new[] { 1UL, 2UL, 4UL }, 3UL, 5000L));
+            Assert.False(SquadDungeonService.HasConfirmedFollowerGroupExit(leader, new[] { 1UL, 2UL, 3UL }, 3UL, 5001L));
+        }
+
+        [Fact]
         public void Provisioning_WaterOnlyModeNeedsAWaterCapableIdleMage()
         {
             var mage = new SquadMemberState
@@ -516,6 +532,28 @@ namespace CopilotBuddy.PartyGrind.Tests
 
             Assert.False(SquadTankBridge.CanInitiatePull(leader, 28f, manaHoldExpired: false));
             Assert.True(SquadTankBridge.CanInitiatePull(leader, 28f, manaHoldExpired: true));
+        }
+
+        [Theory]
+        [InlineData(24f, 80f, true)]
+        [InlineData(25f, 80f, false)]
+        [InlineData(24f, 79f, false)]
+        public void PullManaGate_ExpiredHoldOnlyExcusesRestForHealthyMembersWithDryHealer(
+            float mana, float health, bool canPull)
+        {
+            var leader = new SquadLeaderState { Phase = SquadPhase.DungeonClearing };
+            leader.Members.Add(new SquadMemberSummary
+            {
+                IsConnected = true,
+                Role = SquadRole.Healer,
+                Class = WoWClass.Priest,
+                PowerType = WoWPowerType.Mana,
+                PowerPercent = mana,
+                HealthPercent = health,
+                NeedsRest = true
+            });
+
+            Assert.Equal(canPull, SquadTankBridge.CanInitiatePull(leader, 28f, manaHoldExpired: true));
         }
 
         [Fact]

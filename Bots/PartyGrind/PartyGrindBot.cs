@@ -91,7 +91,6 @@ namespace CopilotBuddy.Bots.PartyGrind
         private const long WorldReentryGraceMs = 4000L;
         private const long DeathStateDebounceMs = 1200L;
         private const long PullManaHoldMaxMs = 45000L;
-        private const float PullManaEmergencyFloor = 25f;
         private const float DungeonForcedStepArrivalDistance = 2f;
         private const long IdleSnapshotIntervalMs = 5000L;
         private const int TerminalStateDeliveryTimeoutMs = 1000;
@@ -454,7 +453,6 @@ namespace CopilotBuddy.Bots.PartyGrind
 
             SquadMemberState localState = CaptureLocalMemberState(settings, now);
             SquadContext.UpdateLocalMemberState(localState);
-            ResolvePullManaHoldExpired(SquadContext.GetLeaderStateSnapshot(), now);
 
             if (settings.IsCoordinator)
             {
@@ -462,6 +460,7 @@ namespace CopilotBuddy.Bots.PartyGrind
             }
             else
             {
+                ResolvePullManaHoldExpired(SquadContext.GetLeaderStateSnapshot(), now);
                 PulseFollower(settings, localState, now);
             }
 
@@ -614,7 +613,9 @@ namespace CopilotBuddy.Bots.PartyGrind
         private void PulseCoordinator(SquadSettings settings, SquadMemberState localState, long now)
         {
             var snapshots = _ipcServer?.GetMemberSnapshots() ?? new List<SquadConnectedMemberSnapshot>();
-            _partySync.PulseCoordinatorPartySync(settings, snapshots);
+            ulong resetDanceOwnerGuid = _dungeon.ResetDanceInProgress ? localState.Guid :
+                _dungeon.IsResetPendingOutside ? SquadDungeonService.GetFollowerResetDanceOwner(snapshots) : 0UL;
+            _partySync.PulseCoordinatorPartySync(settings, snapshots, resetDanceOwnerGuid != 0);
 
             SquadProfileSnapshot profileSnap = CaptureProfileSnapshot(now);
             int hourlyResets = settings.BotMode == SquadBotMode.Dungeon ? _dungeon.GetHourlyResetCount(now) : 0;
@@ -645,6 +646,8 @@ namespace CopilotBuddy.Bots.PartyGrind
                 lockoutRemainingSeconds: lockoutRem,
                 resolveDungeon: level => _dungeon.CaptureSnapshot(settings, snapshots, level, now));
 
+            leaderState.DungeonResetDanceOwnerGuid = resetDanceOwnerGuid;
+            ResolvePullManaHoldExpired(leaderState, now);
             UpdateCoordinatorTargets(now, leaderState);
             leaderState.FocusTargetGuid = _currentFocusGuid;
             leaderState.SecondaryTargetGuid = _currentSecondaryGuid;
@@ -1068,7 +1071,7 @@ namespace CopilotBuddy.Bots.PartyGrind
         /// after that, resting longer cannot save the run and the tank has to keep the instance moving.
         /// </summary>
         internal static bool ShouldYieldRestForPull(bool manaHoldExpired, bool localIsTank, float healerManaPercent) =>
-            manaHoldExpired && localIsTank && healerManaPercent < PullManaEmergencyFloor;
+            manaHoldExpired && localIsTank && healerManaPercent < SquadTankBridge.PullManaEmergencyFloor;
 
         private static bool HostilesNearbyForRest(out bool aggro, out bool inMeleeRange)
         {
@@ -1532,6 +1535,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                 ActiveSubProfileMaxLevel = currentSub?.MaxLevel ?? 85,
                 IsInsideDungeon = insideDungeon,
                 HasDungeonTelemetry = true,
+                DungeonResetDanceInProgress = _dungeon.ResetDanceInProgress,
                 CurrentLfgDungeonId = SquadContext.IsDungeonModeActive ? global::Bots.DungeonBuddy.LfgManager.CurrentLfgDungeonId : 0U,
                 LfgMode = SquadContext.IsDungeonModeActive ? SquadDungeonService.SafeGetLfgMode() : string.Empty,
                 LfgRoleCheckPending = SquadContext.IsDungeonModeActive && global::Bots.DungeonBuddy.LfgManager.RoleCheckPending,
