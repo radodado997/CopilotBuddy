@@ -116,6 +116,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private readonly HashSet<uint> _currentRunKilledBosses = new();
         internal const float HotspotArrivalDistance = 4.5f;
         internal const long ResetPendingOutsideTimeoutMs = 20000L;
+        internal const long ResetDanceTimeoutMs = 45000L;
+        internal const long ResetDanceStepMs = 1500L;
+        internal const long ResetDanceInviteSettleMs = 1200L;
         internal const long ResetPendingOutsideLogThrottleMs = 5000L;
         // Trash is cleared one breadcrumb at a time: the leader never advances more than a
         // single step and refuses any step whose corridor still holds live hostile trash.
@@ -129,6 +132,12 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private bool _resetPendingOutside;
         private long _resetPendingOutsideSinceUtcMs;
         private long _lastResetPendingOutsideLogUtcMs;
+        private ResetDancePhase _resetDancePhase;
+        private long _resetDanceStartedUtcMs;
+        private long _resetDanceNextActionUtcMs;
+        private int _resetDanceIndex;
+        private readonly List<string> _resetDanceNames = new();
+        private bool _sawGroupDisbandedForReset;
         private uint _walkInRunDungeonId;
         private uint _walkInRunMapId;
         private int _hotspotIndex;
@@ -557,18 +566,193 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             _resetPendingOutside = true;
             _resetPendingOutsideSinceUtcMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             _lastResetPendingOutsideLogUtcMs = 0;
+            ResetDanceState();
         }
 
-        internal static bool ShouldAbandonResetPendingOutside(bool resetIssued, long pendingSinceUtcMs, long nowUtcMs) =>
+        internal static bool ShouldAbandonResetPendingOutside(
+            bool resetIssued,
+            long pendingSinceUtcMs,
+            long nowUtcMs,
+            long timeoutMs = ResetPendingOutsideTimeoutMs) =>
             !resetIssued &&
             pendingSinceUtcMs > 0 &&
-            nowUtcMs - pendingSinceUtcMs >= ResetPendingOutsideTimeoutMs;
+            nowUtcMs - pendingSinceUtcMs >= timeoutMs;
+
+        internal static long ResolveResetAbandonTimeoutMs(bool grouped) =>
+            grouped ? ResetDanceTimeoutMs : ResetPendingOutsideTimeoutMs;
+
+        internal static bool ShouldKickPartyMembers(bool isPartyLeader, int otherMembers) =>
+            isPartyLeader && otherMembers > 0;
+
+        private enum ResetDancePhase
+        {
+            None = 0,
+            Kick = 1,
+            Reset = 2,
+            Invite = 3
+        }
+
+        private enum ResetDanceResult
+        {
+            Idle = 0,
+            Working = 1,
+            Completed = 2,
+            Failed = 3
+        }
+
+        internal static bool IsLocalPartyLeader() =>
+            Lua.GetReturnVal<bool>("return (IsPartyLeader() and true) or false", 0);
+
+        private static void AcceptPendingGroupInvite()
+        {
+            Lua.DoString("if not (GetNumPartyMembers() > 0 or GetNumRaidMembers() > 0) then pcall(AcceptGroup) end");
+        }
+
+        /// <summary>
+        /// RDF keeps handing out the same instance ID after a completed run, and ResetInstances()
+        /// is only accepted for a party leader with everyone outside. The leader therefore kicks
+        /// the squad, resets while solo and invites everybody back before the next LFG queue.
+        /// </summary>
+        private ResetDanceResult RunInstanceResetDance(SquadSettings settings, long nowUtcMs)
+        {
+            var me = StyxWoW.Me;
+            if (me == null)
+                return ResetDanceResult.Failed;
+
+            if (!IsLocalPartyLeader())
+                return ResetDanceResult.Idle;
+
+            var group = me.GroupInfo;
+            group.InvalidateCache();
+            int others = group.NumPartyMembers > 0 ? group.NumPartyMembers : group.NumRaidMembers;
+            string[] expected = settings.GetExpectedMemberNames();
+            int expectedOthers = Math.Max(0, expected.Length - 1);
+
+            if (_resetDancePhase == ResetDancePhase.None)
+            {
+                _resetDancePhase = ShouldKickPartyMembers(true, others)
+                    ? ResetDancePhase.Kick
+                    : ResetDancePhase.Reset;
+
+                _resetDanceStartedUtcMs = nowUtcMs;
+                _resetDanceNextActionUtcMs = nowUtcMs;
+                _resetDanceIndex = 0;
+                _resetDanceNames.Clear();
+            }
+
+            if (nowUtcMs - _resetDanceStartedUtcMs > ResetDanceTimeoutMs)
+            {
+                Logging.Write("[PartyGrind Dungeon] Instance reset dance timed out; re-queueing without a reset.");
+                ResetDanceState();
+                return ResetDanceResult.Failed;
+            }
+
+            if (nowUtcMs < _resetDanceNextActionUtcMs)
+                return ResetDanceResult.Working;
+
+            switch (_resetDancePhase)
+            {
+                case ResetDancePhase.Kick:
+                {
+                    var othersNow = group.AllMembers
+                        .Where(m => m.Guid != 0 && m.Guid != me.Guid && !string.IsNullOrEmpty(m.Name))
+                        .Select(m => m.Name)
+                        .ToList();
+
+                    if (othersNow.Count == 0)
+                    {
+                        _resetDancePhase = ResetDancePhase.Reset;
+                        _resetDanceNextActionUtcMs = nowUtcMs + ResetDanceInviteSettleMs;
+                        return ResetDanceResult.Working;
+                    }
+
+                    if (othersNow.Count > expectedOthers && expectedOthers > 0)
+                    {
+                        ResetDanceState();
+                        Logging.Write("[PartyGrind Dungeon] Party holds unexpected members; skipping the kick step.");
+                        return ResetDanceResult.Failed;
+                    }
+
+                    if (_resetDanceNames.Count == 0)
+                        _resetDanceNames.AddRange(othersNow);
+
+                    int index = Math.Min(_resetDanceIndex, othersNow.Count - 1);
+                    string victim = othersNow[index];
+                    Lua.DoString("UninviteByName(\"" + Lua.Escape(victim) + "\")");
+                    _resetDanceIndex++;
+                    _resetDanceNextActionUtcMs = nowUtcMs + ResetDanceStepMs;
+                    return ResetDanceResult.Working;
+                }
+
+                case ResetDancePhase.Reset:
+                {
+                    Lua.DoString("ResetInstances()");
+                    SquadPartySyncService.LogAction("Dungeon: instances reset while the squad was ungrouped");
+                    _resetDancePhase = ResetDancePhase.Invite;
+                    _resetDanceIndex = 0;
+                    _resetDanceNextActionUtcMs = nowUtcMs + ResetDanceInviteSettleMs;
+                    return ResetDanceResult.Working;
+                }
+
+                case ResetDancePhase.Invite:
+                {
+                    var targets = _resetDanceNames.Count > 0
+                        ? _resetDanceNames
+                        : expected
+                            .Where(n => !string.IsNullOrEmpty(n) && !string.Equals(n, me.Name, StringComparison.OrdinalIgnoreCase))
+                            .ToList();
+
+                    if (targets.Count == 0)
+                    {
+                        Logging.Write("[PartyGrind Dungeon] No squadmate names known; skipping the re-invite step.");
+                        ResetDanceState();
+                        return ResetDanceResult.Failed;
+                    }
+
+                    var present = group.AllMembers
+                        .Where(m => m.Guid != 0 && m.Guid != me.Guid)
+                        .Select(m => m.Name)
+                        .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+                    var missing = targets
+                        .Where(n => !present.Contains(n))
+                        .ToList();
+
+                    if (missing.Count == 0)
+                    {
+                        RecordInstanceReset(nowUtcMs);
+                        SquadPartySyncService.LogAction("Dungeon: party re-formed after the instance reset");
+                        ResetDanceState();
+                        return ResetDanceResult.Completed;
+                    }
+
+                    string invitee = missing[_resetDanceIndex % missing.Count];
+                    Lua.DoString("InviteByName(\"" + Lua.Escape(invitee) + "\")");
+                    _resetDanceIndex++;
+                    _resetDanceNextActionUtcMs = nowUtcMs + ResetDanceStepMs;
+                    return ResetDanceResult.Working;
+                }
+            }
+
+            return ResetDanceResult.Working;
+        }
 
         private void ClearResetPendingOutside()
         {
             _resetPendingOutside = false;
             _resetPendingOutsideSinceUtcMs = 0;
             _lastResetPendingOutsideLogUtcMs = 0;
+            ResetDanceState();
+        }
+
+        private void ResetDanceState()
+        {
+            _resetDancePhase = ResetDancePhase.None;
+            _resetDanceStartedUtcMs = 0;
+            _resetDanceNextActionUtcMs = 0;
+            _resetDanceIndex = 0;
+            _resetDanceNames.Clear();
+            _sawGroupDisbandedForReset = false;
         }
 
         public SquadDungeonSnapshot CaptureSnapshot(SquadSettings settings, IReadOnlyList<SquadConnectedMemberSnapshot> connected, int effectiveMinLevel, long nowUtcMs)
@@ -813,20 +997,56 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                         Logging.Write("[PartyGrind Dungeon] Resetting instances for next run.");
                     }
 
-                    bool resetIssued = Lua.GetReturnVal<bool>(
-                        "if (GetNumPartyMembers() == 0 and GetNumRaidMembers() == 0) or IsPartyLeader() then ResetInstances(); return true end return false", 0);
-                    if (resetIssued)
+                    switch (RunInstanceResetDance(settings, nowUtcMs))
                     {
-                        RecordInstanceReset(nowUtcMs);
-                        _lfgRunCompletedAwaitingRequeue = false;
-                        ClearResetPendingOutside();
-                        return true;
+                        case ResetDanceResult.Working:
+                            if (me.IsMoving)
+                                WoWMovement.MoveStop();
+                            return true;
+
+                        case ResetDanceResult.Completed:
+                            ClearResetPendingOutside();
+                            _lfgRunCompletedAwaitingRequeue = false;
+                            LfgManager.DungeonCompletedReason = CompleteReason.None;
+                            return false;
+
+                        case ResetDanceResult.Failed:
+                            ClearResetPendingOutside();
+                            _lfgRunCompletedAwaitingRequeue = false;
+                            LfgManager.DungeonCompletedReason = CompleteReason.None;
+                            return false;
                     }
 
-                    if (ShouldAbandonResetPendingOutside(resetIssued, _resetPendingOutsideSinceUtcMs, nowUtcMs))
+                    AcceptPendingGroupInvite();
+
+                    bool groupDisbanded = group.NumPartyMembers == 0 && group.NumRaidMembers == 0;
+                    if (groupDisbanded)
+                        _sawGroupDisbandedForReset = true;
+                    else if (_sawGroupDisbandedForReset)
+                    {
+                        string[] expectedNames = settings.GetExpectedMemberNames();
+                        var presentNames = group.AllMembers
+                            .Where(m => m.Guid != 0)
+                            .Select(m => m.Name)
+                            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+                        bool partyReformed = expectedNames.Length == 0 ||
+                            expectedNames.All(n => string.Equals(n, me.Name, StringComparison.OrdinalIgnoreCase) || presentNames.Contains(n));
+                        if (partyReformed)
+                        {
+                            RecordInstanceReset(nowUtcMs);
+                            Logging.Write("[PartyGrind Dungeon] Party re-formed after the reset; re-queueing for a fresh instance.");
+                            ClearResetPendingOutside();
+                            _lfgRunCompletedAwaitingRequeue = false;
+                            LfgManager.DungeonCompletedReason = CompleteReason.None;
+                            return false;
+                        }
+                    }
+
+                    long abandonTimeoutMs = ResolveResetAbandonTimeoutMs(me.IsInParty);
+                    if (ShouldAbandonResetPendingOutside(false, _resetPendingOutsideSinceUtcMs, nowUtcMs, abandonTimeoutMs))
                     {
                         Logging.Write("[PartyGrind Dungeon] Instance reset could not be issued within {0}s ({1}); re-queueing without a reset.",
-                            ResetPendingOutsideTimeoutMs / 1000, me.IsInParty ? "not the party leader" : "no group");
+                            abandonTimeoutMs / 1000, me.IsInParty ? "not the party leader" : "no group");
                         ClearResetPendingOutside();
                         _lfgRunCompletedAwaitingRequeue = false;
                         LfgManager.DungeonCompletedReason = CompleteReason.None;
@@ -840,6 +1060,23 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 {
                     if (me.IsMoving)
                         WoWMovement.MoveStop();
+
+                    switch (RunInstanceResetDance(settings, nowUtcMs))
+                    {
+                        case ResetDanceResult.Working:
+                        case ResetDanceResult.Completed:
+                            return true;
+
+                        case ResetDanceResult.Failed:
+                            return false;
+                    }
+
+                    AcceptPendingGroupInvite();
+                    if (nowUtcMs - _lastResetPendingOutsideLogUtcMs >= ResetPendingOutsideLogThrottleMs)
+                    {
+                        _lastResetPendingOutsideLogUtcMs = nowUtcMs;
+                        SquadPartySyncService.LogAction("Dungeon: waiting for the instance reset");
+                    }
                     return true;
                 }
             }
