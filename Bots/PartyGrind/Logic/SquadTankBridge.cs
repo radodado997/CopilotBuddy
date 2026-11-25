@@ -132,7 +132,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             {
                 if (!m.IsConnected)
                     continue;
-                bool restBlocksPull = m.NeedsRest && !(manaHoldExpired && m.HealthPercent >= 80f);
+                bool restBlocksPull = m.NeedsRest && !(holdExpired && m.HealthPercent >= 80f);
                 if (!m.HasTelemetry || m.IsDead || m.IsGhost || m.IsInCombat || restBlocksPull ||
                     (m.NeedsTown && !m.TownTasksComplete && leader.BotMode != SquadBotMode.Dungeon))
                     return false;

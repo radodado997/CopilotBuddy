@@ -1048,6 +1048,7 @@ namespace CopilotBuddy.Bots.PartyGrind
             {
                 _manaHoldSinceUtcMs = 0;
                 _pullManaHoldExpiredThisTick = false;
+                SquadTankBridge.ManaHoldExpired = false;
                 return false;
             }
 

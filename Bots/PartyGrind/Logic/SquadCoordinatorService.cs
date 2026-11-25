@@ -939,25 +939,12 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private static bool CanProvideHealthstoneTo(SquadMemberState provider, SquadMemberState receiver) =>
             provider.CanProvideHealthstone && provider.HealthstoneMinReceiverLevel is int minLevel && receiver.Level >= minLevel;
 
-        internal static bool ClassUsesDrinks(WoWClass cls) =>
-            cls == WoWClass.Mage || cls == WoWClass.Priest || cls == WoWClass.Warlock ||
-            cls == WoWClass.Druid || cls == WoWClass.Shaman || cls == WoWClass.Paladin;
-
         /// <summary>
-        /// A member whose bag-slot guard or momentary combat flag suppressed <c>WantsDrink</c> still
-        /// needs water. Without this the arbitration resolves the pair as "needs resolved" while the
-        /// healer's own bag count is empty, which is how a dry healer entered the instance.
+        /// Same definition the mage uses for conjuring and trading, so an assignment can never
+        /// outlive or outrun what the provider is willing to hand over.
         /// </summary>
-        internal static bool SquadWantsDrink(SquadMemberSummary member, SquadSettings settings)
-        {
-            if (member == null)
-                return false;
-            if (member.WantsDrink)
-                return true;
-            return member.FreeBagSlots >= 2 &&
-                ClassUsesDrinks(member.Class) &&
-                member.DrinkCount < settings.MinMemberDrinkStack;
-        }
+        internal static bool SquadWantsDrink(SquadMemberSummary member, SquadSettings settings) =>
+            SquadProvisioningService.SquadWantsDrink(member, settings);
 
         /// <summary>
         /// Picks a squad healer that is out of mana and out of drink while everyone is idle enough
@@ -998,6 +985,20 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             }
 
             long timeoutMs = Math.Max(4, settings.TradeOfferTimeoutSeconds + 3) * 1000L;
+
+            // A water emergency outranks whatever pair is in flight: drop food assignments and
+            // pending healthstone rituals so a mage is free for the dry healer, but never the
+            // water hand-off itself.
+            if (waterOnlyRecipient != null && !IsWaterOnlyEmergencyAssignment(waterOnlyRecipient))
+            {
+                if (!string.IsNullOrEmpty(_activeProvisioner))
+                {
+                    Logging.WriteDebug("[PartyGrind Provision] Released '{0}' -> '{1}' (water emergency)",
+                        _activeProvisioner, _activeTradeTarget);
+                    SquadPartySyncService.MarkActivity();
+                }
+                ClearProvisioning();
+            }
 
             if (!string.IsNullOrEmpty(_activeProvisioner))
             {
@@ -1051,7 +1052,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             // Pick next provisioner -> target pair (Mage first, then Warlock).
             if (allowFoodAndDrink && settings.EnableMageProvisioning)
             {
-                foreach (var mage in rosterStates.Where(m => !m.IsDead && !m.IsGhost && (m.CanProvideMageFood || m.CanProvideMageDrink)))
+                foreach (var mage in rosterStates.Where(m =>
+                    (m.CanProvideMageFood || m.CanProvideMageDrink) &&
+                    (waterOnlyRecipient == null || CanProvideInWaterOnlyMode(m))))
                 {
                     var magePos = new WoWPoint(mage.X, mage.Y, mage.Z);
                     var target = rosterStates.FirstOrDefault(m =>
@@ -1117,11 +1120,37 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 nowUtcMs < until;
         }
 
+        /// <summary>
+        /// In water-only mode the provider has to be able to conjure water and be idle enough to
+        /// trade; a food-only or fighting mage cannot serve the emergency.
+        /// </summary>
+        internal static bool CanProvideInWaterOnlyMode(SquadMemberState mage) =>
+            mage != null && !mage.IsDead && !mage.IsGhost && !mage.IsInCombat && mage.CanProvideMageDrink;
+
+        /// <summary>
+        /// True only for the exact hand-off a water emergency asks for: water to the dry healer,
+        /// with no food or healthstone part that would keep the mage busy elsewhere.
+        /// </summary>
+        internal static bool IsWaterOnlyEmergencyAssignment(
+            bool assignedDrink,
+            bool assignedFood,
+            bool assignedHealthstone,
+            string? activeTradeTarget,
+            string recipient) =>
+            assignedDrink && !assignedFood && !assignedHealthstone &&
+            string.Equals(activeTradeTarget, recipient, StringComparison.OrdinalIgnoreCase);
+
+        private bool IsWaterOnlyEmergencyAssignment(string recipient) =>
+            IsWaterOnlyEmergencyAssignment(_assignedDrink, _assignedFood, _assignedHealthstone, _activeTradeTarget, recipient);
+
         private void ClearProvisioning()
         {
             _activeProvisioner = string.Empty;
             _activeTradeTarget = string.Empty;
             _provisionStartedUtcMs = 0;
+            _assignedFood = false;
+            _assignedDrink = false;
+            _assignedHealthstone = false;
         }
 
         private List<SquadMemberSummary> BuildMemberSummaries(

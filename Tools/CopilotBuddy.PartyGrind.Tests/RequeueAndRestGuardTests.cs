@@ -328,6 +328,60 @@ namespace CopilotBuddy.PartyGrind.Tests
                 resetPendingOutside: false, isCoordinator: false, leaderResetPendingOutside: true, localIsPartyLeader: false));
             Assert.False(SquadDungeonService.ShouldEnterResetDance(
                 resetPendingOutside: false, isCoordinator: false, leaderResetPendingOutside: false, localIsPartyLeader: true));
+
+            // A broadcast request that was already danced for stays closed until it is cleared.
+            Assert.False(SquadDungeonService.ShouldEnterResetDance(
+                resetPendingOutside: false, isCoordinator: false, leaderResetPendingOutside: true,
+                localIsPartyLeader: true, followerRequestAlreadyHandled: true));
+            Assert.True(SquadDungeonService.ShouldEnterResetDance(
+                resetPendingOutside: true, isCoordinator: false, leaderResetPendingOutside: true,
+                localIsPartyLeader: true, followerRequestAlreadyHandled: true));
+            Assert.True(SquadDungeonService.ShouldEnterResetDance(
+                resetPendingOutside: false, isCoordinator: false, leaderResetPendingOutside: true,
+                localIsPartyLeader: true, followerRequestAlreadyHandled: false));
+        }
+
+        [Fact]
+        public void Provisioning_WaterEmergencyOnlyKeepsTheWaterHandOff()
+        {
+            // The dry healer's water hand-off survives the release.
+            Assert.True(SquadCoordinatorService.IsWaterOnlyEmergencyAssignment(
+                assignedDrink: true, assignedFood: false, assignedHealthstone: false,
+                activeTradeTarget: "Ksionc", recipient: "ksionc"));
+            // Food, healthstone and other-recipient assignments do not.
+            Assert.False(SquadCoordinatorService.IsWaterOnlyEmergencyAssignment(
+                assignedDrink: true, assignedFood: true, assignedHealthstone: false,
+                activeTradeTarget: "Ksionc", recipient: "Ksionc"));
+            Assert.False(SquadCoordinatorService.IsWaterOnlyEmergencyAssignment(
+                assignedDrink: false, assignedFood: false, assignedHealthstone: true,
+                activeTradeTarget: "Ksionc", recipient: "Ksionc"));
+            Assert.False(SquadCoordinatorService.IsWaterOnlyEmergencyAssignment(
+                assignedDrink: true, assignedFood: false, assignedHealthstone: false,
+                activeTradeTarget: "Bedoes", recipient: "Ksionc"));
+        }
+
+        [Fact]
+        public void Provisioning_WaterOnlyModeNeedsAWaterCapableIdleMage()
+        {
+            var mage = new SquadMemberState
+            {
+                CharacterName = "Sentino",
+                Class = WoWClass.Mage,
+                CanProvideMageFood = true,
+                CanProvideMageDrink = true
+            };
+            Assert.True(SquadCoordinatorService.CanProvideInWaterOnlyMode(mage));
+
+            mage.IsInCombat = true;
+            Assert.False(SquadCoordinatorService.CanProvideInWaterOnlyMode(mage));
+
+            mage.IsInCombat = false;
+            mage.CanProvideMageDrink = false; // food-only mage cannot serve a water emergency
+            Assert.False(SquadCoordinatorService.CanProvideInWaterOnlyMode(mage));
+
+            mage.CanProvideMageDrink = true;
+            mage.IsDead = true;
+            Assert.False(SquadCoordinatorService.CanProvideInWaterOnlyMode(mage));
         }
 
         [Fact]
@@ -436,7 +490,14 @@ namespace CopilotBuddy.PartyGrind.Tests
         [Fact]
         public void PullManaGate_ExpiryIsVisibleToEveryStaticCaller()
         {
-            var leader = new SquadLeaderState { X = 100f, Y = 100f, Z = 0f, MapId = 0 };
+            var leader = new SquadLeaderState
+            {
+                Phase = SquadPhase.DungeonClearing,
+                X = 100f,
+                Y = 100f,
+                Z = 0f,
+                MapId = 0
+            };
             leader.Members.Add(new SquadMemberSummary
             {
                 Guid = 1,

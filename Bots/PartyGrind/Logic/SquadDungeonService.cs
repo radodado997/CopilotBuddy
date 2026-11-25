@@ -133,6 +133,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private long _resetPendingOutsideSinceUtcMs;
         private long _lastResetPendingOutsideLogUtcMs;
         private ResetDancePhase _resetDancePhase;
+        private bool _followerResetHandledForBroadcast;
         private long _resetDanceStartedUtcMs;
         private long _resetDanceNextActionUtcMs;
         private int _resetDanceIndex;
@@ -609,8 +610,16 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             bool resetPendingOutside,
             bool isCoordinator,
             bool leaderResetPendingOutside,
-            bool localIsPartyLeader) =>
-            resetPendingOutside || (!isCoordinator && leaderResetPendingOutside && localIsPartyLeader);
+            bool localIsPartyLeader,
+            bool followerRequestAlreadyHandled = false) =>
+            resetPendingOutside ||
+            (!isCoordinator && leaderResetPendingOutside && localIsPartyLeader && !followerRequestAlreadyHandled);
+
+        /// <summary>
+        /// True while the kick/reset/invite dance is running, so the periodic auto-invite pulse does
+        /// not re-add a member the dance just removed (that would break the ungrouped reset).
+        /// </summary>
+        internal static bool ResetDanceInProgress { get; private set; }
 
         internal static bool IsLocalPartyLeader() =>
             Lua.GetReturnVal<bool>("return (IsPartyLeader() and true) or false", 0);
@@ -640,6 +649,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 _resetDancePhase = ShouldKickPartyMembers(true, others)
                     ? ResetDancePhase.Kick
                     : ResetDancePhase.Reset;
+                ResetDanceInProgress = true;
 
                 _resetDanceStartedUtcMs = nowUtcMs;
                 _resetDanceNextActionUtcMs = nowUtcMs;
@@ -754,6 +764,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
         private void ResetDanceState()
         {
+            ResetDanceInProgress = false;
             _resetDancePhase = ResetDancePhase.None;
             _resetDanceStartedUtcMs = 0;
             _resetDanceNextActionUtcMs = 0;
@@ -965,11 +976,16 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 return RunWalkInPortalEntryTick(settings, leader, nowUtcMs);
             }
 
+            bool leaderResetRequested = leader?.DungeonResetPendingOutside == true;
+            if (!leaderResetRequested)
+                _followerResetHandledForBroadcast = false;
+
             bool resetGateOpen = ShouldEnterResetDance(
                 _resetPendingOutside,
                 settings.IsCoordinator,
-                leader?.DungeonResetPendingOutside == true,
-                IsLocalPartyLeader());
+                leaderResetRequested,
+                IsLocalPartyLeader(),
+                _followerResetHandledForBroadcast);
             if (resetGateOpen)
             {
                 if (settings.IsCoordinator)
@@ -1066,7 +1082,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     return true;
                 }
 
-                if (leader?.DungeonResetPendingOutside == true)
+                if (leaderResetRequested && !_followerResetHandledForBroadcast)
                 {
                     if (me.IsMoving)
                         WoWMovement.MoveStop();
@@ -1074,10 +1090,16 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     switch (RunInstanceResetDance(settings, nowUtcMs))
                     {
                         case ResetDanceResult.Working:
+                            return true;
+
                         case ResetDanceResult.Completed:
+                            // The coordinator keeps broadcasting until it sees the outcome; without
+                            // this record the completed dance would start over for the same request.
+                            _followerResetHandledForBroadcast = true;
                             return true;
 
                         case ResetDanceResult.Failed:
+                            _followerResetHandledForBroadcast = true;
                             return false;
                     }
 

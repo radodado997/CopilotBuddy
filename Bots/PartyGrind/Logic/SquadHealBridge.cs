@@ -428,7 +428,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                         candidateIsTankHealTarget: leader?.Members?.Any(m =>
                             m.Guid == priorityCandidate.Guid && m.Role == SquadRole.TankLeader) == true,
                         candidateIsSelf: priorityCandidate.IsSelf,
-                        localManaPercent: me.ManaPercent,
+                        localManaPercent: (float)me.ManaPercent,
                         localRole: settings.Role);
                 if (!routineHandoffAllowed)
                     StopActiveHealBehavior();
