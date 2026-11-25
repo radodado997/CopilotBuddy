@@ -600,13 +600,20 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             Failed = 3
         }
 
+        /// <summary>
+        /// The reset dance runs on the coordinator, and on a follower that has become the instance
+        /// leader (the coordinator left or handed over) while the broadcast reset flag is set.
+        /// Non-leader followers keep their old path: they never start the dance themselves.
+        /// </summary>
+        internal static bool ShouldEnterResetDance(
+            bool resetPendingOutside,
+            bool isCoordinator,
+            bool leaderResetPendingOutside,
+            bool localIsPartyLeader) =>
+            resetPendingOutside || (!isCoordinator && leaderResetPendingOutside && localIsPartyLeader);
+
         internal static bool IsLocalPartyLeader() =>
             Lua.GetReturnVal<bool>("return (IsPartyLeader() and true) or false", 0);
-
-        private static void AcceptPendingGroupInvite()
-        {
-            Lua.DoString("if not (GetNumPartyMembers() > 0 or GetNumRaidMembers() > 0) then pcall(AcceptGroup) end");
-        }
 
         /// <summary>
         /// RDF keeps handing out the same instance ID after a completed run, and ResetInstances()
@@ -678,7 +685,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
                     int index = Math.Min(_resetDanceIndex, othersNow.Count - 1);
                     string victim = othersNow[index];
-                    Lua.DoString("UninviteByName(\"" + Lua.Escape(victim) + "\")");
+                    Lua.DoString("UninviteUnit(\"" + Lua.Escape(victim) + "\")");
                     _resetDanceIndex++;
                     _resetDanceNextActionUtcMs = nowUtcMs + ResetDanceStepMs;
                     return ResetDanceResult.Working;
@@ -727,7 +734,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     }
 
                     string invitee = missing[_resetDanceIndex % missing.Count];
-                    Lua.DoString("InviteByName(\"" + Lua.Escape(invitee) + "\")");
+                    Lua.DoString("InviteUnit(\"" + Lua.Escape(invitee) + "\")");
                     _resetDanceIndex++;
                     _resetDanceNextActionUtcMs = nowUtcMs + ResetDanceStepMs;
                     return ResetDanceResult.Working;
@@ -958,7 +965,12 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 return RunWalkInPortalEntryTick(settings, leader, nowUtcMs);
             }
 
-            if (_resetPendingOutside)
+            bool resetGateOpen = ShouldEnterResetDance(
+                _resetPendingOutside,
+                settings.IsCoordinator,
+                leader?.DungeonResetPendingOutside == true,
+                IsLocalPartyLeader());
+            if (resetGateOpen)
             {
                 if (settings.IsCoordinator)
                 {
@@ -1017,8 +1029,6 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                             return false;
                     }
 
-                    AcceptPendingGroupInvite();
-
                     bool groupDisbanded = group.NumPartyMembers == 0 && group.NumRaidMembers == 0;
                     if (groupDisbanded)
                         _sawGroupDisbandedForReset = true;
@@ -1071,7 +1081,6 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                             return false;
                     }
 
-                    AcceptPendingGroupInvite();
                     if (nowUtcMs - _lastResetPendingOutsideLogUtcMs >= ResetPendingOutsideLogThrottleMs)
                     {
                         _lastResetPendingOutsideLogUtcMs = nowUtcMs;

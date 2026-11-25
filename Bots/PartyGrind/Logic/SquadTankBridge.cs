@@ -53,10 +53,16 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         {
             if (member == null)
                 return 100f;
-            if (member.Class == WoWClass.Druid && member.ManaPercent > 0f)
+            if (member.Class == WoWClass.Druid)
                 return member.ManaPercent;
             return member.PowerPercent;
         }
+
+        internal static bool HasUsableManaTelemetry(SquadMemberSummary member) =>
+            member != null && member.HasTelemetry;
+
+        /// <summary>Per-tick decision published by the tank so every static caller sees it.</summary>
+        internal static bool ManaHoldExpired { get; set; }
 
         /// <summary>
         /// Lowest mana pool that matters for the next pull: the healer's when the roster knows
@@ -80,6 +86,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 if (!usesMana)
                     continue;
 
+                if (!HasUsableManaTelemetry(member))
+                    continue;
+
                 float percent = ReadMemberManaPercent(member);
                 if (percent < anyLowest)
                     anyLowest = percent;
@@ -98,8 +107,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         internal static bool IsManaHoldBlockingPull(float healerManaPercent, bool manaHoldExpired) =>
             healerManaPercent < PullHealerManaFloor && !manaHoldExpired;
 
-        public static bool CanInitiatePull(SquadLeaderState? leader, float maxPullGatherDistance, bool manaHoldExpired = false)
+        public static bool CanInitiatePull(SquadLeaderState? leader, float maxPullGatherDistance, bool? manaHoldExpired = null)
         {
+            bool holdExpired = manaHoldExpired ?? ManaHoldExpired;
             if (leader == null)
                 return true;
 
@@ -134,7 +144,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             }
 
             // A dry healer turns every pull into a corpse run; hold until the pool is back.
-            return !IsManaHoldBlockingPull(LowestHealerManaPercent(leader), manaHoldExpired);
+            return !IsManaHoldBlockingPull(LowestHealerManaPercent(leader), holdExpired);
         }
 
         /// <summary>
@@ -205,7 +215,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 if (isDungeon)
                 {
                     WoWPoint meLoc = StyxWoW.Me.Location;
-                    bool canPull = StyxWoW.Me.Combat || committedGuid != 0 || CanInitiatePull(leader, settings.MaxPullGatherDistance);
+                    bool canPull = StyxWoW.Me.Combat || committedGuid != 0 || CanInitiatePull(leader, settings.MaxPullGatherDistance, ManaHoldExpired);
                     foreach (WoWObject obj in incomingUnits)
                     {
                         if (obj is not WoWUnit unit || !unit.IsValid || unit.Dead || !unit.CanSelect || !unit.Attackable)

@@ -206,6 +206,7 @@ namespace Singular.Helpers
         #region Move Behind
 
         internal const float RepositionAggroRadius = 8f;
+        private static WoWPoint _lastRepositionDestination = WoWPoint.Zero;
 
         /// <summary>
         ///   Creates a move behind target behavior. If it cannot fully navigate will move to target location
@@ -244,14 +245,42 @@ namespace Singular.Helpers
                     {
                         WoWUnit behindTarget = StyxWoW.Me.CurrentTarget;
                         if (behindTarget == null)
-                            return;
+                            return RunStatus.Failure;
 
                         WoWPoint destination = CalculatePointBehindTarget();
                         if (!IsSafeRepositionPoint(behindTarget, destination))
-                            return;
+                        {
+                            StopOwnReposition();
+                            return RunStatus.Failure;
+                        }
 
+                        _lastRepositionDestination = destination;
                         Navigator.MoveTo(destination);
+                        return RunStatus.Success;
                     }));
+        }
+
+        /// <summary>
+        /// Cancels the reposition move only when the path we are walking is the one this
+        /// behavior started; movement requested by other behaviors stays untouched.
+        /// </summary>
+        private static void StopOwnReposition()
+        {
+            if (_lastRepositionDestination == WoWPoint.Zero)
+                return;
+
+            WoWPoint destination = _lastRepositionDestination;
+            _lastRepositionDestination = WoWPoint.Zero;
+
+            if (!StyxWoW.Me.IsMoving && Navigator.Destination == WoWPoint.Zero)
+                return;
+
+            WoWPoint current = Navigator.Destination;
+            if (current == WoWPoint.Zero || current.Distance(destination) > 1.5f)
+                return;
+
+            Navigator.Clear();
+            WoWMovement.MoveStop();
         }
 
         private static WoWPoint CalculatePointBehindTarget()

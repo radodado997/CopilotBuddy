@@ -505,8 +505,14 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 }
             }
 
-            // Provisioning arbitration.
-            if (anyInCombat || anyDead || _inTownRun || _migratingZone)
+            // Provisioning arbitration. A dry healer is a wipe waiting to happen, so a
+            // mage-to-healer water run stays allowed in combat windows when both are idle.
+            string? waterOnlyRecipient = anyInCombat
+                ? SelectDryHealerWaterRecipient(rosterStates, settings)
+                : null;
+            bool provisioningBlocked = anyDead || _inTownRun || _migratingZone ||
+                (anyInCombat && string.IsNullOrEmpty(waterOnlyRecipient));
+            if (provisioningBlocked)
             {
                 if (!string.IsNullOrEmpty(_activeProvisioner))
                 {
@@ -518,7 +524,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             }
             else
             {
-                EvaluateProvisioningArbitration(settings, rosterStates, nowUtcMs, dungeon?.HasRandomPartyMembers != true);
+                EvaluateProvisioningArbitration(settings, rosterStates, nowUtcMs,
+                    dungeon?.HasRandomPartyMembers != true, waterOnlyRecipient);
             }
 
             SquadPhase phase;
@@ -932,11 +939,57 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private static bool CanProvideHealthstoneTo(SquadMemberState provider, SquadMemberState receiver) =>
             provider.CanProvideHealthstone && provider.HealthstoneMinReceiverLevel is int minLevel && receiver.Level >= minLevel;
 
+        internal static bool ClassUsesDrinks(WoWClass cls) =>
+            cls == WoWClass.Mage || cls == WoWClass.Priest || cls == WoWClass.Warlock ||
+            cls == WoWClass.Druid || cls == WoWClass.Shaman || cls == WoWClass.Paladin;
+
+        /// <summary>
+        /// A member whose bag-slot guard or momentary combat flag suppressed <c>WantsDrink</c> still
+        /// needs water. Without this the arbitration resolves the pair as "needs resolved" while the
+        /// healer's own bag count is empty, which is how a dry healer entered the instance.
+        /// </summary>
+        internal static bool SquadWantsDrink(SquadMemberSummary member, SquadSettings settings)
+        {
+            if (member == null)
+                return false;
+            if (member.WantsDrink)
+                return true;
+            return member.FreeBagSlots >= 2 &&
+                ClassUsesDrinks(member.Class) &&
+                member.DrinkCount < settings.MinMemberDrinkStack;
+        }
+
+        /// <summary>
+        /// Picks a squad healer that is out of mana and out of drink while everyone is idle enough
+        /// for a mage to hand water over. Returns null when no such window exists.
+        /// </summary>
+        internal static string? SelectDryHealerWaterRecipient(
+            IReadOnlyList<SquadMemberState> rosterStates,
+            SquadSettings settings)
+        {
+            if (rosterStates == null || !settings.EnableMageProvisioning)
+                return null;
+
+            bool mageReady = rosterStates.Any(m =>
+                !m.IsDead && !m.IsGhost && !m.IsInCombat && m.CanProvideMageDrink);
+            if (!mageReady)
+                return null;
+
+            var healer = rosterStates.FirstOrDefault(m =>
+                !m.IsDead && !m.IsGhost && !m.IsInCombat &&
+                (m.Role == SquadRole.Healer || m.Role == SquadRole.HybridOffHeal) &&
+                SquadWantsDrink(m, settings) &&
+                m.ManaPercent < 40f &&
+                m.FreeBagSlots >= 2);
+            return healer?.CharacterName;
+        }
+
         private void EvaluateProvisioningArbitration(
             SquadSettings settings,
             List<SquadMemberState> rosterStates,
             long nowUtcMs,
-            bool allowFoodAndDrink)
+            bool allowFoodAndDrink,
+            string? waterOnlyRecipient = null)
         {
             if (!allowFoodAndDrink && (_assignedFood || _assignedDrink))
             {
@@ -957,9 +1010,10 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     return;
 
                 bool timedOut = (nowUtcMs - _provisionStartedUtcMs) > timeoutMs;
-                bool stillNeeded = prov != null && (prov.IsProvisioningBusy ||
+                bool receiverUnknown = !string.IsNullOrEmpty(_activeTradeTarget) && recv == null;
+                bool stillNeeded = prov != null && (prov.IsProvisioningBusy || receiverUnknown ||
                     (recv != null && ((_assignedFood && recv.WantsFood) ||
-                        (_assignedDrink && recv.WantsDrink) || (_assignedHealthstone && recv.WantsHealthstone))));
+                        (_assignedDrink && SquadWantsDrink(recv, settings)) || (_assignedHealthstone && recv.WantsHealthstone))));
 
                 bool healthstoneSupplyLost = _assignedHealthstone &&
                     (prov == null || (!prov.IsProvisioningBusy &&
@@ -1006,13 +1060,14 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                         m.MapId == mage.MapId &&
                         magePos.Distance(new WoWPoint(m.X, m.Y, m.Z)) <= 40f &&
                         m.FreeBagSlots >= 2 &&
-                        ((mage.CanProvideMageFood && m.WantsFood) || (mage.CanProvideMageDrink && m.WantsDrink)) &&
+                        (waterOnlyRecipient == null || string.Equals(m.CharacterName, waterOnlyRecipient, StringComparison.OrdinalIgnoreCase)) &&
+                        ((mage.CanProvideMageFood && m.WantsFood) || (mage.CanProvideMageDrink && SquadWantsDrink(m, settings))) &&
                         !IsOnProvisionCooldown(m.CharacterName, nowUtcMs));
 
                     if (target != null)
                     {
-                        _assignedFood = mage.CanProvideMageFood && target.WantsFood;
-                        _assignedDrink = mage.CanProvideMageDrink && target.WantsDrink;
+                        _assignedFood = waterOnlyRecipient == null && mage.CanProvideMageFood && target.WantsFood;
+                        _assignedDrink = mage.CanProvideMageDrink && SquadWantsDrink(target, settings);
                         _assignedHealthstone = false;
                         _activeProvisioner = mage.CharacterName;
                         _activeTradeTarget = target.CharacterName;
@@ -1025,7 +1080,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 }
             }
 
-            if (settings.EnableWarlockHealthstones)
+            if (settings.EnableWarlockHealthstones && waterOnlyRecipient == null)
             {
                 foreach (var warlock in rosterStates.Where(m => !m.IsDead && !m.IsGhost && m.CanProvideHealthstone))
                 {

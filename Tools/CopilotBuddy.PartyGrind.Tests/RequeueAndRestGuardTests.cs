@@ -308,5 +308,178 @@ namespace CopilotBuddy.PartyGrind.Tests
                 healerManaPercent: 92.0);
             Assert.Equal("Heal", combatTank);
         }
+        [Fact]
+        public void ResetDance_AlsoOpensForTheFollowerThatBecameTheLeader()
+        {
+            // The local flag always wins (coordinator or a follower that ran the reset itself).
+            Assert.True(SquadDungeonService.ShouldEnterResetDance(
+                resetPendingOutside: true, isCoordinator: true, leaderResetPendingOutside: false, localIsPartyLeader: false));
+            Assert.True(SquadDungeonService.ShouldEnterResetDance(
+                resetPendingOutside: true, isCoordinator: false, leaderResetPendingOutside: false, localIsPartyLeader: false));
+
+            // A coordinator never derives the gate from the broadcast flag.
+            Assert.False(SquadDungeonService.ShouldEnterResetDance(
+                resetPendingOutside: false, isCoordinator: true, leaderResetPendingOutside: true, localIsPartyLeader: true));
+
+            // A follower only dances when it is the instance leader.
+            Assert.True(SquadDungeonService.ShouldEnterResetDance(
+                resetPendingOutside: false, isCoordinator: false, leaderResetPendingOutside: true, localIsPartyLeader: true));
+            Assert.False(SquadDungeonService.ShouldEnterResetDance(
+                resetPendingOutside: false, isCoordinator: false, leaderResetPendingOutside: true, localIsPartyLeader: false));
+            Assert.False(SquadDungeonService.ShouldEnterResetDance(
+                resetPendingOutside: false, isCoordinator: false, leaderResetPendingOutside: false, localIsPartyLeader: true));
+        }
+
+        [Fact]
+        public void Provisioning_DrinkNeedSurvivesTheBagSlotAndCombatGuards()
+        {
+            var settings = SquadSettings.Instance;
+
+            var priest = new SquadMemberSummary
+            {
+                Class = WoWClass.Priest,
+                DrinkCount = 0,
+                FreeBagSlots = 4,
+                WantsDrink = false // suppressed by the need evaluation guard
+            };
+            Assert.True(SquadCoordinatorService.SquadWantsDrink(priest, settings));
+
+            priest.DrinkCount = settings.MinMemberDrinkStack;
+            Assert.False(SquadCoordinatorService.SquadWantsDrink(priest, settings));
+
+            priest.DrinkCount = 0;
+            priest.FreeBagSlots = 1; // cannot take a trade anyway
+            Assert.False(SquadCoordinatorService.SquadWantsDrink(priest, settings));
+
+            var warrior = new SquadMemberSummary { Class = WoWClass.Warrior, DrinkCount = 0, FreeBagSlots = 8 };
+            Assert.False(SquadCoordinatorService.SquadWantsDrink(warrior, settings));
+
+            // An explicitly reported need is always honoured.
+            Assert.True(SquadCoordinatorService.SquadWantsDrink(
+                new SquadMemberSummary { Class = WoWClass.Mage, DrinkCount = 99, FreeBagSlots = 8, WantsDrink = true },
+                settings));
+        }
+
+        [Fact]
+        public void Provisioning_GivesADryHealerWaterBetweenPulls()
+        {
+            var settings = SquadSettings.Instance;
+            var mage = new SquadMemberState
+            {
+                CharacterName = "Sentino",
+                Class = WoWClass.Mage,
+                Role = SquadRole.DpsRanged,
+                CanProvideMageDrink = true,
+                CanProvideMageFood = true,
+                FreeBagSlots = 6
+            };
+            var healer = new SquadMemberState
+            {
+                CharacterName = "Ksionc",
+                Class = WoWClass.Priest,
+                Role = SquadRole.Healer,
+                WantsDrink = true,
+                ManaPercent = 12f,
+                FreeBagSlots = 5
+            };
+
+            var roster = new List<SquadMemberState> { mage, healer };
+            Assert.Equal("Ksionc", SquadCoordinatorService.SelectDryHealerWaterRecipient(roster, settings));
+
+            healer.ManaPercent = 90f;
+            Assert.Null(SquadCoordinatorService.SelectDryHealerWaterRecipient(roster, settings));
+
+            healer.ManaPercent = 12f;
+            healer.IsInCombat = true;
+            Assert.Null(SquadCoordinatorService.SelectDryHealerWaterRecipient(roster, settings));
+
+            healer.IsInCombat = false;
+            mage.IsInCombat = true;
+            Assert.Null(SquadCoordinatorService.SelectDryHealerWaterRecipient(roster, settings));
+
+            mage.IsInCombat = false;
+            mage.CanProvideMageDrink = false;
+            Assert.Null(SquadCoordinatorService.SelectDryHealerWaterRecipient(roster, settings));
+        }
+
+        [Fact]
+        public void PullManaGate_DruidManaIsNeverReplacedByPower()
+        {
+            var druid = new SquadMemberSummary
+            {
+                Class = WoWClass.Druid,
+                PowerType = WoWPowerType.Energy,
+                ManaPercent = 0f,
+                PowerPercent = 100f
+            };
+            Assert.Equal(0f, SquadTankBridge.ReadMemberManaPercent(druid), 3);
+
+            var leader = new SquadLeaderState();
+            leader.Members.Add(new SquadMemberSummary
+            {
+                Guid = 1,
+                CharacterName = "Druid",
+                IsConnected = true,
+                Role = SquadRole.DpsMelee,
+                Class = WoWClass.Druid,
+                PowerType = WoWPowerType.Energy,
+                ManaPercent = 0f,
+                PowerPercent = 100f
+            });
+            Assert.Equal(0f, SquadTankBridge.LowestHealerManaPercent(leader), 3);
+
+            // Missing telemetry must read as unknown, not as an empty pool.
+            leader.Members[0].HasTelemetry = false;
+            Assert.Equal(100f, SquadTankBridge.LowestHealerManaPercent(leader), 3);
+        }
+
+        [Fact]
+        public void PullManaGate_ExpiryIsVisibleToEveryStaticCaller()
+        {
+            var leader = new SquadLeaderState { X = 100f, Y = 100f, Z = 0f, MapId = 0 };
+            leader.Members.Add(new SquadMemberSummary
+            {
+                Guid = 1,
+                CharacterName = "Healer",
+                IsConnected = true,
+                Role = SquadRole.Healer,
+                Class = WoWClass.Priest,
+                PowerType = WoWPowerType.Mana,
+                PowerPercent = 10f,
+                HealthPercent = 100f,
+                MapId = 0,
+                X = 105f,
+                Y = 100f,
+                Z = 0f
+            });
+
+            Assert.False(SquadTankBridge.CanInitiatePull(leader, 28f, manaHoldExpired: false));
+            Assert.True(SquadTankBridge.CanInitiatePull(leader, 28f, manaHoldExpired: true));
+        }
+
+        [Fact]
+        public void Rest_YieldsToAPullOnlyWhenTheHoldExpiredOnADryHealer()
+        {
+            Assert.False(PartyGrindBot.ShouldYieldRestForPull(manaHoldExpired: false, localIsTank: true, healerManaPercent: 10f));
+            Assert.False(PartyGrindBot.ShouldYieldRestForPull(manaHoldExpired: true, localIsTank: false, healerManaPercent: 10f));
+            Assert.False(PartyGrindBot.ShouldYieldRestForPull(manaHoldExpired: true, localIsTank: true, healerManaPercent: 40f));
+            Assert.True(PartyGrindBot.ShouldYieldRestForPull(manaHoldExpired: true, localIsTank: true, healerManaPercent: 20f));
+        }
+
+        [Fact]
+        public void RoutineHealHandoff_StaysOffNonTankTargetsAtLowMana()
+        {
+            Assert.False(SquadHealBridge.IsRoutineHandoffTargetAppropriate(
+                candidateIsTankHealTarget: false, candidateIsSelf: false, localManaPercent: 80f, localRole: SquadRole.Healer));
+            Assert.True(SquadHealBridge.IsRoutineHandoffTargetAppropriate(
+                candidateIsTankHealTarget: true, candidateIsSelf: false, localManaPercent: 80f, localRole: SquadRole.Healer));
+            Assert.True(SquadHealBridge.IsRoutineHandoffTargetAppropriate(
+                candidateIsTankHealTarget: false, candidateIsSelf: true, localManaPercent: 80f, localRole: SquadRole.Healer));
+            Assert.False(SquadHealBridge.IsRoutineHandoffTargetAppropriate(
+                candidateIsTankHealTarget: true, candidateIsSelf: false, localManaPercent: 20f, localRole: SquadRole.Healer));
+            Assert.False(SquadHealBridge.IsRoutineHandoffTargetAppropriate(
+                candidateIsTankHealTarget: true, candidateIsSelf: false, localManaPercent: 80f, localRole: SquadRole.DpsMelee));
+        }
+
     }
 }

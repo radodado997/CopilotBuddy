@@ -178,6 +178,23 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             return Math.Min(threshold, reserveCap);
         }
 
+        /// <summary>
+        /// The routine heal behavior cannot be aimed, so only hand off when losing the target is
+        /// harmless: tank/self triage keeps the pull alive, everyone else is healed directly.
+        /// </summary>
+        internal static bool IsRoutineHandoffTargetAppropriate(
+            bool candidateIsTankHealTarget,
+            bool candidateIsSelf,
+            float localManaPercent,
+            SquadRole localRole)
+        {
+            if (!candidateIsTankHealTarget && !candidateIsSelf)
+                return false;
+            if (localManaPercent < LowManaSpellSwapPercent)
+                return false;
+            return localRole == SquadRole.Healer || localRole == SquadRole.HybridOffHeal || localRole == SquadRole.TankLeader;
+        }
+
         internal static void RecordHealCast(ulong targetGuid, string? spellName, long nowUtcMs)
         {
             if (targetGuid == 0 || string.IsNullOrEmpty(spellName))
@@ -403,8 +420,16 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 // Stage 1: Try Routine's HealBehavior when level >= 10 and not in Hybrid emergency-only mode.
                 // The routine targets on its own thresholds (it happily heals 80-90% members), so it
                 // only takes over during combat and only when a target is genuinely low.
+                // The routine picks its own target from HealTargeting, so handing off for a non-tank
+                // member while the tank is hurt makes it heal the tank and drop the intended target.
                 bool routineHandoffAllowed = anyCombat &&
-                    priorityCandidate.HealthPercent < Math.Min(threshold, RoutineHealHandoffThreshold);
+                    priorityCandidate.HealthPercent < Math.Min(threshold, RoutineHealHandoffThreshold) &&
+                    IsRoutineHandoffTargetAppropriate(
+                        candidateIsTankHealTarget: leader?.Members?.Any(m =>
+                            m.Guid == priorityCandidate.Guid && m.Role == SquadRole.TankLeader) == true,
+                        candidateIsSelf: priorityCandidate.IsSelf,
+                        localManaPercent: me.ManaPercent,
+                        localRole: settings.Role);
                 if (!routineHandoffAllowed)
                     StopActiveHealBehavior();
                 if (!triedRoutine && routineHandoffAllowed && !emergencyOnly && me.Level >= 10 &&
