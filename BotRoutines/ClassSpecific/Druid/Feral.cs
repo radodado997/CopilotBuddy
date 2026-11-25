@@ -177,8 +177,8 @@ namespace Singular.ClassSpecific.Druid
                             CreateFeralLevel2046Pull()),
 
                         Spell.BuffSelf("Cat Form"),
-                        Spell.BuffSelf("Prowl", ret => !StyxWoW.Me.IsInParty && StyxWoW.Me.CurrentTarget != null && StyxWoW.Me.CurrentTarget.DistanceSqr < 30 * 30),
                         Helpers.Common.CreateAutoAttack(true),
+                        Spell.BuffSelf("Prowl", ret => !StyxWoW.Me.IsInParty && StyxWoW.Me.CurrentTarget != null && StyxWoW.Me.CurrentTarget.DistanceSqr < 30 * 30),
                         Spell.Cast("Feral Charge - Cat"),
                         Spell.Cast("Dash",
                             ret => StyxWoW.Me.CurrentTarget != null &&
@@ -280,8 +280,8 @@ namespace Singular.ClassSpecific.Druid
         {
             return new PrioritySelector(
                 Spell.BuffSelf("Cat Form"),
-                Spell.BuffSelf("Prowl", ret => SpellManager.HasSpell("Pounce") && !StyxWoW.Me.IsInParty),
                 Helpers.Common.CreateAutoAttack(true),
+                Spell.BuffSelf("Prowl", ret => SpellManager.HasSpell("Pounce") && !StyxWoW.Me.IsInParty),
                 Spell.Cast("Feral Charge - Cat"),				
 				Spell.Cast("Pounce"),
                 Spell.Cast("Shred", ret => StyxWoW.Me.CurrentTarget != null && StyxWoW.Me.CurrentTarget.MeIsBehind),
@@ -923,26 +923,22 @@ return Action.RAKE;*/
                               Helpers.Common.CreateInterruptSpellCast(ret => StyxWoW.Me.CurrentTarget)),
                 new Decorator(
                     ret =>
-                    StyxWoW.Me.CurrentTarget != null &&
-                    ((SingularSettings.Instance.Druid.Shapeform == 0 && Group.MeIsTank)
+                    (SingularSettings.Instance.Druid.Shapeform == 0 && Group.MeIsTank)
                     || SingularSettings.Instance.Druid.Shapeform == 2
-                    || (SingularSettings.Instance.Druid.Shapeform == 3 && StyxWoW.Me.HasAura("Dire Bear Form"))),
+                    || (SingularSettings.Instance.Druid.Shapeform == 3 && StyxWoW.Me.HasAura("Dire Bear Form")),
                     CreateFeralBearInstanceCombat()),
                 new Decorator(
                     ret =>
-                    StyxWoW.Me.CurrentTarget != null &&
-                    ((SingularSettings.Instance.Druid.Shapeform == 1)
+                    (SingularSettings.Instance.Druid.Shapeform == 1)
                     || (SingularSettings.Instance.Druid.Shapeform == 0 && !Group.MeIsTank)
-                    || (SingularSettings.Instance.Druid.Shapeform == 3 && StyxWoW.Me.HasAura("Cat Form"))),
+                    || (SingularSettings.Instance.Druid.Shapeform == 3 && StyxWoW.Me.HasAura("Cat Form")),
                     CreateFeralCatInstanceCombat())
                 );
         }
 
         private static Composite CreateFeralBearInstanceCombat()
         {
-            return new Decorator(
-                ret => StyxWoW.Me.CurrentTarget != null,
-                new PrioritySelector(
+            return new PrioritySelector(
                 Spell.BuffSelf("Dire Bear Form"),
                 Spell.Cast("Feral Charge - Bear",
                            ret => StyxWoW.Me.CurrentTarget.CanCharge() &&
@@ -1181,14 +1177,12 @@ return Action.RAKE;*/
                                    (StyxWoW.Me.ActiveAuras.ContainsKey("Clearcasting") ? 0 : 15)
                             ),
                         Movement.CreateMoveToMeleeBehavior(true)))
-                ));
+                );
         }
 
         private static Composite CreateFeralCatInstanceCombat()
         {
-            return new Decorator(
-                ret => StyxWoW.Me.CurrentTarget != null,
-                new PrioritySelector(
+            return new PrioritySelector(
                 Common.CreateRaidCatHeal(),
                 Spell.BuffSelf("Cat Form"),
                 Spell.Cast(
@@ -1212,8 +1206,7 @@ return Action.RAKE;*/
                     })),
                 new Decorator(
                     ret =>
-                    StyxWoW.Me.CurrentTarget is WoWUnit target &&
-                    (StyxWoW.Me.IsInRaid || StyxWoW.Me.IsInParty) && target.ThreatInfo.RawPercent > 89 &&
+                    (StyxWoW.Me.IsInRaid || StyxWoW.Me.IsInParty) && StyxWoW.Me.CurrentTarget.ThreatInfo.RawPercent > 89 &&
                     Settings.RaidCatProwl,
                     Spell.Cast("Cower")),
                 /*Tiger's Fury!*/
@@ -1224,11 +1217,10 @@ return Action.RAKE;*/
                                       StyxWoW.Me.CurrentTarget.Level < 80),
                 // #2
                 Spell.BuffSelf("Tiger's Fury",
-                               ret => StyxWoW.Me.CurrentTarget is WoWUnit target &&
-                                      SingularSettings.Instance.Druid.CatRaidTigers && CurrentEnergy <= 35 &&
+                               ret => SingularSettings.Instance.Druid.CatRaidTigers && CurrentEnergy <= 35 &&
                                       !StyxWoW.Me.ActiveAuras.ContainsKey("Clearcasting") &&
                                       !SpellManager.GlobalCooldown &&
-                                      target.Level >= 80),
+                                      StyxWoW.Me.CurrentTarget.Level >= 80),
                 /*Berserk!*/
 
                 //#4
@@ -1479,7 +1471,7 @@ return Action.RAKE;*/
                         )
                     ),
                 Movement.CreateMoveToMeleeBehavior(true)
-                ));
+                );
         }
 
 

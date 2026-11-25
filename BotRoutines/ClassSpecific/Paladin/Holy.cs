@@ -20,18 +20,14 @@ namespace Singular.ClassSpecific.Paladin
         public static Composite CreateHolyPaladinRest()
         {
             return new PrioritySelector(
-                // Heal self before resting, unless already eating/drinking.
-                new Decorator(
-                    ret => !StyxWoW.Me.HasAura("Drink") && !StyxWoW.Me.HasAura("Food") && !StyxWoW.Me.HasAura("Refreshment"),
-                    CreatePaladinHealBehavior(true)),
+                // Heal self before resting. There is no need to eat while we have 100% mana
+                CreatePaladinHealBehavior(true),
                 // Rest up damnit! Do this first, so we make sure we're fully rested.
                 Rest.CreateDefaultRestBehaviour(),
                 // Can we res people?
                 Spell.Resurrect("Redemption"),
-                // Make sure we're healing OOC too (without breaking active food/drink)!
-                new Decorator(
-                    ret => !StyxWoW.Me.HasAura("Drink") && !StyxWoW.Me.HasAura("Food") && !StyxWoW.Me.HasAura("Refreshment"),
-                    CreatePaladinHealBehavior(false, false)));
+                // Make sure we're healing OOC too!
+                CreatePaladinHealBehavior(false, false));
         }
 
         [Class(WoWClass.Paladin)]

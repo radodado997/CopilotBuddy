@@ -253,48 +253,61 @@ namespace Singular.Helpers
         /// <param name = "onUnit">The on unit.</param>
         /// <param name = "requirements">The requirements.</param>
         /// <returns>.</returns>
-        internal static bool CanCastOnUnit(string name, WoWUnit target, bool checkMovement = true)
-        {
-            if (name == null || target == null || !target.IsValid)
-                return false;
-
-            if (!SpellManager.CanCast(name, target, false, checkMovement))
-                return false;
-
-            if (target.IsMe)
-                return true;
-
-            WoWSpell spell;
-            if (!SpellManager.Spells.TryGetValue(name, out spell))
-                return false;
-
-            var rangeId = spell.SpellRangeId;
-            var minRange = spell.MinRange;
-            var maxRange = spell.MaxRange;
-            var targetDistance = target.Distance;
-            // RangeId 2 or melee range spell (or any 0-range ability on hostile target)
-            if (rangeId == 2 || spell.IsMeleeSpell || (maxRange == 0 && (target.IsHostile || !target.IsFriendly)))
-                return targetDistance < MeleeRange || target.IsWithinMeleeRange;
-            // RangeId 1 is "Self Only".
-            if (rangeId == 1)
-                return true;
-
-            // LOS check only for true ranged spells.
-            if (!target.InLineOfSpellSight)
-                return false;
-
-            return targetDistance < maxRange &&
-                   targetDistance > (minRange == 0 ? minRange : minRange + 3);
-        }
-
         public static Composite Cast(string name, SimpleBooleanDelegate checkMovement, UnitSelectionDelegate onUnit, SimpleBooleanDelegate requirements)
         {
             return new Decorator(
                 ret =>
                 {
+                    //Logger.WriteDebug("Casting spell: " + name);
+                    //Logger.WriteDebug("Requirements: " + requirements(ret));
+                    //Logger.WriteDebug("OnUnit: " + onUnit(ret));
+                    //Logger.WriteDebug("CanCast: " + SpellManager.CanCast(name, onUnit(ret), false));
+
                     var target = onUnit != null ? onUnit(ret) : null;
-                    return requirements != null && target != null && target.IsValid && requirements(ret) &&
-                           CanCastOnUnit(name, target, checkMovement(ret));
+                    var minReqs = requirements != null && target != null && target.IsValid && requirements(ret) && name != null;
+                    var canCast = false;
+                    var inRange = false;
+                    if (minReqs)
+                    {
+                        canCast = SpellManager.CanCast(name, target, false, checkMovement(ret));
+
+                        if (canCast)
+                        {
+                            // We're always in range of ourselves. So just ignore this bit if we're casting it on us
+                            if (target.IsMe)
+                            {
+                                inRange = true;
+                            }
+                            else
+                            {
+                                WoWSpell spell;
+                                if (SpellManager.Spells.TryGetValue(name, out spell))
+                                {
+                                    var rangeId = spell.SpellRangeId;
+                                    var minRange = spell.MinRange;
+                                    var maxRange = spell.MaxRange;
+                                    var targetDistance = target.Distance;
+                                    // RangeId 2 or melee range spell (or any 0-range ability on hostile target)
+                                    if (rangeId == 2 || spell.IsMeleeSpell || (maxRange == 0 && (target.IsHostile || !target.IsFriendly)))
+                                        inRange = targetDistance < MeleeRange || target.IsWithinMeleeRange;
+                                    // RangeId 1 is "Self Only".
+                                    else if (rangeId == 1)
+                                        inRange = true;
+                                    else
+                                    {
+                                        // LOS check only for true ranged spells.
+                                        if (!target.InLineOfSpellSight)
+                                            inRange = false;
+                                        else
+                                            inRange = targetDistance < maxRange &&
+                                                      targetDistance > (minRange == 0 ? minRange : minRange + 3);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    return minReqs && canCast && inRange;
                 },
                 new Sequence( 
                     new DecoratorContinue(ret => StyxWoW.Me.Mounted && !name.Contains("Aura") && !name.Contains("Presence") && !name.Contains("Stance"),

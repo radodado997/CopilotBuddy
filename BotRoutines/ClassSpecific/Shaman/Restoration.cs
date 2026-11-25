@@ -45,17 +45,11 @@ namespace Singular.ClassSpecific.Shaman
         public static Composite CreateRestoShamanRest()
         {
             return new PrioritySelector(
-                new Decorator(
-                    ret => !StyxWoW.Me.HasAura("Drink") && !StyxWoW.Me.HasAura("Food") && !StyxWoW.Me.HasAura("Refreshment"),
-                    CreateRestoShamanHealingBuffs()),
-                new Decorator(
-                    ret => !StyxWoW.Me.HasAura("Drink") && !StyxWoW.Me.HasAura("Food") && !StyxWoW.Me.HasAura("Refreshment"),
-                    CreateRestoShamanHealingOnlyBehavior(true)),
+                CreateRestoShamanHealingBuffs(),
+                CreateRestoShamanHealingOnlyBehavior(true),
                 Rest.CreateDefaultRestBehaviour(),
                 Spell.Resurrect("Ancestral Spirit"),
-                new Decorator(
-                    ret => !StyxWoW.Me.HasAura("Drink") && !StyxWoW.Me.HasAura("Food") && !StyxWoW.Me.HasAura("Refreshment"),
-                    CreateRestoShamanHealingOnlyBehavior(false,false))
+                CreateRestoShamanHealingOnlyBehavior(false,false)
                 );
         }
 
