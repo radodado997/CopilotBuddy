@@ -126,7 +126,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         // control only when somebody actually needs a heal right now, never for top-ups.
         internal const double RoutineHealHandoffThreshold = 70.0;
         internal const double LowManaSpellSwapPercent = 45.0;
-        internal const long HealDuplicateWindowMs = 2500L;
+        internal const long HealDuplicateWindowMs = 1500L;
         private static readonly Dictionary<ulong, (string Spell, long AtUtcMs)> _recentHealCasts = new();
 
         /// <summary>
