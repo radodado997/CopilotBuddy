@@ -115,6 +115,17 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             return candidates.Count(c => c.Distance <= 38.0 && c.HealthPercent < healthThresholdPct);
         }
 
+        // Out-of-combat healing is deliberately below the rest hysteresis
+        // (SquadSettings.TriggerRestHealthPct = 50 by default): food/drink regenerate the party
+        // for free, so the healer only spends mana on real damage.
+        internal const double HealThresholdCombat = 75.0;
+        internal const double HealThresholdOutOfCombat = 40.0;
+        internal const double HealThresholdResting = 40.0;
+        internal const double HealThresholdDrinking = 35.0;
+        // The routine healer owns its own (much greedier) targeting, so the bridge hands over
+        // control only when somebody actually needs a heal right now, never for top-ups.
+        internal const double RoutineHealHandoffThreshold = 70.0;
+
         /// <summary>
         /// Computes the maximum health percentage at which a healer or off-healer should act,
         /// conserving mana out of combat and avoiding interrupting active drinking/eating
@@ -130,23 +141,48 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (emergencyOnly)
             {
                 if (healerActivelyDrinkingOrEating && !anyCombat)
-                    return 45.0;
+                    return HealThresholdDrinking;
                 if (mainHealerUnavailableOrOom)
-                    return anyCombat ? 80.0 : 68.0;
-                return anyCombat ? 55.0 : 48.0;
+                    return anyCombat ? 70.0 : 55.0;
+                return anyCombat ? 50.0 : HealThresholdOutOfCombat;
             }
 
             if (anyCombat)
-                return 90.0;
+                return HealThresholdCombat;
 
             if (healerActivelyDrinkingOrEating)
-                return 45.0;
+                return HealThresholdDrinking;
 
             if (healerInRestPhase)
-                return 60.0;
+                return HealThresholdResting;
 
-            return 78.0;
+            return HealThresholdOutOfCombat;
         }
+
+        /// <summary>
+        /// Caps the heal threshold by the healer's own mana pool: a low-mana healer only reacts to
+        /// targets that would otherwise die, instead of topping the party off and going OOM.
+        /// </summary>
+        public static double ApplyManaReserveThreshold(double threshold, double healerManaPercent)
+        {
+            if (threshold <= 0.0 || healerManaPercent >= 45.0)
+                return threshold;
+
+            double reserveCap = healerManaPercent < 15.0 ? 35.0
+                : healerManaPercent < 30.0 ? 50.0
+                : 60.0;
+            return Math.Min(threshold, reserveCap);
+        }
+
+        private static double ReadManaPercent(LocalPlayer me)
+        {
+            if (me.MaxMana <= 0)
+                return 100.0;
+            return me.PowerType == WoWPowerType.Mana ? me.PowerPercent : me.ManaPercent;
+        }
+
+        private static double ResolveHealThreshold(LocalPlayer me, double baseThreshold) =>
+            ApplyManaReserveThreshold(baseThreshold, ReadManaPercent(me));
 
         private static bool IsSquadCombatActive(LocalPlayer me, SquadLeaderState? leader, IReadOnlyCollection<SquadHealCandidate> candidates)
         {
@@ -191,12 +227,12 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 mainHealerDown = mainHealer != null &&
                     (mainHealer.IsDead || mainHealer.IsGhost || !mainHealer.IsConnected || mainHealer.PowerPercent < 20f);
             }
-            double threshold = ComputeEffectiveHealThreshold(
+            double threshold = ResolveHealThreshold(me, ComputeEffectiveHealThreshold(
                 emergencyOnly: emergencyOnly,
                 anyCombat: anyCombat,
                 healerActivelyDrinkingOrEating: activelyDrinking,
                 healerInRestPhase: inRestPhase,
-                mainHealerUnavailableOrOom: mainHealerDown);
+                mainHealerUnavailableOrOom: mainHealerDown));
 
             if (!candidates.Any(c => c.HealthPercent < threshold))
                 return false;
@@ -253,12 +289,12 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     (mainHealer.IsDead || mainHealer.IsGhost || !mainHealer.IsConnected || mainHealer.PowerPercent < 20f);
             }
 
-            double threshold = ComputeEffectiveHealThreshold(
+            double threshold = ResolveHealThreshold(me, ComputeEffectiveHealThreshold(
                 emergencyOnly: emergencyOnly,
                 anyCombat: anyCombat,
                 healerActivelyDrinkingOrEating: activelyDrinking,
                 healerInRestPhase: inRestPhase,
-                mainHealerUnavailableOrOom: mainHealerDown);
+                mainHealerUnavailableOrOom: mainHealerDown));
 
             if (me.IsCasting || me.ChanneledCastingSpellId != 0)
             {
@@ -299,7 +335,14 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     continue;
 
                 // Stage 1: Try Routine's HealBehavior when level >= 10 and not in Hybrid emergency-only mode.
-                if (!triedRoutine && !emergencyOnly && me.Level >= 10 && targetUnit.Distance <= 35f && targetUnit.InLineOfSpellSight)
+                // The routine targets on its own thresholds (it happily heals 80-90% members), so it
+                // only takes over during combat and only when a target is genuinely low.
+                bool routineHandoffAllowed = anyCombat &&
+                    priorityCandidate.HealthPercent < Math.Min(threshold, RoutineHealHandoffThreshold);
+                if (!routineHandoffAllowed)
+                    StopActiveHealBehavior();
+                if (!triedRoutine && routineHandoffAllowed && !emergencyOnly && me.Level >= 10 &&
+                    targetUnit.Distance <= 35f && targetUnit.InLineOfSpellSight)
                 {
                     triedRoutine = true;
                     var healBehavior = RoutineManager.Current?.HealBehavior;
@@ -504,7 +547,10 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (me == null || !me.IsAlive || !settings.HealerAssistDps || leader == null)
                 return false;
 
-            if (me.PowerType == WoWPowerType.Mana && me.PowerPercent < settings.HealerDpsAboveManaPct)
+            // Keep a mana reserve for healing: assisting below the reserve is what turned
+            // harmless Smite filler into an out-of-mana wipe.
+            int assistManaFloor = Math.Max(settings.HealerDpsAboveManaPct, 80);
+            if (me.PowerType == WoWPowerType.Mana && me.PowerPercent < assistManaFloor)
                 return false;
 
             var candidates = CollectLiveHealCandidates(leader);
@@ -621,6 +667,11 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             switch (healerClass)
             {
                 case WoWClass.Priest:
+                    // Critical health first: a shield does not stop lethal damage on a 20% target.
+                    if (hp < 35.0 && CanCastHeal("Flash Heal"))
+                        return ("Flash Heal", null);
+                    if (hp < 25.0 && CanCastHeal("Greater Heal"))
+                        return ("Greater Heal", null);
                     if (!emergencyOnly && injured78Count >= 3 && CanCastHeal("Prayer of Healing"))
                         return ("Prayer of Healing", null);
                     if (!emergencyOnly && injured78Count >= 2 && CanCastHeal("Circle of Healing"))
@@ -655,11 +706,11 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     if (!emergencyOnly && inCombat && isTank && !hasAuraFromHealer("Sacred Shield") &&
                         CanCastHeal("Sacred Shield"))
                         return ("Sacred Shield", null);
-                    if (hp < 70.0 && CanCastHeal("Holy Shock"))
+                    if (hp < (inCombat ? 50.0 : 40.0) && CanCastHeal("Holy Shock"))
                         return ("Holy Shock", null);
-                    if (hp < (inCombat ? 82.0 : 76.0) && CanCastHeal("Flash of Light"))
+                    if (hp < (inCombat ? 78.0 : 60.0) && CanCastHeal("Flash of Light"))
                         return ("Flash of Light", null);
-                    if (hp < (inCombat ? 72.0 : 65.0) && CanCastHeal("Holy Light"))
+                    if (hp < (inCombat ? 55.0 : 45.0) && CanCastHeal("Holy Light"))
                         return ("Holy Light", null);
                     break;
 

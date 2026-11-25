@@ -543,6 +543,55 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private static ulong _lastDungeonPullTargetGuid;
         private static readonly SquadApproach PullApproach = new();
 
+        // Pulling a mob that already stands next to its pack with a multi-target opener
+        // (Avenger's Shield bounces to three targets) drags the whole pack in one go.
+        internal const float PullPackNeighbourRadius = 10f;
+
+        /// <summary>
+        /// Pull opener priority per class. An isolated target may be opened with the strongest
+        /// tool, while a packed target must be opened with a single-target spell so the pull stays
+        /// one pack and never chains the next group behind it.
+        /// </summary>
+        public static string[] GetPullSpellPriority(
+            WoWClass playerClass, bool isolatedTarget, bool targetIsUndeadOrDemon = false)
+        {
+            switch (playerClass)
+            {
+                case WoWClass.Paladin:
+                    // Exorcism is single-target but only lands on undead/demons: it must not be
+                    // queued ahead of a usable tool for the usual humanoid trash, or the opener
+                    // silently fails and the tank never pulls.
+                    if (isolatedTarget)
+                        return new[] { "Avenger's Shield", "Hand of Reckoning", "Exorcism" };
+                    return targetIsUndeadOrDemon
+                        ? new[] { "Hand of Reckoning", "Exorcism", "Avenger's Shield" }
+                        : new[] { "Hand of Reckoning", "Avenger's Shield", "Exorcism" };
+                case WoWClass.Warrior:
+                    return new[] { "Heroic Throw", "Taunt", "Shoot", "Throw" };
+                case WoWClass.Druid:
+                    return new[] { "Faerie Fire (Feral)", "Growl", "Moonfire" };
+                case WoWClass.DeathKnight:
+                    return new[] { "Dark Command", "Icy Touch", "Death Coil" };
+                default:
+                    return Array.Empty<string>();
+            }
+        }
+
+        private static bool TargetHasCloseNeighbours(WoWUnit target)
+        {
+            foreach (var unit in ObjectManager.CachedUnits)
+            {
+                if (unit == null || !unit.IsValid || unit.Dead || unit.Guid == target.Guid)
+                    continue;
+                if (!unit.Attackable || unit.IsFriendly || unit.IsPlayer)
+                    continue;
+                if (unit.Location.Distance(target.Location) > PullPackNeighbourRadius)
+                    continue;
+                return true;
+            }
+            return false;
+        }
+
         public static bool TryExecuteSafeDungeonPull(ulong targetGuid)
         {
             var me = StyxWoW.Me;
@@ -566,14 +615,10 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 return true;
             }
 
-            string[] pullSpells = me.Class switch
-            {
-                WoWClass.Paladin => new[] { "Avenger's Shield", "Hand of Reckoning", "Exorcism" },
-                WoWClass.Warrior => new[] { "Heroic Throw", "Taunt", "Shoot", "Throw" },
-                WoWClass.Druid => new[] { "Faerie Fire (Feral)", "Growl", "Moonfire" },
-                WoWClass.DeathKnight => new[] { "Dark Command", "Icy Touch", "Death Coil" },
-                _ => Array.Empty<string>()
-            };
+            string[] pullSpells = GetPullSpellPriority(
+                me.Class,
+                isolatedTarget: !TargetHasCloseNeighbours(target),
+                targetIsUndeadOrDemon: target.IsUndead || target.IsDemon);
 
             string? chosenSpell = pullSpells.FirstOrDefault(s =>
                 SpellManager.HasSpell(s) && SpellManager.CanCast(s, target, checkRange: false, checkMovement: false));

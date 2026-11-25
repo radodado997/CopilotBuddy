@@ -151,6 +151,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 $"if GetRaidTargetIndex(u) ~= {icon} then SetRaidTarget(u, {icon}) end break end end");
         }
 
+        internal const float PartyBuffRange = 30f;
+
         private static List<WoWUnit> CollectBuffableAllies(LocalPlayer me, SquadLeaderState? leader)
         {
             var list = new List<WoWUnit> { me };
@@ -163,13 +165,55 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
                 WoWUnit? unit = ObjectManager.GetObjectByGuid<WoWUnit>(guid);
                 if (unit != null && unit.IsValid && unit.IsAlive && !unit.Dead && !unit.IsGhost &&
-                    unit.Location.Distance(me.Location) <= 30f)
+                    unit.Location.Distance(me.Location) <= PartyBuffRange)
                 {
                     list.Add(unit);
                 }
             }
 
             return list;
+        }
+
+        private static bool PaladinCanReachTarget(LocalPlayer me, WoWUnit ally, string paladinName)
+        {
+            if (string.IsNullOrEmpty(paladinName))
+                return false;
+            if (string.Equals(paladinName, me.Name, StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            foreach (ulong guid in SquadContext.GetKnownMemberGuids())
+            {
+                WoWUnit? unit = ObjectManager.GetObjectByGuid<WoWUnit>(guid);
+                if (unit == null || !unit.IsValid || unit.Dead || unit.IsGhost)
+                    continue;
+                if (!string.Equals(unit.Name, paladinName, StringComparison.OrdinalIgnoreCase))
+                    continue;
+                return unit.Location.Distance(ally.Location) <= PartyBuffRange;
+            }
+
+            return false;
+        }
+
+        private static List<IReadOnlyList<string>> RestrictBlessingOwnersToReachable(
+            LocalPlayer me,
+            WoWUnit ally,
+            List<string> paladinNames,
+            List<IReadOnlyList<string>> knownByPaladin,
+            int selfIndex,
+            out int selfOwnerIndex)
+        {
+            selfOwnerIndex = -1;
+            var reachable = new List<IReadOnlyList<string>>(paladinNames.Count);
+            for (int i = 0; i < paladinNames.Count && i < knownByPaladin.Count; i++)
+            {
+                if (i != selfIndex && !PaladinCanReachTarget(me, ally, paladinNames[i]))
+                    continue;
+                if (i == selfIndex)
+                    selfOwnerIndex = reachable.Count;
+                reachable.Add(knownByPaladin[i]);
+            }
+
+            return reachable;
         }
 
         private static bool BuffMage(LocalPlayer me, List<WoWUnit> allies)
@@ -252,28 +296,141 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
         public static bool IsNonHolyPaladinAuraOwner(LocalPlayer me, SquadLeaderState? leader)
         {
-            var nonHolyPaladins = (leader?.Members ?? new List<SquadMemberSummary>())
-                .Where(m => m.Class == WoWClass.Paladin && m.Role != SquadRole.Healer && m.IsConnected && !m.IsDead && !m.IsGhost && m.MapId == me.MapId)
-                .OrderByDescending(m => m.Role == SquadRole.TankLeader)
-                .ThenBy(m => m.CharacterName, StringComparer.OrdinalIgnoreCase)
-                .ToList();
+            bool meIsNonHolyPaladin = SquadContext.ActiveRole != SquadRole.Healer;
+            var owners = new List<(string Name, bool IsTank)>();
 
-            if (nonHolyPaladins.Count == 0)
+            foreach (var member in leader?.Members ?? new List<SquadMemberSummary>())
+            {
+                if (member.Class != WoWClass.Paladin || member.Role == SquadRole.Healer)
+                    continue;
+                if (!member.IsConnected || member.IsDead || member.IsGhost || member.MapId != me.MapId)
+                    continue;
+                if (string.IsNullOrWhiteSpace(member.CharacterName))
+                    continue;
+                owners.Add((member.CharacterName.Trim(), member.Role == SquadRole.TankLeader));
+            }
+
+            // The leader roster does not always carry the local player (telemetry filtering or a
+            // stale snapshot). Without it a Paladin concluded "no other owner" -> false, so nobody
+            // ever managed the aura.
+            if (!string.IsNullOrWhiteSpace(me.Name) &&
+                !owners.Any(o => string.Equals(o.Name, me.Name.Trim(), StringComparison.OrdinalIgnoreCase)))
+            {
+                if (!meIsNonHolyPaladin)
+                    return false;
+                owners.Add((me.Name.Trim(), SquadContext.ActiveRole == SquadRole.TankLeader));
+            }
+
+            if (owners.Count == 0)
                 return true;
 
-            return string.Equals(nonHolyPaladins[0].CharacterName, me.Name, StringComparison.OrdinalIgnoreCase);
+            var owner = owners
+                .OrderByDescending(o => o.IsTank)
+                .ThenBy(o => o.Name, StringComparer.OrdinalIgnoreCase)
+                .First();
+            return string.Equals(owner.Name, me.Name, StringComparison.OrdinalIgnoreCase);
+        }
+
+        internal static readonly string[] PaladinBlessingSpells =
+        {
+            "Blessing of Sanctuary",
+            "Blessing of Kings",
+            "Blessing of Might",
+            "Blessing of Wisdom"
+        };
+
+        /// <summary>
+        /// Paladin blessings share one buff slot per player, so a target that already carries
+        /// any blessing must never be re-buffed with a different one.
+        /// </summary>
+        internal static bool HasAnyPaladinBlessing(Func<string, bool> hasAura)
+        {
+            if (hasAura == null)
+                return false;
+
+            foreach (string blessing in PaladinBlessingSpells)
+            {
+                if (hasAura(blessing) || hasAura("Greater " + blessing))
+                    return true;
+            }
+            return false;
+        }
+
+        internal static IReadOnlyList<string> BlessingPreferenceFor(SquadRole role, WoWClass targetClass)
+        {
+            if (role == SquadRole.TankLeader)
+                return new[] { "Blessing of Sanctuary", "Blessing of Kings", "Blessing of Might", "Blessing of Wisdom" };
+            if (role == SquadRole.Healer || targetClass is WoWClass.Mage or WoWClass.Priest or WoWClass.Warlock)
+                return new[] { "Blessing of Wisdom", "Blessing of Kings", "Blessing of Sanctuary", "Blessing of Might" };
+            return new[] { "Blessing of Might", "Blessing of Kings", "Blessing of Sanctuary", "Blessing of Wisdom" };
+        }
+
+        /// <summary>
+        /// Deterministic cross-Paladin blessing assignment: every target gets exactly one blessing
+        /// and exactly one Paladin owns it. This is what stops two Paladins from overwriting each
+        /// other's Kings/Might (the "bok/bom loop").
+        /// </summary>
+        internal static (int CasterIndex, string SpellName) SelectBlessingAssignment(
+            SquadRole role,
+            WoWClass targetClass,
+            IReadOnlyList<IReadOnlyList<string>> knownByPaladin)
+        {
+            if (knownByPaladin == null || knownByPaladin.Count == 0)
+                return (-1, string.Empty);
+
+            foreach (string desired in BlessingPreferenceFor(role, targetClass))
+            {
+                for (int i = 0; i < knownByPaladin.Count; i++)
+                {
+                    IReadOnlyList<string> known = knownByPaladin[i];
+                    if (known == null)
+                        continue;
+                    if (known.Any(spell => string.Equals(spell, desired, StringComparison.OrdinalIgnoreCase)))
+                        return (i, desired);
+                }
+            }
+
+            return (-1, string.Empty);
+        }
+
+        private static List<string> BuildPaladinRoster(LocalPlayer me, SquadLeaderState? leader)
+        {
+            var names = new List<string>();
+            if (!string.IsNullOrWhiteSpace(me.Name))
+                names.Add(me.Name.Trim());
+
+            foreach (var member in leader?.Members ?? new List<SquadMemberSummary>())
+            {
+                if (member.Class != WoWClass.Paladin || !member.IsConnected || member.IsDead || member.IsGhost)
+                    continue;
+                if (member.MapId != me.MapId || string.IsNullOrWhiteSpace(member.CharacterName))
+                    continue;
+                string name = member.CharacterName.Trim();
+                if (!names.Any(n => string.Equals(n, name, StringComparison.OrdinalIgnoreCase)))
+                    names.Add(name);
+            }
+
+            names.Sort(StringComparer.OrdinalIgnoreCase);
+            return names;
+        }
+
+        private static IReadOnlyList<string> KnownBlessingsOf(LocalPlayer me, SquadLeaderState? leader, string characterName)
+        {
+            if (string.Equals(characterName, me.Name, StringComparison.OrdinalIgnoreCase))
+                return PaladinBlessingSpells.Where(SpellManager.HasSpell).ToList();
+
+            var member = leader?.Members?.FirstOrDefault(m =>
+                string.Equals(m.CharacterName, characterName, StringComparison.OrdinalIgnoreCase));
+            if (member?.KnownBlessings == null || member.KnownBlessings.Count == 0)
+                return Array.Empty<string>();
+            return member.KnownBlessings;
         }
 
         private static bool BuffPaladin(LocalPlayer me, List<WoWUnit> allies, SquadLeaderState? leader)
         {
-            // Determine Paladin index among party Paladins so multiple Paladins pick distinct auras & blessings.
-            var paladinNames = (leader?.Members ?? new List<SquadMemberSummary>())
-                .Where(m => m.Class == WoWClass.Paladin && m.IsConnected && !m.IsDead && !m.IsGhost && m.MapId == me.MapId)
-                .Select(m => m.CharacterName)
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .OrderBy(n => n, StringComparer.OrdinalIgnoreCase)
-                .ToList();
-
+            // Roster always contains the local player: the leader snapshot may be stale or filtered,
+            // and a missing self used to collapse every Paladin onto index 0.
+            var paladinNames = BuildPaladinRoster(me, leader);
             int paladinIndex = Math.Max(0, paladinNames.FindIndex(n => string.Equals(n, me.Name, StringComparison.OrdinalIgnoreCase)));
 
             string[] preferredAuras = paladinIndex switch
@@ -298,24 +455,35 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 }
             }
 
+            var knownByPaladin = paladinNames
+                .Select(name => KnownBlessingsOf(me, leader, name))
+                .ToList();
+
             foreach (var ally in allies)
             {
                 var role = SquadContext.GetMemberByGuid(ally.Guid)?.Role ??
                            (ally.Guid == me.Guid ? SquadContext.ActiveRole : SquadRole.DpsMelee);
 
-                string desiredBlessing = SelectBlessingForRole(role, ally.Class, paladinIndex);
-                if (role == SquadRole.TankLeader && paladinNames.Count > 1)
-                {
-                    var capabilities = paladinNames.Select(name => (IReadOnlyList<string>)(
-                        string.Equals(name, me.Name, StringComparison.OrdinalIgnoreCase)
-                            ? new[] { "Blessing of Sanctuary", "Blessing of Kings", "Blessing of Might", "Blessing of Wisdom" }.Where(SpellManager.HasSpell).ToList()
-                            : leader!.Members.First(m => m.CharacterName == name).KnownBlessings)).ToList();
-                    desiredBlessing = SelectTankBlessing(paladinIndex, capabilities);
-                }
-                if (!string.IsNullOrEmpty(desiredBlessing) &&
-                    !ally.HasAura(desiredBlessing) &&
-                    !ally.HasAura("Greater " + desiredBlessing) &&
-                    TryCastPartyBuff(desiredBlessing, ally, true))
+                var reachableOwners = RestrictBlessingOwnersToReachable(
+                    me,
+                    ally,
+                    paladinNames,
+                    knownByPaladin,
+                    paladinIndex,
+                    out int selfOwnerIndex);
+                if (selfOwnerIndex < 0)
+                    continue;
+
+                var (casterIndex, desiredBlessing) = SelectBlessingAssignment(role, ally.Class, reachableOwners);
+                if (string.IsNullOrEmpty(desiredBlessing) || casterIndex != selfOwnerIndex)
+                    continue;
+
+                // Never take the buff slot away from another Paladin: that is the mutual
+                // recast loop (Kings -> Might -> Kings ...) the squad kept hitting.
+                if (HasAnyPaladinBlessing(ally.HasAura))
+                    continue;
+
+                if (TryCastPartyBuff(desiredBlessing, ally, true))
                 {
                     SquadPartySyncService.LogAction("Buffing " + ally.Name + ": " + desiredBlessing);
                     return true;

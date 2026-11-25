@@ -82,6 +82,10 @@ namespace CopilotBuddy.Bots.PartyGrind
         private const float PullCommitMaxTargetDistance = 60.0f;
         private const float PullCandidateMaxDistance = 55.0f;
         private const long CombatFocusStickyMs = 2500L;
+        private const float DungeonTrashScanRadius = 40f;
+        private const long DungeonAdvanceBlockMaxMs = 8000L;
+        private const long DungeonForcedStepMaxMs = 4000L;
+        private const float DungeonForcedStepArrivalDistance = 2f;
         private const long IdleSnapshotIntervalMs = 5000L;
         private const int TerminalStateDeliveryTimeoutMs = 1000;
         private bool _wasInCombat;
@@ -110,6 +114,11 @@ namespace CopilotBuddy.Bots.PartyGrind
             _rejectedGhostEntranceUntilUtcMs.TryGetValue(source, out long until) && nowUtcMs < until;
         private bool _dungeonScriptTicked;
         private bool _localWasNeedingRest;
+        private long _dungeonAdvanceBlockedSinceUtcMs;
+        private WoWPoint _dungeonForcedStep = WoWPoint.Zero;
+        private WoWPoint _dungeonForcedStepObjective = WoWPoint.Zero;
+        private ulong _dungeonForcedStepLeaderGuid;
+        private long _dungeonForcedStepIssuedUtcMs;
         private bool _lootFilterAttached;
         private bool _levelCapStopRequested;
         private SquadLeaderStateDelivery? _terminalStateDelivery;
@@ -237,6 +246,8 @@ namespace CopilotBuddy.Bots.PartyGrind
             _ghostPathFailures = 0;
             _rejectedGhostEntranceUntilUtcMs.Clear();
             _localWasNeedingRest = false;
+            _dungeonAdvanceBlockedSinceUtcMs = 0;
+            ClearDungeonForcedStep();
 
             try
             {
@@ -880,6 +891,81 @@ namespace CopilotBuddy.Bots.PartyGrind
         private static bool HasLivingAllyInCombat(SquadLeaderState? leader, ulong localGuid)
         {
             return leader?.Members?.Any(m => m.Guid != localGuid && m.IsConnected && !m.IsDead && !m.IsGhost && m.IsInCombat) == true;
+        }
+
+        /// <summary>
+        /// Live hostile trash positions around the leader, used to decide whether the next dungeon
+        /// breadcrumb step is safe. Hostiles already locked in a fight with the squad are included
+        /// on purpose: the tank must finish that pack before walking deeper into the corridor.
+        /// </summary>
+        private static List<WoWPoint> CollectDungeonTrashPoints(WoWPoint from, float radius)
+        {
+            var points = new List<WoWPoint>();
+            foreach (var unit in ObjectManager.CachedUnits)
+            {
+                if (unit == null || !unit.IsValid || unit.Dead)
+                    continue;
+                if (!unit.Attackable || unit.IsFriendly || unit.IsPlayer || unit.IsCritter || unit.IsNonCombatPet)
+                    continue;
+                if (unit.ControllingPlayer != null)
+                    continue;
+                if (unit.Location.Distance(from) > radius)
+                    continue;
+                points.Add(unit.Location);
+            }
+            return points;
+        }
+
+        private void ClearDungeonForcedStep()
+        {
+            _dungeonForcedStep = WoWPoint.Zero;
+            _dungeonForcedStepObjective = WoWPoint.Zero;
+            _dungeonForcedStepLeaderGuid = 0;
+            _dungeonForcedStepIssuedUtcMs = 0;
+        }
+
+        private void SyncDungeonForcedStepObjective(WoWPoint objective)
+        {
+            if (_dungeonForcedStep == WoWPoint.Zero)
+                return;
+            if (objective == WoWPoint.Zero || objective != _dungeonForcedStepObjective)
+                ClearDungeonForcedStep();
+        }
+
+        private void IssueDungeonForcedStep(WoWPoint step, WoWPoint objective, ulong leaderGuid, long nowUtcMs)
+        {
+            _dungeonForcedStep = step;
+            _dungeonForcedStepObjective = objective;
+            _dungeonForcedStepLeaderGuid = leaderGuid;
+            _dungeonForcedStepIssuedUtcMs = nowUtcMs;
+            Navigator.MoveTo(step, "Advancing through dungeon");
+        }
+
+        private bool DungeonForcedStepActive(ulong leaderGuid, long nowUtcMs)
+        {
+            if (_dungeonForcedStep == WoWPoint.Zero)
+                return false;
+
+            var me = StyxWoW.Me;
+            bool stale = me == null ||
+                         leaderGuid != _dungeonForcedStepLeaderGuid ||
+                         nowUtcMs - _dungeonForcedStepIssuedUtcMs > DungeonForcedStepMaxMs ||
+                         me.Location.Distance(_dungeonForcedStep) <= DungeonForcedStepArrivalDistance;
+            if (!stale)
+                return true;
+
+            ClearDungeonForcedStep();
+            return false;
+        }
+
+        private void StopMovementUnlessDungeonForcedStep(ulong leaderGuid, long nowUtcMs)
+        {
+            if (DungeonForcedStepActive(leaderGuid, nowUtcMs))
+                return;
+
+            var me = StyxWoW.Me;
+            if (me != null && me.IsMoving)
+                WoWMovement.MoveStop();
         }
 
         private static bool IsBossPullBlocked(SquadSettings settings, SquadLeaderState? leader, LocalPlayer me)
@@ -2556,16 +2642,55 @@ namespace CopilotBuddy.Bots.PartyGrind
                     if (leader != null && !SquadTankBridge.CanInitiatePull(leader, settings.MaxPullGatherDistance))
                     {
                         SquadPartySyncService.LogAction("Dungeon: waiting for squadmates to gather");
-                        if (me.IsMoving)
-                            WoWMovement.MoveStop();
+                        StopMovementUnlessDungeonForcedStep(leader.LeaderGuid, now);
                         return RunStatus.Success;
                     }
 
                     WoWPoint nextDungeonPt = _dungeon.ComputeLeaderNextDungeonPoint();
                     if (nextDungeonPt != WoWPoint.Zero && me.Location.Distance(nextDungeonPt) > SquadDungeonService.HotspotArrivalDistance)
                     {
+                        // Breadcrumb-by-breadcrumb advance: walk one short step at a time and stop
+                        // whenever live trash still sits on the corridor, so the pack in front is
+                        // pulled and killed before the tank moves on toward the objective.
+                        SyncDungeonForcedStepObjective(nextDungeonPt);
+                        WoWPoint advanceStep = SquadDungeonService.ResolveDungeonAdvanceStep(
+                            me.Location,
+                            nextDungeonPt,
+                            CollectDungeonTrashPoints(me.Location, DungeonTrashScanRadius));
+
+                        if (advanceStep == WoWPoint.Zero)
+                        {
+                            if (_dungeonAdvanceBlockedSinceUtcMs == 0)
+                            {
+                                _dungeonAdvanceBlockedSinceUtcMs = now;
+                                SquadPartySyncService.LogAction("Dungeon: clearing trash before " + (leader?.CurrentBossName ?? "next objective"));
+                            }
+
+                            // Never wedge forever: if the corridor stays blocked while nothing can be
+                            // pulled (uneven floor, unreachable pack), resume the advance after a grace.
+                            if (now - _dungeonAdvanceBlockedSinceUtcMs >= DungeonAdvanceBlockMaxMs)
+                            {
+                                _dungeonAdvanceBlockedSinceUtcMs = 0;
+                                advanceStep = SquadDungeonService.ResolveDungeonAdvanceStep(
+                                    me.Location,
+                                    nextDungeonPt,
+                                    null,
+                                    clearance: 0f);
+                            }
+                        }
+                        else
+                        {
+                            _dungeonAdvanceBlockedSinceUtcMs = 0;
+                        }
+
+                        if (advanceStep == WoWPoint.Zero)
+                        {
+                            StopMovementUnlessDungeonForcedStep(leader?.LeaderGuid ?? 0UL, now);
+                            return RunStatus.Success;
+                        }
+
                         SquadPartySyncService.LogAction("Dungeon: advancing toward " + (leader?.CurrentBossName ?? "next objective"));
-                        Navigator.MoveTo(nextDungeonPt, "Advancing through dungeon");
+                        IssueDungeonForcedStep(advanceStep, nextDungeonPt, leader?.LeaderGuid ?? 0UL, now);
                     }
                     else if (me.IsMoving)
                     {
