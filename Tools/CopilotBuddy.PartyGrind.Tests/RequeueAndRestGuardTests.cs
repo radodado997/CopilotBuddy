@@ -580,5 +580,23 @@ namespace CopilotBuddy.PartyGrind.Tests
                 candidateIsTankHealTarget: true, candidateIsSelf: false, localManaPercent: 80f, localRole: SquadRole.DpsMelee));
         }
 
+        [Fact]
+        public void ResetExitBarrier_NeedsFreshEvidenceForEveryMember()
+        {
+            ulong[] group = { 1UL, 2UL, 3UL };
+
+            Assert.False(SquadDungeonService.AreMembersConfirmedOutside(null, 0L, 1000L, group));
+            Assert.False(SquadDungeonService.AreMembersConfirmedOutside(Array.Empty<ulong>(), 0L, 1000L, group));
+            Assert.False(SquadDungeonService.AreMembersConfirmedOutside(new ulong[] { 1UL, 2UL }, 0L, 1000L, group));
+            Assert.True(SquadDungeonService.AreMembersConfirmedOutside(new ulong[] { 1UL, 2UL, 3UL }, 0L, 1000L, group));
+
+            // Stale evidence no longer admits the dance.
+            Assert.False(SquadDungeonService.AreMembersConfirmedOutside(new ulong[] { 1UL, 2UL, 3UL }, 900L, 1000L, group));
+            Assert.True(SquadDungeonService.AreMembersConfirmedOutside(new ulong[] { 1UL, 2UL, 3UL }, 1200L, 1000L, group));
+
+            // An ungrouped client has nobody to wait for.
+            Assert.True(SquadDungeonService.AreMembersConfirmedOutside(new ulong[] { 1UL }, 0L, 1000L, Array.Empty<ulong>()));
+        }
+
     }
 }

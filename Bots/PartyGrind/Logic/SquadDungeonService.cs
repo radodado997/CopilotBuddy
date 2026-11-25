@@ -136,6 +136,10 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private long _lastResetPendingOutsideLogUtcMs;
         private ResetDancePhase _resetDancePhase;
         private bool _followerResetHandledForBroadcast;
+        private readonly List<string> _resetRecoveryNames = new();
+        private long _lastResetRecoveryInviteUtcMs;
+        private long _resetRecoveryStartedUtcMs;
+        private const long ResetRecoveryTimeoutMs = 60000L;
         private long _followerResetDanceRequestedUtcMs;
         private long _resetDanceStartedUtcMs;
         private long _resetDanceNextActionUtcMs;
@@ -637,6 +641,49 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         /// leader (the coordinator left or handed over) while the broadcast reset flag is set.
         /// Non-leader followers keep their old path: they never start the dance themselves.
         /// </summary>
+        /// <summary>
+        /// Exit barrier shared by the coordinator's published evidence and the follower that would
+        /// otherwise kick the group while a member is still inside (ResetInstances() then fails and
+        /// the single request for this run is burnt).
+        /// </summary>
+        internal static bool AreMembersConfirmedOutside(
+            ulong[]? confirmedGuids,
+            long evidenceValidUntilUtcMs,
+            long nowUtcMs,
+            IEnumerable<ulong> groupGuids)
+        {
+            if (confirmedGuids == null || confirmedGuids.Length == 0)
+                return false;
+            if (evidenceValidUntilUtcMs != 0 && nowUtcMs > evidenceValidUntilUtcMs)
+                return false;
+
+            foreach (ulong guid in groupGuids)
+            {
+                if (guid == 0)
+                    continue;
+                if (Array.IndexOf(confirmedGuids, guid) < 0)
+                    return false;
+            }
+            return true;
+        }
+
+        private bool AreLocalGroupMembersConfirmedOutside(SquadLeaderState? leader, long nowUtcMs)
+        {
+            var me = StyxWoW.Me;
+            if (me == null)
+                return false;
+            var group = me.GroupInfo;
+            group.InvalidateCache();
+            var guids = group.AllMembers.Where(m => m.Guid != 0).Select(m => m.Guid).ToList();
+            if (guids.Count == 0)
+                guids.Add(me.Guid);
+            return AreMembersConfirmedOutside(
+                leader?.DungeonResetExitConfirmedGuids,
+                leader?.DungeonResetExitEvidenceValidUntilUtcMs ?? 0L,
+                nowUtcMs,
+                guids);
+        }
+
         internal static bool ShouldEnterResetDance(
             bool resetPendingOutside,
             bool isCoordinator,
@@ -683,15 +730,14 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             var group = me.GroupInfo;
             group.InvalidateCache();
             int others = group.NumPartyMembers > 0 ? group.NumPartyMembers : group.NumRaidMembers;
-            if (!IsLocalPartyLeader())
+            // Leadership only matters while someone else is still grouped: a client that is
+            // already alone can issue ResetInstances() itself.
+            if (!IsLocalPartyLeader() && others > 0)
             {
                 if (_resetDancePhase == ResetDancePhase.None)
                     return ResetDanceResult.Idle;
-                if (others > 0)
-                {
-                    ResetDanceState();
-                    return ResetDanceResult.Failed;
-                }
+                ResetDanceState();
+                return ResetDanceResult.Failed;
             }
             string[] expected = settings.GetExpectedMemberNames();
             int expectedOthers = Math.Max(0, expected.Length - 1);
@@ -711,6 +757,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (nowUtcMs - _resetDanceStartedUtcMs > ResetDanceTimeoutMs)
             {
                 Logging.Write("[PartyGrind Dungeon] Instance reset dance timed out; re-queueing without a reset.");
+                RememberResetRecoveryNames(nowUtcMs);
                 ResetDanceState();
                 return ResetDanceResult.Failed;
             }
@@ -803,6 +850,58 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             }
 
             return ResetDanceResult.Working;
+        }
+
+        /// <summary>
+        /// The kick step is only safe when the squad is coming back: keep the kicked names so a
+        /// failed or timed-out dance still restores the party instead of leaving it short.
+        /// </summary>
+        private void RememberResetRecoveryNames(long nowUtcMs)
+        {
+            if (_resetDanceNames.Count == 0)
+                return;
+            _resetRecoveryNames.Clear();
+            _resetRecoveryNames.AddRange(_resetDanceNames);
+            _resetRecoveryStartedUtcMs = nowUtcMs;
+            _lastResetRecoveryInviteUtcMs = 0;
+        }
+
+        private void PulseResetRecovery(long nowUtcMs)
+        {
+            if (_resetRecoveryNames.Count == 0 || !IsLocalPartyLeader())
+                return;
+
+            var me = StyxWoW.Me;
+            if (me == null || me.Dead || me.IsGhost || IsInDungeonMap(me))
+                return;
+
+            if (_resetRecoveryStartedUtcMs != 0 && nowUtcMs - _resetRecoveryStartedUtcMs > ResetRecoveryTimeoutMs)
+            {
+                _resetRecoveryNames.Clear();
+                _resetRecoveryStartedUtcMs = 0;
+                return;
+            }
+
+            var group = me.GroupInfo;
+            group.InvalidateCache();
+            var present = group.AllMembers
+                .Where(m => !string.IsNullOrEmpty(m.Name))
+                .Select(m => m.Name.Trim())
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            _resetRecoveryNames.RemoveAll(n => present.Contains(n));
+            if (_resetRecoveryNames.Count == 0)
+            {
+                _resetRecoveryStartedUtcMs = 0;
+                return;
+            }
+
+            if (nowUtcMs - _lastResetRecoveryInviteUtcMs < ResetDanceStepMs)
+                return;
+
+            _lastResetRecoveryInviteUtcMs = nowUtcMs;
+            string missing = _resetRecoveryNames[0];
+            Lua.DoString("InviteUnit(\"" + Lua.Escape(missing) + "\")");
+            Logging.Write("[PartyGrind Dungeon] Restoring the party after the reset: inviting {0}.", missing);
         }
 
         private void ClearResetPendingOutside()
@@ -1014,6 +1113,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (me == null || me.Dead || me.IsGhost)
                 return false;
 
+            // A reset that failed or timed out must still leave the squad grouped.
+            PulseResetRecovery(nowUtcMs);
+
             if (LfgManager.RoleCheckPending || SafeGetLfgMode() == "rolecheck")
             {
                 _lfgRunCompletedAwaitingRequeue = false;
@@ -1174,6 +1276,17 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                         _followerResetDanceRequestedUtcMs = nowUtcMs;
                     if (leader?.DungeonResetDanceOwnerGuid != me.Guid)
                         return true;
+
+                    // Same barrier the coordinator applies before it issues the reset itself.
+                    if (_resetDancePhase == ResetDancePhase.None && !AreLocalGroupMembersConfirmedOutside(leader, nowUtcMs))
+                    {
+                        if (nowUtcMs - _lastResetPendingOutsideLogUtcMs >= ResetPendingOutsideLogThrottleMs)
+                        {
+                            _lastResetPendingOutsideLogUtcMs = nowUtcMs;
+                            SquadPartySyncService.LogAction("Dungeon: waiting for exit confirmation before the reset");
+                        }
+                        return true;
+                    }
 
                     switch (RunInstanceResetDance(settings, nowUtcMs))
                     {

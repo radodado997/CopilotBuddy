@@ -90,6 +90,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private string _activeProvisioner = string.Empty;
         private string _activeTradeTarget = string.Empty;
         private long _provisionStartedUtcMs;
+        private long _lastNoPairLogUtcMs;
+        private const long NoPairLogIntervalMs = 15000L;
         private SquadPhase? _lastLoggedPhase;
         private bool _assignedFood, _assignedDrink, _assignedHealthstone;
         private string _townRunRequestedByName = string.Empty;
@@ -258,7 +260,10 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             int profileMaxLevel = profile.ProfileMaxLevel;
 
             // Detect sub-profile transition -> MigratingZone.
-            string subProfileKey = $"{profile.ProfileXmlPath}|{profile.ProfileXmlHash}|{profile.SubProfileName}|{profile.SubProfileMinLevel}|{profile.SubProfileMaxLevel}|{profile.MapId}";
+            // The live MapId is deliberately not part of the key: entering a dungeon (or any zone
+            // change) is not a profile switch, and treating it as one left _migratingZone stuck for
+            // a whole instance run because the migration hotspot is an open-world point.
+            string subProfileKey = $"{profile.ProfileXmlPath}|{profile.ProfileXmlHash}|{profile.SubProfileName}|{profile.SubProfileMinLevel}|{profile.SubProfileMaxLevel}";
             if (profile.HasProfile)
             {
                 if (!string.IsNullOrEmpty(_lastSubProfileKey) &&
@@ -507,17 +512,17 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
             // Provisioning arbitration. A dry healer is a wipe waiting to happen, so a
             // mage-to-healer water run stays allowed in combat windows when both are idle.
+            // A trade only needs the two members taking part: one member fighting or one corpse
+            // waiting for a rez must not keep a dry healer without water for a whole instance.
             string? waterOnlyRecipient = anyInCombat
                 ? SelectDryHealerWaterRecipient(rosterStates, settings)
                 : null;
-            bool provisioningBlocked = anyDead || _inTownRun || _migratingZone ||
-                (anyInCombat && string.IsNullOrEmpty(waterOnlyRecipient));
-            if (provisioningBlocked)
+            bool migratingOutsideDungeon = _migratingZone && dungeon?.IsInsideDungeon != true;
+            if (_inTownRun || migratingOutsideDungeon)
             {
                 if (!string.IsNullOrEmpty(_activeProvisioner))
                 {
-                    Logging.WriteDebug("[PartyGrind Provision] Cleared '{0}' (combat/death/town/rest/migration)",
-                        _activeProvisioner);
+                    Logging.WriteDebug("[PartyGrind Provision] Cleared '{0}' (town/migration)", _activeProvisioner);
                     SquadPartySyncService.MarkActivity();
                 }
                 ClearProvisioning();
@@ -525,7 +530,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             else
             {
                 EvaluateProvisioningArbitration(settings, rosterStates, nowUtcMs,
-                    dungeon?.HasRandomPartyMembers != true, waterOnlyRecipient);
+                    dungeon?.HasRandomPartyMembers != true, waterOnlyRecipient,
+                    lfgTransitionPending: dungeon?.LfgProposalPending == true);
             }
 
             SquadPhase phase;
@@ -980,7 +986,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             List<SquadMemberState> rosterStates,
             long nowUtcMs,
             bool allowFoodAndDrink,
-            string? waterOnlyRecipient = null)
+            string? waterOnlyRecipient = null,
+            bool lfgTransitionPending = false)
         {
             if (!allowFoodAndDrink && (_assignedFood || _assignedDrink))
             {
@@ -1056,16 +1063,18 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 }
             }
 
-            // Pick next provisioner -> target pair (Mage first, then Warlock).
-            if (allowFoodAndDrink && settings.EnableMageProvisioning)
+            // Pick next provisioner -> target pair (Mage first, then Warlock). A pair is only
+            // started when both sides are idle; starting one during the LFG teleport wasted the
+            // only assignment of a whole run.
+            if (allowFoodAndDrink && settings.EnableMageProvisioning && !lfgTransitionPending)
             {
                 foreach (var mage in rosterStates.Where(m =>
-                    (m.CanProvideMageFood || m.CanProvideMageDrink) &&
+                    (m.CanProvideMageFood || m.CanProvideMageDrink) && !m.IsInCombat &&
                     (waterOnlyRecipient == null || CanProvideInWaterOnlyMode(m))))
                 {
                     var magePos = new WoWPoint(mage.X, mage.Y, mage.Z);
                     var target = rosterStates.FirstOrDefault(m =>
-                        !m.IsDead && !m.IsGhost &&
+                        !m.IsDead && !m.IsGhost && !m.IsInCombat &&
                         !string.Equals(m.CharacterName, mage.CharacterName, StringComparison.OrdinalIgnoreCase) &&
                         m.MapId == mage.MapId &&
                         magePos.Distance(new WoWPoint(m.X, m.Y, m.Z)) <= 40f &&
@@ -1092,11 +1101,11 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
             if (settings.EnableWarlockHealthstones && waterOnlyRecipient == null)
             {
-                foreach (var warlock in rosterStates.Where(m => !m.IsDead && !m.IsGhost && m.CanProvideHealthstone))
+                foreach (var warlock in rosterStates.Where(m => !m.IsDead && !m.IsGhost && !m.IsInCombat && m.CanProvideHealthstone))
                 {
                     var lockPos = new WoWPoint(warlock.X, warlock.Y, warlock.Z);
                     var target = rosterStates.FirstOrDefault(m =>
-                        !m.IsDead && !m.IsGhost &&
+                        !m.IsDead && !m.IsGhost && !m.IsInCombat &&
                         !string.Equals(m.CharacterName, warlock.CharacterName, StringComparison.OrdinalIgnoreCase) &&
                         m.MapId == warlock.MapId &&
                         lockPos.Distance(new WoWPoint(m.X, m.Y, m.Z)) <= 40f &&
@@ -1118,6 +1127,38 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     }
                 }
             }
+
+            LogNoProvisionPair(settings, rosterStates, nowUtcMs);
+        }
+
+        /// <summary>
+        /// Throttled diagnostic: exactly which side of a possible pair is blocking provisioning.
+        /// Without it a run can go minutes with a dry member and no log line at all.
+        /// </summary>
+        private void LogNoProvisionPair(SquadSettings settings, List<SquadMemberState> rosterStates, long nowUtcMs)
+        {
+            if (rosterStates == null || nowUtcMs - _lastNoPairLogUtcMs < NoPairLogIntervalMs)
+                return;
+
+            var needer = rosterStates.FirstOrDefault(m =>
+                !m.IsDead && !m.IsGhost && (m.WantsFood || SquadWantsDrink(m, settings)));
+            if (needer == null)
+                return;
+
+            _lastNoPairLogUtcMs = nowUtcMs;
+            var provider = rosterStates.FirstOrDefault(m => m.CanProvideMageDrink || m.CanProvideMageFood);
+            Logging.WriteDebug(
+                "[PartyGrind Provision] No pair: needer='{0}' (drink={1}, wantsDrink={2}, bags={3}, combat={4}) provider='{5}' (drink={6}, combat={7}, dist={8:F0}, cooldown={9})",
+                needer.CharacterName,
+                needer.DrinkCount,
+                SquadWantsDrink(needer, settings),
+                needer.FreeBagSlots,
+                needer.IsInCombat,
+                provider?.CharacterName ?? "-",
+                provider?.CanProvideMageDrink == true,
+                provider?.IsInCombat == true,
+                provider == null ? -1f : new WoWPoint(provider.X, provider.Y, provider.Z).Distance(new WoWPoint(needer.X, needer.Y, needer.Z)),
+                provider != null && IsOnProvisionCooldown(provider.CharacterName, nowUtcMs));
         }
 
         private bool IsOnProvisionCooldown(string name, long nowUtcMs)
