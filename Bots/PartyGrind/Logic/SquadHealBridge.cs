@@ -126,6 +126,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         // control only when somebody actually needs a heal right now, never for top-ups.
         internal const double RoutineHealHandoffThreshold = 70.0;
         internal const double LowManaSpellSwapPercent = 45.0;
+        internal const double LowManaDpsHealFloor = 45.0;
         internal const long HealDuplicateWindowMs = 1500L;
         private static readonly Dictionary<ulong, (string Spell, long AtUtcMs)> _recentHealCasts = new();
 
@@ -723,6 +724,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         {
             string? blockedSpell = null;
             bool lowMana = healerManaPercent < LowManaSpellSwapPercent;
+            bool worthCheapHeal = isTank || hp < LowManaDpsHealFloor;
 
             bool CanCastHeal(string spellName)
             {
@@ -742,11 +744,11 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     {
                         if (hp < 30.0 && CanCastHeal("Flash Heal"))
                             return ("Flash Heal", null);
-                        if (hp < (inCombat ? 70.0 : 60.0) && !hasAuraFromHealer("Renew") && CanCastHeal("Renew"))
+                        if (worthCheapHeal && hp < (inCombat ? 70.0 : 60.0) && !hasAuraFromHealer("Renew") && CanCastHeal("Renew"))
                             return ("Renew", null);
-                        if (hp < (inCombat ? 62.0 : 52.0) && CanCastHeal("Heal"))
+                        if (worthCheapHeal && hp < (inCombat ? 62.0 : 52.0) && CanCastHeal("Heal"))
                             return ("Heal", null);
-                        if (hp < (inCombat ? 62.0 : 52.0) && CanCastHeal("Lesser Heal"))
+                        if (worthCheapHeal && hp < (inCombat ? 62.0 : 52.0) && CanCastHeal("Lesser Heal"))
                             return ("Lesser Heal", null);
                         break;
                     }
@@ -787,7 +789,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     {
                         if (hp < 35.0 && CanCastHeal("Holy Shock"))
                             return ("Holy Shock", null);
-                        if (hp < (inCombat ? 70.0 : 55.0) && CanCastHeal("Flash of Light"))
+                        if (worthCheapHeal && hp < (inCombat ? 70.0 : 55.0) && CanCastHeal("Flash of Light"))
                             return ("Flash of Light", null);
                         break;
                     }
@@ -808,11 +810,11 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 case WoWClass.Druid:
                     if (lowMana)
                     {
-                        if (hp < (inCombat ? 70.0 : 60.0) && !hasAuraFromHealer("Rejuvenation") && CanCastHeal("Rejuvenation"))
+                        if (worthCheapHeal && hp < (inCombat ? 70.0 : 60.0) && !hasAuraFromHealer("Rejuvenation") && CanCastHeal("Rejuvenation"))
                             return ("Rejuvenation", null);
-                        if (hp < (inCombat ? 60.0 : 50.0) && CanCastHeal("Nourish"))
+                        if (worthCheapHeal && hp < (inCombat ? 60.0 : 50.0) && CanCastHeal("Nourish"))
                             return ("Nourish", null);
-                        if (hp < (inCombat ? 60.0 : 50.0) && CanCastHeal("Healing Touch"))
+                        if (worthCheapHeal && hp < (inCombat ? 60.0 : 50.0) && CanCastHeal("Healing Touch"))
                             return ("Healing Touch", null);
                         break;
                     }
@@ -838,9 +840,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     {
                         if (hp < 35.0 && CanCastHeal("Riptide"))
                             return ("Riptide", null);
-                        if (hp < (inCombat ? 68.0 : 58.0) && CanCastHeal("Lesser Healing Wave"))
+                        if (worthCheapHeal && hp < (inCombat ? 68.0 : 58.0) && CanCastHeal("Lesser Healing Wave"))
                             return ("Lesser Healing Wave", null);
-                        if (hp < (inCombat ? 58.0 : 48.0) && CanCastHeal("Healing Wave"))
+                        if (worthCheapHeal && hp < (inCombat ? 58.0 : 48.0) && CanCastHeal("Healing Wave"))
                             return ("Healing Wave", null);
                         break;
                     }

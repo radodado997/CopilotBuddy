@@ -88,6 +88,9 @@ namespace CopilotBuddy.Bots.PartyGrind
         private const float RestThreatRadius = 15f;
         private const float RestMeleeThreatRadius = 10f;
         private const long WorldTransitionGraceMs = 3000L;
+        private const long WorldReentryGraceMs = 4000L;
+        private const long DeathStateDebounceMs = 1200L;
+        private const long PullManaHoldMaxMs = 45000L;
         private const float DungeonForcedStepArrivalDistance = 2f;
         private const long IdleSnapshotIntervalMs = 5000L;
         private const int TerminalStateDeliveryTimeoutMs = 1000;
@@ -125,6 +128,10 @@ namespace CopilotBuddy.Bots.PartyGrind
         private long _packPullHoldSinceUtcMs;
         private uint _lastObservedMapId;
         private long _lastMapChangeUtcMs;
+        private bool _wasInWorld;
+        private long _worldReentryGraceUntilUtcMs;
+        private long _deathObservedSinceUtcMs;
+        private long _manaHoldSinceUtcMs;
         private bool _lootFilterAttached;
         private bool _levelCapStopRequested;
         private SquadLeaderStateDelivery? _terminalStateDelivery;
@@ -257,6 +264,10 @@ namespace CopilotBuddy.Bots.PartyGrind
             _packPullHoldSinceUtcMs = 0;
             _lastObservedMapId = 0;
             _lastMapChangeUtcMs = 0;
+            _wasInWorld = false;
+            _worldReentryGraceUntilUtcMs = 0;
+            _deathObservedSinceUtcMs = 0;
+            _manaHoldSinceUtcMs = 0;
 
             try
             {
@@ -970,39 +981,61 @@ namespace CopilotBuddy.Bots.PartyGrind
         internal static bool IsTransientWorldTransition(bool isInWorld, long mapChangeUtcMs, long nowUtcMs) =>
             !isInWorld || (mapChangeUtcMs > 0 && nowUtcMs - mapChangeUtcMs < WorldTransitionGraceMs);
 
+        internal static bool IsTransientWorldTransition(bool isInWorld, long mapChangeUtcMs, long reentryGraceUntilUtcMs, long nowUtcMs) =>
+            !isInWorld ||
+            nowUtcMs < reentryGraceUntilUtcMs ||
+            (mapChangeUtcMs > 0 && nowUtcMs - mapChangeUtcMs < WorldTransitionGraceMs);
+
+        internal static bool ShouldConfirmDeath(bool rawDead, bool transientTransition, long firstObservedUtcMs, long nowUtcMs) =>
+            rawDead &&
+            !transientTransition &&
+            firstObservedUtcMs > 0 &&
+            nowUtcMs - firstObservedUtcMs >= DeathStateDebounceMs;
+
+        private bool InWorldTransition(long nowUtcMs) =>
+            IsTransientWorldTransition(StyxWoW.IsInWorld, _lastMapChangeUtcMs, _worldReentryGraceUntilUtcMs, nowUtcMs);
+
+        private void TrackWorldPresence(long nowUtcMs)
+        {
+            bool inWorld = StyxWoW.IsInWorld;
+            if (inWorld && !_wasInWorld)
+                _worldReentryGraceUntilUtcMs = nowUtcMs + WorldReentryGraceMs;
+            _wasInWorld = inWorld;
+        }
+
+        private bool TrackConfirmedDeath(bool rawDead, bool transientTransition, long nowUtcMs)
+        {
+            if (!rawDead || transientTransition)
+            {
+                _deathObservedSinceUtcMs = 0;
+                return false;
+            }
+
+            if (_deathObservedSinceUtcMs == 0)
+                _deathObservedSinceUtcMs = nowUtcMs;
+
+            return ShouldConfirmDeath(true, false, _deathObservedSinceUtcMs, nowUtcMs);
+        }
+
         internal static bool ShouldDeferRest(bool hostileAggroNearby, bool hostileInMeleeRange, bool partyMemberInCombat) =>
             partyMemberInCombat || hostileAggroNearby || hostileInMeleeRange;
 
-        private static float LowestPartyManaPercent(SquadLeaderState? leader)
+        private bool ResolvePullManaHoldExpired(SquadLeaderState? leader, long now)
         {
-            if (leader?.Members == null)
-                return 100f;
-
-            float healerLowest = 100f;
-            float anyLowest = 100f;
-            bool sawHealer = false;
-
-            foreach (var member in leader.Members)
+            float healerMana = SquadTankBridge.LowestHealerManaPercent(leader);
+            if (healerMana >= SquadTankBridge.PullHealerManaFloor)
             {
-                if (!member.IsConnected || member.IsDead || member.IsGhost)
-                    continue;
-                bool usesMana = member.PowerType == WoWPowerType.Mana || member.Class == WoWClass.Druid;
-                if (!usesMana)
-                    continue;
-
-                float percent = member.Class == WoWClass.Druid && member.ManaPercent > 0f ? member.ManaPercent : member.PowerPercent;
-                if (percent < anyLowest)
-                    anyLowest = percent;
-
-                if (member.Role == SquadRole.Healer || member.Role == SquadRole.HybridOffHeal)
-                {
-                    sawHealer = true;
-                    if (percent < healerLowest)
-                        healerLowest = percent;
-                }
+                _manaHoldSinceUtcMs = 0;
+                return true;
             }
 
-            return sawHealer ? healerLowest : anyLowest;
+            if (_manaHoldSinceUtcMs == 0)
+            {
+                _manaHoldSinceUtcMs = now;
+                SquadPartySyncService.LogAction("Waiting for the healer to recover mana before pulling");
+            }
+
+            return now - _manaHoldSinceUtcMs >= PullManaHoldMaxMs;
         }
 
         private static bool HostilesNearbyForRest(out bool aggro, out bool inMeleeRange)
@@ -1268,8 +1301,9 @@ namespace CopilotBuddy.Bots.PartyGrind
                 _lastObservedMapId = me.MapId;
                 _lastMapChangeUtcMs = now;
             }
-            bool inWorldTransition = IsTransientWorldTransition(StyxWoW.IsInWorld, _lastMapChangeUtcMs, now);
-            bool isDead = me.Dead && !me.IsGhost && !inWorldTransition;
+            TrackWorldPresence(now);
+            bool inWorldTransition = InWorldTransition(now);
+            bool isDead = TrackConfirmedDeath(me.Dead && !me.IsGhost, inWorldTransition, now);
             bool isGhost = me.IsGhost && !inWorldTransition;
             bool insideDungeon = SquadDungeonService.IsInDungeonMap(me);
             if (isDead)
@@ -1297,13 +1331,20 @@ namespace CopilotBuddy.Bots.PartyGrind
             bool usesManaForDrinks = usesMana || isDruid;
             float restPowerPercent = isDruid && me.MaxMana > 0 ? (float)me.ManaPercent : (float)me.PowerPercent;
 
-            _localWasNeedingRest = !me.Combat && !isDead && !isGhost && !me.IsSwimming &&
-                SquadCoordinatorService.EvaluateRestHysteresis(
+            bool canEvaluateRest = !me.Combat && !isDead && !isGhost && !me.IsSwimming;
+            if (canEvaluateRest)
+            {
+                _localWasNeedingRest = SquadCoordinatorService.EvaluateRestHysteresis(
                     _localWasNeedingRest,
                     (float)me.HealthPercent,
                     restPowerPercent,
                     usesManaForDrinks,
                     settings);
+            }
+            else if (isDead || isGhost)
+            {
+                _localWasNeedingRest = false;
+            }
 
             ulong aggroGuid = 0UL;
             bool needsPeel = false;
@@ -1669,8 +1710,12 @@ namespace CopilotBuddy.Bots.PartyGrind
             if (me == null)
                 return RunStatus.Failure;
 
-            if (IsTransientWorldTransition(StyxWoW.IsInWorld, _lastMapChangeUtcMs, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()))
+            long behaviorNowUtcMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            if (InWorldTransition(behaviorNowUtcMs))
+            {
+                _deathObservedSinceUtcMs = 0;
                 return RunStatus.Failure;
+            }
 
             var settings = SquadContext.ActiveSettings ?? SquadSettings.Instance;
             var leader = SquadContext.GetLeaderStateSnapshot();
@@ -2711,7 +2756,8 @@ namespace CopilotBuddy.Bots.PartyGrind
                     }
 
                     bool followerCombat = leader?.Members?.Any(m => m.IsConnected && !m.IsDead && !m.IsGhost && m.IsInCombat) == true;
-                    if (!followerCombat && SquadTankBridge.CanInitiatePull(leader, settings.MaxPullGatherDistance))
+                    bool manaHoldExpired = ResolvePullManaHoldExpired(leader, now);
+                    if (!followerCombat && SquadTankBridge.CanInitiatePull(leader, settings.MaxPullGatherDistance, manaHoldExpired))
                     {
                         WoWUnit? dungeonTarget = Targeting.Instance.FirstUnit;
                         if (dungeonTarget != null && dungeonTarget.IsValid && !dungeonTarget.Dead &&
@@ -2733,7 +2779,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                             int packSize = SquadTankBridge.CountPullPackSize(dungeonTarget);
                             if (SquadTankBridge.IsPackPullTooRisky(
                                     packSize,
-                                    LowestPartyManaPercent(leader),
+                                    SquadTankBridge.LowestHealerManaPercent(leader),
                                     now - _packPullHoldSinceUtcMs))
                             {
                                 if (startingPackHold)
@@ -2835,7 +2881,8 @@ namespace CopilotBuddy.Bots.PartyGrind
 
                 // 4. Ready to pull?
                 bool followerCombatGrind = leader?.Members?.Any(m => m.IsConnected && !m.IsDead && !m.IsGhost && m.IsInCombat) == true;
-                if (!followerCombatGrind && SquadTankBridge.CanInitiatePull(leader, settings.MaxPullGatherDistance))
+                bool grindManaHoldExpired = ResolvePullManaHoldExpired(leader, now);
+                if (!followerCombatGrind && SquadTankBridge.CanInitiatePull(leader, settings.MaxPullGatherDistance, grindManaHoldExpired))
                 {
                     WoWUnit? target = Targeting.Instance.TargetList.FirstOrDefault(u =>
                         u != null && u.IsValid && !u.Dead && u.Attackable && !u.IsFriendly &&
