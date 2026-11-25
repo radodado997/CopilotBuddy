@@ -115,6 +115,14 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private int _lastResetGeneration;
         private readonly HashSet<uint> _currentRunKilledBosses = new();
         internal const float HotspotArrivalDistance = 4.5f;
+        // Trash is cleared one breadcrumb at a time: the leader never advances more than a
+        // single step and refuses any step whose corridor still holds live hostile trash.
+        internal const float DungeonAdvanceStepDistance = 18f;
+        internal const float DungeonAdvanceTrashClearance = 12f;
+        internal const float DungeonAdvanceClearanceHeight = 8f;
+        // A boss may only be approached directly while it is already inside pull range;
+        // farther bosses have to be reached through the cleared breadcrumb corridor.
+        internal const float BossFallbackApproachDistance = 40f;
         private bool _runtimeInitialized;
         private bool _resetPendingOutside;
         private uint _walkInRunDungeonId;
@@ -1182,6 +1190,85 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             return WoWPoint.Zero;
         }
 
+        /// <summary>
+        /// Perpendicular (2D) distance from <paramref name="point"/> to the corridor segment
+        /// <paramref name="from"/>-<paramref name="to"/>. Used to decide whether the next step
+        /// of the leader corridor still runs through live trash.
+        /// </summary>
+        internal static float DistanceToCorridorSegment(WoWPoint point, WoWPoint from, WoWPoint to) =>
+            DistanceToCorridorSegment(point, from, to, out _);
+
+        internal static float DistanceToCorridorSegment(WoWPoint point, WoWPoint from, WoWPoint to, out float alongTrack)
+        {
+            float dx = to.X - from.X;
+            float dy = to.Y - from.Y;
+            float lengthSquared = dx * dx + dy * dy;
+            if (lengthSquared <= 0.0001f)
+            {
+                alongTrack = 0f;
+                float offsetX = point.X - from.X;
+                float offsetY = point.Y - from.Y;
+                return MathF.Sqrt(offsetX * offsetX + offsetY * offsetY);
+            }
+
+            alongTrack = ((point.X - from.X) * dx + (point.Y - from.Y) * dy) / MathF.Sqrt(lengthSquared);
+            float projection = Math.Clamp(alongTrack / MathF.Sqrt(lengthSquared), 0f, 1f);
+            float closestX = from.X + dx * projection;
+            float closestY = from.Y + dy * projection;
+            float deltaX = point.X - closestX;
+            float deltaY = point.Y - closestY;
+            return MathF.Sqrt(deltaX * deltaX + deltaY * deltaY);
+        }
+
+        /// <summary>
+        /// Resolves the next leader step along the dungeon corridor. The step is always clamped to
+        /// <paramref name="maxStep"/> so the tank never charges a distant boss through several packs,
+        /// and it is refused (Zero) while live hostile trash still sits inside
+        /// <paramref name="clearance"/> of the corridor, so the pull logic clears that pack first.
+        /// </summary>
+        internal static WoWPoint ResolveDungeonAdvanceStep(
+            WoWPoint from,
+            WoWPoint destination,
+            IReadOnlyList<WoWPoint>? hostileLocations,
+            float maxStep = DungeonAdvanceStepDistance,
+            float clearance = DungeonAdvanceTrashClearance)
+        {
+            if (from == WoWPoint.Zero || destination == WoWPoint.Zero)
+                return WoWPoint.Zero;
+
+            float distance = from.Distance(destination);
+            if (distance <= 0.01f)
+                return WoWPoint.Zero;
+
+            WoWPoint step = destination;
+            if (maxStep > 0f && distance > maxStep)
+            {
+                float ratio = maxStep / distance;
+                step = new WoWPoint(
+                    from.X + (destination.X - from.X) * ratio,
+                    from.Y + (destination.Y - from.Y) * ratio,
+                    from.Z + (destination.Z - from.Z) * ratio);
+            }
+
+            if (clearance > 0f && hostileLocations != null)
+            {
+                foreach (WoWPoint hostile in hostileLocations)
+                {
+                    if (hostile == WoWPoint.Zero)
+                        continue;
+                    if (MathF.Abs(hostile.Z - from.Z) > DungeonAdvanceClearanceHeight)
+                        continue;
+                    // Only trash the leader would walk into counts: a mob trailing behind the group
+                    // must not freeze the advance for the whole corridor.
+                    if (DistanceToCorridorSegment(hostile, from, step, out float alongTrack) <= clearance &&
+                        alongTrack > 0f)
+                        return WoWPoint.Zero;
+                }
+            }
+
+            return step;
+        }
+
         public WoWPoint ComputeLeaderNextDungeonPoint()
         {
             var me = StyxWoW.Me;
@@ -1258,7 +1345,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                                     (!b.Optional || BossManager.KillOptionalBossesEnabled) &&
                                     (currentBoss == null || b.Entry == currentBoss.Entry || b.KillOrder <=
                                      (profile.BossEncounters.FirstOrDefault(pb => pb.Entry == currentBoss.Entry)?.KillOrder ?? int.MaxValue))))
-                    .Where(u => Navigator.PathDistance(me.Location, u.Location, 100f) is float pd && pd < 100f)
+                    .Where(u => Navigator.PathDistance(me.Location, u.Location, BossFallbackApproachDistance) is float pd &&
+                                pd < BossFallbackApproachDistance)
                     .OrderBy(u => profile.BossEncounters.FirstOrDefault(b => b.Entry == u.Entry)?.KillOrder ?? int.MaxValue)
                     .ThenBy(u => u.DistanceSqr)
                     .FirstOrDefault();

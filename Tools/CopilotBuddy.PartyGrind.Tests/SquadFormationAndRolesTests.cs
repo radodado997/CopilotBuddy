@@ -209,11 +209,12 @@ namespace CopilotBuddy.PartyGrind.Tests
         [Fact]
         public void HealBridge_ConservesManaOutOfCombatAndPreservesActiveDrinking()
         {
-            // Combat heals up to 90%, OOC idle heals only below 78%, resting phase below 60%, active drink below 45%
-            Assert.Equal(90.0, SquadHealBridge.ComputeEffectiveHealThreshold(false, anyCombat: true, healerActivelyDrinkingOrEating: false, healerInRestPhase: false));
-            Assert.Equal(78.0, SquadHealBridge.ComputeEffectiveHealThreshold(false, anyCombat: false, healerActivelyDrinkingOrEating: false, healerInRestPhase: false));
-            Assert.Equal(60.0, SquadHealBridge.ComputeEffectiveHealThreshold(false, anyCombat: false, healerActivelyDrinkingOrEating: false, healerInRestPhase: true));
-            Assert.Equal(45.0, SquadHealBridge.ComputeEffectiveHealThreshold(false, anyCombat: false, healerActivelyDrinkingOrEating: true, healerInRestPhase: true));
+            // Combat heals up to 75%, out-of-combat healing stays below the 50% rest trigger,
+            // an active drink is only interrupted below 35%.
+            Assert.Equal(75.0, SquadHealBridge.ComputeEffectiveHealThreshold(false, anyCombat: true, healerActivelyDrinkingOrEating: false, healerInRestPhase: false));
+            Assert.Equal(40.0, SquadHealBridge.ComputeEffectiveHealThreshold(false, anyCombat: false, healerActivelyDrinkingOrEating: false, healerInRestPhase: false));
+            Assert.Equal(40.0, SquadHealBridge.ComputeEffectiveHealThreshold(false, anyCombat: false, healerActivelyDrinkingOrEating: false, healerInRestPhase: true));
+            Assert.Equal(35.0, SquadHealBridge.ComputeEffectiveHealThreshold(false, anyCombat: false, healerActivelyDrinkingOrEating: true, healerInRestPhase: true));
 
             var knownPriestSpells = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
             {
