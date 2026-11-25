@@ -61,6 +61,21 @@ namespace CopilotBuddy.PartyGrind.Tests
         }
 
         [Theory]
+        [InlineData(4, 10f, 5, 10f, true)]
+        [InlineData(3, 10f, 7, 10f, true)]
+        [InlineData(4, 10f, 4, 10f, false)]
+        [InlineData(5, 10f, 6, 10f, false)]
+        [InlineData(2, 10f, 3, 10f, false)]
+        [InlineData(3, 30f, 7, 10f, false)]
+        [InlineData(3, 21f, 7, 10f, true)]
+        public void PullTarget_SwapsToASmallerPackWithinADetour(
+            int candidatePack, float candidateDistance, int currentPack, float currentDistance, bool expected)
+        {
+            Assert.Equal(expected, SquadTankBridge.IsBetterPullCandidate(
+                candidatePack, candidateDistance, currentPack, currentDistance));
+        }
+
+        [Theory]
         [InlineData(false, false, false, false)]
         [InlineData(true, false, false, true)]
         [InlineData(false, true, false, true)]

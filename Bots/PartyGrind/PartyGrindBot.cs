@@ -2717,6 +2717,15 @@ namespace CopilotBuddy.Bots.PartyGrind
                         if (dungeonTarget != null && dungeonTarget.IsValid && !dungeonTarget.Dead &&
                             dungeonTarget.Attackable && !dungeonTarget.IsFriendly)
                         {
+                            WoWUnit? isolatedTarget = SquadTankBridge.SelectIsolatedPullTarget(
+                                dungeonTarget, me.Location, SquadTankBridge.MaxPullCandidateScanRadius);
+                            if (isolatedTarget != null && isolatedTarget.Guid != dungeonTarget.Guid)
+                            {
+                                SquadPartySyncService.LogAction("Dungeon: pulling " + isolatedTarget.Name +
+                                    " instead of " + dungeonTarget.Name + " to keep the pack small");
+                                dungeonTarget = isolatedTarget;
+                            }
+
                             bool startingPackHold = _packPullHoldSinceUtcMs == 0;
                             if (startingPackHold)
                                 _packPullHoldSinceUtcMs = now;

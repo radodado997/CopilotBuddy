@@ -546,6 +546,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         // Pulling a mob that already stands next to its pack with a multi-target opener
         // (Avenger's Shield bounces to three targets) drags the whole pack in one go.
         internal const float PullPackNeighbourRadius = 10f;
+        internal const float MaxPullCandidateScanRadius = 40f;
+        internal const float MaxPullCandidateDetour = 12f;
+        internal const int MaxPullCandidateCount = 8;
         internal const int MaxComfortablePackSize = 3;
         internal const int MaxBlockedPackSize = 5;
         internal const float PackPullManaFloor = 55f;
@@ -601,6 +604,59 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             }
 
             return count;
+        }
+
+        internal static bool IsBetterPullCandidate(int candidatePack, float candidateDistance, int currentPack, float currentDistance)
+        {
+            if (currentPack <= MaxComfortablePackSize)
+                return false;
+            if (candidatePack >= currentPack)
+                return false;
+            if (candidatePack > MaxComfortablePackSize + 1)
+                return false;
+            return candidateDistance <= currentDistance + MaxPullCandidateDetour;
+        }
+
+        internal static WoWUnit? SelectIsolatedPullTarget(WoWUnit? current, WoWPoint from, float scanRadius)
+        {
+            if (current == null || !current.IsValid || current.Dead)
+                return current;
+
+            int currentPack = CountPullPackSize(current);
+            if (currentPack <= MaxComfortablePackSize)
+                return current;
+
+            WoWUnit? best = null;
+            int bestPack = currentPack;
+            float bestDistance = from.Distance(current.Location);
+
+            int inspected = 0;
+            foreach (var unit in ObjectManager.CachedUnits)
+            {
+                if (inspected >= MaxPullCandidateCount)
+                    break;
+                if (unit == null || !unit.IsValid || unit.Dead || unit.Guid == current.Guid)
+                    continue;
+                if (!unit.Attackable || unit.IsFriendly || unit.IsPlayer || unit.IsCritter || unit.IsNonCombatPet)
+                    continue;
+                if (unit.ControllingPlayer != null || unit.Combat)
+                    continue;
+
+                float distance = from.Distance(unit.Location);
+                if (distance > scanRadius)
+                    continue;
+
+                inspected++;
+                int pack = CountPullPackSize(unit);
+                if (!IsBetterPullCandidate(pack, distance, bestPack, bestDistance))
+                    continue;
+
+                best = unit;
+                bestPack = pack;
+                bestDistance = distance;
+            }
+
+            return best ?? current;
         }
 
         internal static bool IsPackPullTooRisky(int packSize, float lowestPartyManaPercent, long holdElapsedMs)
