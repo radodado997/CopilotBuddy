@@ -164,9 +164,6 @@ namespace Singular.ClassSpecific.Warlock
                 Safers.EnsureTarget(),
                 Movement.CreateMoveToLosBehavior(),
                 Movement.CreateFaceTargetBehavior(),
-                new Decorator(
-                    ret => StyxWoW.Me.CastingSpell != null && StyxWoW.Me.CastingSpell.Name == "Hellfire" && StyxWoW.Me.HealthPercent < 60,
-                    new Action(ret => SpellManager.StopCasting())),
                 Spell.WaitForCast(true),
                 Helpers.Common.CreateAutoAttack(true),
                 Helpers.Common.CreateInterruptSpellCast(ret => StyxWoW.Me.CurrentTarget),
@@ -183,8 +180,7 @@ namespace Singular.ClassSpecific.Warlock
                         Spell.BuffSelf("Metamorphosis"),
                         Spell.BuffSelf("Immolation Aura", ret => StyxWoW.Me.ActiveAuras.ContainsKey("Metamorphosis")),
                         Spell.BuffSelf("Shadowflame",
-                            ret => Unit.NearbyUnfriendlyUnits.Count(u => u.DistanceSqr < 10 * 10 && StyxWoW.Me.IsSafelyFacing(u, 90)) >= 3),
-                        Spell.BuffSelf("Hellfire", ret => StyxWoW.Me.HealthPercent > 60)
+                            ret => Unit.NearbyUnfriendlyUnits.Count(u => u.DistanceSqr < 10 * 10 && StyxWoW.Me.IsSafelyFacing(u, 90)) >= 3)
                         )),
 
                 // Single target rotation
