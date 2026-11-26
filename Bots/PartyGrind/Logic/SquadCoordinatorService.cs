@@ -23,7 +23,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         public int SubProfileMaxLevel { get; set; } = 85;
         /// <summary>Highest MaxLevel of the loaded profile's sub-profiles; 0 when unknown.</summary>
         public int ProfileMaxLevel { get; set; }
-        public uint MapId { get; set; }
+        public uint? MapId { get; set; }
         public float HotspotX { get; set; }
         public float HotspotY { get; set; }
         public float HotspotZ { get; set; }
@@ -194,7 +194,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     Guid = snap.Handshake.Guid,
                     Class = snap.Handshake.Class,
                     Role = snap.Handshake.Role,
-                    Level = snap.Handshake.Level
+                    Level = snap.Handshake.Level,
+                    HasValidMap = false
                 };
 
                 roles[name] = state.Role;
@@ -258,9 +259,13 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             int profileMaxLevel = profile.ProfileMaxLevel;
 
             // Detect sub-profile transition -> MigratingZone.
-            string subProfileKey = $"{profile.ProfileXmlPath}|{profile.ProfileXmlHash}|{profile.SubProfileName}|{profile.SubProfileMinLevel}|{profile.SubProfileMaxLevel}|{profile.MapId}";
-            if (profile.HasProfile)
+            if (isDungeonMode)
             {
+                _migratingZone = false;
+            }
+            else if (profile.HasProfile && profile.MapId.HasValue)
+            {
+                string subProfileKey = $"{profile.ProfileXmlPath}|{profile.ProfileXmlHash}|{profile.SubProfileName}|{profile.SubProfileMinLevel}|{profile.SubProfileMaxLevel}|{profile.MapId.Value}";
                 if (!string.IsNullOrEmpty(_lastSubProfileKey) &&
                     !string.Equals(_lastSubProfileKey, subProfileKey, StringComparison.Ordinal))
                 {
@@ -393,9 +398,12 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (_migratingZone)
             {
                 var hotspot = new WoWPoint(profile.HotspotX, profile.HotspotY, profile.HotspotZ);
-                bool allArrived = rosterStates.Where(m => !m.IsDead && !m.IsGhost).All(m =>
-                    m.MapId == profile.MapId &&
-                    new WoWPoint(m.X, m.Y, m.Z).Distance(hotspot) <= settings.SoftWaitDistance);
+                bool allArrived = !rosterIncomplete &&
+                    profile.MapId.HasValue &&
+                    rosterStates.Where(m => !m.IsDead && !m.IsGhost).All(m =>
+                        m.HasValidMap &&
+                        m.MapId == profile.MapId.Value &&
+                        new WoWPoint(m.X, m.Y, m.Z).Distance(hotspot) <= settings.SoftWaitDistance);
 
                 if (allArrived)
                     _migratingZone = false;
@@ -650,6 +658,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 LowestMemberXpPercent = lowestXpPct,
                 LevelCapReached = levelCapReached,
                 MapId = leaderLocal.MapId,
+                HasValidMap = leaderLocal.HasValidMap,
                 ZoneId = leaderLocal.ZoneId,
                 X = leaderLocal.X,
                 Y = leaderLocal.Y,
@@ -701,7 +710,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 KillOptionalBosses = settings.KillOptionalBosses,
                 IsInsideDungeon = dungeon?.IsInsideDungeon == true || leaderLocal.IsInsideDungeon,
                 ActiveDungeonId = dungeon?.ActiveDungeonId ?? 0U,
-                ActiveDungeonMapId = dungeon?.ActiveDungeonMapId ?? 0U,
+                ActiveDungeonMapId = dungeon?.ActiveDungeonMapId,
                 ActiveDungeonName = dungeon?.ActiveDungeonName ?? string.Empty,
                 CurrentBossEntry = dungeon?.CurrentBossEntry ?? 0U,
                 CurrentBossName = dungeon?.CurrentBossName ?? string.Empty,
@@ -717,7 +726,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 DungeonPortalX = dungeon?.PortalX ?? 0f,
                 DungeonPortalY = dungeon?.PortalY ?? 0f,
                 DungeonPortalZ = dungeon?.PortalZ ?? 0f,
-                DungeonPortalMapId = dungeon?.PortalMapId ?? 0U,
+                DungeonPortalMapId = dungeon?.PortalMapId,
                 DungeonExitX = dungeon?.ExitX ?? 0f,
                 DungeonExitY = dungeon?.ExitY ?? 0f,
                 DungeonExitZ = dungeon?.ExitZ ?? 0f,

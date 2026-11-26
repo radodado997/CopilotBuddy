@@ -232,5 +232,56 @@ namespace CopilotBuddy.PartyGrind.Tests
             Assert.True(CopilotBuddy.Bots.PartyGrind.PartyGrindBot.ShouldClearCoordinatorTargetsWhenDead(isDead: false, isGhost: true));
             Assert.False(CopilotBuddy.Bots.PartyGrind.PartyGrindBot.ShouldClearCoordinatorTargetsWhenDead(isDead: false, isGhost: false));
         }
+
+        [Fact]
+        public void DungeonPolylineAdvanceStep_FollowsNavmeshCorridorAroundObstacle()
+        {
+            var from = new WoWPoint(2519.44f, 917.63f, 46.07f);
+            var objective = new WoWPoint(2517.19f, 859.79f, 47.68f);
+            var polyPath = new[]
+            {
+                from,
+                new WoWPoint(2529.44f, 917.63f, 46.07f),
+                new WoWPoint(2529.44f, 907.63f, 46.57f),
+                new WoWPoint(2518.74f, 899.65f, 46.57f)
+            };
+
+            WoWPoint step = SquadDungeonService.ResolvePolylineAdvanceStep(
+                from,
+                polyPath,
+                objective,
+                Array.Empty<WoWPoint>());
+
+            Assert.NotEqual(WoWPoint.Zero, step);
+            Assert.Equal(2529.44f, step.X, 2);
+            Assert.Equal(909.64f, step.Y, 2);
+            Assert.Equal(8.0f, new WoWPoint(2529.44f, 917.63f, 46.07f).Distance(step), 2);
+            Assert.True(step.Distance(new WoWPoint(2518.74f, 899.65f, 46.57f)) > 5f);
+        }
+
+        [Fact]
+        public void DungeonPolylineAdvanceStep_RefusesBlockedSegmentAndFallsBackWhenEmpty()
+        {
+            var from = Origin;
+            var objective = new WoWPoint(160f, 200f, 30f);
+            var polyPath = new[]
+            {
+                from,
+                new WoWPoint(110f, 200f, 30f),
+                new WoWPoint(110f, 208f, 30f)
+            };
+            var trashOnTurn = new[] { new WoWPoint(110f, 206f, 30f) };
+
+            Assert.Equal(WoWPoint.Zero, SquadDungeonService.ResolvePolylineAdvanceStep(
+                from, polyPath, objective, trashOnTurn));
+
+            WoWPoint besideTrash = SquadDungeonService.ResolvePolylineAdvanceStep(
+                from, polyPath, objective, new[] { new WoWPoint(130f, 206f, 30f) });
+            Assert.Equal(new WoWPoint(110f, 208f, 30f), besideTrash);
+
+            WoWPoint fallback = SquadDungeonService.ResolvePolylineAdvanceStep(
+                from, Array.Empty<WoWPoint>(), objective, Array.Empty<WoWPoint>());
+            Assert.Equal(SquadDungeonService.ResolveDungeonAdvanceStep(from, objective, Array.Empty<WoWPoint>()), fallback);
+        }
     }
 }

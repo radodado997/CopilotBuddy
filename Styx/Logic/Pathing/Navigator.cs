@@ -92,6 +92,29 @@ namespace Styx.Logic.Pathing
 		/// <summary>true when there are unvisited waypoints in the current navmesh path.</summary>
 		public static bool HasActivePath => _meshNavigator?.HasActivePath ?? false;
 
+		public static WoWPoint[] ComputeRawPath(WoWPoint from, WoWPoint to, out bool isPartialPath)
+		{
+			isPartialPath = false;
+			if (!IsNavigatorLoaded) return Array.Empty<WoWPoint>();
+			try
+			{
+				uint mapId = GetCurrentMapId();
+				var result = TripperNavigator.FindPath(mapId,
+					new Vector3(from.X, from.Y, from.Z),
+					new Vector3(to.X, to.Y, to.Z), true);
+				if (result == null || !result.Status.Succeeded || result.Points == null || result.Points.Length == 0)
+					return Array.Empty<WoWPoint>();
+				isPartialPath = result.IsPartialPath;
+				return result.Points.Select(p => new WoWPoint(p.X, p.Y, p.Z)).ToArray();
+			}
+			catch { return Array.Empty<WoWPoint>(); }
+		}
+
+		public static void OverrideCurrentPath(WoWPoint[] points, bool isPartialPath)
+		{
+			_meshNavigator?.OverrideCurrentPath(points, isPartialPath);
+		}
+
 		// HB 6.2.3: stored fallback precision used when there is no NavigationProvider.
 		private static float _defaultPathPrecision = 2f;
 
@@ -164,6 +187,8 @@ namespace Styx.Logic.Pathing
 		public static WoWPoint Destination => _meshNavigator?.Destination ?? WoWPoint.Zero;
 
 		public static List<WoWPoint> CurrentPath => _meshNavigator?.CurrentPath ?? new List<WoWPoint>();
+
+		public static int CurrentPathGeneration => _meshNavigator?.PathGeneration ?? 0;
 
 		/// <summary>true if the player is at the given point (HB 6.2.3 Navigator.AtLocation(WoWPoint)).</summary>
 		public static bool AtLocation(WoWPoint point)

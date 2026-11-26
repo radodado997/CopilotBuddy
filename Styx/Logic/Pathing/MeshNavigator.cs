@@ -45,6 +45,7 @@ namespace Styx.Logic.Pathing
 		private TripperNav.AreaType[]? _currentPolyTypes;
 		private TripperNav.AbilityFlags[]? _currentAbilityFlags;
 		private bool _isPartialPath;
+		private int _pathGeneration;
 		private bool _ridingElevator;
 
 		// Push-ahead cache (HB 6.2.3 method_25/26)
@@ -251,10 +252,16 @@ namespace Styx.Logic.Pathing
 			// HB 6.2.3 method_9: compare new destination against PATH ENDPOINT
 			float destThresholdSqr = PathPrecision * PathPrecision;
 			WoWPoint pathEndpoint = _currentPath.Count > 0 ? _currentPath[_currentPath.Count - 1] : _destination;
-			bool destinationChanged = _destination == WoWPoint.Zero
-				|| (pathEndpoint != WoWPoint.Zero
-					? pathEndpoint.DistanceSqr(destination) > destThresholdSqr
-					: _destination.DistanceSqr(destination) > destThresholdSqr);
+			bool logicalDestinationChanged = _destination == WoWPoint.Zero
+				|| _destination.DistanceSqr(destination) > destThresholdSqr;
+			bool followActivePartialPath = !logicalDestinationChanged
+				&& _isPartialPath
+				&& _currentPath.Count > 0
+				&& _currentPathIndex < _currentPath.Count;
+			bool destinationChanged = logicalDestinationChanged
+				|| (!followActivePartialPath
+					&& pathEndpoint != WoWPoint.Zero
+					&& pathEndpoint.DistanceSqr(destination) > destThresholdSqr);
 			bool needsPathRegen = !destinationChanged && _currentPath.Count == 0;
 
 			if (destinationChanged || needsPathRegen)
@@ -266,7 +273,7 @@ namespace Styx.Logic.Pathing
 				_destination = destination;
 				_currentPath.Clear();
 
-				if (destinationChanged)
+				if (logicalDestinationChanged)
 				{
 					try { StuckHandler.Reset(); } catch { }
 					_ridingElevator = false;
@@ -288,7 +295,7 @@ namespace Styx.Logic.Pathing
 				_currentPolyTypes = pathResult.PolyTypes;
 				_currentAbilityFlags = pathResult.AbilityFlags;
 				_isPartialPath = pathResult.IsPartialPath;
-
+				_pathGeneration++;
 				_currentPathIndex = 0;
 				_cachedPushAheadIndex = -1;
 
@@ -385,7 +392,15 @@ namespace Styx.Logic.Pathing
 					_currentPathIndex++;
 					_ridingElevator = false;
 					if (_currentPathIndex >= _currentPath.Count)
-						return _isPartialPath ? MoveResult.Failed : MoveResult.ReachedDestination;
+					{
+						if (_isPartialPath)
+						{
+							_currentPath.Clear();
+							_currentPathIndex = 0;
+							return MoveResult.Failed;
+						}
+						return MoveResult.ReachedDestination;
+					}
 					return MoveResult.Moved;
 				}
 
@@ -441,11 +456,17 @@ namespace Styx.Logic.Pathing
 
 						if (hadAvoidPath)
 						{
-							var refreshedPath = Navigator.ComputeRawPath(me.Location, _destination);
+							var refreshedPath = Navigator.ComputeRawPath(me.Location, _destination, out bool refreshedPartial);
 							if (refreshedPath == null || refreshedPath.Length == 0)
+							{
+								_currentPath.Clear();
+								_currentPathIndex = 0;
+								_isPartialPath = false;
+								_cachedPushAheadIndex = -1;
 								return MoveResult.PathGenerationFailed;
+							}
 
-							OverrideCurrentPath(refreshedPath);
+							OverrideCurrentPath(refreshedPath, refreshedPartial);
 							try { StuckHandler.Reset(); } catch { }
 						}
 					}
@@ -468,7 +489,15 @@ namespace Styx.Logic.Pathing
 
 					_currentPathIndex++;
 					if (_currentPathIndex >= _currentPath.Count)
-						return _isPartialPath ? MoveResult.Failed : MoveResult.ReachedDestination;
+					{
+						if (_isPartialPath)
+						{
+							_currentPath.Clear();
+							_currentPathIndex = 0;
+							return MoveResult.Failed;
+						}
+						return MoveResult.ReachedDestination;
+					}
 
 					if (_currentFlags != null && (_currentPathIndex - 1) < _currentFlags.Length
 					    && (_currentFlags[_currentPathIndex - 1] & TripperNav.StraightPathFlags.OffMeshConnection) != 0)
@@ -507,6 +536,8 @@ namespace Styx.Logic.Pathing
 			_destination = WoWPoint.Zero;
 			_currentPath.Clear();
 			_currentPathIndex = 0;
+			_isPartialPath = false;
+			_pathGeneration++;
 			_currentFlags = null;
 			_currentPolyTypes = null;
 			_currentAbilityFlags = null;
@@ -627,6 +658,8 @@ namespace Styx.Logic.Pathing
 
 		public bool IsRidingElevator => _ridingElevator;
 
+		public int PathGeneration => _pathGeneration;
+
 		/// <summary>
 		/// Returns the remaining unvisited navmesh waypoints.
 		/// Used by Bots.DungeonBuddy.Avoidance.Helpers.GetAvoidPath().
@@ -644,11 +677,22 @@ namespace Styx.Logic.Pathing
 		/// </summary>
 		public void OverrideCurrentPath(WoWPoint[] points)
 		{
+			bool isPartial = points != null &&
+				points.Length > 0 &&
+				_destination != WoWPoint.Zero &&
+				points[points.Length - 1].DistanceSqr(_destination) > PathPrecision * PathPrecision;
+			OverrideCurrentPath(points, isPartial);
+		}
+
+		public void OverrideCurrentPath(WoWPoint[] points, bool isPartialPath)
+		{
 			_currentPath.Clear();
 			if (points != null)
 				foreach (var p in points)
 					_currentPath.Add(p);
 			_currentPathIndex = 0;
+			_isPartialPath = isPartialPath;
+			_pathGeneration++;
 			_currentFlags = null;
 			_currentPolyTypes = null;
 			_currentAbilityFlags = null;
