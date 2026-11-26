@@ -125,11 +125,31 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             bool isTargetingHealer,
             bool alreadyInCombatWithSquad)
         {
+            return ComputeTankTargetBonus(
+                isTargetingNonTankPartyMember,
+                isTargetingHealer,
+                alreadyInCombatWithSquad,
+                distanceToTank: 0f,
+                tankInCombat: false);
+        }
+
+        public static double ComputeTankTargetBonus(
+            bool isTargetingNonTankPartyMember,
+            bool isTargetingHealer,
+            bool alreadyInCombatWithSquad,
+            float distanceToTank,
+            bool tankInCombat)
+        {
+            double bonus = 0.0;
             if (isTargetingNonTankPartyMember)
-                return isTargetingHealer ? 10500.0 : 10000.0;
-            if (alreadyInCombatWithSquad)
-                return 2000.0;
-            return 0.0;
+                bonus = isTargetingHealer ? 10500.0 : 10000.0;
+            else if (alreadyInCombatWithSquad)
+                bonus = 2000.0;
+
+            if (tankInCombat && distanceToTank > 10f)
+                bonus -= 9500.0 + (distanceToTank - 10f) * 100.0;
+
+            return bonus;
         }
 
         private static void SquadIncludeTargetsFilter(List<WoWObject> incomingUnits, HashSet<WoWObject> outgoingUnits)
@@ -326,6 +346,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (settings.Role == SquadRole.TankLeader)
             {
                 ulong myGuid = StyxWoW.Me.Guid;
+                WoWPoint meLoc = StyxWoW.Me.Location;
+                bool tankInCombat = StyxWoW.Me.Combat;
                 foreach (var tp in units)
                 {
                     if (tp.Object is not WoWUnit unit || !unit.IsValid)
@@ -336,9 +358,10 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                         (unit.IsTargetingMyPartyMember || memberGuids.Contains(targetGuid));
                     bool targetingHealer = targetingOtherParty && SquadContext.IsMemberRole(targetGuid, SquadRole.Healer);
                     bool inCombatWithSquad = unit.Combat && (unit.IsTargetingMeOrPet || unit.IsTargetingMyPartyMember || unit.TaggedByMe);
+                    float distToTank = (float)unit.Location.Distance(meLoc);
 
-                    tp.Score += ComputeTankTargetBonus(targetingOtherParty, targetingHealer, inCombatWithSquad);
-                    if (isDungeon && !StyxWoW.Me.Combat)
+                    tp.Score += ComputeTankTargetBonus(targetingOtherParty, targetingHealer, inCombatWithSquad, distToTank, tankInCombat);
+                    if (isDungeon && !tankInCombat)
                         tp.Score -= unit.Distance * 2.0;
                 }
             }
@@ -409,6 +432,41 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             };
         }
 
+        private static long _lastGlobalTauntUtcMs;
+        private static readonly Dictionary<ulong, long> LastMobTauntUtcMs = new();
+
+        internal static bool CanAttemptTauntPeel(long lastGlobalTauntMs, long lastMobTauntMs, long nowMs)
+        {
+            return nowMs - lastGlobalTauntMs >= 2000L && nowMs - lastMobTauntMs >= 4000L;
+        }
+
+        private static bool RecordTauntCast(ulong mobGuid, long nowMs)
+        {
+            _lastGlobalTauntUtcMs = nowMs;
+            LastMobTauntUtcMs[mobGuid] = nowMs;
+            return true;
+        }
+
+        private static bool RecordAreaTauntCast(IEnumerable<WoWUnit> looseMobs, long nowMs)
+        {
+            _lastGlobalTauntUtcMs = nowMs;
+            foreach (WoWUnit mob in looseMobs)
+            {
+                if (mob.Distance <= 9f)
+                    LastMobTauntUtcMs[mob.Guid] = nowMs;
+            }
+            return true;
+        }
+
+        private static bool IsSquadOrPartyHealer(LocalPlayer me, ulong guid)
+        {
+            if (guid == 0UL)
+                return false;
+            if (SquadContext.IsMemberRole(guid, SquadRole.Healer))
+                return true;
+            return me.GroupInfo.AllMembers.Any(pm => pm.Guid == guid && pm.HasRole(WoWPartyMember.GroupRole.Healer));
+        }
+
         /// <summary>
         /// Scans for hostile mobs attacking non-tank party members and casts a class taunt to peel them.
         /// </summary>
@@ -431,6 +489,16 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (!HasAvailableTauntSpell(me.Class, SpellManager.HasSpell))
                 return false;
 
+            long nowMs = Environment.TickCount64;
+            if (nowMs - _lastGlobalTauntUtcMs < 2000L)
+                return false;
+
+            if (LastMobTauntUtcMs.Count > 16)
+            {
+                foreach (ulong staleGuid in LastMobTauntUtcMs.Where(kv => nowMs - kv.Value > 15000L).Select(kv => kv.Key).ToList())
+                    LastMobTauntUtcMs.Remove(staleGuid);
+            }
+
             var memberGuids = SquadContext.GetKnownMemberGuids();
             ulong myGuid = me.Guid;
 
@@ -438,41 +506,75 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 .Where(u => u != null && u.IsValid && !u.Dead && u.Combat && u.Attackable && !u.IsFriendly && !u.IsPlayer)
                 .Where(u => u.CurrentTargetGuid != 0 && u.CurrentTargetGuid != myGuid &&
                             (u.IsTargetingMyPartyMember || memberGuids.Contains(u.CurrentTargetGuid)))
-                .OrderByDescending(u => SquadContext.IsMemberRole(u.CurrentTargetGuid, SquadRole.Healer) ? 1 : 0)
+                .OrderByDescending(u => IsSquadOrPartyHealer(me, u.CurrentTargetGuid) ? 1 : 0)
                 .ThenBy(u => u.Location.Distance(me.Location))
                 .ToList();
 
             if (looseMobs.Count == 0)
                 return false;
 
+            int unthrottledAreaCount = looseMobs.Count(u =>
+                u.Distance <= 9f &&
+                CanAttemptTauntPeel(
+                    _lastGlobalTauntUtcMs,
+                    LastMobTauntUtcMs.TryGetValue(u.Guid, out long areaMobMs) ? areaMobMs : 0L,
+                    nowMs));
+
             foreach (WoWUnit loose in looseMobs)
             {
-                if (me.Class == WoWClass.Paladin && !SpellManager.HasSpell("Hand of Reckoning"))
+                long lastMobMs = LastMobTauntUtcMs.TryGetValue(loose.Guid, out long recordedMs) ? recordedMs : 0L;
+                if (!CanAttemptTauntPeel(_lastGlobalTauntUtcMs, lastMobMs, nowMs))
+                    continue;
+
+                bool attackingHealer = IsSquadOrPartyHealer(me, loose.CurrentTargetGuid);
+
+                if (me.Class == WoWClass.Paladin)
                 {
-                    WoWUnit? attackedAlly = ObjectManager.GetObjectByGuid<WoWUnit>(loose.CurrentTargetGuid);
-                    if (attackedAlly != null && attackedAlly.IsValid && !attackedAlly.Dead &&
-                        SpellManager.CanCast("Righteous Defense", attackedAlly, false, false))
+                    bool mobInHandRange = loose.Distance <= 30f && loose.InLineOfSpellSight;
+                    if (mobInHandRange && SpellManager.CanCast("Hand of Reckoning", loose, true, false))
                     {
-                        if (attackedAlly.Distance > 38f || !attackedAlly.InLineOfSpellSight)
-                        {
-                            if (PeelApproach.TryMove(attackedAlly, "Peeling for " + attackedAlly.Name))
-                                return true;
-                            continue;
-                        }
-                        if (SpellManager.CanCast("Righteous Defense", attackedAlly, true, false))
-                            return SpellManager.Cast("Righteous Defense", attackedAlly);
+                        WoWUnit? prevTarget = me.CurrentTarget;
+                        if (me.CurrentTargetGuid != loose.Guid)
+                            loose.Target();
+                        if (!me.IsFacing(loose))
+                            loose.Face();
+                        if (SpellManager.Cast("Hand of Reckoning", loose))
+                            return RecordTauntCast(loose.Guid, nowMs);
+                        if (prevTarget != null && prevTarget.IsValid && !prevTarget.Dead && me.CurrentTargetGuid != prevTarget.Guid)
+                            prevTarget.Target();
                     }
+
+                    WoWUnit? paladinAlly = ObjectManager.GetObjectByGuid<WoWUnit>(loose.CurrentTargetGuid);
+                    if (paladinAlly != null && paladinAlly.IsValid && !paladinAlly.Dead &&
+                        SpellManager.CanCast("Righteous Defense", paladinAlly, false, false))
+                    {
+                        if (paladinAlly.Distance <= 38f && paladinAlly.InLineOfSpellSight)
+                        {
+                            if (SpellManager.CanCast("Righteous Defense", paladinAlly, true, false) &&
+                                SpellManager.Cast("Righteous Defense", paladinAlly))
+                            {
+                                return RecordTauntCast(loose.Guid, nowMs);
+                            }
+                        }
+                        else if ((!me.Combat || attackingHealer) && PeelApproach.TryMove(paladinAlly, "Peeling for " + paladinAlly.Name))
+                        {
+                            return true;
+                        }
+                    }
+
+                    if (!mobInHandRange && (!me.Combat || attackingHealer) && PeelApproach.TryMove(loose, "Peeling " + loose.Name))
+                        return true;
                     continue;
                 }
 
                 bool canTauntThisMob = me.Class switch
                 {
                     WoWClass.Warrior =>
-                        (looseMobs.Count(u => u.Distance <= 9f) >= 2 && SpellManager.CanCast("Challenging Shout", me, false, false)) ||
+                        (unthrottledAreaCount >= 2 && SpellManager.CanCast("Challenging Shout", me, false, false)) ||
                         SpellManager.CanCast("Taunt", loose, false, false) ||
                         SpellManager.CanCast("Mocking Blow", loose, false, false),
                     WoWClass.Druid =>
-                        (looseMobs.Count(u => u.Distance <= 9f) >= 2 && SpellManager.CanCast("Challenging Roar", me, false, false)) ||
+                        (unthrottledAreaCount >= 2 && SpellManager.CanCast("Challenging Roar", me, false, false)) ||
                         SpellManager.CanCast("Growl", loose, false, false),
                     WoWClass.Paladin =>
                         SpellManager.CanCast("Hand of Reckoning", loose, false, false) ||
@@ -487,9 +589,10 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 if (!canTauntThisMob)
                     continue;
 
-                if (loose.Distance > 28f || !loose.InLineOfSpellSight)
+                if (loose.Distance > 30f || !loose.InLineOfSpellSight)
                 {
-                    if (PeelApproach.TryMove(loose, "Peeling " + loose.Name)) return true;
+                    if ((!me.Combat || attackingHealer) && PeelApproach.TryMove(loose, "Peeling " + loose.Name))
+                        return true;
                     continue;
                 }
 
@@ -502,37 +605,41 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 switch (me.Class)
                 {
                     case WoWClass.Warrior:
-                        if (looseMobs.Count(u => u.Distance <= 9f) >= 2 && SpellManager.CanCast("Challenging Shout", me, false, false))
-                            return SpellManager.Cast("Challenging Shout", me);
-                        if (SpellManager.CanCast("Taunt", loose, true, false))
-                            return SpellManager.Cast("Taunt", loose);
-                        if (loose.Distance <= 5.5f && SpellManager.CanCast("Mocking Blow", loose, true, false))
-                            return SpellManager.Cast("Mocking Blow", loose);
+                        if (unthrottledAreaCount >= 2 && SpellManager.CanCast("Challenging Shout", me, false, false) &&
+                            SpellManager.Cast("Challenging Shout", me))
+                            return RecordAreaTauntCast(looseMobs, nowMs);
+                        if (SpellManager.CanCast("Taunt", loose, true, false) && SpellManager.Cast("Taunt", loose))
+                            return RecordTauntCast(loose.Guid, nowMs);
+                        if (loose.Distance <= 5.5f && SpellManager.CanCast("Mocking Blow", loose, true, false) &&
+                            SpellManager.Cast("Mocking Blow", loose))
+                            return RecordTauntCast(loose.Guid, nowMs);
                         break;
 
                     case WoWClass.Druid:
-                        if (looseMobs.Count(u => u.Distance <= 9f) >= 2 && SpellManager.CanCast("Challenging Roar", me, false, false))
-                            return SpellManager.Cast("Challenging Roar", me);
-                        if (SpellManager.CanCast("Growl", loose, true, false))
-                            return SpellManager.Cast("Growl", loose);
+                        if (unthrottledAreaCount >= 2 && SpellManager.CanCast("Challenging Roar", me, false, false) &&
+                            SpellManager.Cast("Challenging Roar", me))
+                            return RecordAreaTauntCast(looseMobs, nowMs);
+                        if (SpellManager.CanCast("Growl", loose, true, false) && SpellManager.Cast("Growl", loose))
+                            return RecordTauntCast(loose.Guid, nowMs);
                         break;
 
                     case WoWClass.Paladin:
-                        if (SpellManager.CanCast("Hand of Reckoning", loose, true, false))
-                            return SpellManager.Cast("Hand of Reckoning", loose);
+                        if (SpellManager.CanCast("Hand of Reckoning", loose, true, false) && SpellManager.Cast("Hand of Reckoning", loose))
+                            return RecordTauntCast(loose.Guid, nowMs);
                         WoWUnit? attackedAlly = ObjectManager.GetObjectByGuid<WoWUnit>(loose.CurrentTargetGuid);
                         if (attackedAlly != null && attackedAlly.IsValid && !attackedAlly.Dead &&
-                            SpellManager.CanCast("Righteous Defense", attackedAlly, true, false))
+                            SpellManager.CanCast("Righteous Defense", attackedAlly, true, false) &&
+                            SpellManager.Cast("Righteous Defense", attackedAlly))
                         {
-                            return SpellManager.Cast("Righteous Defense", attackedAlly);
+                            return RecordTauntCast(loose.Guid, nowMs);
                         }
                         break;
 
                     case WoWClass.DeathKnight:
-                        if (SpellManager.CanCast("Dark Command", loose, true, false))
-                            return SpellManager.Cast("Dark Command", loose);
-                        if (SpellManager.CanCast("Death Grip", loose, true, false))
-                            return SpellManager.Cast("Death Grip", loose);
+                        if (SpellManager.CanCast("Dark Command", loose, true, false) && SpellManager.Cast("Dark Command", loose))
+                            return RecordTauntCast(loose.Guid, nowMs);
+                        if (SpellManager.CanCast("Death Grip", loose, true, false) && SpellManager.Cast("Death Grip", loose))
+                            return RecordTauntCast(loose.Guid, nowMs);
                         break;
                 }
             }

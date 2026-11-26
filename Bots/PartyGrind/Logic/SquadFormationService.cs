@@ -106,7 +106,34 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (tankDist > 0.25f && axial < tankDist)
                 axial = tankDist;
 
-            float maxMeleeReach = MathF.Max(radius, targetCombatReach + 2.83f);
+            float swingReach = MathF.Max(radius, targetCombatReach + 2.83f);
+            float meleeGateReach = MathF.Max(5.0f, targetCombatReach + 2.8333334f);
+            bool tankInsideMeleeGate = tankDist <= meleeGateReach;
+            float maxMeleeReach = totalMeleeCount > 1 && tankDist > swingReach && tankInsideMeleeGate
+                ? MathF.Max(swingReach, meleeGateReach - 0.16f)
+                : swingReach;
+
+            if (tankInsideMeleeGate)
+            {
+                if (totalMeleeCount <= 1 && axial > meleeGateReach - 0.25f)
+                {
+                    float minNonAheadAxial = MathF.Max(0f, tankDist - 0.6f);
+                    axial = MathF.Max(minNonAheadAxial, meleeGateReach - 0.25f);
+                }
+                else if (totalMeleeCount > 1)
+                {
+                    float currentLateralLimit = axial < maxMeleeReach
+                        ? MathF.Sqrt(MathF.Max(0f, maxMeleeReach * maxMeleeReach - axial * axial))
+                        : 0f;
+                    if (currentLateralLimit < 0.8f)
+                    {
+                        float minNonAheadAxial = MathF.Max(0f, tankDist - 0.6f);
+                        float desiredAxial = MathF.Max(minNonAheadAxial, MathF.Min(axial, maxMeleeReach - 0.5f));
+                        axial = MathF.Min(axial, desiredAxial);
+                    }
+                }
+            }
+
             if (totalMeleeCount <= 1 && axial >= maxMeleeReach)
             {
                 lateral = 0f;
@@ -128,7 +155,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     lateral *= lateralLimit / maxPatternLateral;
             }
 
-            float z = tankDist > maxMeleeReach ? tankPos.Z : targetPos.Z;
+            float z = tankPos.Distance(targetPos) > meleeGateReach ? tankPos.Z : targetPos.Z;
             return new WoWPoint(
                 targetPos.X + ux * axial + px * lateral,
                 targetPos.Y + uy * axial + py * lateral,

@@ -198,5 +198,39 @@ namespace CopilotBuddy.PartyGrind.Tests
                 SquadTankBridge.GetPullSpellPriority(WoWClass.Warrior, isolatedTarget: false));
             Assert.Empty(SquadTankBridge.GetPullSpellPriority(WoWClass.Hunter, isolatedTarget: true));
         }
+
+        [Fact]
+        public void TankCombatTargetWeight_PenalizesDistantCastersOverNearbyMeleeMobs_ThrottlesTaunt_AndClearsDeadCoordinator()
+        {
+            double nearbyMeleeMob = SquadTankBridge.ComputeTankTargetBonus(
+                isTargetingNonTankPartyMember: false,
+                isTargetingHealer: false,
+                alreadyInCombatWithSquad: true,
+                distanceToTank: 4.5f,
+                tankInCombat: true);
+            double nearbyHealerPeel = SquadTankBridge.ComputeTankTargetBonus(
+                isTargetingNonTankPartyMember: true,
+                isTargetingHealer: true,
+                alreadyInCombatWithSquad: true,
+                distanceToTank: 6.0f,
+                tankInCombat: true);
+            double distantCasterHittingHealer = SquadTankBridge.ComputeTankTargetBonus(
+                isTargetingNonTankPartyMember: true,
+                isTargetingHealer: true,
+                alreadyInCombatWithSquad: true,
+                distanceToTank: 20.0f,
+                tankInCombat: true);
+
+            Assert.True(nearbyHealerPeel > nearbyMeleeMob);
+            Assert.True(nearbyMeleeMob > distantCasterHittingHealer);
+
+            Assert.False(SquadTankBridge.CanAttemptTauntPeel(lastGlobalTauntMs: 10000L, lastMobTauntMs: 0L, nowMs: 11500L));
+            Assert.False(SquadTankBridge.CanAttemptTauntPeel(lastGlobalTauntMs: 5000L, lastMobTauntMs: 9000L, nowMs: 12000L));
+            Assert.True(SquadTankBridge.CanAttemptTauntPeel(lastGlobalTauntMs: 5000L, lastMobTauntMs: 5000L, nowMs: 10000L));
+
+            Assert.True(CopilotBuddy.Bots.PartyGrind.PartyGrindBot.ShouldClearCoordinatorTargetsWhenDead(isDead: true, isGhost: false));
+            Assert.True(CopilotBuddy.Bots.PartyGrind.PartyGrindBot.ShouldClearCoordinatorTargetsWhenDead(isDead: false, isGhost: true));
+            Assert.False(CopilotBuddy.Bots.PartyGrind.PartyGrindBot.ShouldClearCoordinatorTargetsWhenDead(isDead: false, isGhost: false));
+        }
     }
 }

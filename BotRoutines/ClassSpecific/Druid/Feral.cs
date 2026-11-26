@@ -666,7 +666,7 @@ namespace Singular.ClassSpecific.Druid
                            StyxWoW.Me.CurrentTarget.Distance >= 10 &&
                            StyxWoW.Me.CurrentTarget.Distance <= 23),
                 Spell.Cast("Dash",
-                           ret => Settings.CatRaidDash && StyxWoW.Me.CurrentTarget.Distance > Spell.MeleeRange + 2f),
+                           ret => Settings.CatRaidDash && !Styx.PartyGrind.SquadContext.IsDungeonModeActive && StyxWoW.Me.CurrentTarget.Distance > Spell.MeleeRange + 2f),
                 Spell.BuffSelf("Barkskin", ret => (StyxWoW.Me.HealthPercent <= 40 && EnemyUnitsPvP.Count == 2) ||
                                                   (StyxWoW.Me.HealthPercent <= 70 && EnemyUnitsPvP.Count > 2) ||
                                                   (StyxWoW.Me.HealthPercent <= 30 && EnemyUnitsPvP.Count == 1)),
@@ -1192,7 +1192,7 @@ return Action.RAKE;*/
                 Common.CreateRaidCatHeal(),
                 Spell.BuffSelf("Cat Form"),
                 Spell.Cast("Dash",
-                           ret => Settings.CatRaidDash && StyxWoW.Me.CurrentTarget.Distance > Spell.MeleeRange + 2f),
+                           ret => Settings.CatRaidDash && !Styx.PartyGrind.SquadContext.IsDungeonModeActive && StyxWoW.Me.CurrentTarget.Distance > Spell.MeleeRange + 2f),
                 Spell.BuffSelf("Barkskin", ret => StyxWoW.Me.HealthPercent < Settings.FeralBarkskin),
                 Spell.BuffSelf("Survival Instincts", ret => StyxWoW.Me.HealthPercent < Settings.SurvivalInstinctsHealth),
                 /*Bases on Mew!*/

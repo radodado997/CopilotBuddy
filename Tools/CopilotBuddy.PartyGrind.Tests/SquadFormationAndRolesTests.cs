@@ -501,6 +501,51 @@ namespace CopilotBuddy.PartyGrind.Tests
                     Assert.True(fourPositions[i].Distance2D(fourPositions[j]) > 0.4f, $"4-melee slots {i} and {j} overlapped.");
                 }
             }
+
+            var tankAtSwingBoundary = new WoWPoint(4.329f, 0f, 0f);
+            var swingBoundaryPositions = new System.Collections.Generic.List<WoWPoint>();
+            for (int slot = 0; slot < 3; slot++)
+            {
+                WoWPoint pos = SquadFormationService.ComputeDungeonMeleePosition(
+                    mobPos,
+                    tankAtSwingBoundary,
+                    targetFacingRadians: 0f,
+                    meleeFlankRadius: 3.2f,
+                    meleeSlotIndex: slot,
+                    totalMeleeCount: 3,
+                    targetCombatReach: 1.5f);
+
+                Assert.False(SquadFormationService.IsPositionAheadOfTank(pos, mobPos, tankAtSwingBoundary));
+                Assert.True(pos.Distance2D(mobPos) <= 4.331f, $"Slot {slot} at 4.329f exceeded swing reach: {pos.Distance2D(mobPos):F2}");
+                swingBoundaryPositions.Add(pos);
+            }
+            Assert.True(swingBoundaryPositions[0].Distance2D(swingBoundaryPositions[1]) > 0.4f);
+            Assert.True(swingBoundaryPositions[0].Distance2D(swingBoundaryPositions[2]) > 0.4f);
+
+            var tankAtFiveYardGate = new WoWPoint(5.0f, 0f, 0f);
+            var gatePositions = new System.Collections.Generic.List<WoWPoint>();
+            for (int slot = 0; slot < 3; slot++)
+            {
+                WoWPoint pos = SquadFormationService.ComputeDungeonMeleePosition(
+                    mobPos,
+                    tankAtFiveYardGate,
+                    targetFacingRadians: 0f,
+                    meleeFlankRadius: 3.2f,
+                    meleeSlotIndex: slot,
+                    totalMeleeCount: 3,
+                    targetCombatReach: 1.5f);
+
+                Assert.False(SquadFormationService.IsPositionAheadOfTank(pos, mobPos, tankAtFiveYardGate));
+                Assert.True(pos.Distance2D(mobPos) <= 5.001f, $"Slot {slot} at 5.0f exceeded 5.0f melee gate: {pos.Distance2D(mobPos):F2}");
+                gatePositions.Add(pos);
+            }
+            Assert.True(gatePositions[0].Distance2D(gatePositions[1]) > 0.4f);
+            Assert.True(gatePositions[0].Distance2D(gatePositions[2]) > 0.4f);
+
+            var tankElevated = new WoWPoint(4.0f, 0f, 8.0f);
+            WoWPoint elevatedSlot = SquadFormationService.ComputeDungeonMeleePosition(
+                mobPos, tankElevated, targetFacingRadians: 0f, meleeFlankRadius: 3.2f, meleeSlotIndex: 0, totalMeleeCount: 1, targetCombatReach: 1.5f);
+            Assert.Equal(8.0f, elevatedSlot.Z, 2);
         }
 
         [Fact]
@@ -536,6 +581,14 @@ namespace CopilotBuddy.PartyGrind.Tests
             Assert.True(tightIsTankSide);
             Assert.Equal(meleePos, tightTarget);
 
+            var atFivePointOneFromUnsafeTarget = new WoWPoint(5.1f, 0f, 0f);
+            bool tightStepAtBoundary = CopilotBuddy.Bots.PartyGrind.PartyGrindBot.ResolveDungeonMeleeMoveTarget(
+                atFivePointOneFromUnsafeTarget, new WoWPoint(5.0f, 0f, 0f), true, mobPos, false, true, new WoWPoint(5.0f, 0f, 0f), 5.0f,
+                out WoWPoint boundaryTarget, out bool boundaryIsTankSide);
+            Assert.True(tightStepAtBoundary);
+            Assert.True(boundaryIsTankSide);
+            Assert.Equal(new WoWPoint(5.0f, 0f, 0f), boundaryTarget);
+
             var atTankWithinGate = new WoWPoint(9.0f, 0f, 0f);
             bool alignedFallback = CopilotBuddy.Bots.PartyGrind.PartyGrindBot.ResolveDungeonMeleeMoveTarget(
                 atTankWithinGate, tankWithinGate, false, mobPos, true, true, tankWithinGate, meleeGateReach,
@@ -562,6 +615,64 @@ namespace CopilotBuddy.PartyGrind.Tests
             Assert.True(CopilotBuddy.Bots.PartyGrind.PartyGrindBot.IsFailedDungeonMeleePrimaryActive(100UL, 5000L, 100UL, 3000L));
             Assert.False(CopilotBuddy.Bots.PartyGrind.PartyGrindBot.IsFailedDungeonMeleePrimaryActive(100UL, 5000L, 100UL, 5000L));
             Assert.False(CopilotBuddy.Bots.PartyGrind.PartyGrindBot.IsFailedDungeonMeleePrimaryActive(100UL, 5000L, 200UL, 3000L));
+        }
+
+        [Fact]
+        public void DungeonMeleeRangeAndFallbackAdd_ExcludeTrueOutOfRangeBand_AndPreventFreeze()
+        {
+            Assert.True(CopilotBuddy.Bots.PartyGrind.PartyGrindBot.IsDungeonMeleeInTrueSpellRange(4.8f, 1.5f, 1.5f));
+            Assert.False(CopilotBuddy.Bots.PartyGrind.PartyGrindBot.IsDungeonMeleeInTrueSpellRange(6.5f, 1.5f, 1.5f));
+            Assert.False(CopilotBuddy.Bots.PartyGrind.PartyGrindBot.IsDungeonMeleeInTrueSpellRange(8.3f, 1.5f, 1.5f));
+            Assert.True(CopilotBuddy.Bots.PartyGrind.PartyGrindBot.IsDungeonMeleeInTrueSpellRange(7.5f, 1.5f, 5.0f));
+
+            Assert.True(CopilotBuddy.Bots.PartyGrind.PartyGrindBot.CanSwitchDungeonMeleeToNearbyAdd(
+                primaryInMeleeRange: false,
+                tankKnown: true,
+                tankDistanceToPrimary: 18f,
+                primaryMeleeGateReach: 5.0f,
+                candidateDistanceToSelf: 4.0f,
+                candidateDistanceToTank: 4.5f));
+
+            Assert.False(CopilotBuddy.Bots.PartyGrind.PartyGrindBot.CanSwitchDungeonMeleeToNearbyAdd(
+                primaryInMeleeRange: true,
+                tankKnown: true,
+                tankDistanceToPrimary: 18f,
+                primaryMeleeGateReach: 5.0f,
+                candidateDistanceToSelf: 4.0f,
+                candidateDistanceToTank: 4.5f));
+
+            Assert.False(CopilotBuddy.Bots.PartyGrind.PartyGrindBot.CanSwitchDungeonMeleeToNearbyAdd(
+                primaryInMeleeRange: false,
+                tankKnown: true,
+                tankDistanceToPrimary: 4.5f,
+                primaryMeleeGateReach: 5.0f,
+                candidateDistanceToSelf: 4.0f,
+                candidateDistanceToTank: 4.5f));
+
+            Assert.False(CopilotBuddy.Bots.PartyGrind.PartyGrindBot.CanSwitchDungeonMeleeToNearbyAdd(
+                primaryInMeleeRange: false,
+                tankKnown: true,
+                tankDistanceToPrimary: 18f,
+                primaryMeleeGateReach: 5.0f,
+                candidateDistanceToSelf: 16.0f,
+                candidateDistanceToTank: 15.0f));
+
+            Assert.False(CopilotBuddy.Bots.PartyGrind.PartyGrindBot.CanSwitchDungeonMeleeToNearbyAdd(
+                primaryInMeleeRange: false,
+                tankKnown: true,
+                tankDistanceToPrimary: 18f,
+                primaryMeleeGateReach: 5.0f,
+                candidateDistanceToSelf: 6.0f,
+                candidateDistanceToTank: 14.0f));
+
+            Assert.True(CopilotBuddy.Bots.PartyGrind.PartyGrindBot.CanSwitchDungeonMeleeToNearbyAdd(
+                primaryInMeleeRange: false,
+                tankKnown: true,
+                tankDistanceToPrimary: 7.0f,
+                primaryMeleeGateReach: 5.0f,
+                candidateDistanceToSelf: 4.0f,
+                candidateDistanceToTank: 7.5f,
+                candidateMeleeGateReach: 8.33f));
         }
     }
 }
