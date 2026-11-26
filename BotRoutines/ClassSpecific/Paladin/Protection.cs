@@ -51,7 +51,13 @@ namespace Singular.ClassSpecific.Paladin
         public static Composite CreateProtectionPaladinCombat()
         {
             return new PrioritySelector(
-                ctx => TankManager.Instance.FirstUnit ?? StyxWoW.Me.CurrentTarget,
+                ctx => Styx.PartyGrind.SquadContext.IsActive &&
+                       StyxWoW.Me.CurrentTarget != null &&
+                       StyxWoW.Me.CurrentTarget.IsValid &&
+                       StyxWoW.Me.CurrentTarget.IsAlive &&
+                       StyxWoW.Me.CurrentTarget.Attackable
+                    ? StyxWoW.Me.CurrentTarget
+                    : (TankManager.Instance.FirstUnit ?? StyxWoW.Me.CurrentTarget),
                 Safers.EnsureTarget(),
                 Spell.WaitForCast(false),
                 Movement.CreateMoveToLosBehavior(),
@@ -84,9 +90,23 @@ namespace Singular.ClassSpecific.Paladin
 
                 Spell.Cast("Hand of Reckoning",
                     ret => TankManager.Instance.NeedToTaunt.FirstOrDefault(),
-                    ret => SingularSettings.Instance.EnableTaunting && StyxWoW.Me.IsInInstance),
+                    ret => SingularSettings.Instance.EnableTaunting && StyxWoW.Me.IsInInstance && !Styx.PartyGrind.SquadContext.IsActive),
 
                 Common.CreatePaladinCombatSelfHeal(),
+
+                new Decorator(
+                    ret => !SingularSettings.Instance.DisableAllMovement &&
+                           global::Bots.DungeonBuddy.Helpers.ScriptHelpers.MovementEnabled &&
+                           StyxWoW.Me.CurrentTarget != null &&
+                           StyxWoW.Me.CurrentTarget.IsValid &&
+                           StyxWoW.Me.CurrentTarget.IsAlive &&
+                           StyxWoW.Me.CurrentTarget.Attackable &&
+                           StyxWoW.Me.CurrentTarget.Distance > Spell.GetMeleeRange(StyxWoW.Me.CurrentTarget),
+                    new Action(ret =>
+                    {
+                        Styx.Logic.Pathing.Navigator.MoveTo(StyxWoW.Me.CurrentTarget.Location);
+                        return RunStatus.Failure;
+                    })),
 
                 //Multi target
                 new Decorator(
@@ -160,7 +180,7 @@ namespace Singular.ClassSpecific.Paladin
                     Spell.Cast(
                         "Hand of Reckoning",
                         ret => TankManager.Instance.NeedToTaunt.FirstOrDefault(),
-                        ret => SingularSettings.Instance.EnableTaunting && TankManager.Instance.NeedToTaunt.Count != 0),
+                        ret => SingularSettings.Instance.EnableTaunting && !Styx.PartyGrind.SquadContext.IsActive && TankManager.Instance.NeedToTaunt.Count != 0),
                     Spell.BuffSelf("Avenging Wrath"),
                     Spell.BuffSelf(
                         "Lay on Hands",

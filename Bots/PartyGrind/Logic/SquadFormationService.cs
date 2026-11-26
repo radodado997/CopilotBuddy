@@ -58,6 +58,128 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 targetPos.Z);
         }
 
+        public static WoWPoint ComputeDungeonMeleePosition(
+            WoWPoint targetPos,
+            WoWPoint tankPos,
+            float targetFacingRadians,
+            float meleeFlankRadius,
+            int meleeSlotIndex,
+            int totalMeleeCount,
+            float targetCombatReach = 1.5f)
+        {
+            float dx = tankPos.X - targetPos.X;
+            float dy = tankPos.Y - targetPos.Y;
+            float tankDist = MathF.Sqrt(dx * dx + dy * dy);
+
+            float ux;
+            float uy;
+            if (tankDist > 0.25f)
+            {
+                ux = dx / tankDist;
+                uy = dy / tankDist;
+            }
+            else
+            {
+                ux = MathF.Cos(targetFacingRadians);
+                uy = MathF.Sin(targetFacingRadians);
+            }
+
+            float px = -uy;
+            float py = ux;
+
+            float minReachRadius = MathF.Max(2.2f, targetCombatReach + 1.2f);
+            float safeMeleeReach = MathF.Max(minReachRadius, targetCombatReach + 2.2f);
+            float requestedRadius = MathF.Max(MathF.Max(totalMeleeCount >= 4 ? 3.4f : totalMeleeCount == 3 ? 3.0f : 2.2f, meleeFlankRadius), minReachRadius);
+            float radius = MathF.Min(requestedRadius, safeMeleeReach);
+
+            float[] offsetsDeg = totalMeleeCount switch
+            {
+                <= 1 => new[] { 0f },
+                2 => new[] { -30f, 30f },
+                _ => new[] { -35f, 35f, 0f, -55f, 55f }
+            };
+
+            float angleOffset = offsetsDeg[Math.Abs(meleeSlotIndex) % offsetsDeg.Length] * Deg2Rad;
+            float axial = MathF.Cos(angleOffset) * radius;
+            float lateral = MathF.Sin(angleOffset) * radius;
+
+            if (tankDist > 0.25f && axial < tankDist)
+                axial = tankDist;
+
+            float swingReach = MathF.Max(radius, targetCombatReach + 2.83f);
+            float meleeGateReach = MathF.Max(5.0f, targetCombatReach + 2.8333334f);
+            bool tankInsideMeleeGate = tankDist <= meleeGateReach;
+            float maxMeleeReach = totalMeleeCount > 1 && tankDist > swingReach && tankInsideMeleeGate
+                ? MathF.Max(swingReach, meleeGateReach - 0.16f)
+                : swingReach;
+
+            if (tankInsideMeleeGate)
+            {
+                if (totalMeleeCount <= 1 && axial > meleeGateReach - 0.25f)
+                {
+                    float minNonAheadAxial = MathF.Max(0f, tankDist - 0.6f);
+                    axial = MathF.Max(minNonAheadAxial, meleeGateReach - 0.25f);
+                }
+                else if (totalMeleeCount > 1)
+                {
+                    float currentLateralLimit = axial < maxMeleeReach
+                        ? MathF.Sqrt(MathF.Max(0f, maxMeleeReach * maxMeleeReach - axial * axial))
+                        : 0f;
+                    if (currentLateralLimit < 0.8f)
+                    {
+                        float minNonAheadAxial = MathF.Max(0f, tankDist - 0.6f);
+                        float desiredAxial = MathF.Max(minNonAheadAxial, MathF.Min(axial, maxMeleeReach - 0.5f));
+                        axial = MathF.Min(axial, desiredAxial);
+                    }
+                }
+            }
+
+            if (totalMeleeCount <= 1 && axial >= maxMeleeReach)
+            {
+                lateral = 0f;
+            }
+            else
+            {
+                float lateralLimit = axial < maxMeleeReach
+                    ? MathF.Sqrt(MathF.Max(0f, maxMeleeReach * maxMeleeReach - axial * axial))
+                    : 2.0f;
+                int activeSlotCount = Math.Min(Math.Max(1, totalMeleeCount), offsetsDeg.Length);
+                float maxPatternLateral = 0f;
+                for (int i = 0; i < activeSlotCount; i++)
+                {
+                    float candidateLateral = MathF.Abs(MathF.Sin(offsetsDeg[i] * Deg2Rad) * radius);
+                    if (candidateLateral > maxPatternLateral)
+                        maxPatternLateral = candidateLateral;
+                }
+                if (maxPatternLateral > lateralLimit && maxPatternLateral > 0.001f)
+                    lateral *= lateralLimit / maxPatternLateral;
+            }
+
+            float z = tankPos.Distance(targetPos) > meleeGateReach ? tankPos.Z : targetPos.Z;
+            return new WoWPoint(
+                targetPos.X + ux * axial + px * lateral,
+                targetPos.Y + uy * axial + py * lateral,
+                z);
+        }
+
+        public static bool IsPositionAheadOfTank(
+            WoWPoint position,
+            WoWPoint targetPos,
+            WoWPoint tankPos,
+            float tolerance = 0.75f)
+        {
+            float dx = tankPos.X - targetPos.X;
+            float dy = tankPos.Y - targetPos.Y;
+            float tankDist = MathF.Sqrt(dx * dx + dy * dy);
+            if (tankDist <= 0.25f)
+                return false;
+
+            float ux = dx / tankDist;
+            float uy = dy / tankDist;
+            float proj = (position.X - targetPos.X) * ux + (position.Y - targetPos.Y) * uy;
+            return proj < tankDist - tolerance;
+        }
+
         /// <summary>
         /// Computes a non-overlapping standoff position behind <paramref name="tankPos"/>
         /// for ranged DPS or Healers (typically 18–24 yd behind the tank, away from the active mob).

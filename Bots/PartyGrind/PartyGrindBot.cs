@@ -122,6 +122,10 @@ namespace CopilotBuddy.Bots.PartyGrind
         private WoWPoint _dungeonForcedStepObjective = WoWPoint.Zero;
         private ulong _dungeonForcedStepLeaderGuid;
         private long _dungeonForcedStepIssuedUtcMs;
+        private ulong _failedDungeonMeleeTargetGuid;
+        private long _failedDungeonMeleeUntilUtcMs;
+        private WoWPoint _failedDungeonMeleeDest = WoWPoint.Zero;
+        private bool _failedDungeonMeleeDirect;
         private long _packPullHoldSinceUtcMs;
         private uint _lastObservedMapId;
         private long _lastMapChangeUtcMs;
@@ -814,6 +818,15 @@ namespace CopilotBuddy.Bots.PartyGrind
                 }
             }
 
+            if (ShouldClearCoordinatorTargetsWhenDead(me.Dead, me.IsGhost))
+            {
+                _currentFocusGuid = 0UL;
+                _currentSecondaryGuid = 0UL;
+                _pullStartedUtcMs = 0L;
+                ClearPullCommit();
+                return;
+            }
+
             WoWUnit? focus = me.CurrentTarget;
             if (focus == null || !focus.IsValid || focus.Dead || focus.IsFriendly)
             {
@@ -892,8 +905,12 @@ namespace CopilotBuddy.Bots.PartyGrind
             }
             _currentFocusGuid = newFocusGuid;
 
+            var memberGuids = SquadContext.GetKnownMemberGuids();
             WoWUnit? secondary = Targeting.Instance.TargetList
-                .FirstOrDefault(u => u != null && u.IsValid && !u.Dead && u.Guid != _currentFocusGuid && (u.Combat || u.IsTargetingMyPartyMember));
+                .FirstOrDefault(u => u != null && u.IsValid && !u.Dead && u.CanSelect && u.Guid != _currentFocusGuid &&
+                    u.Combat &&
+                    (u.IsTargetingMyPartyMember || u.IsTargetingMeOrPet || u.TaggedByMe ||
+                     (u.CurrentTargetGuid != 0 && memberGuids.Contains(u.CurrentTargetGuid))));
             _currentSecondaryGuid = secondary?.Guid ?? 0UL;
         }
 
@@ -1941,6 +1958,192 @@ namespace CopilotBuddy.Bots.PartyGrind
             return (false, WoWPoint.Zero);
         }
 
+        internal static bool ShouldClearCoordinatorTargetsWhenDead(bool isDead, bool isGhost)
+        {
+            return isDead || isGhost;
+        }
+
+        internal static float GetTrueDungeonMeleeReach(float selfCombatReach, float targetCombatReach, bool targetIsPlayer = false)
+        {
+            return targetIsPlayer ? 3.5f : MathF.Max(5f, selfCombatReach + 1.3333334f + targetCombatReach);
+        }
+
+        internal static bool IsDungeonMeleeInTrueSpellRange(float distanceToTarget, float selfCombatReach, float targetCombatReach, bool targetIsPlayer = false)
+        {
+            return distanceToTarget <= GetTrueDungeonMeleeReach(selfCombatReach, targetCombatReach, targetIsPlayer);
+        }
+
+        internal static bool CanSwitchDungeonMeleeToNearbyAdd(
+            bool primaryInMeleeRange,
+            bool tankKnown,
+            float tankDistanceToPrimary,
+            float primaryMeleeGateReach,
+            float candidateDistanceToSelf,
+            float candidateDistanceToTank,
+            float candidateMeleeGateReach = 0f)
+        {
+            if (primaryInMeleeRange)
+                return false;
+            if (!tankKnown || tankDistanceToPrimary <= primaryMeleeGateReach)
+                return false;
+            float addGate = candidateMeleeGateReach > 0f ? candidateMeleeGateReach : primaryMeleeGateReach;
+            return candidateDistanceToSelf <= addGate || candidateDistanceToTank <= addGate;
+        }
+
+        private static bool TrySelectNearbyEngagedDungeonAdd(
+            LocalPlayer me,
+            bool tankKnown,
+            WoWPoint tankPos,
+            SquadLeaderState? leader,
+            ulong primaryGuid,
+            float tankDistToPrimary,
+            float primaryMeleeGateReach,
+            out WoWUnit? selectedAdd)
+        {
+            selectedAdd = null;
+            if (!tankKnown || tankDistToPrimary <= primaryMeleeGateReach)
+                return false;
+
+            WoWUnit? best = null;
+            float bestDist = float.MaxValue;
+            var memberGuids = SquadContext.GetKnownMemberGuids();
+
+            void ConsiderCandidate(WoWUnit? candidate)
+            {
+                if (candidate == null || !candidate.IsValid || candidate.Dead || !candidate.CanSelect || candidate.Guid == primaryGuid)
+                    return;
+                if (!candidate.Attackable || candidate.IsFriendly || candidate.IsPlayer)
+                    return;
+                bool engagedWithSquad = candidate.Combat &&
+                                        (candidate.IsTargetingMyPartyMember ||
+                                         candidate.IsTargetingMeOrPet ||
+                                         candidate.TaggedByMe ||
+                                         (candidate.CurrentTargetGuid != 0 && memberGuids.Contains(candidate.CurrentTargetGuid)));
+                if (!engagedWithSquad)
+                    return;
+
+                float distSelf = (float)candidate.Distance;
+                float distTank = (float)candidate.Location.Distance(tankPos);
+                float candidateGate = GetTrueDungeonMeleeReach(me.CombatReach, candidate.CombatReach, candidate.IsPlayer);
+                if (!CanSwitchDungeonMeleeToNearbyAdd(false, tankKnown, tankDistToPrimary, primaryMeleeGateReach, distSelf, distTank, candidateGate))
+                    return;
+                if (distSelf >= bestDist)
+                    return;
+                if (global::Bots.DungeonBuddy.Avoidance.AvoidanceManager.IsInAvoidance(candidate.Location))
+                    return;
+                if (distSelf > candidateGate && !Navigator.CanNavigateFully(me.Location, candidate.Location))
+                    return;
+
+                best = candidate;
+                bestDist = distSelf;
+            }
+
+            if (leader != null && leader.SecondaryTargetGuid != 0 && leader.SecondaryTargetGuid != primaryGuid)
+                ConsiderCandidate(ObjectManager.GetObjectByGuid<WoWUnit>(leader.SecondaryTargetGuid));
+
+            foreach (WoWUnit unit in Targeting.Instance.TargetList)
+                ConsiderCandidate(unit);
+
+            selectedAdd = best;
+            return selectedAdd != null;
+        }
+
+        internal static bool ShouldBlockDungeonMeleeRoutineFromRange(bool inDungeon, bool isMelee, bool isWithinMeleeRange)
+        {
+            return inDungeon && isMelee && !isWithinMeleeRange;
+        }
+
+        internal static bool ResolveDungeonMeleeMoveTarget(
+            WoWPoint myLocation,
+            WoWPoint meleePos,
+            bool safeMeleePos,
+            WoWPoint targetLocation,
+            bool safeTargetPos,
+            bool tankKnown,
+            WoWPoint tankLocation,
+            float meleeGateReach,
+            out WoWPoint moveTarget,
+            out bool isTankSideMove)
+        {
+            const float ArrivalTolerance = 0.8f;
+            const float TightArrivalTolerance = 0.05f;
+
+            if (safeMeleePos && myLocation.Distance(meleePos) > ArrivalTolerance)
+            {
+                moveTarget = meleePos;
+                isTankSideMove = true;
+                return true;
+            }
+
+            bool holdBehindApproachingTank = tankKnown && tankLocation.Distance(targetLocation) > meleeGateReach;
+            if (!holdBehindApproachingTank && safeTargetPos && myLocation.Distance(targetLocation) > ArrivalTolerance)
+            {
+                moveTarget = targetLocation;
+                isTankSideMove = false;
+                return true;
+            }
+
+            if (!holdBehindApproachingTank && safeMeleePos && myLocation.Distance(meleePos) > TightArrivalTolerance)
+            {
+                moveTarget = meleePos;
+                isTankSideMove = true;
+                return true;
+            }
+
+            moveTarget = WoWPoint.Empty;
+            isTankSideMove = false;
+            return false;
+        }
+
+        internal static bool HasUnreachableDungeonMeleeApproach(bool safeMeleePos, bool safeTargetPos, MoveResult lastMoveResult)
+        {
+            if (!safeMeleePos && !safeTargetPos)
+                return true;
+
+            return lastMoveResult == MoveResult.PathGenerationFailed || lastMoveResult == MoveResult.Failed;
+        }
+
+        internal static bool IsFailedDungeonMeleePrimaryActive(ulong failedTargetGuid, long failedUntilUtcMs, ulong targetGuid, long nowUtcMs)
+        {
+            return failedTargetGuid != 0UL && failedTargetGuid == targetGuid && nowUtcMs < failedUntilUtcMs;
+        }
+
+        private static bool TryResolveSafeDungeonMeleePosition(
+            LocalPlayer me,
+            WoWUnit combatTarget,
+            bool tankKnown,
+            WoWPoint tankPosForEngage,
+            float meleeFlankRadius,
+            float meleeGateReach,
+            int slotIdx,
+            int slotCount,
+            bool bypassFailedDest,
+            WoWPoint failedDest,
+            out WoWPoint meleePos)
+        {
+            meleePos = tankKnown
+                ? SquadFormationService.ComputeDungeonMeleePosition(
+                    combatTarget.Location, tankPosForEngage, combatTarget.Rotation, meleeFlankRadius, slotIdx, slotCount, combatTarget.CombatReach)
+                : combatTarget.Location;
+            bool slotFailed = bypassFailedDest && meleePos.DistanceSqr(failedDest) <= 1.0f;
+            bool withinGate = !tankKnown ||
+                              combatTarget.Location.Distance(tankPosForEngage) > meleeGateReach ||
+                              combatTarget.Location.Distance(meleePos) <= meleeGateReach;
+            bool safePos = !slotFailed &&
+                           withinGate &&
+                           !global::Bots.DungeonBuddy.Avoidance.AvoidanceManager.IsInAvoidance(meleePos) &&
+                           Navigator.CanNavigateFully(me.Location, meleePos);
+            bool tankFailed = bypassFailedDest && tankPosForEngage.DistanceSqr(failedDest) <= 1.0f;
+            if (!safePos && tankKnown && !tankFailed &&
+                !global::Bots.DungeonBuddy.Avoidance.AvoidanceManager.IsInAvoidance(tankPosForEngage) &&
+                Navigator.CanNavigateFully(me.Location, tankPosForEngage))
+            {
+                meleePos = tankPosForEngage;
+                safePos = true;
+            }
+            return safePos;
+        }
+
         internal static bool CanFollowerEngageFocus(
             bool meInCombat,
             bool leaderInCombat,
@@ -2156,41 +2359,254 @@ namespace CopilotBuddy.Bots.PartyGrind
                                                me.CurrentTarget.Combat &&
                                                !me.CurrentTarget.IsFriendly &&
                                                (me.IsCasting || me.ChanneledCastingSpellId != 0 || _activeCombatRoutine != null);
-                if (me.CurrentTargetGuid != focus.Guid && !currentTargetIsValidAdd)
-                    focus.Target();
-
-                if (me.GotAlivePet)
-                {
-                    WoWPetControl.Attack(focus);
-                }
-
                 var (slotIdx, slotCount) = SquadFormationService.ResolveSubRoleSlot(me.Name ?? string.Empty, settings.Role, leader);
+                ulong combatGuid = focus.Guid;
+                WoWUnit petTarget = focus;
                 if (isMelee)
                 {
-                    bool canFlank = _activeCombatRoutine == null &&
-                                    (!SquadContext.IsDungeonModeActive || global::Bots.DungeonBuddy.Helpers.ScriptHelpers.MovementEnabled);
-                    if (canFlank && focus.Distance <= 12f && !focus.IsWithinMeleeRange)
+                    bool inDungeon = SquadContext.IsDungeonModeActive && SquadDungeonService.IsInDungeonMap(me);
+                    if (inDungeon)
                     {
-                        WoWPoint flankPos = SquadFormationService.ComputeMeleeFlankPosition(
-                            focus.Location, focus.Rotation, settings.MeleeFlankRadius, slotIdx, slotCount, focus.CombatReach);
-                        bool safeFlank = !SquadContext.IsDungeonModeActive ||
-                                         (!global::Bots.DungeonBuddy.Avoidance.AvoidanceManager.IsInAvoidance(flankPos) &&
-                                          Navigator.CanNavigateFully(me.Location, flankPos));
-                        if (safeFlank && me.Location.Distance2D(flankPos) > 2.2f)
+                        var memberGuids = SquadContext.GetKnownMemberGuids();
+                        WoWUnit? currentUnit = me.CurrentTarget;
+                        bool keepCurrentEngagedAdd = currentUnit != null &&
+                                                     currentUnit.IsValid &&
+                                                     !currentUnit.Dead &&
+                                                     currentUnit.CanSelect &&
+                                                     currentUnit.Attackable &&
+                                                     !currentUnit.IsFriendly &&
+                                                     !currentUnit.IsPlayer &&
+                                                     currentUnit.Guid != focus.Guid &&
+                                                     currentUnit.Combat &&
+                                                     (currentUnit.IsTargetingMyPartyMember ||
+                                                      currentUnit.IsTargetingMeOrPet ||
+                                                      currentUnit.TaggedByMe ||
+                                                      (currentUnit.CurrentTargetGuid != 0 && memberGuids.Contains(currentUnit.CurrentTargetGuid))) &&
+                                                     (currentTargetIsValidAdd ||
+                                                      (!IsDungeonMeleeInTrueSpellRange((float)focus.Distance, me.CombatReach, focus.CombatReach, focus.IsPlayer) &&
+                                                       tankKnown &&
+                                                       tankPosForEngage.Distance(focus.Location) > GetTrueDungeonMeleeReach(me.CombatReach, focus.CombatReach, focus.IsPlayer) &&
+                                                       (IsDungeonMeleeInTrueSpellRange((float)currentUnit.Distance, me.CombatReach, currentUnit.CombatReach, currentUnit.IsPlayer) ||
+                                                        ((currentUnit.Location.Distance(tankPosForEngage) <= GetTrueDungeonMeleeReach(me.CombatReach, currentUnit.CombatReach, currentUnit.IsPlayer)) &&
+                                                         !global::Bots.DungeonBuddy.Avoidance.AvoidanceManager.IsInAvoidance(currentUnit.Location) &&
+                                                         Navigator.CanNavigateFully(me.Location, currentUnit.Location)))));
+
+                        WoWUnit combatTarget = keepCurrentEngagedAdd && currentUnit != null ? currentUnit : focus;
+                        float meleeGateReach = GetTrueDungeonMeleeReach(me.CombatReach, combatTarget.CombatReach, combatTarget.IsPlayer);
+                        bool inTrueMelee = IsDungeonMeleeInTrueSpellRange((float)combatTarget.Distance, me.CombatReach, combatTarget.CombatReach, combatTarget.IsPlayer);
+                        if (!inTrueMelee && tankKnown && combatTarget.Guid == focus.Guid &&
+                            TrySelectNearbyEngagedDungeonAdd(
+                                me,
+                                tankKnown,
+                                tankPosForEngage,
+                                leader,
+                                combatTarget.Guid,
+                                (float)tankPosForEngage.Distance(combatTarget.Location),
+                                meleeGateReach,
+                                out WoWUnit? nearbyAdd) &&
+                            nearbyAdd != null)
                         {
-                            SquadPartySyncService.LogAction("Moving to flank " + focus.Name);
-                            Navigator.MoveTo(flankPos, "Flanking " + focus.Name);
+                            combatTarget = nearbyAdd;
+                        }
+
+                        if (me.CurrentTargetGuid != combatTarget.Guid)
+                            combatTarget.Target();
+
+                        if (me.CurrentTargetGuid != combatTarget.Guid && combatTarget.Guid != focus.Guid)
+                        {
+                            combatTarget = focus;
+                            if (me.CurrentTargetGuid != combatTarget.Guid)
+                                combatTarget.Target();
+                        }
+
+                        combatGuid = combatTarget.Guid;
+                        petTarget = combatTarget;
+                        meleeGateReach = GetTrueDungeonMeleeReach(me.CombatReach, combatTarget.CombatReach, combatTarget.IsPlayer);
+                        inTrueMelee = IsDungeonMeleeInTrueSpellRange((float)combatTarget.Distance, me.CombatReach, combatTarget.CombatReach, combatTarget.IsPlayer);
+
+                        if (me.GotAlivePet)
+                        {
+                            WoWPetControl.Attack(petTarget);
+                        }
+
+                        bool canMove = global::Bots.DungeonBuddy.Helpers.ScriptHelpers.MovementEnabled;
+                        if (ShouldBlockDungeonMeleeRoutineFromRange(inDungeon, isMelee, inTrueMelee))
+                        {
+                            if (canMove)
+                            {
+                                long nowUtcMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                                bool bypassPrimary = IsFailedDungeonMeleePrimaryActive(
+                                    _failedDungeonMeleeTargetGuid,
+                                    _failedDungeonMeleeUntilUtcMs,
+                                    combatTarget.Guid,
+                                    nowUtcMs);
+                                bool bypassSlot = bypassPrimary && !_failedDungeonMeleeDirect;
+                                WoWPoint meleePos = combatTarget.Location;
+                                bool safePos = TryResolveSafeDungeonMeleePosition(
+                                    me,
+                                    combatTarget,
+                                    tankKnown,
+                                    tankPosForEngage,
+                                    settings.MeleeFlankRadius,
+                                    meleeGateReach,
+                                    slotIdx,
+                                    slotCount,
+                                    bypassSlot,
+                                    _failedDungeonMeleeDest,
+                                    out meleePos);
+                                if (!safePos)
+                                    meleePos = combatTarget.Location;
+
+                                bool directFailed = bypassPrimary && _failedDungeonMeleeDirect;
+                                bool safeTargetPos = !directFailed &&
+                                                     !global::Bots.DungeonBuddy.Avoidance.AvoidanceManager.IsInAvoidance(combatTarget.Location) &&
+                                                     Navigator.CanNavigateFully(me.Location, combatTarget.Location);
+                                if (ResolveDungeonMeleeMoveTarget(
+                                        me.Location,
+                                        meleePos,
+                                        safePos,
+                                        combatTarget.Location,
+                                        safeTargetPos,
+                                        tankKnown,
+                                        tankPosForEngage,
+                                        meleeGateReach,
+                                        out WoWPoint moveTarget,
+                                        out bool isTankSideMove))
+                                {
+                                    float movePrecision = isTankSideMove && me.Location.Distance(meleePos) <= 0.8f ? 0.05f : 0.75f;
+                                    SquadPartySyncService.LogAction(
+                                        (isTankSideMove ? "Moving to tank-side melee position " : "Moving to melee ") + combatTarget.Name);
+                                    MoveResult moveResult = Navigator.MoveTo(
+                                        moveTarget,
+                                        movePrecision,
+                                        (isTankSideMove ? "Dungeon melee position " : "Moving to ") + combatTarget.Name);
+
+                                    if (isTankSideMove && moveResult == MoveResult.ReachedDestination)
+                                    {
+                                        if (ResolveDungeonMeleeMoveTarget(
+                                                me.Location,
+                                                meleePos,
+                                                safeMeleePos: false,
+                                                combatTarget.Location,
+                                                safeTargetPos,
+                                                tankKnown,
+                                                tankPosForEngage,
+                                                meleeGateReach,
+                                                out WoWPoint fallbackTarget,
+                                                out _) &&
+                                            me.Location.Distance(fallbackTarget) > 0.8f)
+                                        {
+                                            SquadPartySyncService.LogAction("Moving to melee " + combatTarget.Name);
+                                            moveResult = Navigator.MoveTo(fallbackTarget, 0.75f, "Moving to " + combatTarget.Name);
+                                            if (moveResult == MoveResult.PathGenerationFailed || moveResult == MoveResult.Failed)
+                                            {
+                                                _failedDungeonMeleeTargetGuid = combatTarget.Guid;
+                                                _failedDungeonMeleeUntilUtcMs = nowUtcMs + 2500L;
+                                                _failedDungeonMeleeDirect = true;
+                                            }
+                                        }
+                                        else if (me.IsMoving)
+                                        {
+                                            WoWMovement.MoveStop();
+                                        }
+                                    }
+                                    else if (moveResult == MoveResult.PathGenerationFailed || moveResult == MoveResult.Failed)
+                                    {
+                                        _failedDungeonMeleeTargetGuid = combatTarget.Guid;
+                                        _failedDungeonMeleeUntilUtcMs = nowUtcMs + 2500L;
+                                        if (isTankSideMove)
+                                        {
+                                            _failedDungeonMeleeDest = moveTarget;
+                                            _failedDungeonMeleeDirect = false;
+                                        }
+                                        else
+                                        {
+                                            _failedDungeonMeleeDirect = true;
+                                        }
+                                    }
+                                    else if (isTankSideMove || _failedDungeonMeleeTargetGuid != combatTarget.Guid)
+                                    {
+                                        _failedDungeonMeleeTargetGuid = 0UL;
+                                        _failedDungeonMeleeDest = WoWPoint.Zero;
+                                        _failedDungeonMeleeDirect = false;
+                                    }
+
+                                    if (HasUnreachableDungeonMeleeApproach(safePos, safeTargetPos, moveResult) && me.IsMoving)
+                                    {
+                                        WoWMovement.MoveStop();
+                                    }
+                                }
+                                else if (me.IsMoving)
+                                {
+                                    WoWMovement.MoveStop();
+                                }
+                            }
                             return RunStatus.Success;
+                        }
+
+                        if (_activeCombatRoutine == null && canMove && tankKnown &&
+                            SquadFormationService.IsPositionAheadOfTank(me.Location, combatTarget.Location, tankPosForEngage) &&
+                            TryResolveSafeDungeonMeleePosition(
+                                me,
+                                combatTarget,
+                                tankKnown,
+                                tankPosForEngage,
+                                settings.MeleeFlankRadius,
+                                meleeGateReach,
+                                slotIdx,
+                                slotCount,
+                                bypassFailedDest: false,
+                                failedDest: WoWPoint.Zero,
+                                out WoWPoint aheadMeleePos) &&
+                            me.Location.Distance(aheadMeleePos) > 1.5f)
+                        {
+                            SquadPartySyncService.LogAction("Moving to tank-side melee position " + combatTarget.Name);
+                            MoveResult repositionResult = Navigator.MoveTo(aheadMeleePos, 0.75f, "Dungeon melee position " + combatTarget.Name);
+                            if (repositionResult != MoveResult.PathGenerationFailed && repositionResult != MoveResult.Failed)
+                                return RunStatus.Success;
+                        }
+                    }
+                    else
+                    {
+                        if (me.CurrentTargetGuid != focus.Guid && !currentTargetIsValidAdd)
+                            focus.Target();
+
+                        if (me.GotAlivePet)
+                        {
+                            WoWPetControl.Attack(petTarget);
+                        }
+
+                        bool canFlank = _activeCombatRoutine == null;
+                        if (canFlank && focus.Distance <= 12f && !focus.IsWithinMeleeRange)
+                        {
+                            WoWPoint flankPos = SquadFormationService.ComputeMeleeFlankPosition(
+                                focus.Location, focus.Rotation, settings.MeleeFlankRadius, slotIdx, slotCount, focus.CombatReach);
+                            if (me.Location.Distance2D(flankPos) > 2.2f &&
+                                Navigator.CanNavigateFully(me.Location, flankPos))
+                            {
+                                SquadPartySyncService.LogAction("Moving to flank " + focus.Name);
+                                MoveResult flankMoveResult = Navigator.MoveTo(flankPos, "Flanking " + focus.Name);
+                                if (flankMoveResult != MoveResult.PathGenerationFailed && flankMoveResult != MoveResult.Failed)
+                                    return RunStatus.Success;
+                            }
                         }
                     }
                 }
                 else
                 {
+                    if (me.CurrentTargetGuid != focus.Guid && !currentTargetIsValidAdd)
+                        focus.Target();
+
+                    if (me.GotAlivePet)
+                    {
+                        WoWPetControl.Attack(petTarget);
+                    }
+
                     if (PositionBackline(settings.RangedStandoffDistance, leader, me, focus))
                         return RunStatus.Success;
                 }
 
-                return RunRoutineCombat(focus.Guid);
+                return RunRoutineCombat(combatGuid);
             }
 
             return RunStatus.Failure;

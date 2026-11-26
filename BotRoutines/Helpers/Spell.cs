@@ -274,7 +274,7 @@ namespace Singular.Helpers
             var targetDistance = target.Distance;
             // RangeId 2 or melee range spell (or any 0-range ability on hostile target)
             if (rangeId == 2 || spell.IsMeleeSpell || (maxRange == 0 && (target.IsHostile || !target.IsFriendly)))
-                return targetDistance < MeleeRange || target.IsWithinMeleeRange;
+                return targetDistance <= GetMeleeRange(target);
             // RangeId 1 is "Self Only".
             if (rangeId == 1)
                 return true;
@@ -952,15 +952,22 @@ namespace Singular.Helpers
         {
             get
             {
-                // If we have no target... then give nothing.
                 if (StyxWoW.Me.CurrentTargetGuid == 0)
                     return 0f;
 
-                if (StyxWoW.Me.CurrentTarget.IsPlayer)
-                    return 3.5f;
-
-                return Math.Max(5f, StyxWoW.Me.CombatReach + 1.3333334f + StyxWoW.Me.CurrentTarget.CombatReach);
+                return GetMeleeRange(StyxWoW.Me.CurrentTarget);
             }
+        }
+
+        internal static float GetMeleeRange(WoWUnit target)
+        {
+            if (target == null)
+                return 0f;
+
+            if (target.IsPlayer)
+                return 3.5f;
+
+            return Math.Max(5f, StyxWoW.Me.CombatReach + 1.3333334f + target.CombatReach);
         }
 
         public static float SafeMeleeRange { get { return Math.Max(MeleeRange - 1f, 5f); } }
