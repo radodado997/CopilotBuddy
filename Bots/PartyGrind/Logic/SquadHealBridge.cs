@@ -126,6 +126,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         // control only when somebody actually needs a heal right now, never for top-ups.
         internal const double RoutineHealHandoffThreshold = 70.0;
         internal const double LowManaSpellSwapPercent = 45.0;
+        internal const double LowManaDpsHealFloor = 45.0;
         internal const long HealDuplicateWindowMs = 1500L;
         private static readonly Dictionary<ulong, (string Spell, long AtUtcMs)> _recentHealCasts = new();
 
@@ -175,6 +176,23 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 : healerManaPercent < 30.0 ? 50.0
                 : 60.0;
             return Math.Min(threshold, reserveCap);
+        }
+
+        /// <summary>
+        /// The routine heal behavior cannot be aimed, so only hand off when losing the target is
+        /// harmless: tank/self triage keeps the pull alive, everyone else is healed directly.
+        /// </summary>
+        internal static bool IsRoutineHandoffTargetAppropriate(
+            bool candidateIsTankHealTarget,
+            bool candidateIsSelf,
+            float localManaPercent,
+            SquadRole localRole)
+        {
+            if (!candidateIsTankHealTarget && !candidateIsSelf)
+                return false;
+            if (localManaPercent < LowManaSpellSwapPercent)
+                return false;
+            return localRole == SquadRole.Healer || localRole == SquadRole.HybridOffHeal || localRole == SquadRole.TankLeader;
         }
 
         internal static void RecordHealCast(ulong targetGuid, string? spellName, long nowUtcMs)
@@ -402,8 +420,16 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 // Stage 1: Try Routine's HealBehavior when level >= 10 and not in Hybrid emergency-only mode.
                 // The routine targets on its own thresholds (it happily heals 80-90% members), so it
                 // only takes over during combat and only when a target is genuinely low.
+                // The routine picks its own target from HealTargeting, so handing off for a non-tank
+                // member while the tank is hurt makes it heal the tank and drop the intended target.
                 bool routineHandoffAllowed = anyCombat &&
-                    priorityCandidate.HealthPercent < Math.Min(threshold, RoutineHealHandoffThreshold);
+                    priorityCandidate.HealthPercent < Math.Min(threshold, RoutineHealHandoffThreshold) &&
+                    IsRoutineHandoffTargetAppropriate(
+                        candidateIsTankHealTarget: leader?.Members?.Any(m =>
+                            m.Guid == priorityCandidate.Guid && m.Role == SquadRole.TankLeader) == true,
+                        candidateIsSelf: priorityCandidate.IsSelf,
+                        localManaPercent: (float)me.ManaPercent,
+                        localRole: settings.Role);
                 if (!routineHandoffAllowed)
                     StopActiveHealBehavior();
                 if (!triedRoutine && routineHandoffAllowed && !emergencyOnly && me.Level >= 10 &&
@@ -723,6 +749,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         {
             string? blockedSpell = null;
             bool lowMana = healerManaPercent < LowManaSpellSwapPercent;
+            bool worthCheapHeal = isTank || hp < LowManaDpsHealFloor;
 
             bool CanCastHeal(string spellName)
             {
@@ -742,11 +769,11 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     {
                         if (hp < 30.0 && CanCastHeal("Flash Heal"))
                             return ("Flash Heal", null);
-                        if (hp < (inCombat ? 70.0 : 60.0) && !hasAuraFromHealer("Renew") && CanCastHeal("Renew"))
+                        if (worthCheapHeal && hp < (inCombat ? 70.0 : 60.0) && !hasAuraFromHealer("Renew") && CanCastHeal("Renew"))
                             return ("Renew", null);
-                        if (hp < (inCombat ? 62.0 : 52.0) && CanCastHeal("Heal"))
+                        if (worthCheapHeal && hp < (inCombat ? 62.0 : 52.0) && CanCastHeal("Heal"))
                             return ("Heal", null);
-                        if (hp < (inCombat ? 62.0 : 52.0) && CanCastHeal("Lesser Heal"))
+                        if (worthCheapHeal && hp < (inCombat ? 62.0 : 52.0) && CanCastHeal("Lesser Heal"))
                             return ("Lesser Heal", null);
                         break;
                     }
@@ -787,7 +814,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     {
                         if (hp < 35.0 && CanCastHeal("Holy Shock"))
                             return ("Holy Shock", null);
-                        if (hp < (inCombat ? 70.0 : 55.0) && CanCastHeal("Flash of Light"))
+                        if (worthCheapHeal && hp < (inCombat ? 70.0 : 55.0) && CanCastHeal("Flash of Light"))
                             return ("Flash of Light", null);
                         break;
                     }
@@ -808,11 +835,11 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 case WoWClass.Druid:
                     if (lowMana)
                     {
-                        if (hp < (inCombat ? 70.0 : 60.0) && !hasAuraFromHealer("Rejuvenation") && CanCastHeal("Rejuvenation"))
+                        if (worthCheapHeal && hp < (inCombat ? 70.0 : 60.0) && !hasAuraFromHealer("Rejuvenation") && CanCastHeal("Rejuvenation"))
                             return ("Rejuvenation", null);
-                        if (hp < (inCombat ? 60.0 : 50.0) && CanCastHeal("Nourish"))
+                        if (worthCheapHeal && hp < (inCombat ? 60.0 : 50.0) && CanCastHeal("Nourish"))
                             return ("Nourish", null);
-                        if (hp < (inCombat ? 60.0 : 50.0) && CanCastHeal("Healing Touch"))
+                        if (worthCheapHeal && hp < (inCombat ? 60.0 : 50.0) && CanCastHeal("Healing Touch"))
                             return ("Healing Touch", null);
                         break;
                     }
@@ -838,9 +865,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     {
                         if (hp < 35.0 && CanCastHeal("Riptide"))
                             return ("Riptide", null);
-                        if (hp < (inCombat ? 68.0 : 58.0) && CanCastHeal("Lesser Healing Wave"))
+                        if (worthCheapHeal && hp < (inCombat ? 68.0 : 58.0) && CanCastHeal("Lesser Healing Wave"))
                             return ("Lesser Healing Wave", null);
-                        if (hp < (inCombat ? 58.0 : 48.0) && CanCastHeal("Healing Wave"))
+                        if (worthCheapHeal && hp < (inCombat ? 58.0 : 48.0) && CanCastHeal("Healing Wave"))
                             return ("Healing Wave", null);
                         break;
                     }

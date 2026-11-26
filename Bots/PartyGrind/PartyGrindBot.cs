@@ -88,6 +88,9 @@ namespace CopilotBuddy.Bots.PartyGrind
         private const float RestThreatRadius = 15f;
         private const float RestMeleeThreatRadius = 10f;
         private const long WorldTransitionGraceMs = 3000L;
+        private const long WorldReentryGraceMs = 4000L;
+        private const long DeathStateDebounceMs = 1200L;
+        private const long PullManaHoldMaxMs = 45000L;
         private const float DungeonForcedStepArrivalDistance = 2f;
         private const long IdleSnapshotIntervalMs = 5000L;
         private const int TerminalStateDeliveryTimeoutMs = 1000;
@@ -129,6 +132,12 @@ namespace CopilotBuddy.Bots.PartyGrind
         private long _packPullHoldSinceUtcMs;
         private uint _lastObservedMapId;
         private long _lastMapChangeUtcMs;
+        private bool _wasInWorld;
+        private long _worldReentryGraceUntilUtcMs;
+        private long _deathObservedSinceUtcMs;
+        private long _manaHoldSinceUtcMs;
+        private bool _pullManaHoldExpiredThisTick;
+        private float _healerManaPercentThisTick = 100f;
         private bool _lootFilterAttached;
         private bool _levelCapStopRequested;
         private SquadLeaderStateDelivery? _terminalStateDelivery;
@@ -261,6 +270,13 @@ namespace CopilotBuddy.Bots.PartyGrind
             _packPullHoldSinceUtcMs = 0;
             _lastObservedMapId = 0;
             _lastMapChangeUtcMs = 0;
+            _wasInWorld = false;
+            _worldReentryGraceUntilUtcMs = 0;
+            _deathObservedSinceUtcMs = 0;
+            _manaHoldSinceUtcMs = 0;
+            _pullManaHoldExpiredThisTick = false;
+            _healerManaPercentThisTick = 100f;
+            SquadTankBridge.ManaHoldExpired = false;
 
             try
             {
@@ -448,6 +464,7 @@ namespace CopilotBuddy.Bots.PartyGrind
             }
             else
             {
+                ResolvePullManaHoldExpired(SquadContext.GetLeaderStateSnapshot(), now);
                 PulseFollower(settings, localState, now);
             }
 
@@ -600,7 +617,9 @@ namespace CopilotBuddy.Bots.PartyGrind
         private void PulseCoordinator(SquadSettings settings, SquadMemberState localState, long now)
         {
             var snapshots = _ipcServer?.GetMemberSnapshots() ?? new List<SquadConnectedMemberSnapshot>();
-            _partySync.PulseCoordinatorPartySync(settings, snapshots);
+            ulong resetDanceOwnerGuid = _dungeon.ResetDanceInProgress ? localState.Guid :
+                _dungeon.IsResetPendingOutside ? SquadDungeonService.GetFollowerResetDanceOwner(snapshots) : 0UL;
+            _partySync.PulseCoordinatorPartySync(settings, snapshots, resetDanceOwnerGuid != 0);
 
             SquadProfileSnapshot profileSnap = CaptureProfileSnapshot(now);
             int hourlyResets = settings.BotMode == SquadBotMode.Dungeon ? _dungeon.GetHourlyResetCount(now) : 0;
@@ -631,6 +650,8 @@ namespace CopilotBuddy.Bots.PartyGrind
                 lockoutRemainingSeconds: lockoutRem,
                 resolveDungeon: level => _dungeon.CaptureSnapshot(settings, snapshots, level, now));
 
+            leaderState.DungeonResetDanceOwnerGuid = resetDanceOwnerGuid;
+            ResolvePullManaHoldExpired(leaderState, now);
             UpdateCoordinatorTargets(now, leaderState);
             leaderState.FocusTargetGuid = _currentFocusGuid;
             leaderState.SecondaryTargetGuid = _currentSecondaryGuid;
@@ -987,40 +1008,87 @@ namespace CopilotBuddy.Bots.PartyGrind
         internal static bool IsTransientWorldTransition(bool isInWorld, long mapChangeUtcMs, long nowUtcMs) =>
             !isInWorld || (mapChangeUtcMs > 0 && nowUtcMs - mapChangeUtcMs < WorldTransitionGraceMs);
 
+        internal static bool IsTransientWorldTransition(bool isInWorld, long mapChangeUtcMs, long reentryGraceUntilUtcMs, long nowUtcMs) =>
+            !isInWorld ||
+            nowUtcMs < reentryGraceUntilUtcMs ||
+            (mapChangeUtcMs > 0 && nowUtcMs - mapChangeUtcMs < WorldTransitionGraceMs);
+
+        internal static bool ShouldConfirmDeath(bool rawDead, bool transientTransition, long firstObservedUtcMs, long nowUtcMs) =>
+            rawDead &&
+            !transientTransition &&
+            firstObservedUtcMs > 0 &&
+            nowUtcMs - firstObservedUtcMs >= DeathStateDebounceMs;
+
+        private bool InWorldTransition(long nowUtcMs) =>
+            IsTransientWorldTransition(StyxWoW.IsInWorld, _lastMapChangeUtcMs, _worldReentryGraceUntilUtcMs, nowUtcMs);
+
+        private void TrackWorldPresence(long nowUtcMs)
+        {
+            bool inWorld = StyxWoW.IsInWorld;
+            if (inWorld && !_wasInWorld)
+                _worldReentryGraceUntilUtcMs = nowUtcMs + WorldReentryGraceMs;
+            _wasInWorld = inWorld;
+        }
+
+        private bool TrackConfirmedDeath(bool rawDead, bool transientTransition, long nowUtcMs)
+        {
+            if (!rawDead || transientTransition)
+            {
+                _deathObservedSinceUtcMs = 0;
+                return false;
+            }
+
+            if (_deathObservedSinceUtcMs == 0)
+                _deathObservedSinceUtcMs = nowUtcMs;
+
+            return ShouldConfirmDeath(true, false, _deathObservedSinceUtcMs, nowUtcMs);
+        }
+
         internal static bool ShouldDeferRest(bool hostileAggroNearby, bool hostileInMeleeRange, bool partyMemberInCombat) =>
             partyMemberInCombat || hostileAggroNearby || hostileInMeleeRange;
 
-        private static float LowestPartyManaPercent(SquadLeaderState? leader)
+        private bool ResolvePullManaHoldExpired(SquadLeaderState? leader, long now)
         {
-            if (leader?.Members == null)
-                return 100f;
+            float healerMana = SquadTankBridge.LowestHealerManaPercent(leader);
+            _healerManaPercentThisTick = healerMana;
 
-            float healerLowest = 100f;
-            float anyLowest = 100f;
-            bool sawHealer = false;
-
-            foreach (var member in leader.Members)
+            bool pullingPhase = leader == null ||
+                leader.Phase == SquadPhase.Grinding ||
+                leader.Phase == SquadPhase.DungeonClearing;
+            bool canPull = (SquadContext.ActiveSettings ?? SquadSettings.Instance).IsCoordinator && pullingPhase;
+            if (!canPull)
             {
-                if (!member.IsConnected || member.IsDead || member.IsGhost)
-                    continue;
-                bool usesMana = member.PowerType == WoWPowerType.Mana || member.Class == WoWClass.Druid;
-                if (!usesMana)
-                    continue;
-
-                float percent = member.Class == WoWClass.Druid && member.ManaPercent > 0f ? member.ManaPercent : member.PowerPercent;
-                if (percent < anyLowest)
-                    anyLowest = percent;
-
-                if (member.Role == SquadRole.Healer || member.Role == SquadRole.HybridOffHeal)
-                {
-                    sawHealer = true;
-                    if (percent < healerLowest)
-                        healerLowest = percent;
-                }
+                _manaHoldSinceUtcMs = 0;
+                _pullManaHoldExpiredThisTick = false;
+                SquadTankBridge.ManaHoldExpired = false;
+                return false;
             }
 
-            return sawHealer ? healerLowest : anyLowest;
+            if (healerMana >= SquadTankBridge.PullHealerManaFloor)
+            {
+                _manaHoldSinceUtcMs = 0;
+                _pullManaHoldExpiredThisTick = false;
+                SquadTankBridge.ManaHoldExpired = false;
+                return false;
+            }
+
+            if (_manaHoldSinceUtcMs == 0)
+            {
+                _manaHoldSinceUtcMs = now;
+                SquadPartySyncService.LogAction("Waiting for the healer to recover mana before pulling");
+            }
+
+            _pullManaHoldExpiredThisTick = now - _manaHoldSinceUtcMs >= PullManaHoldMaxMs;
+            SquadTankBridge.ManaHoldExpired = _pullManaHoldExpiredThisTick;
+            return _pullManaHoldExpiredThisTick;
         }
+
+        /// <summary>
+        /// Rest keeps priority until the pull-mana hold has expired on a critically dry healer:
+        /// after that, resting longer cannot save the run and the tank has to keep the instance moving.
+        /// </summary>
+        internal static bool ShouldYieldRestForPull(bool manaHoldExpired, bool localIsTank, float healerManaPercent) =>
+            manaHoldExpired && localIsTank && healerManaPercent < SquadTankBridge.PullManaEmergencyFloor;
 
         private static bool HostilesNearbyForRest(out bool aggro, out bool inMeleeRange)
         {
@@ -1285,8 +1353,9 @@ namespace CopilotBuddy.Bots.PartyGrind
                 _lastObservedMapId = me.MapId;
                 _lastMapChangeUtcMs = now;
             }
-            bool inWorldTransition = IsTransientWorldTransition(StyxWoW.IsInWorld, _lastMapChangeUtcMs, now);
-            bool isDead = me.Dead && !me.IsGhost && !inWorldTransition;
+            TrackWorldPresence(now);
+            bool inWorldTransition = InWorldTransition(now);
+            bool isDead = TrackConfirmedDeath(me.Dead && !me.IsGhost, inWorldTransition, now);
             bool isGhost = me.IsGhost && !inWorldTransition;
             bool insideDungeon = SquadDungeonService.IsInDungeonMap(me);
             if (isDead)
@@ -1314,13 +1383,20 @@ namespace CopilotBuddy.Bots.PartyGrind
             bool usesManaForDrinks = usesMana || isDruid;
             float restPowerPercent = isDruid && me.MaxMana > 0 ? (float)me.ManaPercent : (float)me.PowerPercent;
 
-            _localWasNeedingRest = !me.Combat && !isDead && !isGhost && !me.IsSwimming &&
-                SquadCoordinatorService.EvaluateRestHysteresis(
+            bool canEvaluateRest = !me.Combat && !isDead && !isGhost && !me.IsSwimming;
+            if (canEvaluateRest)
+            {
+                _localWasNeedingRest = SquadCoordinatorService.EvaluateRestHysteresis(
                     _localWasNeedingRest,
                     (float)me.HealthPercent,
                     restPowerPercent,
                     usesManaForDrinks,
                     settings);
+            }
+            else if (isDead || isGhost)
+            {
+                _localWasNeedingRest = false;
+            }
 
             ulong aggroGuid = 0UL;
             bool needsPeel = false;
@@ -1476,6 +1552,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                 ActiveSubProfileMaxLevel = currentSub?.MaxLevel ?? 85,
                 IsInsideDungeon = insideDungeon,
                 HasDungeonTelemetry = true,
+                DungeonResetDanceInProgress = _dungeon.ResetDanceInProgress,
                 CurrentLfgDungeonId = SquadContext.IsDungeonModeActive ? global::Bots.DungeonBuddy.LfgManager.CurrentLfgDungeonId : 0U,
                 LfgMode = SquadContext.IsDungeonModeActive ? SquadDungeonService.SafeGetLfgMode() : string.Empty,
                 LfgRoleCheckPending = SquadContext.IsDungeonModeActive && global::Bots.DungeonBuddy.LfgManager.RoleCheckPending,
@@ -1686,14 +1763,24 @@ namespace CopilotBuddy.Bots.PartyGrind
             if (me == null)
                 return RunStatus.Failure;
 
-            if (IsTransientWorldTransition(StyxWoW.IsInWorld, _lastMapChangeUtcMs, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()))
+            long behaviorNowUtcMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            if (InWorldTransition(behaviorNowUtcMs))
+            {
+                _deathObservedSinceUtcMs = 0;
                 return RunStatus.Failure;
+            }
 
             var settings = SquadContext.ActiveSettings ?? SquadSettings.Instance;
             var leader = SquadContext.GetLeaderStateSnapshot();
 
             if (!me.IsGhost)
             {
+                // A one-tick Dead flicker during a loading screen must not start a corpse run.
+                if (_deathObservedSinceUtcMs == 0)
+                    _deathObservedSinceUtcMs = behaviorNowUtcMs;
+                if (!ShouldConfirmDeath(true, false, _deathObservedSinceUtcMs, behaviorNowUtcMs))
+                    return RunStatus.Failure;
+
                 _diedInsideDungeon ??= SquadDungeonService.IsInDungeonMap(me);
                 if (_diedInsideDungeon == true && _deathDungeonId == 0)
                 {
@@ -2836,13 +2923,17 @@ namespace CopilotBuddy.Bots.PartyGrind
             return status == RunStatus.Failure ? RunStatus.Success : status;
         }
 
-        private static bool IsRestingPhaseActive()
+        private bool IsRestingPhaseActive()
         {
             var me = StyxWoW.Me;
             if (me == null || me.Combat || me.Dead || me.IsGhost || me.IsSwimming)
                 return false;
 
             var leader = SquadContext.GetLeaderStateSnapshot();
+            bool localIsTank = SquadContext.ActiveSettings?.Role == SquadRole.TankLeader;
+            if (ShouldYieldRestForPull(_pullManaHoldExpiredThisTick, localIsTank, _healerManaPercentThisTick))
+                return false;
+
             bool partyMemberInCombat = leader?.Members?.Any(m => m.Guid != me.Guid && m.IsConnected && !m.IsDead && !m.IsGhost && m.IsInCombat) == true;
             if (HostilesNearbyForRest(out bool hostileAggroNearby, out bool hostileInMeleeRange) &&
                 ShouldDeferRest(hostileAggroNearby, hostileInMeleeRange, partyMemberInCombat))
@@ -2919,7 +3010,18 @@ namespace CopilotBuddy.Bots.PartyGrind
                 return true;
 
             var leader = SquadContext.GetLeaderStateSnapshot();
-            return leader != null && leader.Phase == SquadPhase.Provisioning;
+            if (leader == null)
+                return false;
+            if (leader.Phase == SquadPhase.Provisioning)
+                return true;
+
+            // Inside a dungeon the phase is DungeonClearing, so an explicit assignment is the only
+            // signal that a mage/healer pair still owes a trade. Without this the dry healer never
+            // receives water and drains to "no water to drink" between pulls.
+            if (string.IsNullOrEmpty(leader.ActiveTradeTargetName))
+                return false;
+            return string.Equals(me.Name, leader.ActiveProvisionerName, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(me.Name, leader.ActiveTradeTargetName, StringComparison.OrdinalIgnoreCase);
         }
 
         private static bool IsLootNeeded()
@@ -3127,7 +3229,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                     }
 
                     bool followerCombat = leader?.Members?.Any(m => m.IsConnected && !m.IsDead && !m.IsGhost && m.IsInCombat) == true;
-                    if (!followerCombat && SquadTankBridge.CanInitiatePull(leader, settings.MaxPullGatherDistance))
+                    if (!followerCombat && SquadTankBridge.CanInitiatePull(leader, settings.MaxPullGatherDistance, _pullManaHoldExpiredThisTick))
                     {
                         WoWUnit? dungeonTarget = Targeting.Instance.FirstUnit;
                         if (dungeonTarget != null && dungeonTarget.IsValid && !dungeonTarget.Dead &&
@@ -3149,7 +3251,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                             int packSize = SquadTankBridge.CountPullPackSize(dungeonTarget);
                             if (SquadTankBridge.IsPackPullTooRisky(
                                     packSize,
-                                    LowestPartyManaPercent(leader),
+                                    SquadTankBridge.LowestHealerManaPercent(leader),
                                     now - _packPullHoldSinceUtcMs))
                             {
                                 if (startingPackHold)
@@ -3251,7 +3353,7 @@ namespace CopilotBuddy.Bots.PartyGrind
 
                 // 4. Ready to pull?
                 bool followerCombatGrind = leader?.Members?.Any(m => m.IsConnected && !m.IsDead && !m.IsGhost && m.IsInCombat) == true;
-                if (!followerCombatGrind && SquadTankBridge.CanInitiatePull(leader, settings.MaxPullGatherDistance))
+                if (!followerCombatGrind && SquadTankBridge.CanInitiatePull(leader, settings.MaxPullGatherDistance, _pullManaHoldExpiredThisTick))
                 {
                     WoWUnit? target = Targeting.Instance.TargetList.FirstOrDefault(u =>
                         u != null && u.IsValid && !u.Dead && u.Attackable && !u.IsFriendly &&

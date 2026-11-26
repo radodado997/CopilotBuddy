@@ -168,6 +168,7 @@ namespace Styx.PartyGrind.IPC
         public bool CanFly { get; set; }
         public bool IsMounted { get; set; }
         public int FreeBagSlots { get; set; }
+        public int DrinkCount { get; set; }
         public bool WantsFood { get; set; }
         public bool WantsDrink { get; set; }
         public bool WantsHealthstone { get; set; }
@@ -266,6 +267,9 @@ namespace Styx.PartyGrind.IPC
         public bool AcceptLfgProposalOrder { get; set; }
         public bool TeleportOutOrder { get; set; }
         public bool DungeonResetPendingOutside { get; set; }
+        public ulong DungeonResetDanceOwnerGuid { get; set; }
+        public ulong[] DungeonResetExitConfirmedGuids { get; set; } = Array.Empty<ulong>();
+        public long DungeonResetExitEvidenceValidUntilUtcMs { get; set; }
         public string LfgStatusText { get; set; } = string.Empty;
         public bool HasRandomPartyMembers { get; set; }
         public ulong EffectiveTankGuid { get; set; }
@@ -370,6 +374,7 @@ namespace Styx.PartyGrind.IPC
 
         public bool IsInsideDungeon { get; set; }
         public bool HasDungeonTelemetry { get; set; }
+        public bool DungeonResetDanceInProgress { get; set; }
         public uint CurrentLfgDungeonId { get; set; }
         public string LfgMode { get; set; } = string.Empty;
         public bool LfgRoleCheckPending { get; set; }

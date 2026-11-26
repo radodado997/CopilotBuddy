@@ -205,6 +205,9 @@ namespace Singular.Helpers
 
         #region Move Behind
 
+        internal const float RepositionAggroRadius = 8f;
+        private static WoWPoint _lastRepositionDestination = WoWPoint.Zero;
+
         /// <summary>
         ///   Creates a move behind target behavior. If it cannot fully navigate will move to target location
         /// </summary>
@@ -238,7 +241,46 @@ namespace Singular.Helpers
                             (StyxWoW.Me.CurrentTarget.CurrentTarget == null || 
                              StyxWoW.Me.CurrentTarget.CurrentTarget != StyxWoW.Me || 
                              StyxWoW.Me.CurrentTarget.Stunned),
-                    new Action(ret => { if (StyxWoW.Me.CurrentTarget != null) Navigator.MoveTo(CalculatePointBehindTarget()); }));
+                    new Action(ret =>
+                    {
+                        WoWUnit behindTarget = StyxWoW.Me.CurrentTarget;
+                        if (behindTarget == null)
+                            return RunStatus.Failure;
+
+                        WoWPoint destination = CalculatePointBehindTarget();
+                        if (!IsSafeRepositionPoint(behindTarget, destination))
+                        {
+                            StopOwnReposition();
+                            return RunStatus.Failure;
+                        }
+
+                        _lastRepositionDestination = destination;
+                        Navigator.MoveTo(destination);
+                        return RunStatus.Success;
+                    }));
+        }
+
+        /// <summary>
+        /// Cancels the reposition move only when the path we are walking is the one this
+        /// behavior started; movement requested by other behaviors stays untouched.
+        /// </summary>
+        private static void StopOwnReposition()
+        {
+            if (_lastRepositionDestination == WoWPoint.Zero)
+                return;
+
+            WoWPoint destination = _lastRepositionDestination;
+            _lastRepositionDestination = WoWPoint.Zero;
+
+            if (!StyxWoW.Me.IsMoving && Navigator.Destination == WoWPoint.Zero)
+                return;
+
+            WoWPoint current = Navigator.Destination;
+            if (current == WoWPoint.Zero || current.Distance(destination) > 1.5f)
+                return;
+
+            Navigator.Clear();
+            WoWMovement.MoveStop();
         }
 
         private static WoWPoint CalculatePointBehindTarget()
@@ -246,6 +288,35 @@ namespace Singular.Helpers
             return
                 StyxWoW.Me.CurrentTarget.Location.RayCast(
                     StyxWoW.Me.CurrentTarget.Rotation + WoWMathHelper.DegreesToRadians(150), Spell.MeleeRange - 2f);
+        }
+
+        /// <summary>
+        /// Keeps the move-behind step from dragging fresh trash: the destination must hug the
+        /// current target and must not sit inside the social-aggro radius of another hostile.
+        /// </summary>
+        internal static bool IsSafeRepositionPoint(WoWUnit target, WoWPoint destination)
+        {
+            if (target == null || destination == WoWPoint.Zero || float.IsNaN(destination.X) || float.IsNaN(destination.Y))
+                return false;
+
+            if (destination.Distance(target.Location) > Spell.MeleeRange + 1.5f)
+                return false;
+
+            foreach (WoWUnit other in ObjectManager.GetObjectsOfType<WoWUnit>(true, false))
+            {
+                if (other == null || !other.IsValid || other.Dead || other.Guid == target.Guid)
+                    continue;
+                if (!other.Attackable || other.IsFriendly || other.IsPlayer || other.IsCritter || other.IsNonCombatPet)
+                    continue;
+                if (other.ControllingPlayer != null)
+                    continue;
+                if (other.Combat || other.IsTargetingMyPartyMember)
+                    continue;
+                if (other.Location.Distance(destination) <= RepositionAggroRadius)
+                    return false;
+            }
+
+            return true;
         }
 
         #endregion

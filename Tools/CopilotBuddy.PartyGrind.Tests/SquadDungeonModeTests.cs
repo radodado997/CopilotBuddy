@@ -286,6 +286,44 @@ namespace CopilotBuddy.PartyGrind.Tests
         }
 
         [Fact]
+        public void WaterEmergency_RetainsEligibleMageAndReassignsWhenThatMageEntersCombat()
+        {
+            var coordinator = new SquadCoordinatorService();
+            var settings = CreateDungeonSettings();
+            settings.EnableMageProvisioning = true;
+            settings.MinMemberDrinkStack = 10;
+
+            var tank = MakeMemberState("TankA", 1UL, SquadRole.TankLeader, WoWClass.Warrior, 30, insideDungeon: true);
+            tank.IsInCombat = true;
+            var healer = MakeMemberState("HealB", 2UL, SquadRole.Healer, WoWClass.Priest, 30, insideDungeon: true);
+            healer.ManaPercent = 20f;
+            healer.DrinkCount = 2;
+            var first = MakeMemberState("DpsC", 3UL, SquadRole.DpsRanged, WoWClass.Mage, 30, insideDungeon: true);
+            var second = MakeMemberState("DpsD", 4UL, SquadRole.DpsRanged, WoWClass.Mage, 30, insideDungeon: true);
+            first.CanProvideMageDrink = second.CanProvideMageDrink = true;
+            first.DrinkCount = second.DrinkCount = 10;
+
+            SquadLeaderState Evaluate(long now) => coordinator.EvaluateTick(
+                settings, tank, [WrapClient(healer, now), WrapClient(first, now), WrapClient(second, now)],
+                new SquadProfileSnapshot(), 0, 0, 0, 0f, now, dungeon: new SquadDungeonSnapshot { IsInsideDungeon = true });
+
+            var assigned = Evaluate(10_000L);
+            Assert.Equal("DpsC", assigned.ActiveProvisionerName);
+            Assert.Equal("HealB", assigned.ActiveTradeTargetName);
+            var healerSummary = Assert.Single(assigned.Members, m => m.Guid == healer.Guid);
+            Assert.Equal(2, healerSummary.DrinkCount);
+            Assert.True(SquadProvisioningService.SquadWantsDrink(healerSummary, settings));
+
+            Assert.Equal("DpsC", Evaluate(11_000L).ActiveProvisionerName);
+
+            first.IsInCombat = true;
+            first.IsProvisioningBusy = true;
+            var reassigned = Evaluate(12_000L);
+            Assert.Equal("DpsD", reassigned.ActiveProvisionerName);
+            Assert.Equal("HealB", reassigned.ActiveTradeTargetName);
+        }
+
+        [Fact]
         public void PartialSquadWithPugs_DetectsRandomMembers_DelegatesPugTank_AndDisablesProvisioning()
         {
             var squadGuids = new HashSet<ulong> { 10UL, 11UL, 12UL };

@@ -108,6 +108,28 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             };
         }
 
+        internal static bool ClassUsesDrinks(WoWClass cls) =>
+            cls == WoWClass.Mage || cls == WoWClass.Priest || cls == WoWClass.Warlock ||
+            cls == WoWClass.Druid || cls == WoWClass.Shaman || cls == WoWClass.Paladin;
+
+        /// <summary>
+        /// Single drink-need definition shared by the coordinator (assignments) and the mage
+        /// (conjuring/trading). <see cref="EvaluateConsumableNeeds"/> returns <c>default</c> while
+        /// the local bag-slot or combat guard is tripped, so the published <c>WantsDrink</c> flag
+        /// alone would hide a dry member whose bag count is still below the target stack.
+        /// </summary>
+        public static bool SquadWantsDrink(SquadMemberSummary? member, SquadSettings settings)
+        {
+            return member != null &&
+                SquadWantsDrink(member.WantsDrink, member.FreeBagSlots, member.Class, member.DrinkCount, settings);
+        }
+
+        internal static bool SquadWantsDrink(bool wantsDrink, int freeBagSlots, WoWClass memberClass, int drinkCount, SquadSettings settings)
+        {
+            return wantsDrink ||
+                (freeBagSlots >= 2 && ClassUsesDrinks(memberClass) && drinkCount < settings.MinMemberDrinkStack);
+        }
+
         /// <summary>
         /// Selects the best non-soulbound bag item that satisfies <c>RequiredLevel &lt;= receiverLevel</c>.
         /// </summary>
@@ -562,7 +584,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                         string.Equals(m.CharacterName, _activeTradeTarget, StringComparison.OrdinalIgnoreCase));
                     int receiverLevel = targetSummary?.Level ?? me.Level;
                     bool wantFood = me.Class == WoWClass.Mage && settings.EnableMageProvisioning && SpellManager.HasSpell("Conjure Food") && (targetSummary?.WantsFood ?? false);
-                    bool wantDrink = me.Class == WoWClass.Mage && settings.EnableMageProvisioning && SpellManager.HasSpell("Conjure Water") && (targetSummary?.WantsDrink ?? false);
+                    bool wantDrink = me.Class == WoWClass.Mage && settings.EnableMageProvisioning && SpellManager.HasSpell("Conjure Water") &&
+                        SquadWantsDrink(targetSummary, settings);
                     bool wantHs = me.Class == WoWClass.Warlock && settings.EnableWarlockHealthstones && (targetSummary?.WantsHealthstone ?? false);
 
                     int tradeSlot = 1;
@@ -641,7 +664,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             var needers = members.Where(m =>
                 m.IsConnected && !m.IsDead && !m.IsGhost &&
                 !string.Equals(m.CharacterName, me.Name, StringComparison.OrdinalIgnoreCase) &&
-                (m.WantsFood || m.WantsDrink)).ToList();
+                (m.WantsFood || SquadWantsDrink(m, settings))).ToList();
 
             // At 70+, drop a Refreshment Table if Arcane Powder is available and >= 2 need food/drink.
             if (settings.UseRitualTablesWhenAvailable &&
@@ -692,7 +715,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             }
 
             // Ensure we have tradable water if receiver wants drink.
-            if (targetSummary.WantsDrink && FindTradableBagItem(me, receiverLevel, false, true, false) == null)
+            if (SquadWantsDrink(targetSummary, settings) && FindTradableBagItem(me, receiverLevel, false, true, false) == null)
             {
                 if (me.Level >= 75 && CanUseRefreshment(receiverLevel) && SpellManager.CanCast("Conjure Refreshment", me, false, false))
                 {
