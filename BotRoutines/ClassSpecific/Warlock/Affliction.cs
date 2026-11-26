@@ -66,11 +66,11 @@ namespace Singular.ClassSpecific.Warlock
                 Movement.CreateMoveToLosBehavior(),
                 Movement.CreateFaceTargetBehavior(),
                 Spell.WaitForCast(true),
-                Helpers.Common.CreateAutoAttack(true),
+                Helpers.Common.CreatePetAttack(),
                 // Apply our DoTs to open. Low-level warlocks (no Unstable Affliction until 68) get
                 // a castable opener via the shared helper instead of stalling with no attack.
                 CreateApplyAfflictionDotsBehavior(),
-                Movement.CreateMoveToTargetBehavior(true, 32f)
+                Movement.CreateMoveToTargetBehavior(true, 28f)
                 );
         }
 
@@ -84,8 +84,8 @@ namespace Singular.ClassSpecific.Warlock
                 Safers.EnsureTarget(),
                 Movement.CreateMoveToLosBehavior(),
                 Movement.CreateFaceTargetBehavior(),
-                Spell.WaitForCast(true),
-                Helpers.Common.CreateAutoAttack(true),
+                Spell.WaitForCastOrChannel(),
+                Helpers.Common.CreatePetAttack(),
                 Helpers.Common.CreateInterruptSpellCast(ret => StyxWoW.Me.CurrentTarget),
 
                 // Cooldowns
@@ -97,17 +97,17 @@ namespace Singular.ClassSpecific.Warlock
                             ret => Unit.NearbyUnfriendlyUnits.Count(u => u.DistanceSqr < 10 * 10 && StyxWoW.Me.IsSafelyFacing(u, 90)) >= 3),
 
                 Spell.BuffSelf("Howl of Terror", ret => Unit.NearbyUnfriendlyUnits.Count(u => u.DistanceSqr < 10 * 10) >= 3),
-                Spell.Buff("Fear", ret => Targeting.Instance.TargetList.ElementAtOrDefault(1), ret => !StyxWoW.Me.CurrentTarget.HasAura("Fear")),
+                Spell.Buff("Fear", ret => Targeting.Instance.TargetList.ElementAtOrDefault(1), ret => StyxWoW.Me.CurrentTarget != null && !StyxWoW.Me.CurrentTarget.HasAura("Fear")),
                 Spell.Buff("Fear", ret => StyxWoW.Me.HealthPercent < 80),
 
                 // Single target rotation — DoTs via the shared helper (see CreateApplyAfflictionDotsBehavior)
                 CreateApplyAfflictionDotsBehavior(),
                 // WotLK QC: Removed Soulburn aura check (Cata 4.0.1 — does not exist in WotLK)
                 Spell.Cast("Drain Life", ret => StyxWoW.Me.HealthPercent < 80),
-                Spell.Cast("Drain Soul", ret => StyxWoW.Me.CurrentTarget.HealthPercent < 25),
+                Spell.Cast("Drain Soul", ret => StyxWoW.Me.CurrentTarget != null && StyxWoW.Me.CurrentTarget.HealthPercent < 25),
                 Spell.Cast("Shadow Bolt"),
 
-                Movement.CreateMoveToTargetBehavior(true, 32f)
+                Movement.CreateMoveToTargetBehavior(true, 28f)
                 );
         }
 
@@ -126,8 +126,8 @@ namespace Singular.ClassSpecific.Warlock
                 Safers.EnsureTarget(),
                 Movement.CreateMoveToLosBehavior(),
                 Movement.CreateFaceTargetBehavior(),
-                Spell.WaitForCast(true),
-                Helpers.Common.CreateAutoAttack(true),
+                Spell.WaitForCastOrChannel(),
+                Helpers.Common.CreatePetAttack(),
                 Helpers.Common.CreateInterruptSpellCast(ret => StyxWoW.Me.CurrentTarget),
 
                 // Cooldowns
@@ -150,10 +150,10 @@ namespace Singular.ClassSpecific.Warlock
                 Spell.Buff("Unstable Affliction", true, ret => StyxWoW.Me.CurrentTarget.GetAuraTimeLeft("Unstable Affliction", true).TotalSeconds < 3, ""),
                 // WotLK QC: Removed Soulburn aura check (Cata 4.0.1 — does not exist in WotLK)
                 Spell.Cast("Drain Life", ret => StyxWoW.Me.HealthPercent < 80),
-                Spell.Cast("Drain Soul", ret => StyxWoW.Me.CurrentTarget.HealthPercent < 25),
+                Spell.Cast("Drain Soul", ret => StyxWoW.Me.CurrentTarget != null && StyxWoW.Me.CurrentTarget.HealthPercent < 25),
                 Spell.Cast("Shadow Bolt"),
 
-                Movement.CreateMoveToTargetBehavior(true, 32f)
+                Movement.CreateMoveToTargetBehavior(true, 28f)
                 );
         }
 
@@ -172,8 +172,8 @@ namespace Singular.ClassSpecific.Warlock
                 Safers.EnsureTarget(),
                 Movement.CreateMoveToLosBehavior(),
                 Movement.CreateFaceTargetBehavior(),
-                Spell.WaitForCast(true),
-                Helpers.Common.CreateAutoAttack(true),
+                Spell.WaitForCastOrChannel(),
+                Helpers.Common.CreatePetAttack(),
                 Helpers.Common.CreateInterruptSpellCast(ret => StyxWoW.Me.CurrentTarget),
 
                 // Cooldowns
@@ -199,10 +199,10 @@ namespace Singular.ClassSpecific.Warlock
                 Spell.Buff("Curse of Agony", true, ret => !StyxWoW.Me.CurrentTarget.IsBoss()),
                 Spell.Buff("Corruption", true),
                 Spell.Buff("Unstable Affliction", true, ret => StyxWoW.Me.CurrentTarget.GetAuraTimeLeft("Unstable Affliction", true).TotalSeconds < 3, ""),
-                Spell.Cast("Drain Soul", ret => StyxWoW.Me.CurrentTarget.HealthPercent < 25),
+                Spell.Cast("Drain Soul", ret => StyxWoW.Me.CurrentTarget != null && StyxWoW.Me.CurrentTarget.HealthPercent < 25),
                 Spell.Cast("Shadow Bolt"),
 
-                Movement.CreateMoveToTargetBehavior(true, 32f)
+                Movement.CreateMoveToTargetBehavior(true, 28f)
                 );
         }
 
