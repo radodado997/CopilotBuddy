@@ -179,7 +179,7 @@ namespace Singular.ClassSpecific.Druid
                         Spell.BuffSelf("Cat Form"),
                         Spell.BuffSelf("Prowl", ret => !StyxWoW.Me.IsInParty && StyxWoW.Me.CurrentTarget != null && StyxWoW.Me.CurrentTarget.DistanceSqr < 30 * 30),
                         Helpers.Common.CreateAutoAttack(true),
-                        Spell.Cast("Feral Charge - Cat"),
+                        Spell.Cast("Feral Charge - Cat", ret => !StyxWoW.Me.IsInParty && !StyxWoW.Me.IsInInstance),
                         Spell.Cast("Dash",
                             ret => StyxWoW.Me.CurrentTarget != null &&
                                    StyxWoW.Me.CurrentTarget.Distance > Spell.MeleeRange + 2f &&
@@ -237,7 +237,7 @@ namespace Singular.ClassSpecific.Druid
                     ret => StyxWoW.Me.Level < 46,
                     CreateFeralLevel2046Combat()),
 
-                Movement.CreateMoveBehindTargetBehavior(),
+                Movement.CreateMoveBehindTargetBehavior(ret => !Styx.PartyGrind.SquadContext.IsDungeonModeActive),
                 Spell.BuffSelf("Tiger's Fury"),
                 Spell.Cast("Ferocious Bite",
                     ret => StyxWoW.Me.ComboPoints > 1 && StyxWoW.Me.CurrentTarget != null && StyxWoW.Me.CurrentTarget.HealthPercent < 20),
@@ -282,7 +282,7 @@ namespace Singular.ClassSpecific.Druid
                 Spell.BuffSelf("Cat Form"),
                 Spell.BuffSelf("Prowl", ret => SpellManager.HasSpell("Pounce") && !StyxWoW.Me.IsInParty),
                 Helpers.Common.CreateAutoAttack(true),
-                Spell.Cast("Feral Charge - Cat"),				
+                Spell.Cast("Feral Charge - Cat", ret => !StyxWoW.Me.IsInParty && !StyxWoW.Me.IsInInstance),
 				Spell.Cast("Pounce"),
                 Spell.Cast("Shred", ret => StyxWoW.Me.CurrentTarget != null && StyxWoW.Me.CurrentTarget.MeIsBehind),
 				Spell.Buff("Rake", true, ret => StyxWoW.Me.CurrentTarget),
@@ -719,7 +719,7 @@ namespace Singular.ClassSpecific.Druid
                         Movement.CreateMoveToMeleeBehavior(true)
                         )
                     ),
-                Movement.CreateMoveBehindTargetBehavior(),
+                Movement.CreateMoveBehindTargetBehavior(ret => !Styx.PartyGrind.SquadContext.IsDungeonModeActive),
                 new Decorator(
                     ret => EnemyUnitsPvP.Count <
                            4,
@@ -1191,11 +1191,6 @@ return Action.RAKE;*/
                 new PrioritySelector(
                 Common.CreateRaidCatHeal(),
                 Spell.BuffSelf("Cat Form"),
-                Spell.Cast(
-                    "Feral Charge - Cat",
-                    ret => StyxWoW.Me.CurrentTarget.CanCharge() &&
-                           Settings.CatRaidUseFeralCharge && StyxWoW.Me.CurrentTarget.Distance >= 10 &&
-                           StyxWoW.Me.CurrentTarget.Distance <= 23),
                 Spell.Cast("Dash",
                            ret => Settings.CatRaidDash && StyxWoW.Me.CurrentTarget.Distance > Spell.MeleeRange + 2f),
                 Spell.BuffSelf("Barkskin", ret => StyxWoW.Me.HealthPercent < Settings.FeralBarkskin),
@@ -1259,7 +1254,7 @@ return Action.RAKE;*/
                         Movement.CreateMoveToMeleeBehavior(true)
                         )
                     ),
-                Movement.CreateMoveBehindTargetBehavior(),
+                Movement.CreateMoveBehindTargetBehavior(ret => !Styx.PartyGrind.SquadContext.IsDungeonModeActive),
                 new Decorator(
                     ret => EnemyUnits.Count <
                            SingularSettings.Instance.Druid.CatRaidAoe,
