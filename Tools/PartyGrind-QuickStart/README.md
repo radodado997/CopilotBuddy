@@ -56,8 +56,12 @@ Uwaga: `-Force` nadpisuje istniejący `PartyGrindSecrets.json` i ustawienia inst
 1. Uruchom klientów WoW i zaloguj się na postacie z listy.
 2. Uruchom `BOT_DIR\Start-PartyGrind.bat`.
 3. Skrypt pokaże tabelę procesów `Wow` z `Id`, `StartTime` i `MainWindowTitle`.
-   Wpisz PID odpowiadający każdej postaci. Tytuł okna służy tylko do rozpoznania —
-   bot wiąże się z wpisanym PID-em (`-pid=%PID1%` itd.).
+   Wpisz **wszystkie PID-y w jednej linii**, w kolejności postaci, np. `1111 2222 3333`
+   (spacje, przecinki lub średniki). Można też podać je od razu jako argumenty:
+   `Start-PartyGrind.bat 1111 2222 3333`. Tytuł okna służy tylko do rozpoznania —
+   bot wiąże się z wpisanym PID-em (`-pid=%PID1%` itd.). Liczba PID-ów musi się
+   zgadzać z liczbą klientów, a każdy PID musi być inny; launcher sprawdza to
+   jednym wywołaniem PowerShella i przy błędzie pyta ponownie.
 4. Launcher odpala najpierw koordynatora, potem (po 3 s) followerów. Przed zakończeniem
    pokazuje listę użytych PID-ów i czeka na naciśnięcie klawisza (`pause`) — dzięki temu
    widać ewentualny błąd, zamiast natychmiast zamykanego okna.

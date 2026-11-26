@@ -131,24 +131,18 @@ for ($i = 0; $i -lt $ClientCount; $i++) {
 # 3. Launcher. Character names, roles and the profile path come from the same
 #    parameters used above, so they cannot drift out of sync.
 $setLines = New-Object System.Text.StringBuilder
-$pidPromptLines = New-Object System.Text.StringBuilder
-$pidCheckLines = New-Object System.Text.StringBuilder
-$duplicateCheckLines = New-Object System.Text.StringBuilder
 $launchLines = New-Object System.Text.StringBuilder
+# PIDs are entered in one line ("1111 2222 3333"), or passed straight to the
+# .bat as arguments. %~1..%~5 are collected into one string for validation.
+$argSlots = New-Object System.Text.StringBuilder
+$pidReadLines = New-Object System.Text.StringBuilder
+$tokenLetters = @('a', 'b', 'c', 'd', 'e')
 
 for ($i = 0; $i -lt $ClientCount; $i++) {
     $n = $i + 1
     [void] $setLines.AppendLine(('set "NAME{0}={1}"' -f $n, $names[$i]))
     [void] $setLines.AppendLine(('set "ROLE{0}={1}"' -f $n, $roles[$i]))
-    [void] $pidPromptLines.AppendLine(('set /p PID{0}=WoW PID for {1} (Client{0}, {2}): ' -f $n, $names[$i], $roles[$i]))
-    [void] $pidCheckLines.AppendLine(('if "%PID{0}%"=="" goto :missing_pid' -f $n))
-    # Pass the value through an environment variable: this avoids for-variable
-    # substitution issues and is the same validation pattern the UI generates.
-    [void] $pidCheckLines.AppendLine(('powershell -NoProfile -Command "$p=0; if ([int]::TryParse($env:PID{0},[ref]$p) -and $p -gt 0) {{ exit 0 }}; exit 1"' -f $n))
-    [void] $pidCheckLines.AppendLine('if errorlevel 1 goto :bad_pid')
-    for ($j = 0; $j -lt $i; $j++) {
-        [void] $duplicateCheckLines.AppendLine(('if "%PID{0}%"=="%PID{1}%" goto :duplicate_pid' -f $n, ($j + 1)))
-    }
+    [void] $argSlots.Append((' %~{0}' -f $n))
 
     $isCoordinator = if ($i -eq 0) { 'true' } else { 'false' }
     [void] $launchLines.AppendLine(('echo Launching Client{0} ({1}, {2}) with WoW PID %PID{0}%' -f $n, $names[$i], $roles[$i]))
@@ -158,6 +152,60 @@ for ($i = 0; $i -lt $ClientCount; $i++) {
         [void] $launchLines.AppendLine('timeout /t 3 /nobreak >nul')
     }
 }
+
+# PIDs: one prompt for all clients (or straight from %~1..%~n), validated and
+# split into %PID1%..%PIDn% by a single PowerShell call, so the .bat stays short.
+$order = $names -join ', '
+[void] $pidReadLines.AppendLine('set "PID_OUT=%TEMP%\PartyGrind_pids_%RANDOM%.txt"')
+[void] $pidReadLines.AppendLine('set "FROM_ARGS="')
+[void] $pidReadLines.AppendLine('set "RAW="')
+[void] $pidReadLines.AppendLine('if not "%~1"=="" (')
+[void] $pidReadLines.AppendLine('    set "FROM_ARGS=1"')
+[void] $pidReadLines.AppendLine(('    set "RAW=%s"' -f $argSlots.ToString().TrimStart()))
+[void] $pidReadLines.AppendLine(')')
+[void] $pidReadLines.AppendLine('')
+[void] $pidReadLines.AppendLine(':PID_PROMPT')
+[void] $pidReadLines.AppendLine('if defined FROM_ARGS goto PID_VALIDATE')
+[void] $pidReadLines.AppendLine('echo.')
+[void] $pidReadLines.AppendLine(('echo PID order = client order: {0}' -f $order))
+[void] $pidReadLines.AppendLine('set "RAW="')
+[void] $pidReadLines.AppendLine(('set /p RAW=Enter {0} WoW PIDs (space or comma separated): ' -f $ClientCount))
+[void] $pidReadLines.AppendLine('')
+[void] $pidReadLines.AppendLine(':PID_VALIDATE')
+[void] $pidReadLines.AppendLine('if not defined RAW (')
+[void] $pidReadLines.AppendLine(('    echo [ERROR] Enter all {0} WoW PIDs on one line.' -f $ClientCount))
+[void] $pidReadLines.AppendLine('    set "FROM_ARGS="')
+[void] $pidReadLines.AppendLine('    goto PID_PROMPT')
+[void] $pidReadLines.AppendLine(')')
+[void] $pidReadLines.AppendLine('REM One check for the whole list: count, positive integers, no duplicates.')
+[void] $pidReadLines.AppendLine('powershell -NoProfile -Command ^')
+[void] $pidReadLines.AppendLine('  "$raw = @([string]$env:RAW -split ''[\s,;]+'' | Where-Object { $_ -ne '''' });" ^')
+[void] $pidReadLines.AppendLine(('  "if ($raw.Count -ne {0}) {{ Write-Host (''[ERROR] Expected {0} PIDs, got '' + $raw.Count + ''.''); exit 1 }};"' -f $ClientCount))
+[void] $pidReadLines.AppendLine('  "$pids = @(); foreach ($r in $raw) { $p = 0; if (-not [int]::TryParse($r, [ref]$p) -or $p -le 0) { Write-Host (''[ERROR] Not a valid PID: '' + $r); exit 1 }; $pids += $p };" ^')
+[void] $pidReadLines.AppendLine(('  "if (($pids | Sort-Object -Unique).Count -ne {0}) {{ Write-Host ''[ERROR] Every client needs a different WoW PID.''; exit 1 }};"' -f $ClientCount))
+[void] $pidReadLines.AppendLine('  "Set-Content -LiteralPath $env:PID_OUT -Value ($pids -join '' '') -Encoding ASCII"')
+[void] $pidReadLines.AppendLine('if errorlevel 1 (')
+[void] $pidReadLines.AppendLine('    set "RAW="')
+[void] $pidReadLines.AppendLine('    set "FROM_ARGS="')
+[void] $pidReadLines.AppendLine('    goto PID_PROMPT')
+[void] $pidReadLines.AppendLine(')')
+for ($i = 0; $i -lt $ClientCount; $i++) {
+    [void] $pidReadLines.AppendLine(('set "PID{0}="' -f ($i + 1)))
+}
+$tokens = (1..$ClientCount) -join ','
+[void] $pidReadLines.AppendLine(('for /f "usebackq tokens=%s" %%%%a in ("%%PID_OUT%%") do (' -f $tokens))
+for ($i = 0; $i -lt $ClientCount; $i++) {
+    [void] $pidReadLines.AppendLine(('    set "PID{0}=%%%{1}"' -f ($i + 1), $tokenLetters[$i]))
+}
+[void] $pidReadLines.AppendLine(')')
+[void] $pidReadLines.AppendLine('del "%PID_OUT%" >nul 2>&1')
+[void] $pidReadLines.AppendLine('echo.')
+$pidSummary = @()
+for ($i = 0; $i -lt $ClientCount; $i++) {
+    $pidSummary += ('{0}=%PID{1}%' -f $names[$i], ($i + 1))
+}
+[void] $pidReadLines.AppendLine(('echo PIDs: {0}' -f ($pidSummary -join '  ')))
+[void] $pidReadLines.AppendLine('echo.')
 
 $roster = $names -join ','
 $batTemplate = @'
@@ -185,17 +233,11 @@ echo.
 echo WoW processes. MainWindowTitle is only a hint - the PID you enter is the attachment selector.
 powershell -NoProfile -Command "Get-Process Wow -ErrorAction SilentlyContinue | Sort-Object StartTime | Format-Table Id,StartTime,MainWindowTitle -AutoSize"
 echo.
-
-{{PID_PROMPTS}}
-
-echo Validating PIDs...
-{{PID_CHECKS}}
-
-{{DUP_CHECKS}}
-
-echo PID validation OK.
-
+echo You can also pass all PIDs as arguments: Start-PartyGrind.bat {{PID_EXAMPLE}}
 echo.
+
+{{PID_READ}}
+
 echo Starting coordinator, then followers. Leave each bot window open.
 echo.
 {{LAUNCH_LINES}}
@@ -204,21 +246,6 @@ echo All clients launched. Watch the bot log for IPC connection messages.
 echo If no bot window appeared, check BOT_DIR\Logs and run CopilotBuddy.exe manually.
 pause
 exit /b 0
-
-:missing_pid
-echo [ERROR] Enter the WoW PID for every client. Do not leave any PID blank.
-pause
-exit /b 1
-
-:bad_pid
-echo [ERROR] One of the entered PIDs is not a positive integer.
-pause
-exit /b 1
-
-:duplicate_pid
-echo [ERROR] Every client must have a different WoW PID.
-pause
-exit /b 1
 '@
 
 $bat = $batTemplate.Replace('{{BOT_DIR}}', $botDirFull)
@@ -228,9 +255,9 @@ $bat = $bat.Replace('{{IPC_PORT}}', [string] $IpcPort)
 $bat = $bat.Replace('{{CLIENT_COUNT}}', [string] $ClientCount)
 $bat = $bat.Replace('{{SET_LINES}}', $setLines.ToString().TrimEnd())
 $bat = $bat.Replace('{{ROSTER}}', $roster)
-$bat = $bat.Replace('{{PID_PROMPTS}}', $pidPromptLines.ToString().TrimEnd())
-$bat = $bat.Replace('{{PID_CHECKS}}', $pidCheckLines.ToString().TrimEnd())
-$bat = $bat.Replace('{{DUP_CHECKS}}', $duplicateCheckLines.ToString().TrimEnd())
+$pidExample = ((1..$ClientCount) | ForEach-Object { '110' + $_ }) -join ' '
+$bat = $bat.Replace('{{PID_EXAMPLE}}', $pidExample)
+$bat = $bat.Replace('{{PID_READ}}', $pidReadLines.ToString().TrimEnd())
 $bat = $bat.Replace('{{LAUNCH_LINES}}', $launchLines.ToString().TrimEnd())
 
 $launcherPath = Join-Path $botDirFull 'Start-PartyGrind.bat'
@@ -248,5 +275,5 @@ Write-Host ''
 Write-Host 'Next steps:'
 Write-Host '  1. Make sure all WoW 3.3.5a (build 12340) clients are logged in to the configured characters.'
 Write-Host '  2. Run Start-PartyGrind.bat from the bot folder.'
-Write-Host '  3. Enter the WoW PID shown for each character. The launcher uses -pid, not the window title.'
+Write-Host '  3. Enter all WoW PIDs in one line (space or comma separated), in client order.'
 Write-Host '  4. Check the bot log for "[PartyGrind] Started as ..." and IPC connection messages.'
