@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using Styx.Combat.CombatRoutine;
 
 namespace Styx.PartyGrind.IPC
@@ -204,6 +205,7 @@ namespace Styx.PartyGrind.IPC
 
         // Position, Combat & Focus Target
         public uint MapId { get; set; }
+        public bool HasValidMap { get; set; } = true;
         public uint ZoneId { get; set; }
         public float X { get; set; }
         public float Y { get; set; }
@@ -256,7 +258,8 @@ namespace Styx.PartyGrind.IPC
         public bool KillOptionalBosses { get; set; }
         public bool IsInsideDungeon { get; set; }
         public uint ActiveDungeonId { get; set; }
-        public uint ActiveDungeonMapId { get; set; }
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public uint? ActiveDungeonMapId { get; set; }
         public string ActiveDungeonName { get; set; } = string.Empty;
         public uint CurrentBossEntry { get; set; }
         public string CurrentBossName { get; set; } = string.Empty;
@@ -272,7 +275,8 @@ namespace Styx.PartyGrind.IPC
         public float DungeonPortalX { get; set; }
         public float DungeonPortalY { get; set; }
         public float DungeonPortalZ { get; set; }
-        public uint DungeonPortalMapId { get; set; }
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public uint? DungeonPortalMapId { get; set; }
         public float DungeonExitX { get; set; }
         public float DungeonExitY { get; set; }
         public float DungeonExitZ { get; set; }
@@ -303,6 +307,7 @@ namespace Styx.PartyGrind.IPC
 
         // Spatial & Health
         public uint MapId { get; set; }
+        public bool HasValidMap { get; set; } = true;
         public uint ZoneId { get; set; }
         public float X { get; set; }
         public float Y { get; set; }

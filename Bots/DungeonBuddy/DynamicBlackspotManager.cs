@@ -15,6 +15,7 @@ namespace Bots.DungeonBuddy
     /// </summary>
     public static class DynamicBlackspotManager
     {
+        private static readonly object _lock = new object();
         private static readonly List<DynamicBlackspot> _blackspots = new List<DynamicBlackspot>();
         private static readonly Dictionary<PolygonReference, (uint MapId, byte Area)> _originalAreas = new Dictionary<PolygonReference, (uint MapId, byte Area)>();
 
@@ -27,7 +28,13 @@ namespace Bots.DungeonBuddy
         {
             bool changed = false;
 
-            foreach (DynamicBlackspot blackspot in _blackspots.Where(blackspot => blackspot.ShouldRemove && blackspot.ClearApplied()).ToArray())
+            DynamicBlackspot[] toRemove;
+            lock (_lock)
+            {
+                toRemove = _blackspots.Where(blackspot => blackspot.ShouldRemove && blackspot.ClearApplied()).ToArray();
+            }
+
+            foreach (DynamicBlackspot blackspot in toRemove)
             {
                 if (!string.IsNullOrEmpty(blackspot.Name))
                     Logging.Write(Colors.RoyalBlue, "Removed blackspot for {0}", blackspot.Name);
@@ -38,17 +45,26 @@ namespace Bots.DungeonBuddy
             if (changed)
                 Reset();
 
-            foreach (DynamicBlackspot blackspot in _blackspots.Where(blackspot => blackspot.ShouldApplyNow && blackspot.Apply()).ToArray())
+            DynamicBlackspot[] candidates;
+            lock (_lock)
             {
-                if (blackspot.EffectedPolys == null)
+                candidates = _blackspots.Where(blackspot => blackspot.ShouldApplyNow).ToArray();
+            }
+
+            foreach (DynamicBlackspot blackspot in candidates)
+            {
+                if (!blackspot.Apply())
                     continue;
 
-                lock (_originalAreas)
+                if (blackspot.EffectedPolys != null)
                 {
-                    foreach (KeyValuePair<PolygonReference, byte> polygonArea in blackspot.EffectedPolys)
+                    lock (_lock)
                     {
-                        if (!_originalAreas.ContainsKey(polygonArea.Key))
-                            _originalAreas[polygonArea.Key] = ((uint)blackspot.MapId, polygonArea.Value);
+                        foreach (KeyValuePair<PolygonReference, byte> polygonArea in blackspot.EffectedPolys)
+                        {
+                            if (!_originalAreas.ContainsKey(polygonArea.Key))
+                                _originalAreas[polygonArea.Key] = ((uint)blackspot.MapId, polygonArea.Value);
+                        }
                     }
                 }
 
@@ -64,7 +80,10 @@ namespace Bots.DungeonBuddy
 
         public static void AddBlackspot(DynamicBlackspot blackspot)
         {
-            _blackspots.Add(blackspot);
+            lock (_lock)
+            {
+                _blackspots.Add(blackspot);
+            }
         }
 
         public static void AddBlackspots(params DynamicBlackspot[] blackspots)
@@ -74,8 +93,11 @@ namespace Bots.DungeonBuddy
 
         public static void AddBlackspots(IEnumerable<DynamicBlackspot> blackspots)
         {
-            foreach (DynamicBlackspot blackspot in blackspots)
-                _blackspots.Add(blackspot);
+            lock (_lock)
+            {
+                foreach (DynamicBlackspot blackspot in blackspots)
+                    _blackspots.Add(blackspot);
+            }
         }
 
         public static void RemoveBlackspot(DynamicBlackspot blackspot)
@@ -91,34 +113,71 @@ namespace Bots.DungeonBuddy
         public static void RemoveBlackspots(IEnumerable<DynamicBlackspot> blackspots)
         {
             Reset();
-            foreach (DynamicBlackspot blackspot in blackspots)
-                _blackspots.Remove(blackspot);
+            lock (_lock)
+            {
+                foreach (DynamicBlackspot blackspot in blackspots)
+                    _blackspots.Remove(blackspot);
+            }
         }
 
         public static void Clear()
         {
             Reset();
-            _blackspots.Clear();
+            lock (_lock)
+            {
+                _blackspots.Clear();
+            }
         }
 
         public static void Reset()
         {
-            foreach (DynamicBlackspot blackspot in _blackspots)
-                blackspot.ClearApplied();
-
-            var nav = PathNavigator.TripperNavigator;
-            lock (_originalAreas)
+            KeyValuePair<PolygonReference, (uint MapId, byte Area)>[] areasToRestore;
+            lock (_lock)
             {
-                foreach (KeyValuePair<PolygonReference, (uint MapId, byte Area)> polygonArea in _originalAreas)
-                    nav.SetPolyArea(polygonArea.Value.MapId, polygonArea.Key, polygonArea.Value.Area);
+                foreach (DynamicBlackspot blackspot in _blackspots)
+                    blackspot.ClearApplied();
 
+                areasToRestore = _originalAreas.ToArray();
                 _originalAreas.Clear();
             }
+
+            var nav = PathNavigator.TripperNavigator;
+            foreach (KeyValuePair<PolygonReference, (uint MapId, byte Area)> polygonArea in areasToRestore)
+                nav.SetPolyArea(polygonArea.Value.MapId, polygonArea.Key, polygonArea.Value.Area);
         }
 
         private static void OnTileLoaded(object? sender, TileLoadedEventArgs e)
         {
-            Reset();
+            DynamicBlackspot[] overlapping;
+            lock (_lock)
+            {
+                overlapping = _blackspots.Where(b => b.OverlapsTile(e.MapId, e.TileX, e.TileY)).ToArray();
+            }
+
+            if (overlapping.Length == 0)
+                return;
+
+            bool changed = false;
+            foreach (DynamicBlackspot blackspot in overlapping)
+            {
+                Dictionary<PolygonReference, byte>? added = blackspot.ApplyNewlyLoadedPolygons();
+                if (added == null || added.Count == 0)
+                    continue;
+
+                lock (_lock)
+                {
+                    foreach (KeyValuePair<PolygonReference, byte> polygonArea in added)
+                    {
+                        if (!_originalAreas.ContainsKey(polygonArea.Key))
+                            _originalAreas[polygonArea.Key] = ((uint)blackspot.MapId, polygonArea.Value);
+                    }
+                }
+
+                changed = true;
+            }
+
+            if (changed)
+                PathNavigator.Clear();
         }
     }
 }

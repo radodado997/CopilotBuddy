@@ -22,8 +22,11 @@ namespace Styx.Logic.Pathing
     {
         private static readonly List<Blackspot> _blackspots = new List<Blackspot>();
         private static readonly List<GlobalBlackspot> _globalBlackspots = new List<GlobalBlackspot>();
+        private static readonly HashSet<Blackspot> _externalHbProfileBlackspots = new HashSet<Blackspot>();
         private static readonly HashSet<Blackspot> _markedBlackspots = new HashSet<Blackspot>();
         private static readonly HashSet<Blackspot> _failedBlackspotMarks = new HashSet<Blackspot>();
+        private static readonly HashSet<(Blackspot Spot, uint MapId)> _ensuredTilesByMap = new HashSet<(Blackspot Spot, uint MapId)>();
+        private static readonly HashSet<(Blackspot Spot, uint MapId)> _loggedQueryFailuresByMap = new HashSet<(Blackspot Spot, uint MapId)>();
         private static readonly Dictionary<Blackspot, HashSet<TileIdentifier>> _pendingBlackspotTiles = new Dictionary<Blackspot, HashSet<TileIdentifier>>();
         private static readonly Dictionary<Blackspot, List<PolyKey>> _blackspotPolygons = new Dictionary<Blackspot, List<PolyKey>>();
         private static readonly Dictionary<PolyKey, byte> _originalPolyAreas = new Dictionary<PolyKey, byte>();
@@ -81,7 +84,7 @@ namespace Styx.Logic.Pathing
         /// Last map ID where blackspots were marked.
         /// Used to re-mark all blackspots on map change.
         /// </summary>
-        private static uint _lastMarkedMapId = 0;
+        private static uint _lastMarkedMapId = uint.MaxValue;
         
         /// <summary>
         /// Static constructor - subscribes to profile and tile events.
@@ -120,7 +123,7 @@ namespace Styx.Logic.Pathing
                 var profile = ProfileManager.CurrentProfile;
                 if (profile?.Blackspots != null && profile.Blackspots.Count > 0)
                 {
-                    AddBlackspots(profile.Blackspots);
+                    AddExternalProfileBlackspots(profile.Blackspots);
                     EnsureBlackspotsMarked();
                 }
             }
@@ -152,7 +155,7 @@ namespace Styx.Logic.Pathing
                 // Add blackspots from new profile
                 if (args.NewProfile?.Blackspots != null && args.NewProfile.Blackspots.Count > 0)
                 {
-                    AddBlackspots(args.NewProfile.Blackspots);
+                    AddExternalProfileBlackspots(args.NewProfile.Blackspots);
                     Logging.Write($"[Blackspot] Loaded {args.NewProfile.Blackspots.Count} blackspots from profile");
                     EnsureBlackspotsMarked();
                 }
@@ -199,15 +202,21 @@ namespace Styx.Logic.Pathing
         {
             try
             {
-                uint currentMap = StyxWoW.Me?.MapId ?? e.MapId;
-                if (currentMap != 0 && currentMap != e.MapId)
+                var meRef = StyxWoW.Me;
+                bool inInstance = meRef?.IsInInstance ?? false;
+                if (meRef != null && meRef.MapId != e.MapId)
                     return;
 
                 lock (_lock)
                 {
+                    if (_lastMarkedMapId != uint.MaxValue && _lastMarkedMapId != e.MapId)
+                        return;
+
                     var loadedTile = new TileIdentifier(e.TileX, e.TileY);
                     foreach (var spot in _blackspots)
                     {
+                        if (inInstance && _externalHbProfileBlackspots.Contains(spot))
+                            continue;
                         if (_failedBlackspotMarks.Contains(spot) && ShouldMarkOnTileLoaded(spot, e.TileX, e.TileY))
                         {
                             MarkBlackspotPolygons(spot, e.MapId, false, loadedTile);
@@ -265,11 +274,14 @@ namespace Styx.Logic.Pathing
         /// <returns>True if the location is blackspotted.</returns>
         public static bool IsBlackspotted(WoWPoint location, float radius = 0f)
         {
+            bool inInstance = StyxWoW.Me?.IsInInstance ?? false;
             lock (_lock)
             {
                 // Check profile blackspots
                 foreach (var spot in _blackspots)
                 {
+                    if (inInstance && _externalHbProfileBlackspots.Contains(spot))
+                        continue;
                     if (IsInBlackspot(location, spot, radius))
                         return true;
                 }
@@ -314,11 +326,21 @@ namespace Styx.Logic.Pathing
             AddBlackspot(location, radius, height);
         }
 
+        private static void AddExternalProfileBlackspots(IEnumerable<Blackspot> blackspots)
+        {
+            AddBlackspotsInternal(blackspots, isExternalHbProfile: true, markImmediately: false);
+        }
+
         /// <summary>
         /// Adds multiple blackspots and marks the corresponding navmesh polygons.
         /// Like HB WoD: QueryPolygons + SetPolyArea(Blackspot) + SetAreaCost(60f)
         /// </summary>
         public static void AddBlackspots(IEnumerable<Blackspot> blackspots)
+        {
+            AddBlackspotsInternal(blackspots, isExternalHbProfile: false, markImmediately: true);
+        }
+
+        private static void AddBlackspotsInternal(IEnumerable<Blackspot> blackspots, bool isExternalHbProfile, bool markImmediately)
         {
             if (blackspots == null)
                 return;
@@ -333,12 +355,17 @@ namespace Styx.Logic.Pathing
                     if (!_blackspots.Contains(spot))
                     {
                         _blackspots.Add(spot);
-                        
-                        // Mark navmesh polygons for this blackspot
-                        MarkBlackspotPolygons(spot);
                     }
+
+                    if (isExternalHbProfile)
+                        _externalHbProfileBlackspots.Add(spot);
+                    else
+                        _externalHbProfileBlackspots.Remove(spot);
                 }
             }
+
+            if (markImmediately)
+                EnsureBlackspotsMarked();
         }
         
         /// <summary>
@@ -373,31 +400,31 @@ namespace Styx.Logic.Pathing
             if (meRef == null)
                 return;
             uint currentMapId = meRef.MapId;
-                
-            // If map changed, clear marked blackspots to force re-marking
-            if (_lastMarkedMapId != currentMapId)
+            bool inInstance = meRef.IsInInstance;
+
+            EnsureAreaCostInitialized();
+
+            List<Blackspot>? spotsToEnsureTiles = null;
+            lock (_lock)
             {
-                lock (_lock)
+                if (_lastMarkedMapId != currentMapId)
                 {
                     _markedBlackspots.Clear();
                     _failedBlackspotMarks.Clear();
                     _pendingBlackspotTiles.Clear();
+                    _ensuredTilesByMap.Clear();
+                    _loggedQueryFailuresByMap.Clear();
                     _lastMarkedMapId = currentMapId;
                 }
-            }
-            
-            EnsureAreaCostInitialized();
-            
-            lock (_lock)
-            {
-                // A spot whose tile is not loaded is left to OnTileLoaded, which clears the failed
-                // flag and marks it once the tile streams in. HB 4.3.4 smethod_1 works the same way:
-                // it only ever queries from the tile-loaded callback, so the tile is always present.
+
                 foreach (var spot in _blackspots)
                 {
-                    if (!_markedBlackspots.Contains(spot) && !_failedBlackspotMarks.Contains(spot))
+                    if (inInstance && _externalHbProfileBlackspots.Contains(spot))
+                        continue;
+                    if (!_markedBlackspots.Contains(spot) && !_failedBlackspotMarks.Contains(spot) &&
+                        _ensuredTilesByMap.Add((spot, currentMapId)))
                     {
-                        MarkBlackspotPolygons(spot, currentMapId);
+                        (spotsToEnsureTiles ??= new List<Blackspot>()).Add(spot);
                     }
                 }
 
@@ -405,9 +432,66 @@ namespace Styx.Logic.Pathing
                 {
                     if (globalSpot.MapId == currentMapId
                         && !_markedBlackspots.Contains(globalSpot.Blackspot)
+                        && !_failedBlackspotMarks.Contains(globalSpot.Blackspot)
+                        && _ensuredTilesByMap.Add((globalSpot.Blackspot, currentMapId)))
+                    {
+                        (spotsToEnsureTiles ??= new List<Blackspot>()).Add(globalSpot.Blackspot);
+                    }
+                }
+            }
+
+            HashSet<Blackspot>? failedEnsureSpots = null;
+            if (spotsToEnsureTiles != null)
+            {
+                foreach (var spot in spotsToEnsureTiles)
+                {
+                    try
+                    {
+                        var centerXyz = new NativeMethods.XYZ(spot.Location.X, spot.Location.Y, spot.Location.Z);
+                        NativeMethods.EnsureTiles(currentMapId, centerXyz, 1);
+                    }
+                    catch (Exception)
+                    {
+                        (failedEnsureSpots ??= new HashSet<Blackspot>()).Add(spot);
+                    }
+                }
+            }
+
+            lock (_lock)
+            {
+                if (_lastMarkedMapId != currentMapId)
+                    return;
+
+                if (failedEnsureSpots != null)
+                {
+                    foreach (var failedSpot in failedEnsureSpots)
+                        _ensuredTilesByMap.Remove((failedSpot, currentMapId));
+                }
+
+                // A spot whose tile is not loaded is left to OnTileLoaded, which clears the failed
+                // flag and marks it once the tile streams in. HB 4.3.4 smethod_1 works the same way:
+                // it only ever queries from the tile-loaded callback, so the tile is always present.
+                foreach (var spot in _blackspots)
+                {
+                    if (inInstance && _externalHbProfileBlackspots.Contains(spot))
+                        continue;
+                    if (failedEnsureSpots != null && failedEnsureSpots.Contains(spot))
+                        continue;
+                    if (!_markedBlackspots.Contains(spot) && !_failedBlackspotMarks.Contains(spot))
+                    {
+                        MarkBlackspotPolygons(spot, currentMapId, false);
+                    }
+                }
+
+                foreach (var globalSpot in _globalBlackspots)
+                {
+                    if (failedEnsureSpots != null && failedEnsureSpots.Contains(globalSpot.Blackspot))
+                        continue;
+                    if (globalSpot.MapId == currentMapId
+                        && !_markedBlackspots.Contains(globalSpot.Blackspot)
                         && !_failedBlackspotMarks.Contains(globalSpot.Blackspot))
                     {
-                        MarkBlackspotPolygons(globalSpot.Blackspot, currentMapId);
+                        MarkBlackspotPolygons(globalSpot.Blackspot, currentMapId, false);
                     }
                 }
             }
@@ -545,7 +629,8 @@ namespace Styx.Logic.Pathing
                 {
                     _markedBlackspots.Remove(spot);
                     _failedBlackspotMarks.Add(spot);
-                    Logging.Write(FormattableString.Invariant($"Warning: QueryPolygons failed while applying blackspot {spot.Location} with radius {spot.Radius} - tile not loaded?"));
+                    if (_loggedQueryFailuresByMap.Add((spot, mapId)))
+                        Logging.Write(FormattableString.Invariant($"Warning: QueryPolygons failed while applying blackspot {spot.Location} with radius {spot.Radius} - tile not loaded?"));
                     return;
                 }
                 
@@ -631,6 +716,9 @@ namespace Styx.Logic.Pathing
         /// </summary>
         private static void RestoreBlackspotPolygons(Blackspot spot)
         {
+            _ensuredTilesByMap.RemoveWhere(entry => entry.Spot.Equals(spot));
+            _loggedQueryFailuresByMap.RemoveWhere(entry => entry.Spot.Equals(spot));
+
             if (!_blackspotPolygons.TryGetValue(spot, out List<PolyKey>? affectedPolys))
             {
                 _markedBlackspots.Remove(spot);
@@ -694,6 +782,7 @@ namespace Styx.Logic.Pathing
             lock (_lock)
             {
                 _blackspots.Remove(spot);
+                _externalHbProfileBlackspots.Remove(spot);
                 RestoreBlackspotPolygons(spot);
             }
         }
@@ -711,6 +800,7 @@ namespace Styx.Logic.Pathing
                 var spotList = spots.ToList();
                 foreach (var spot in spotList)
                 {
+                    _externalHbProfileBlackspots.Remove(spot);
                     RestoreBlackspotPolygons(spot);
                 }
 
@@ -731,6 +821,9 @@ namespace Styx.Logic.Pathing
                 }
 
                 _blackspots.Clear();
+                _externalHbProfileBlackspots.Clear();
+                _ensuredTilesByMap.Clear();
+                _loggedQueryFailuresByMap.Clear();
             }
         }
 
@@ -764,16 +857,13 @@ namespace Styx.Logic.Pathing
 
                 _globalBlackspots.Add(blackspot);
 
-                // Mark polygon if on current map
-                uint currentMap = StyxWoW.Me?.MapId ?? 0;
-                if (blackspot.MapId == currentMap)
-                {
-                    MarkBlackspotPolygons(blackspot.Blackspot);
-                }
-                
                 SaveGlobalBlackspots();
                 Logging.Write(FormattableString.Invariant($"[Blackspot] Added global blackspot at {blackspot.Blackspot.Location} (radius {blackspot.Blackspot.Radius})"));
             }
+
+            uint currentMap = StyxWoW.Me?.MapId ?? 0;
+            if (blackspot.MapId == currentMap)
+                EnsureBlackspotsMarked();
         }
 
         /// <summary>

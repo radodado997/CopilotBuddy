@@ -56,6 +56,55 @@ namespace Bots.DungeonBuddy
             }
         }
 
+        internal bool OverlapsTile(uint mapId, int tileX, int tileY)
+        {
+            if (MapId != (int)mapId || !_isApplied)
+                return false;
+
+            TileIdentifier min = TileIdentifier.GetByPosition(Location.X - Radius, Location.Y - Radius);
+            TileIdentifier max = TileIdentifier.GetByPosition(Location.X + Radius, Location.Y + Radius);
+            int minX = Math.Clamp(Math.Min(min.X, max.X), 0, 63);
+            int maxX = Math.Clamp(Math.Max(min.X, max.X), 0, 63);
+            int minY = Math.Clamp(Math.Min(min.Y, max.Y), 0, 63);
+            int maxY = Math.Clamp(Math.Max(min.Y, max.Y), 0, 63);
+            return tileX >= minX && tileX <= maxX && tileY >= minY && tileY <= maxY;
+        }
+
+        internal Dictionary<PolygonReference, byte>? ApplyNewlyLoadedPolygons()
+        {
+            if (!_isApplied)
+                return null;
+
+            var nav = PathNavigator.TripperNavigator;
+            var center = new Vector3(Location.X, Location.Y, Location.Z);
+            var extents = new Vector3(Radius, Radius, Height);
+            PolygonReference[] polygons = nav.QueryPolygons((uint)MapId, center, extents, 8192);
+            if (polygons.Length == 0)
+                return null;
+
+            EffectedPolys ??= new Dictionary<PolygonReference, byte>();
+            Dictionary<PolygonReference, byte>? added = null;
+            byte targetArea = (byte)(IsBlocking ? AreaType.Blocked : AreaType.Blackspot);
+            foreach (PolygonReference polygon in polygons)
+            {
+                if (EffectedPolys.ContainsKey(polygon))
+                    continue;
+
+                uint getAreaStatus = nav.GetPolyArea((uint)MapId, polygon, out byte originalArea);
+                if (new Status(getAreaStatus).Failed)
+                    continue;
+
+                uint setAreaStatus = nav.SetPolyArea((uint)MapId, polygon, targetArea);
+                if (new Status(setAreaStatus).Failed)
+                    continue;
+
+                EffectedPolys[polygon] = originalArea;
+                (added ??= new Dictionary<PolygonReference, byte>())[polygon] = originalArea;
+            }
+
+            return added;
+        }
+
         internal bool Apply()
         {
             if (_isApplied)
@@ -72,14 +121,25 @@ namespace Bots.DungeonBuddy
                 return false;
 
             EffectedPolys = new Dictionary<PolygonReference, byte>();
+            bool anyWritten = false;
             foreach (PolygonReference polygon in polygons)
             {
                 uint getAreaStatus = nav.GetPolyArea((uint)MapId, polygon, out byte originalArea);
                 if (new Status(getAreaStatus).Failed)
                     continue;
 
+                uint setAreaStatus = nav.SetPolyArea((uint)MapId, polygon, (byte)(IsBlocking ? AreaType.Blocked : AreaType.Blackspot));
+                if (new Status(setAreaStatus).Failed)
+                    continue;
+
                 EffectedPolys[polygon] = originalArea;
-                nav.SetPolyArea((uint)MapId, polygon, (byte)(IsBlocking ? AreaType.Blocked : AreaType.Blackspot));
+                anyWritten = true;
+            }
+
+            if (!anyWritten)
+            {
+                EffectedPolys = null;
+                return false;
             }
 
             _isApplied = true;

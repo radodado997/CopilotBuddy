@@ -83,12 +83,16 @@ namespace CopilotBuddy.Bots.PartyGrind
         private const float PullCandidateMaxDistance = 55.0f;
         private const long CombatFocusStickyMs = 2500L;
         private const float DungeonTrashScanRadius = 40f;
-        private const long DungeonAdvanceBlockMaxMs = 8000L;
-        private const long DungeonForcedStepMaxMs = 4000L;
+        internal const long DungeonAdvanceBlockMaxMs = 8000L;
+        private const long DungeonForcedStepMaxMs = 8000L;
+        private const long DungeonAdvancePathRefreshMs = 500L;
         private const float RestThreatRadius = 15f;
         private const float RestMeleeThreatRadius = 10f;
         private const long WorldTransitionGraceMs = 3000L;
         private const float DungeonForcedStepArrivalDistance = 2f;
+        private const long GhostPortalStallWindowMs = 10000L;
+        private const float GhostPortalProgressMinYards = 2.0f;
+        private const int GhostPortalMaxFailedMoves = 3;
         private const long IdleSnapshotIntervalMs = 5000L;
         private const int TerminalStateDeliveryTimeoutMs = 1000;
         private bool _wasInCombat;
@@ -100,6 +104,7 @@ namespace CopilotBuddy.Bots.PartyGrind
         private long _deathStartedUtcMs;
         private bool? _diedInsideDungeon;
         private WoWPoint _lastGhostPosition = WoWPoint.Empty;
+        private float _ghostBestEntranceDistance = float.MaxValue;
         private long _lastGhostProgressUtcMs;
         private long _nextGhostPortalAttemptUtcMs;
         private long _nextGhostNoEntranceLogUtcMs;
@@ -112,21 +117,39 @@ namespace CopilotBuddy.Bots.PartyGrind
         private int _ghostPortalAttempts;
         private WoWPoint _ghostPortalApproach = WoWPoint.Empty;
         private int _ghostPathFailures;
+        private int _ghostBestRouteGeneration;
+        private float _ghostBestRouteDistance = float.MaxValue;
         private readonly Dictionary<string, long> _rejectedGhostEntranceUntilUtcMs = new(StringComparer.OrdinalIgnoreCase);
         private bool IsGhostSourceRejected(string source, long nowUtcMs) =>
             _rejectedGhostEntranceUntilUtcMs.TryGetValue(source, out long until) && nowUtcMs < until;
         private bool _dungeonScriptTicked;
         private bool _localWasNeedingRest;
         private long _dungeonAdvanceBlockedSinceUtcMs;
+        private uint _dungeonAdvanceBlockedMapId;
+        private WoWPoint _dungeonAdvanceBlockedObjective = WoWPoint.Zero;
+        private long _dungeonAdvanceLastHoldEvalUtcMs;
         private WoWPoint _dungeonForcedStep = WoWPoint.Zero;
         private WoWPoint _dungeonForcedStepObjective = WoWPoint.Zero;
         private ulong _dungeonForcedStepLeaderGuid;
         private long _dungeonForcedStepIssuedUtcMs;
+        private float _dungeonForcedStepBestDist = float.MaxValue;
+        private float _dungeonForcedObjectiveBestDist = float.MaxValue;
+        private long _dungeonForcedStepLastProgressUtcMs;
+        private bool _dungeonForcedStepBypassTrashGrace;
+        private bool _dungeonForcedStepWasHeldForTrash;
+        private float _dungeonForcedStepMovePrecision;
+        private WoWPoint _dungeonStepFailureObjective = WoWPoint.Zero;
+        private int _dungeonStepConsecutiveFailures;
+        private long _lastDungeonStepFailureUtcMs;
+        private long _lastDungeonAdvancePathUtcMs;
+        private WoWPoint _cachedDungeonAdvanceObjective = WoWPoint.Zero;
+        private WoWPoint[] _cachedDungeonAdvancePath = Array.Empty<WoWPoint>();
         private ulong _failedDungeonMeleeTargetGuid;
         private long _failedDungeonMeleeUntilUtcMs;
         private WoWPoint _failedDungeonMeleeDest = WoWPoint.Zero;
         private bool _failedDungeonMeleeDirect;
         private long _packPullHoldSinceUtcMs;
+        private bool _hasObservedMapId;
         private uint _lastObservedMapId;
         private long _lastMapChangeUtcMs;
         private bool _lootFilterAttached;
@@ -242,6 +265,7 @@ namespace CopilotBuddy.Bots.PartyGrind
             _deathStartedUtcMs = 0;
             _diedInsideDungeon = null;
             _lastGhostPosition = WoWPoint.Empty;
+            _ghostBestEntranceDistance = float.MaxValue;
             _lastGhostProgressUtcMs = 0;
             _nextGhostPortalAttemptUtcMs = 0;
             _nextGhostNoEntranceLogUtcMs = 0;
@@ -254,13 +278,18 @@ namespace CopilotBuddy.Bots.PartyGrind
             _ghostPortalAttempts = 0;
             _ghostPortalApproach = WoWPoint.Empty;
             _ghostPathFailures = 0;
+            _ghostBestRouteGeneration = 0;
+            _ghostBestRouteDistance = float.MaxValue;
             _rejectedGhostEntranceUntilUtcMs.Clear();
             _localWasNeedingRest = false;
-            _dungeonAdvanceBlockedSinceUtcMs = 0;
-            ClearDungeonForcedStep();
-            _packPullHoldSinceUtcMs = 0;
+            _hasObservedMapId = false;
             _lastObservedMapId = 0;
             _lastMapChangeUtcMs = 0;
+            ResetDungeonCorridorBlock();
+            ClearDungeonForcedStep();
+            ResetDungeonStepFailures();
+            ClearDungeonAdvanceCache();
+            _packPullHoldSinceUtcMs = 0;
 
             try
             {
@@ -948,6 +977,151 @@ namespace CopilotBuddy.Bots.PartyGrind
             _dungeonForcedStepObjective = WoWPoint.Zero;
             _dungeonForcedStepLeaderGuid = 0;
             _dungeonForcedStepIssuedUtcMs = 0;
+            _dungeonForcedStepBestDist = float.MaxValue;
+            _dungeonForcedObjectiveBestDist = float.MaxValue;
+            _dungeonForcedStepLastProgressUtcMs = 0;
+            _dungeonForcedStepBypassTrashGrace = false;
+            _dungeonForcedStepWasHeldForTrash = false;
+            _dungeonForcedStepMovePrecision = 0f;
+        }
+
+        private void ResetDungeonCorridorBlock()
+        {
+            _dungeonAdvanceBlockedSinceUtcMs = 0;
+            _dungeonAdvanceBlockedMapId = 0;
+            _dungeonAdvanceBlockedObjective = WoWPoint.Zero;
+            _dungeonAdvanceLastHoldEvalUtcMs = 0;
+        }
+
+        internal static bool EvaluateDungeonCorridorBlock(
+            bool bypassTrashGrace,
+            bool hasTrashOnSegment,
+            uint mapId,
+            WoWPoint corridorObjective,
+            ref uint blockedMapId,
+            ref WoWPoint blockedObjective,
+            ref long lastHoldEvalUtcMs,
+            ref long blockedSinceUtcMs,
+            long nowUtcMs,
+            out bool newlyBlocked,
+            out bool graceExpired,
+            long blockGraceMs = DungeonAdvanceBlockMaxMs,
+            long continuousEvalGapMs = 1500L)
+        {
+            newlyBlocked = false;
+            graceExpired = false;
+
+            if (bypassTrashGrace || !hasTrashOnSegment)
+            {
+                blockedSinceUtcMs = 0;
+                blockedMapId = 0;
+                blockedObjective = WoWPoint.Zero;
+                lastHoldEvalUtcMs = 0;
+                return false;
+            }
+
+            if (blockedSinceUtcMs > 0 &&
+                (blockedMapId != mapId ||
+                 blockedObjective.Distance(corridorObjective) > SquadDungeonService.HotspotArrivalDistance ||
+                 (lastHoldEvalUtcMs > 0 && nowUtcMs - lastHoldEvalUtcMs >= continuousEvalGapMs)))
+            {
+                blockedSinceUtcMs = 0;
+            }
+
+            lastHoldEvalUtcMs = nowUtcMs;
+            if (blockedSinceUtcMs == 0)
+            {
+                blockedSinceUtcMs = nowUtcMs;
+                blockedMapId = mapId;
+                blockedObjective = corridorObjective;
+                newlyBlocked = true;
+            }
+
+            if (nowUtcMs - blockedSinceUtcMs < blockGraceMs)
+                return true;
+
+            blockedSinceUtcMs = 0;
+            blockedMapId = 0;
+            blockedObjective = WoWPoint.Zero;
+            lastHoldEvalUtcMs = 0;
+            graceExpired = true;
+            return false;
+        }
+
+        private void ResetDungeonStepFailures()
+        {
+            _dungeonStepFailureObjective = WoWPoint.Zero;
+            _dungeonStepConsecutiveFailures = 0;
+            _lastDungeonStepFailureUtcMs = 0;
+        }
+
+        private void ClearDungeonAdvanceCache()
+        {
+            _cachedDungeonAdvanceObjective = WoWPoint.Zero;
+            _cachedDungeonAdvancePath = Array.Empty<WoWPoint>();
+            _lastDungeonAdvancePathUtcMs = 0;
+        }
+
+        internal static bool EvaluateDungeonStepProgress(
+            float currentStepDistance,
+            float currentObjectiveDistance,
+            ref float bestStepDistance,
+            ref float bestObjectiveDistance,
+            ref long lastProgressUtcMs,
+            long nowUtcMs,
+            long stallTimeoutMs = SquadDungeonService.DungeonStepStallTimeoutMs,
+            float minProgressYards = SquadDungeonService.DungeonStepMinProgressYards)
+        {
+            bool progressed = bestStepDistance == float.MaxValue ||
+                              currentStepDistance <= bestStepDistance - minProgressYards ||
+                              (currentObjectiveDistance < float.MaxValue && bestObjectiveDistance == float.MaxValue) ||
+                              (currentObjectiveDistance < float.MaxValue &&
+                               currentObjectiveDistance <= bestObjectiveDistance - minProgressYards);
+            if (progressed)
+            {
+                if (currentStepDistance < bestStepDistance)
+                    bestStepDistance = currentStepDistance;
+                if (currentObjectiveDistance < bestObjectiveDistance)
+                    bestObjectiveDistance = currentObjectiveDistance;
+                lastProgressUtcMs = nowUtcMs;
+                return false;
+            }
+
+            return lastProgressUtcMs > 0 && nowUtcMs - lastProgressUtcMs >= stallTimeoutMs;
+        }
+
+        internal static bool RecordDungeonStepFailure(
+            WoWPoint objective,
+            ref WoWPoint failureObjective,
+            ref int consecutiveFailures,
+            ref long lastFailureUtcMs,
+            long nowUtcMs,
+            int maxFailures = SquadDungeonService.DungeonStepMaxConsecutiveFailures,
+            long failureCooldownMs = 500L)
+        {
+            if (objective == WoWPoint.Zero)
+                return false;
+
+            if (failureObjective == WoWPoint.Zero ||
+                failureObjective.Distance(objective) > SquadDungeonService.HotspotArrivalDistance)
+            {
+                failureObjective = objective;
+                consecutiveFailures = 0;
+                lastFailureUtcMs = 0;
+            }
+
+            if (lastFailureUtcMs > 0 && nowUtcMs - lastFailureUtcMs < failureCooldownMs)
+                return false;
+
+            lastFailureUtcMs = nowUtcMs;
+            consecutiveFailures++;
+            if (consecutiveFailures < maxFailures)
+                return false;
+
+            consecutiveFailures = 0;
+            lastFailureUtcMs = 0;
+            failureObjective = WoWPoint.Zero;
+            return true;
         }
 
         private void SyncDungeonForcedStepObjective(WoWPoint objective)
@@ -958,13 +1132,82 @@ namespace CopilotBuddy.Bots.PartyGrind
                 ClearDungeonForcedStep();
         }
 
-        private void IssueDungeonForcedStep(WoWPoint step, WoWPoint objective, ulong leaderGuid, long nowUtcMs)
+        private void HandleFailedDungeonStep(WoWPoint step, WoWPoint objective, uint mapId, long nowUtcMs)
         {
+            ClearDungeonForcedStep();
+            _cachedDungeonAdvanceObjective = objective;
+            _cachedDungeonAdvancePath = Array.Empty<WoWPoint>();
+            _lastDungeonAdvancePathUtcMs = nowUtcMs;
+            if (StyxWoW.Me?.IsMoving == true)
+                WoWMovement.MoveStop();
+            Navigator.Clear();
+            bool shouldBlacklist = RecordDungeonStepFailure(
+                objective,
+                ref _dungeonStepFailureObjective,
+                ref _dungeonStepConsecutiveFailures,
+                ref _lastDungeonStepFailureUtcMs,
+                nowUtcMs);
+            if (shouldBlacklist)
+            {
+                if (objective != WoWPoint.Zero)
+                    _dungeon.BlacklistDungeonNavigationPoint(mapId, objective, nowUtcMs);
+                if (step != WoWPoint.Zero && step.Distance(objective) > SquadDungeonService.HotspotArrivalDistance)
+                    _dungeon.BlacklistDungeonNavigationPoint(mapId, step, nowUtcMs);
+                Logging.WriteDebug("[PartyGrind Dungeon] Blacklisted unreachable advance target ({0:F1},{1:F1},{2:F1}) on map {3} for {4}s",
+                    objective.X, objective.Y, objective.Z, mapId, SquadDungeonService.DungeonStepBlacklistCooldownMs / 1000L);
+            }
+        }
+
+        private MoveResult IssueDungeonForcedStep(
+            WoWPoint step,
+            WoWPoint objective,
+            ulong leaderGuid,
+            long nowUtcMs,
+            bool bypassTrashGrace = false)
+        {
+            var me = StyxWoW.Me;
+            if (me == null)
+                return MoveResult.Failed;
+
+            float stepPrecision = Math.Min(Navigator.PathPrecision, DungeonForcedStepArrivalDistance);
+            MoveResult result = Navigator.MoveTo(step, stepPrecision, "Advancing through dungeon");
+            if (result == MoveResult.ReachedDestination &&
+                objective != WoWPoint.Zero &&
+                me.Location.Distance(objective) > SquadDungeonService.HotspotArrivalDistance &&
+                me.Location.Distance(step) > 0.75f)
+            {
+                stepPrecision = 0.75f;
+                result = Navigator.MoveTo(step, stepPrecision, "Advancing through dungeon");
+            }
+            if (result == MoveResult.PathGenerationFailed || result == MoveResult.Failed)
+            {
+                HandleFailedDungeonStep(step, objective, me.MapId, nowUtcMs);
+                return result;
+            }
+
+            if (result == MoveResult.ReachedDestination)
+            {
+                if (objective != WoWPoint.Zero && me.Location.Distance(objective) > SquadDungeonService.HotspotArrivalDistance)
+                {
+                    HandleFailedDungeonStep(step, objective, me.MapId, nowUtcMs);
+                    return MoveResult.Failed;
+                }
+
+                ClearDungeonForcedStep();
+                ResetDungeonStepFailures();
+                return result;
+            }
+
             _dungeonForcedStep = step;
             _dungeonForcedStepObjective = objective;
             _dungeonForcedStepLeaderGuid = leaderGuid;
             _dungeonForcedStepIssuedUtcMs = nowUtcMs;
-            Navigator.MoveTo(step, "Advancing through dungeon");
+            _dungeonForcedStepBestDist = me.Location.Distance(step);
+            _dungeonForcedObjectiveBestDist = objective != WoWPoint.Zero ? me.Location.Distance(objective) : float.MaxValue;
+            _dungeonForcedStepLastProgressUtcMs = nowUtcMs;
+            _dungeonForcedStepBypassTrashGrace = bypassTrashGrace;
+            _dungeonForcedStepMovePrecision = stepPrecision;
+            return result;
         }
 
         private bool DungeonForcedStepActive(ulong leaderGuid, long nowUtcMs)
@@ -973,19 +1216,130 @@ namespace CopilotBuddy.Bots.PartyGrind
                 return false;
 
             var me = StyxWoW.Me;
+            float arrivalDist = _dungeonForcedStepMovePrecision > 0f
+                ? _dungeonForcedStepMovePrecision
+                : DungeonForcedStepArrivalDistance;
+            bool arrived = me != null && me.Location.Distance(_dungeonForcedStep) <= arrivalDist;
             bool stale = me == null ||
                          leaderGuid != _dungeonForcedStepLeaderGuid ||
                          nowUtcMs - _dungeonForcedStepIssuedUtcMs > DungeonForcedStepMaxMs ||
-                         me.Location.Distance(_dungeonForcedStep) <= DungeonForcedStepArrivalDistance;
+                         arrived;
             if (!stale)
                 return true;
 
             ClearDungeonForcedStep();
+            if (arrived)
+                ResetDungeonStepFailures();
             return false;
         }
 
         internal static bool IsTransientWorldTransition(bool isInWorld, long mapChangeUtcMs, long nowUtcMs) =>
             !isInWorld || (mapChangeUtcMs > 0 && nowUtcMs - mapChangeUtcMs < WorldTransitionGraceMs);
+
+        internal static bool IsSameMapForNavigation(uint localMapId, uint targetMapId) =>
+            localMapId == targetMapId;
+
+        internal static float ComputeGhostPortalProgressDistance(
+            WoWPoint currentLocation,
+            WoWPoint entranceLocation,
+            IReadOnlyList<WoWPoint>? remainingPath)
+        {
+            if (remainingPath == null || remainingPath.Count == 0)
+                return currentLocation.Distance(entranceLocation);
+
+            float total = 0f;
+            WoWPoint prev = currentLocation;
+            bool visitedWaypoint = false;
+            for (int i = 0; i < remainingPath.Count; i++)
+            {
+                WoWPoint wp = remainingPath[i];
+                if (wp == WoWPoint.Zero)
+                    continue;
+                total += prev.Distance(wp);
+                prev = wp;
+                visitedWaypoint = true;
+            }
+
+            return visitedWaypoint ? total + prev.Distance(entranceLocation) : currentLocation.Distance(entranceLocation);
+        }
+
+        internal static bool EvaluateGhostPortalProgress(
+            float progressDistance,
+            bool hasRoutePath,
+            int routeGeneration,
+            ref int bestRouteGeneration,
+            ref float bestRouteDistance,
+            ref float bestStraightDistance,
+            ref long lastProgressUtcMs,
+            long nowUtcMs,
+            long stallWindowMs = GhostPortalStallWindowMs,
+            float minProgressYards = GhostPortalProgressMinYards)
+        {
+            if (hasRoutePath)
+            {
+                if (routeGeneration != bestRouteGeneration)
+                {
+                    bool improvedAcrossReplan = bestRouteDistance != float.MaxValue &&
+                                                progressDistance <= bestRouteDistance - minProgressYards;
+                    bestRouteGeneration = routeGeneration;
+                    bestRouteDistance = progressDistance;
+                    if (lastProgressUtcMs == 0 || improvedAcrossReplan)
+                    {
+                        lastProgressUtcMs = nowUtcMs;
+                        return false;
+                    }
+
+                    return nowUtcMs - lastProgressUtcMs >= stallWindowMs;
+                }
+
+                return EvaluateGhostPortalProgress(
+                    progressDistance,
+                    ref bestRouteDistance,
+                    ref lastProgressUtcMs,
+                    nowUtcMs,
+                    stallWindowMs,
+                    minProgressYards);
+            }
+
+            if (bestStraightDistance == float.MaxValue && bestRouteDistance != float.MaxValue)
+            {
+                bestStraightDistance = progressDistance;
+                return lastProgressUtcMs > 0 && nowUtcMs - lastProgressUtcMs >= stallWindowMs;
+            }
+
+            return EvaluateGhostPortalProgress(
+                progressDistance,
+                ref bestStraightDistance,
+                ref lastProgressUtcMs,
+                nowUtcMs,
+                stallWindowMs,
+                minProgressYards);
+        }
+
+        internal static bool EvaluateGhostPortalProgress(
+            float entranceDistance,
+            ref float bestEntranceDistance,
+            ref long lastProgressUtcMs,
+            long nowUtcMs,
+            long stallWindowMs = GhostPortalStallWindowMs,
+            float minProgressYards = GhostPortalProgressMinYards)
+        {
+            if (bestEntranceDistance == float.MaxValue ||
+                entranceDistance <= bestEntranceDistance - minProgressYards)
+            {
+                bestEntranceDistance = entranceDistance;
+                lastProgressUtcMs = nowUtcMs;
+                return false;
+            }
+
+            if (lastProgressUtcMs == 0)
+            {
+                lastProgressUtcMs = nowUtcMs;
+                return false;
+            }
+
+            return nowUtcMs - lastProgressUtcMs >= stallWindowMs;
+        }
 
         internal static bool ShouldDeferRest(bool hostileAggroNearby, bool hostileInMeleeRange, bool partyMemberInCombat) =>
             partyMemberInCombat || hostileAggroNearby || hostileInMeleeRange;
@@ -1261,7 +1615,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                 SubProfileMinLevel = current?.MinLevel ?? 1,
                 SubProfileMaxLevel = current?.MaxLevel ?? 85,
                 ProfileMaxLevel = ProfileManager.TopProfileMaxLevel,
-                MapId = StyxWoW.Me?.MapId ?? 0,
+                MapId = StyxWoW.Me != null && StyxWoW.IsInWorld ? StyxWoW.Me.MapId : null,
                 HotspotX = hotspot.X,
                 HotspotY = hotspot.Y,
                 HotspotZ = hotspot.Z,
@@ -1280,10 +1634,20 @@ namespace CopilotBuddy.Bots.PartyGrind
             var me = StyxWoW.Me!;
             var leader = SquadContext.GetLeaderStateSnapshot();
 
-            if (me.MapId != _lastObservedMapId)
+            if (!_hasObservedMapId || me.MapId != _lastObservedMapId)
             {
+                bool changedFromKnownMap = _hasObservedMapId;
+                _hasObservedMapId = true;
                 _lastObservedMapId = me.MapId;
-                _lastMapChangeUtcMs = now;
+                if (changedFromKnownMap)
+                {
+                    _lastMapChangeUtcMs = now;
+                    ClearDungeonForcedStep();
+                    ResetDungeonStepFailures();
+                    ClearDungeonAdvanceCache();
+                    ResetDungeonCorridorBlock();
+                    Navigator.Clear();
+                }
             }
             bool inWorldTransition = IsTransientWorldTransition(StyxWoW.IsInWorld, _lastMapChangeUtcMs, now);
             bool isDead = me.Dead && !me.IsGhost && !inWorldTransition;
@@ -1291,7 +1655,7 @@ namespace CopilotBuddy.Bots.PartyGrind
             bool insideDungeon = SquadDungeonService.IsInDungeonMap(me);
             if (isDead)
                 _diedInsideDungeon ??= insideDungeon;
-            else if (!isGhost)
+            else if (!inWorldTransition && !me.Dead && !me.IsGhost)
             {
                 _deathStartedUtcMs = 0;
                 _diedInsideDungeon = null;
@@ -1303,6 +1667,9 @@ namespace CopilotBuddy.Bots.PartyGrind
                 _ghostPortalAttempts = 0;
                 _ghostPortalApproach = WoWPoint.Empty;
                 _ghostPathFailures = 0;
+                _ghostBestRouteGeneration = 0;
+                _ghostBestRouteDistance = float.MaxValue;
+                _ghostBestEntranceDistance = float.MaxValue;
                 _rejectedGhostEntranceUntilUtcMs.Clear();
                 _lastGhostPosition = WoWPoint.Empty;
                 _lastGhostProgressUtcMs = 0;
@@ -1421,6 +1788,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                 NextLevelXp = me.NextLevelXP,
                 XpPerHour = GameStats.XPPerHour,
                 MapId = me.MapId,
+                HasValidMap = StyxWoW.IsInWorld,
                 ZoneId = me.ZoneId,
                 X = me.Location.X,
                 Y = me.Location.Y,
@@ -1496,6 +1864,20 @@ namespace CopilotBuddy.Bots.PartyGrind
                     new Action(ctx =>
                     {
                         SquadPartySyncService.LogAction("Waiting: squad paused or disconnected");
+                        if (StyxWoW.Me?.IsMoving == true)
+                            WoWMovement.MoveStop();
+                        return RunStatus.Success;
+                    })
+                ),
+
+                new Decorator(
+                    ctx => IsTransientWorldTransition(
+                        StyxWoW.IsInWorld,
+                        _lastMapChangeUtcMs,
+                        DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()),
+                    new Action(ctx =>
+                    {
+                        SquadPartySyncService.LogAction("Waiting: world transition");
                         if (StyxWoW.Me?.IsMoving == true)
                             WoWMovement.MoveStop();
                         return RunStatus.Success;
@@ -1687,7 +2069,11 @@ namespace CopilotBuddy.Bots.PartyGrind
                 return RunStatus.Failure;
 
             if (IsTransientWorldTransition(StyxWoW.IsInWorld, _lastMapChangeUtcMs, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()))
-                return RunStatus.Failure;
+            {
+                if (me.IsMoving)
+                    WoWMovement.MoveStop();
+                return RunStatus.Success;
+            }
 
             var settings = SquadContext.ActiveSettings ?? SquadSettings.Instance;
             var leader = SquadContext.GetLeaderStateSnapshot();
@@ -1727,11 +2113,6 @@ namespace CopilotBuddy.Bots.PartyGrind
             _deathStartedUtcMs = 0;
             long ghostNowUtcMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             WoWPoint ghostPosition = me.Location;
-            if (_lastGhostPosition == WoWPoint.Empty || _lastGhostPosition.Distance(ghostPosition) > 2f)
-            {
-                _lastGhostPosition = ghostPosition;
-                _lastGhostProgressUtcMs = ghostNowUtcMs;
-            }
 
             WoWPoint corpsePoint = me.CorpsePoint;
             if (SquadContext.IsDungeonModeActive && _diedInsideDungeon != false)
@@ -1740,6 +2121,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                 if (insideDungeon)
                 {
                     _lastGhostPosition = WoWPoint.Empty;
+                    _ghostBestEntranceDistance = float.MaxValue;
                     _lastGhostProgressUtcMs = 0;
                     _nextGhostPortalAttemptUtcMs = 0;
                     _nextGhostEntranceResolveUtcMs = 0;
@@ -1748,6 +2130,8 @@ namespace CopilotBuddy.Bots.PartyGrind
                     _ghostPortalAttempts = 0;
                     _ghostPortalApproach = WoWPoint.Empty;
                     _ghostPathFailures = 0;
+                    _ghostBestRouteGeneration = 0;
+                    _ghostBestRouteDistance = float.MaxValue;
                     _rejectedGhostEntranceUntilUtcMs.Clear();
                 }
                 else
@@ -1758,38 +2142,55 @@ namespace CopilotBuddy.Bots.PartyGrind
                         float entranceDistance = me.Location.Distance(dungeonEntrance);
                         if (entranceDistance > 6f)
                         {
-                            bool stalled = ghostNowUtcMs - _lastGhostProgressUtcMs >= 10000L;
                             _ghostPortalApproach = ghostPosition;
-                            if (stalled && ghostNowUtcMs >= _nextGhostPortalAttemptUtcMs)
-                            {
-                                Navigator.Clear();
-                                _lastGhostProgressUtcMs = ghostNowUtcMs;
-                            }
+                            _lastGhostPosition = ghostPosition;
                             MoveResult result = Navigator.MoveTo(dungeonEntrance, "Dungeon CorpseRun: returning to portal");
-                            if (result == MoveResult.PathGenerationFailed)
-                            {
-                                if (++_ghostPathFailures >= 3)
-                                {
-                                    if (!string.IsNullOrEmpty(_ghostEntranceSource))
-                                        _rejectedGhostEntranceUntilUtcMs[_ghostEntranceSource] = ghostNowUtcMs + 30000L;
-                                    _ghostEntrance = WoWPoint.Empty;
-                                    _ghostEntranceSource = string.Empty;
-                                    _nextGhostEntranceResolveUtcMs = 0;
-                                    _ghostPathFailures = 0;
-                                    Navigator.Clear();
-                                }
-                            }
-                            else if (result is MoveResult.Moved or MoveResult.ReachedDestination)
-                            {
-                                _ghostPathFailures = 0;
-                            }
+                            bool routeMatchesEntrance = Navigator.Destination != WoWPoint.Zero &&
+                                                        Navigator.Destination.Distance(dungeonEntrance) <= 2f;
+                            WoWPoint[] remainingPath = result == MoveResult.Moved && routeMatchesEntrance
+                                ? Navigator.GetRemainingNavPath()
+                                : Array.Empty<WoWPoint>();
+                            bool hasRoutePath = result == MoveResult.Moved && routeMatchesEntrance && remainingPath.Length > 0;
+                            float progressMetric = ComputeGhostPortalProgressDistance(
+                                me.Location,
+                                dungeonEntrance,
+                                hasRoutePath ? remainingPath : null);
+                            bool stalled = EvaluateGhostPortalProgress(
+                                progressMetric,
+                                hasRoutePath,
+                                Navigator.CurrentPathGeneration,
+                                ref _ghostBestRouteGeneration,
+                                ref _ghostBestRouteDistance,
+                                ref _ghostBestEntranceDistance,
+                                ref _lastGhostProgressUtcMs,
+                                ghostNowUtcMs);
 
-                            if (result != MoveResult.ReachedDestination && ghostNowUtcMs >= _nextGhostPortalAttemptUtcMs)
+                            if (result != MoveResult.ReachedDestination && (stalled || ghostNowUtcMs >= _nextGhostPortalAttemptUtcMs))
                             {
                                 _nextGhostPortalAttemptUtcMs = ghostNowUtcMs + 5000L;
                                 Logging.WriteDebug("[PartyGrind CorpseRun {0}] Portal approach distance={1:F1} result={2} stalled={3} pos=({4:F1},{5:F1},{6:F1}) portal=({7:F1},{8:F1},{9:F1}) attempt={10}",
                                     me.Name, entranceDistance, result, stalled, me.Location.X, me.Location.Y, me.Location.Z,
                                     dungeonEntrance.X, dungeonEntrance.Y, dungeonEntrance.Z, ++_ghostPortalAttempts);
+                            }
+
+                            bool failedMove = result == MoveResult.PathGenerationFailed || result == MoveResult.Failed;
+                            if (stalled || (failedMove && ++_ghostPathFailures >= GhostPortalMaxFailedMoves))
+                            {
+                                if (!string.IsNullOrEmpty(_ghostEntranceSource))
+                                    _rejectedGhostEntranceUntilUtcMs[_ghostEntranceSource] = ghostNowUtcMs + 30000L;
+                                _ghostEntrance = WoWPoint.Empty;
+                                _ghostEntranceSource = string.Empty;
+                                _nextGhostEntranceResolveUtcMs = 0;
+                                _ghostPathFailures = 0;
+                                _ghostBestRouteGeneration = 0;
+                                _ghostBestRouteDistance = float.MaxValue;
+                                _ghostBestEntranceDistance = float.MaxValue;
+                                _lastGhostProgressUtcMs = 0;
+                                Navigator.Clear();
+                            }
+                            else if (result is MoveResult.Moved or MoveResult.ReachedDestination)
+                            {
+                                _ghostPathFailures = 0;
                             }
                             return RunStatus.Success;
                         }
@@ -1881,6 +2282,8 @@ namespace CopilotBuddy.Bots.PartyGrind
 
             _nextGhostEntranceResolveUtcMs = now + 5000L;
             _ghostEntranceDungeonId = dungeonId;
+            WoWPoint previousEntrance = _ghostEntrance;
+            string previousSource = _ghostEntranceSource;
             string source;
 
             var portalObject = ObjectManager.GetObjectsOfType<WoWGameObject>()
@@ -1917,11 +2320,17 @@ namespace CopilotBuddy.Bots.PartyGrind
                 source = "none";
             }
 
-            if (!string.Equals(source, _ghostEntranceSource, StringComparison.Ordinal))
+            if (!string.Equals(source, previousSource, StringComparison.Ordinal) ||
+                _ghostEntrance.Distance(previousEntrance) > 1f)
             {
                 Logging.WriteDebug("[PartyGrind CorpseRun {0}] Entrance target source={1} dungeonId={2} target=({3:F1},{4:F1},{5:F1})",
                     me.Name, source, dungeonId, _ghostEntrance.X, _ghostEntrance.Y, _ghostEntrance.Z);
                 _ghostEntranceSource = source;
+                _ghostBestRouteGeneration = 0;
+                _ghostBestRouteDistance = float.MaxValue;
+                _ghostBestEntranceDistance = float.MaxValue;
+                _lastGhostProgressUtcMs = 0;
+                _ghostPathFailures = 0;
             }
 
             return _ghostEntrance;
@@ -2614,7 +3023,7 @@ namespace CopilotBuddy.Bots.PartyGrind
 
         private bool PositionBackline(float standoffDistance, SquadLeaderState? leader, LocalPlayer me, WoWUnit? selectedTarget = null)
         {
-            if (leader == null || leader.MapId != me.MapId || leader.IsDead || leader.IsGhost)
+            if (leader == null || !leader.HasValidMap || leader.MapId != me.MapId || leader.IsDead || leader.IsGhost)
                 return false;
 
             if (SquadContext.IsDungeonModeActive && !global::Bots.DungeonBuddy.Helpers.ScriptHelpers.MovementEnabled)
@@ -2937,6 +3346,8 @@ namespace CopilotBuddy.Bots.PartyGrind
             var leader = SquadContext.GetLeaderStateSnapshot();
             if (leader != null)
             {
+                if (!leader.HasValidMap || !IsSameMapForNavigation(me.MapId, leader.MapId))
+                    return false;
                 if (leader.InCombat || leader.FocusTargetGuid != 0)
                     return false;
                 if (leader.Phase != SquadPhase.Looting &&
@@ -2977,11 +3388,13 @@ namespace CopilotBuddy.Bots.PartyGrind
             long now = Environment.TickCount64;
             foreach (var guid in LootRetry.Where(p => p.Value <= now).Select(p => p.Key).ToList())
                 LootRetry.Remove(guid);
+            var me = StyxWoW.Me;
             return LootTargeting.Instance.LootingList.FirstOrDefault(o =>
             {
                 if (o == null || !o.IsValid || LootRetry.ContainsKey(o.Guid))
                     return false;
-                if (leader != null && o.Location.Distance(new WoWPoint(leader.X, leader.Y, leader.Z)) > 25f)
+                if (leader != null && (me == null || !leader.HasValidMap || !IsSameMapForNavigation(me.MapId, leader.MapId) ||
+                                       o.Location.Distance(new WoWPoint(leader.X, leader.Y, leader.Z)) > 25f))
                     return false;
                 if (!bossesOnly)
                     return true;
@@ -3089,6 +3502,13 @@ namespace CopilotBuddy.Bots.PartyGrind
                     }
                 }
 
+                if (SquadContext.IsDungeonModeActive && !isDungeon)
+                {
+                    if (me.IsMoving)
+                        WoWMovement.MoveStop();
+                    return RunStatus.Success;
+                }
+
                 // 1. Hard backtrack toward lagging squadmate if > HardBacktrackDistance.
                 if (_coordinator.IsHardBacktracking && leader?.Members != null)
                 {
@@ -3185,48 +3605,199 @@ namespace CopilotBuddy.Bots.PartyGrind
                     WoWPoint nextDungeonPt = _dungeon.ComputeLeaderNextDungeonPoint();
                     if (nextDungeonPt != WoWPoint.Zero && me.Location.Distance(nextDungeonPt) > SquadDungeonService.HotspotArrivalDistance)
                     {
-                        // Breadcrumb-by-breadcrumb advance: walk one short step at a time and stop
-                        // whenever live trash still sits on the corridor, so the pack in front is
-                        // pulled and killed before the tank moves on toward the objective.
+                        ulong leaderGuid = leader?.LeaderGuid ?? 0UL;
                         SyncDungeonForcedStepObjective(nextDungeonPt);
-                        WoWPoint advanceStep = SquadDungeonService.ResolveDungeonAdvanceStep(
-                            me.Location,
-                            nextDungeonPt,
-                            CollectDungeonTrashPoints(me.Location, DungeonTrashScanRadius));
+                        var trashPoints = CollectDungeonTrashPoints(me.Location, DungeonTrashScanRadius);
 
-                        if (advanceStep == WoWPoint.Zero)
+                        if (DungeonForcedStepActive(leaderGuid, now))
                         {
-                            if (_dungeonAdvanceBlockedSinceUtcMs == 0)
-                            {
-                                _dungeonAdvanceBlockedSinceUtcMs = now;
+                            WoWPoint activeStep = _dungeonForcedStep;
+                            WoWPoint[] remainingActiveLegs =
+                                Navigator.Destination != WoWPoint.Zero && Navigator.Destination.Distance(activeStep) <= 1f
+                                    ? Navigator.GetRemainingNavPath()
+                                    : Array.Empty<WoWPoint>();
+                            bool hasTrashOnActiveStep = SquadDungeonService.HasTrashOnPolylineStep(
+                                me.Location,
+                                remainingActiveLegs.Length > 0 ? remainingActiveLegs : _cachedDungeonAdvancePath,
+                                activeStep,
+                                trashPoints);
+                            bool holdForTrash = EvaluateDungeonCorridorBlock(
+                                _dungeonForcedStepBypassTrashGrace,
+                                hasTrashOnActiveStep,
+                                me.MapId,
+                                nextDungeonPt,
+                                ref _dungeonAdvanceBlockedMapId,
+                                ref _dungeonAdvanceBlockedObjective,
+                                ref _dungeonAdvanceLastHoldEvalUtcMs,
+                                ref _dungeonAdvanceBlockedSinceUtcMs,
+                                now,
+                                out bool newlyBlocked,
+                                out bool graceExpired);
+                            if (newlyBlocked)
                                 SquadPartySyncService.LogAction("Dungeon: clearing trash before " + (leader?.CurrentBossName ?? "next objective"));
-                            }
+                            if (graceExpired)
+                                _dungeonForcedStepBypassTrashGrace = true;
 
-                            // Never wedge forever: if the corridor stays blocked while nothing can be
-                            // pulled (uneven floor, unreachable pack), resume the advance after a grace.
-                            if (now - _dungeonAdvanceBlockedSinceUtcMs >= DungeonAdvanceBlockMaxMs)
+                            if (!holdForTrash)
                             {
-                                _dungeonAdvanceBlockedSinceUtcMs = 0;
-                                advanceStep = SquadDungeonService.ResolveDungeonAdvanceStep(
-                                    me.Location,
-                                    nextDungeonPt,
-                                    null,
-                                    clearance: 0f);
-                            }
-                        }
-                        else
-                        {
-                            _dungeonAdvanceBlockedSinceUtcMs = 0;
-                        }
+                                if (_dungeonForcedStepWasHeldForTrash)
+                                {
+                                    _dungeonForcedStepWasHeldForTrash = false;
+                                    _dungeonForcedStepLastProgressUtcMs = now;
+                                }
 
-                        if (advanceStep == WoWPoint.Zero)
-                        {
-                            StopMovementUnlessDungeonForcedStep(leader?.LeaderGuid ?? 0UL, now);
+                                float resumePrecision = _dungeonForcedStepMovePrecision > 0f
+                                    ? _dungeonForcedStepMovePrecision
+                                    : Math.Min(Navigator.PathPrecision, DungeonForcedStepArrivalDistance);
+                                MoveResult activeResult = Navigator.MoveTo(activeStep, resumePrecision, "Advancing through dungeon");
+                                if (Navigator.IsRidingElevator)
+                                {
+                                    _dungeonForcedStepIssuedUtcMs = now;
+                                    _dungeonForcedStepLastProgressUtcMs = now;
+                                    return RunStatus.Success;
+                                }
+                                float curStepDist = me.Location.Distance(activeStep);
+                                float curObjDist = me.Location.Distance(nextDungeonPt);
+                                bool stalled = EvaluateDungeonStepProgress(
+                                    curStepDist,
+                                    curObjDist,
+                                    ref _dungeonForcedStepBestDist,
+                                    ref _dungeonForcedObjectiveBestDist,
+                                    ref _dungeonForcedStepLastProgressUtcMs,
+                                    now);
+
+                                if (activeResult == MoveResult.PathGenerationFailed || activeResult == MoveResult.Failed || stalled)
+                                {
+                                    HandleFailedDungeonStep(activeStep, nextDungeonPt, me.MapId, now);
+                                }
+                                else if ((activeResult == MoveResult.ReachedDestination &&
+                                          (curStepDist <= resumePrecision ||
+                                           curObjDist <= SquadDungeonService.HotspotArrivalDistance)) ||
+                                         curStepDist <= resumePrecision)
+                                {
+                                    ClearDungeonForcedStep();
+                                    ResetDungeonStepFailures();
+                                }
+                                return RunStatus.Success;
+                            }
+
+                            _dungeonForcedStepWasHeldForTrash = true;
+                            _dungeonForcedStepLastProgressUtcMs = now;
+                            if (me.IsMoving)
+                                WoWMovement.MoveStop();
                             return RunStatus.Success;
                         }
 
+                        if (_cachedDungeonAdvanceObjective != nextDungeonPt ||
+                            now - _lastDungeonAdvancePathUtcMs >= DungeonAdvancePathRefreshMs)
+                        {
+                            _cachedDungeonAdvanceObjective = nextDungeonPt;
+                            _cachedDungeonAdvancePath = Navigator.GeneratePath(me.Location, nextDungeonPt);
+                            _lastDungeonAdvancePathUtcMs = now;
+                        }
+                        else if (_cachedDungeonAdvancePath.Length == 0)
+                        {
+                            StopMovementUnlessDungeonForcedStep(leaderGuid, now);
+                            return RunStatus.Success;
+                        }
+
+                        WoWPoint advanceStep = SquadDungeonService.ResolvePolylineAdvanceStep(
+                            me.Location,
+                            _cachedDungeonAdvancePath,
+                            nextDungeonPt,
+                            trashPoints);
+
+                        bool bypassTrashGrace = false;
+                        if (EvaluateDungeonCorridorBlock(
+                            bypassTrashGrace: false,
+                            hasTrashOnSegment: advanceStep == WoWPoint.Zero,
+                            me.MapId,
+                            nextDungeonPt,
+                            ref _dungeonAdvanceBlockedMapId,
+                            ref _dungeonAdvanceBlockedObjective,
+                            ref _dungeonAdvanceLastHoldEvalUtcMs,
+                            ref _dungeonAdvanceBlockedSinceUtcMs,
+                            now,
+                            out bool blockedStarted,
+                            out bool graceElapsed))
+                        {
+                            if (blockedStarted)
+                                SquadPartySyncService.LogAction("Dungeon: clearing trash before " + (leader?.CurrentBossName ?? "next objective"));
+                            StopMovementUnlessDungeonForcedStep(leaderGuid, now);
+                            return RunStatus.Success;
+                        }
+
+                        if (graceElapsed)
+                        {
+                            bypassTrashGrace = true;
+                            advanceStep = SquadDungeonService.ResolvePolylineAdvanceStep(
+                                me.Location,
+                                _cachedDungeonAdvancePath,
+                                nextDungeonPt,
+                                null,
+                                clearance: 0f);
+                        }
+
+                        if (advanceStep == WoWPoint.Zero)
+                        {
+                            StopMovementUnlessDungeonForcedStep(leaderGuid, now);
+                            return RunStatus.Success;
+                        }
+
+                        bool primaryStepUsable = !_dungeon.IsDungeonNavigationPointBlacklisted(me.MapId, advanceStep, now) &&
+                                                 Navigator.CanNavigateFully(me.Location, advanceStep);
+                        if (!primaryStepUsable)
+                        {
+                            WoWPoint fallbackPolyStep = WoWPoint.Zero;
+                            if (_cachedDungeonAdvancePath.Length > 0)
+                            {
+                                WoWPoint cursor = me.Location;
+                                float cumulativePolyDist = 0f;
+                                int maxBudgetIndex = -1;
+                                for (int i = 0; i < _cachedDungeonAdvancePath.Length; i++)
+                                {
+                                    WoWPoint wp = _cachedDungeonAdvancePath[i];
+                                    if (wp == WoWPoint.Zero)
+                                        continue;
+                                    cumulativePolyDist += cursor.Distance(wp);
+                                    cursor = wp;
+                                    if (cumulativePolyDist > SquadDungeonService.DungeonAdvanceStepDistance)
+                                        break;
+                                    maxBudgetIndex = i;
+                                }
+
+                                for (int i = maxBudgetIndex; i >= 0; i--)
+                                {
+                                    WoWPoint candidate = _cachedDungeonAdvancePath[i];
+                                    if (candidate == WoWPoint.Zero ||
+                                        me.Location.Distance(candidate) <= DungeonForcedStepArrivalDistance)
+                                        continue;
+                                    if (_dungeon.IsDungeonNavigationPointBlacklisted(me.MapId, candidate, now))
+                                        continue;
+                                    if (!bypassTrashGrace &&
+                                        SquadDungeonService.HasTrashOnPolylineStep(me.Location, _cachedDungeonAdvancePath, candidate, trashPoints))
+                                        continue;
+                                    if (Navigator.CanNavigateFully(me.Location, candidate))
+                                    {
+                                        fallbackPolyStep = candidate;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if (fallbackPolyStep == WoWPoint.Zero)
+                            {
+                                if (me.IsMoving)
+                                    WoWMovement.MoveStop();
+                                HandleFailedDungeonStep(advanceStep, nextDungeonPt, me.MapId, now);
+                                return RunStatus.Success;
+                            }
+
+                            advanceStep = fallbackPolyStep;
+                        }
+
                         SquadPartySyncService.LogAction("Dungeon: advancing toward " + (leader?.CurrentBossName ?? "next objective"));
-                        IssueDungeonForcedStep(advanceStep, nextDungeonPt, leader?.LeaderGuid ?? 0UL, now);
+                        IssueDungeonForcedStep(advanceStep, nextDungeonPt, leaderGuid, now, bypassTrashGrace);
                     }
                     else if (me.IsMoving)
                     {
@@ -3235,10 +3806,22 @@ namespace CopilotBuddy.Bots.PartyGrind
                     return RunStatus.Success;
                 }
 
+                if (SquadContext.IsDungeonModeActive)
+                {
+                    if (me.IsMoving)
+                        WoWMovement.MoveStop();
+                    return RunStatus.Success;
+                }
+
                 // 3. Migrate cleanly to new sub-profile hotspot when MigratingZone.
                 var grindArea = StyxWoW.AreaManager?.CurrentGrindArea ?? (ProfileManager.CurrentOuterProfile != null ? ProfileManager.CurrentProfile?.GrindArea : null);
                 if (leader != null && leader.Phase == SquadPhase.MigratingZone && grindArea != null && grindArea.Hotspots.Count > 0)
                 {
+                    if (!leader.HasValidMap || !IsSameMapForNavigation(me.MapId, leader.MapId))
+                    {
+                        if (me.IsMoving) WoWMovement.MoveStop();
+                        return RunStatus.Success;
+                    }
                     WoWPoint hs = grindArea.CurrentHotSpot.Position;
                     if (me.Location.Distance(hs) > 10f)
                     {
@@ -3288,7 +3871,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                     WoWPetControl.Follow();
                 }
 
-                if (leader == null)
+                if (leader == null || !leader.HasValidMap || !IsSameMapForNavigation(me.MapId, leader.MapId))
                 {
                     Navigator.Clear();
                     WoWMovement.MoveStop();
@@ -3314,8 +3897,12 @@ namespace CopilotBuddy.Bots.PartyGrind
                     }
                 }
 
-                if (leader.MapId != me.MapId)
+                if (SquadContext.IsDungeonModeActive && !isDungeon)
+                {
+                    if (me.IsMoving)
+                        WoWMovement.MoveStop();
                     return RunStatus.Success;
+                }
 
                 int slotIdx = SquadContext.GetMySlotIndex(me.Name, leader);
                 WoWPoint followPos = isDungeon

@@ -754,5 +754,66 @@ namespace CopilotBuddy.PartyGrind.Tests
             Assert.False(boss2.IsDead);
             Assert.Equal(5678U, global::Bots.DungeonBuddy.BossManager.CurrentBoss?.EntryId);
         }
+
+        [Fact]
+        public void DungeonNavBlacklist_ActivatesAtThreeSpacedFailuresAndExpiresAfterCooldown()
+        {
+            var blacklist = new Dictionary<(int X, int Y, int Z, uint MapId), long>();
+            var target = new WoWPoint(2517.19f, 859.79f, 47.68f);
+            WoWPoint tracked = WoWPoint.Zero;
+            int failures = 0;
+            long lastFailMs = 0L;
+            long t = 1_000_000L;
+
+            Assert.False(CopilotBuddy.Bots.PartyGrind.PartyGrindBot.RecordDungeonStepFailure(
+                target, ref tracked, ref failures, ref lastFailMs, t));
+            Assert.False(CopilotBuddy.Bots.PartyGrind.PartyGrindBot.RecordDungeonStepFailure(
+                target, ref tracked, ref failures, ref lastFailMs, t + 100L));
+            Assert.Equal(1, failures);
+
+            Assert.False(CopilotBuddy.Bots.PartyGrind.PartyGrindBot.RecordDungeonStepFailure(
+                target, ref tracked, ref failures, ref lastFailMs, t + 600L));
+            Assert.Equal(2, failures);
+
+            Assert.True(CopilotBuddy.Bots.PartyGrind.PartyGrindBot.RecordDungeonStepFailure(
+                target, ref tracked, ref failures, ref lastFailMs, t + 1_200L));
+            Assert.Equal(0, failures);
+
+            SquadDungeonService.BlacklistNavPoint(blacklist, 129U, target, t + 1_200L);
+            Assert.True(SquadDungeonService.IsNavPointBlacklisted(blacklist, 129U, target, t + 1_200L));
+            Assert.False(SquadDungeonService.IsNavPointBlacklisted(blacklist, 1U, target, t + 1_200L));
+            Assert.True(SquadDungeonService.IsNavPointBlacklisted(
+                blacklist, 129U, target, t + 1_200L + SquadDungeonService.DungeonStepBlacklistCooldownMs - 1L));
+            Assert.False(SquadDungeonService.IsNavPointBlacklisted(
+                blacklist, 129U, target, t + 1_200L + SquadDungeonService.DungeonStepBlacklistCooldownMs));
+
+            SquadDungeonService.PruneExpiredNavBlacklist(
+                blacklist, t + 1_200L + SquadDungeonService.DungeonStepBlacklistCooldownMs);
+            Assert.Empty(blacklist);
+        }
+
+        [Fact]
+        public void DungeonStepProgress_FlagsStallOnMicroOscillationWithoutAdvancing()
+        {
+            float bestStep = float.MaxValue;
+            float bestObj = float.MaxValue;
+            long lastProgress = 0L;
+            long t0 = 5_000_000L;
+
+            Assert.False(CopilotBuddy.Bots.PartyGrind.PartyGrindBot.EvaluateDungeonStepProgress(
+                18.0f, 92.6f, ref bestStep, ref bestObj, ref lastProgress, t0));
+            Assert.False(CopilotBuddy.Bots.PartyGrind.PartyGrindBot.EvaluateDungeonStepProgress(
+                17.2f, 92.0f, ref bestStep, ref bestObj, ref lastProgress, t0 + 3_000L));
+            Assert.Equal(t0, lastProgress);
+
+            Assert.True(CopilotBuddy.Bots.PartyGrind.PartyGrindBot.EvaluateDungeonStepProgress(
+                17.4f, 92.3f, ref bestStep, ref bestObj, ref lastProgress,
+                t0 + SquadDungeonService.DungeonStepStallTimeoutMs));
+
+            Assert.False(CopilotBuddy.Bots.PartyGrind.PartyGrindBot.EvaluateDungeonStepProgress(
+                15.0f, 90.0f, ref bestStep, ref bestObj, ref lastProgress,
+                t0 + SquadDungeonService.DungeonStepStallTimeoutMs + 100L));
+            Assert.Equal(t0 + SquadDungeonService.DungeonStepStallTimeoutMs + 100L, lastProgress);
+        }
     }
 }

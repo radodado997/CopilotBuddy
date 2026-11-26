@@ -25,7 +25,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
     {
         public bool IsInsideDungeon { get; set; }
         public uint ActiveDungeonId { get; set; }
-        public uint ActiveDungeonMapId { get; set; }
+        public uint? ActiveDungeonMapId { get; set; }
         public string ActiveDungeonName { get; set; } = string.Empty;
         public uint CurrentBossEntry { get; set; }
         public string CurrentBossName { get; set; } = string.Empty;
@@ -40,7 +40,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         public float PortalX { get; set; }
         public float PortalY { get; set; }
         public float PortalZ { get; set; }
-        public uint PortalMapId { get; set; }
+        public uint? PortalMapId { get; set; }
         public float ExitX { get; set; }
         public float ExitY { get; set; }
         public float ExitZ { get; set; }
@@ -122,6 +122,10 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         internal const float DungeonAdvanceStepDistance = 18f;
         internal const float DungeonAdvanceTrashClearance = 12f;
         internal const float DungeonAdvanceClearanceHeight = 8f;
+        internal const long DungeonStepBlacklistCooldownMs = 30000L;
+        internal const int DungeonStepMaxConsecutiveFailures = 3;
+        internal const long DungeonStepStallTimeoutMs = 4500L;
+        internal const float DungeonStepMinProgressYards = 1.5f;
         // A boss may only be approached directly while it is already inside pull range;
         // farther bosses have to be reached through the cleared breadcrumb corridor.
         internal const float BossFallbackApproachDistance = 40f;
@@ -132,8 +136,10 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private uint _walkInRunDungeonId;
         private uint _walkInRunMapId;
         private int _hotspotIndex;
+        private readonly HashSet<int> _visitedFallbackHotspots = new();
         private uint _breadcrumbBossEntry;
         private int _breadcrumbIndex;
+        private readonly Dictionary<(int X, int Y, int Z, uint MapId), long> _blacklistedNavPoints = new();
         private long _completedAtUtcMs;
         private bool _lfgRunCompletedAwaitingRequeue;
         private bool _countedCurrentWalkInEntry;
@@ -177,8 +183,10 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             _lastProposalAcceptUtcMs = 0;
             _lastTeleportOutUtcMs = 0;
             _hotspotIndex = 0;
+            _visitedFallbackHotspots.Clear();
             _breadcrumbBossEntry = 0;
             _breadcrumbIndex = 0;
+            _blacklistedNavPoints.Clear();
             _lfgRunCompletedAwaitingRequeue = false;
             StopActiveEncounter();
         }
@@ -201,8 +209,10 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             _lastSyncedMapId = 0;
             _lastSyncedDungeonId = 0;
             _hotspotIndex = 0;
+            _visitedFallbackHotspots.Clear();
             _breadcrumbBossEntry = 0;
             _breadcrumbIndex = 0;
+            _blacklistedNavPoints.Clear();
             _lfgRunCompletedAwaitingRequeue = false;
         }
 
@@ -303,8 +313,10 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 {
                     StopActiveEncounter();
                     _hotspotIndex = 0;
+                    _visitedFallbackHotspots.Clear();
                     _breadcrumbBossEntry = 0;
                     _breadcrumbIndex = 0;
+                    _blacklistedNavPoints.Clear();
                     DungeonManager.SetDungeonById(desiredDungeonId);
                     BossManager.RestoreKilledBosses(_currentRunKilledBosses);
                     LfgManager.DungeonCompletedReason = CompleteReason.None;
@@ -323,6 +335,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     BossManager.Reset();
                     _lastSyncedDungeonId = 0;
                     _hotspotIndex = 0;
+                    _visitedFallbackHotspots.Clear();
                     _currentRunKilledBosses.Clear();
                 }
                 _lastSyncedMapId = me.MapId;
@@ -486,7 +499,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             return connected.Any(m => m.LastStateReceivedUtcMs > completedAtUtcMs &&
                                       m.LastStateReceivedUtcMs <= nowUtcMs &&
                                       nowUtcMs - m.LastStateReceivedUtcMs <= 5000L &&
-                                      m.LatestState is { HasDungeonTelemetry: true, IsInsideDungeon: false } state &&
+                                      m.LatestState is { HasDungeonTelemetry: true, HasValidMap: true, IsInsideDungeon: false } state &&
                                       state.Guid == participantGuid);
         }
 
@@ -671,14 +684,14 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (!walkIn && inDungeon && complete)
                 _lfgRunCompletedAwaitingRequeue = true;
 
-            uint instanceMapId = 0;
+            uint? instanceMapId = null;
             if (activeId > 0)
             {
                 try
                 {
                     var dbc = LfgDungeons.GetById(activeId);
-                    if (dbc != null)
-                        instanceMapId = (uint)Math.Max(0, dbc.MapId);
+                    if (dbc != null && dbc.MapId >= 0)
+                        instanceMapId = (uint)dbc.MapId;
                 }
                 catch { }
             }
@@ -702,7 +715,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 PortalX = portal.X,
                 PortalY = portal.Y,
                 PortalZ = portal.Z,
-                PortalMapId = me != null && !inDungeon ? me.MapId : 0U,
+                PortalMapId = me != null && !inDungeon && StyxWoW.IsInWorld ? me.MapId : null,
                 ExitX = exit.X,
                 ExitY = exit.Y,
                 ExitZ = exit.Z
@@ -1285,9 +1298,17 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         /// of the leader corridor still runs through live trash.
         /// </summary>
         internal static float DistanceToCorridorSegment(WoWPoint point, WoWPoint from, WoWPoint to) =>
-            DistanceToCorridorSegment(point, from, to, out _);
+            DistanceToCorridorSegment(point, from, to, out _, out _);
 
-        internal static float DistanceToCorridorSegment(WoWPoint point, WoWPoint from, WoWPoint to, out float alongTrack)
+        internal static float DistanceToCorridorSegment(WoWPoint point, WoWPoint from, WoWPoint to, out float alongTrack) =>
+            DistanceToCorridorSegment(point, from, to, out alongTrack, out _);
+
+        internal static float DistanceToCorridorSegment(
+            WoWPoint point,
+            WoWPoint from,
+            WoWPoint to,
+            out float alongTrack,
+            out float projectedZ)
         {
             float dx = to.X - from.X;
             float dy = to.Y - from.Y;
@@ -1295,18 +1316,225 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (lengthSquared <= 0.0001f)
             {
                 alongTrack = 0f;
+                projectedZ = from.Z;
                 float offsetX = point.X - from.X;
                 float offsetY = point.Y - from.Y;
                 return MathF.Sqrt(offsetX * offsetX + offsetY * offsetY);
             }
 
-            alongTrack = ((point.X - from.X) * dx + (point.Y - from.Y) * dy) / MathF.Sqrt(lengthSquared);
-            float projection = Math.Clamp(alongTrack / MathF.Sqrt(lengthSquared), 0f, 1f);
+            float length = MathF.Sqrt(lengthSquared);
+            alongTrack = ((point.X - from.X) * dx + (point.Y - from.Y) * dy) / length;
+            float projection = Math.Clamp(alongTrack / length, 0f, 1f);
+            projectedZ = from.Z + (to.Z - from.Z) * projection;
             float closestX = from.X + dx * projection;
             float closestY = from.Y + dy * projection;
             float deltaX = point.X - closestX;
             float deltaY = point.Y - closestY;
             return MathF.Sqrt(deltaX * deltaX + deltaY * deltaY);
+        }
+
+        internal static bool HasTrashOnSegment(
+            WoWPoint from,
+            WoWPoint to,
+            IReadOnlyList<WoWPoint>? hostileLocations,
+            float clearance = DungeonAdvanceTrashClearance)
+        {
+            if (clearance <= 0f || hostileLocations == null || hostileLocations.Count == 0)
+                return false;
+
+            foreach (WoWPoint hostile in hostileLocations)
+            {
+                if (hostile == WoWPoint.Zero)
+                    continue;
+                if (DistanceToCorridorSegment(hostile, from, to, out float alongTrack, out float projectedZ) <= clearance &&
+                    alongTrack > 0f &&
+                    MathF.Abs(hostile.Z - projectedZ) <= DungeonAdvanceClearanceHeight)
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static float DistanceToPointSegment3D(WoWPoint point, WoWPoint start, WoWPoint end)
+        {
+            float dx = end.X - start.X;
+            float dy = end.Y - start.Y;
+            float dz = end.Z - start.Z;
+            float lengthSquared = dx * dx + dy * dy + dz * dz;
+            if (lengthSquared <= 0.0001f)
+                return point.Distance(start);
+
+            float t = Math.Clamp(
+                ((point.X - start.X) * dx + (point.Y - start.Y) * dy + (point.Z - start.Z) * dz) / lengthSquared,
+                0f,
+                1f);
+            var closest = new WoWPoint(start.X + dx * t, start.Y + dy * t, start.Z + dz * t);
+            return point.Distance(closest);
+        }
+
+        internal static bool HasTrashOnPolylineStep(
+            WoWPoint from,
+            IReadOnlyList<WoWPoint>? pathPoints,
+            WoWPoint step,
+            IReadOnlyList<WoWPoint>? hostileLocations,
+            float clearance = DungeonAdvanceTrashClearance)
+        {
+            if (clearance <= 0f || hostileLocations == null || hostileLocations.Count == 0)
+                return false;
+
+            if (pathPoints != null && pathPoints.Count > 0)
+            {
+                WoWPoint cursor = from;
+                bool matchedOnPath = false;
+                var legs = new List<(WoWPoint From, WoWPoint To)>();
+                for (int i = 0; i < pathPoints.Count; i++)
+                {
+                    WoWPoint wp = pathPoints[i];
+                    if (wp == WoWPoint.Zero)
+                        continue;
+
+                    if (cursor.Distance(wp) <= 0.1f)
+                    {
+                        cursor = wp;
+                        continue;
+                    }
+
+                    if (DistanceToPointSegment3D(step, cursor, wp) <= 0.35f)
+                    {
+                        if (cursor.Distance(step) > 0.1f)
+                            legs.Add((cursor, step));
+                        matchedOnPath = true;
+                        break;
+                    }
+
+                    legs.Add((cursor, wp));
+                    cursor = wp;
+                }
+
+                if (matchedOnPath)
+                {
+                    foreach (var leg in legs)
+                    {
+                        if (HasTrashOnSegment(leg.From, leg.To, hostileLocations, clearance))
+                            return true;
+                    }
+                    return false;
+                }
+            }
+
+            return HasTrashOnSegment(from, step, hostileLocations, clearance);
+        }
+
+        internal static (int X, int Y, int Z, uint MapId) QuantizeNavPoint(uint mapId, WoWPoint point) =>
+            ((int)MathF.Round(point.X), (int)MathF.Round(point.Y), (int)MathF.Round(point.Z), mapId);
+
+        internal static bool IsNavPointBlacklisted(
+            IReadOnlyDictionary<(int X, int Y, int Z, uint MapId), long> blacklist,
+            uint mapId,
+            WoWPoint point,
+            long nowUtcMs)
+        {
+            if (point == WoWPoint.Zero || blacklist.Count == 0)
+                return false;
+
+            return blacklist.TryGetValue(QuantizeNavPoint(mapId, point), out long untilUtcMs) && nowUtcMs < untilUtcMs;
+        }
+
+        internal static void BlacklistNavPoint(
+            IDictionary<(int X, int Y, int Z, uint MapId), long> blacklist,
+            uint mapId,
+            WoWPoint point,
+            long nowUtcMs,
+            long durationMs = DungeonStepBlacklistCooldownMs)
+        {
+            if (point == WoWPoint.Zero || durationMs <= 0L)
+                return;
+
+            blacklist[QuantizeNavPoint(mapId, point)] = nowUtcMs + durationMs;
+        }
+
+        internal static void PruneExpiredNavBlacklist(
+            IDictionary<(int X, int Y, int Z, uint MapId), long> blacklist,
+            long nowUtcMs)
+        {
+            if (blacklist.Count == 0)
+                return;
+
+            List<(int X, int Y, int Z, uint MapId)>? expired = null;
+            foreach (var entry in blacklist)
+            {
+                if (nowUtcMs >= entry.Value)
+                    (expired ??= new List<(int, int, int, uint)>()).Add(entry.Key);
+            }
+
+            if (expired == null)
+                return;
+
+            foreach (var key in expired)
+                blacklist.Remove(key);
+        }
+
+        public void BlacklistDungeonNavigationPoint(uint mapId, WoWPoint point, long nowUtcMs)
+        {
+            BlacklistNavPoint(_blacklistedNavPoints, mapId, point, nowUtcMs);
+        }
+
+        public bool IsDungeonNavigationPointBlacklisted(uint mapId, WoWPoint point, long nowUtcMs) =>
+            IsNavPointBlacklisted(_blacklistedNavPoints, mapId, point, nowUtcMs);
+
+        internal static WoWPoint ResolvePolylineAdvanceStep(
+            WoWPoint from,
+            IReadOnlyList<WoWPoint>? pathPoints,
+            WoWPoint fallbackDestination,
+            IReadOnlyList<WoWPoint>? hostileLocations,
+            float maxStep = DungeonAdvanceStepDistance,
+            float clearance = DungeonAdvanceTrashClearance)
+        {
+            if (from == WoWPoint.Zero)
+                return WoWPoint.Zero;
+
+            if (pathPoints != null && pathPoints.Count > 0)
+            {
+                WoWPoint cursor = from;
+                float remaining = maxStep > 0f ? maxStep : float.MaxValue;
+                WoWPoint selected = WoWPoint.Zero;
+
+                for (int i = 0; i < pathPoints.Count; i++)
+                {
+                    WoWPoint wp = pathPoints[i];
+                    if (wp == WoWPoint.Zero)
+                        continue;
+
+                    float segLen = cursor.Distance(wp);
+                    if (segLen <= 0.25f)
+                        continue;
+
+                    WoWPoint segmentEnd = wp;
+                    if (remaining < segLen)
+                    {
+                        float ratio = remaining / segLen;
+                        segmentEnd = new WoWPoint(
+                            cursor.X + (wp.X - cursor.X) * ratio,
+                            cursor.Y + (wp.Y - cursor.Y) * ratio,
+                            cursor.Z + (wp.Z - cursor.Z) * ratio);
+                    }
+
+                    if (HasTrashOnSegment(cursor, segmentEnd, hostileLocations, clearance))
+                        return WoWPoint.Zero;
+
+                    selected = segmentEnd;
+                    remaining -= cursor.Distance(segmentEnd);
+                    cursor = segmentEnd;
+
+                    if (remaining <= 0.1f)
+                        break;
+                }
+
+                if (selected != WoWPoint.Zero && from.Distance(selected) > 0.01f)
+                    return selected;
+            }
+
+            return ResolveDungeonAdvanceStep(from, fallbackDestination, hostileLocations, maxStep, clearance);
         }
 
         /// <summary>
@@ -1339,37 +1567,36 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     from.Z + (destination.Z - from.Z) * ratio);
             }
 
-            if (clearance > 0f && hostileLocations != null)
-            {
-                foreach (WoWPoint hostile in hostileLocations)
-                {
-                    if (hostile == WoWPoint.Zero)
-                        continue;
-                    if (MathF.Abs(hostile.Z - from.Z) > DungeonAdvanceClearanceHeight)
-                        continue;
-                    // Only trash the leader would walk into counts: a mob trailing behind the group
-                    // must not freeze the advance for the whole corridor.
-                    if (DistanceToCorridorSegment(hostile, from, step, out float alongTrack) <= clearance &&
-                        alongTrack > 0f)
-                        return WoWPoint.Zero;
-                }
-            }
+            if (HasTrashOnSegment(from, step, hostileLocations, clearance))
+                return WoWPoint.Zero;
 
             return step;
+        }
+
+        private bool IsReachableDungeonCandidate(uint mapId, WoWPoint from, WoWPoint candidate, long nowUtcMs)
+        {
+            if (candidate == WoWPoint.Zero)
+                return false;
+            if (IsNavPointBlacklisted(_blacklistedNavPoints, mapId, candidate, nowUtcMs))
+                return false;
+            return Navigator.NavigationProvider != null && Navigator.CanNavigateFully(from, candidate);
         }
 
         public WoWPoint ComputeLeaderNextDungeonPoint()
         {
             var me = StyxWoW.Me;
-            if (me == null)
+            if (me == null || Navigator.NavigationProvider == null)
                 return WoWPoint.Zero;
+
+            long nowUtcMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            PruneExpiredNavBlacklist(_blacklistedNavPoints, nowUtcMs);
 
             if (BotPoi.Current.Type == PoiType.Hotspot && BotPoi.Current.Location != WoWPoint.Zero)
             {
                 WoWPoint hs = BotPoi.Current.Location;
                 if (me.Location.Distance(hs) <= HotspotArrivalDistance)
                     BotPoi.Clear("Reached dungeon hotspot");
-                else
+                else if (!IsNavPointBlacklisted(_blacklistedNavPoints, me.MapId, hs, nowUtcMs))
                     return hs;
             }
 
@@ -1407,21 +1634,64 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
                     WoWUnit? liveCurrentBoss = ObjectManager.GetObjectsOfType<WoWUnit>()
                         .FirstOrDefault(u => u != null && u.IsValid && u.IsAlive && u.Entry == profileBoss.Entry);
-                    float? livePathDist = liveCurrentBoss != null
-                        ? Navigator.PathDistance(me.Location, liveCurrentBoss.Location, 100f)
+                    WoWPoint? eligibleLiveBossLocation = liveCurrentBoss != null &&
+                        !IsNavPointBlacklisted(_blacklistedNavPoints, me.MapId, liveCurrentBoss.Location, nowUtcMs)
+                        ? liveCurrentBoss.Location
+                        : null;
+                    float? livePathDist = eligibleLiveBossLocation.HasValue
+                        ? Navigator.PathDistance(me.Location, eligibleLiveBossLocation.Value, 100f)
                         : null;
 
+                    int committedIndex = _breadcrumbIndex;
+                    int scanIndex = committedIndex;
+                    while (scanIndex < profileBoss.Path.Count)
+                    {
+                        int probeIdx = scanIndex;
+                        WoWPoint crumb = AdvanceBossBreadcrumb(
+                            me.Location,
+                            profileBoss.Path,
+                            WoWPoint.Zero,
+                            eligibleLiveBossLocation,
+                            livePathDist,
+                            ref probeIdx);
+                        if (crumb == WoWPoint.Zero)
+                        {
+                            if (!eligibleLiveBossLocation.HasValue && scanIndex == committedIndex)
+                                committedIndex = probeIdx;
+                            break;
+                        }
+                        if (scanIndex == committedIndex)
+                            committedIndex = probeIdx;
+                        if (eligibleLiveBossLocation.HasValue && crumb == eligibleLiveBossLocation.Value)
+                        {
+                            _breadcrumbIndex = committedIndex;
+                            return crumb;
+                        }
+                        if (!IsNavPointBlacklisted(_blacklistedNavPoints, me.MapId, crumb, nowUtcMs))
+                        {
+                            _breadcrumbIndex = committedIndex;
+                            return crumb;
+                        }
+                        scanIndex = probeIdx + 1;
+                    }
+
+                    _breadcrumbIndex = committedIndex;
+                    bool breadcrumbRouteComplete = profileBoss.Path.Count == 0 ||
+                        _breadcrumbIndex >= profileBoss.Path.Count;
+                    int bossIdx = committedIndex;
                     WoWPoint bossTarget = AdvanceBossBreadcrumb(
                         me.Location,
-                        profileBoss.Path,
+                        Array.Empty<WoWPoint>(),
                         profileBoss.Location,
-                        liveCurrentBoss?.Location,
+                        eligibleLiveBossLocation,
                         livePathDist,
-                        ref _breadcrumbIndex);
-                    if (bossTarget != WoWPoint.Zero)
+                        ref bossIdx);
+                    if (bossTarget != WoWPoint.Zero && IsReachableDungeonCandidate(me.MapId, me.Location, bossTarget, nowUtcMs))
                         return bossTarget;
 
-                    if (liveCurrentBoss == null && me.Location.Distance(profileBoss.Location) <= HotspotArrivalDistance)
+                    if (liveCurrentBoss == null &&
+                        breadcrumbRouteComplete &&
+                        me.Location.Distance(profileBoss.Location) <= HotspotArrivalDistance)
                     {
                         BossManager.MarkBossDead(profileBoss.Entry);
                         _currentRunKilledBosses.Add(profileBoss.Entry);
@@ -1434,6 +1704,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                                     (!b.Optional || BossManager.KillOptionalBossesEnabled) &&
                                     (currentBoss == null || b.Entry == currentBoss.Entry || b.KillOrder <=
                                      (profile.BossEncounters.FirstOrDefault(pb => pb.Entry == currentBoss.Entry)?.KillOrder ?? int.MaxValue))))
+                    .Where(u => !IsNavPointBlacklisted(_blacklistedNavPoints, me.MapId, u.Location, nowUtcMs))
                     .Where(u => Navigator.PathDistance(me.Location, u.Location, BossFallbackApproachDistance) is float pd &&
                                 pd < BossFallbackApproachDistance)
                     .OrderBy(u => profile.BossEncounters.FirstOrDefault(b => b.Entry == u.Entry)?.KillOrder ?? int.MaxValue)
@@ -1443,12 +1714,49 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 if (fallbackBoss != null)
                     return fallbackBoss.Location;
 
+                foreach (var altBoss in profile.BossEncounters.OrderBy(b => b.KillOrder))
+                {
+                    if (profileBoss != null && (altBoss.Entry == profileBoss.Entry || altBoss.KillOrder > profileBoss.KillOrder))
+                        continue;
+                    if (altBoss.Optional && !BossManager.KillOptionalBossesEnabled)
+                        continue;
+                    if (BossManager.Bosses.Any(b => b.Entry == altBoss.Entry && b.IsDead))
+                        continue;
+                    if (altBoss.Location != WoWPoint.Zero &&
+                        me.Location.Distance(altBoss.Location) > HotspotArrivalDistance &&
+                        !IsNavPointBlacklisted(_blacklistedNavPoints, me.MapId, altBoss.Location, nowUtcMs) &&
+                        Navigator.CanNavigateFully(me.Location, altBoss.Location))
+                    {
+                        return altBoss.Location;
+                    }
+                }
+
                 while (_hotspotIndex < profile.HotSpots.Count)
                 {
-                    WoWPoint hotspot = profile.HotSpots[_hotspotIndex];
-                    if (hotspot != WoWPoint.Zero && me.Location.Distance(hotspot) > HotspotArrivalDistance)
+                    WoWPoint hs = profile.HotSpots[_hotspotIndex];
+                    if (hs == WoWPoint.Zero ||
+                        _visitedFallbackHotspots.Contains(_hotspotIndex) ||
+                        me.Location.Distance(hs) <= HotspotArrivalDistance)
+                    {
+                        _visitedFallbackHotspots.Remove(_hotspotIndex);
+                        _hotspotIndex++;
+                        continue;
+                    }
+                    break;
+                }
+
+                for (int i = _hotspotIndex; i < profile.HotSpots.Count; i++)
+                {
+                    WoWPoint hotspot = profile.HotSpots[i];
+                    if (hotspot == WoWPoint.Zero || _visitedFallbackHotspots.Contains(i))
+                        continue;
+                    if (me.Location.Distance(hotspot) <= HotspotArrivalDistance)
+                    {
+                        _visitedFallbackHotspots.Add(i);
+                        continue;
+                    }
+                    if (!IsNavPointBlacklisted(_blacklistedNavPoints, me.MapId, hotspot, nowUtcMs))
                         return hotspot;
-                    _hotspotIndex++;
                 }
             }
 
