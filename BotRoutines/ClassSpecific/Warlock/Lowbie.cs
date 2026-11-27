@@ -1,4 +1,4 @@
-﻿
+
 using System.Linq;
 using Singular.Dynamics;
 using Singular.Helpers;
