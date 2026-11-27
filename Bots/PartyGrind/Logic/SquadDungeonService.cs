@@ -33,6 +33,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         public int TotalBossCount { get; set; }
         public bool IsDungeonComplete { get; set; }
         public bool ResetPendingOutside { get; set; }
+        public bool IsInPartyOrRaid { get; set; }
+        public bool AllExpectedMembersInParty { get; set; } = true;
         public bool LfgProposalPending { get; set; }
         public string LfgMode { get; set; } = string.Empty;
         public bool HasRandomPartyMembers { get; set; }
@@ -111,12 +113,13 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private long _lastProposalAcceptUtcMs;
         private long _lastTeleportInUtcMs;
         private long _lastTeleportOutUtcMs;
+        private long _lastInstanceResetAttemptUtcMs;
         private int _instanceResetGeneration;
         private int _lastResetGeneration;
+        private int _lastObservedResetGenOnFollower;
         private readonly HashSet<uint> _currentRunKilledBosses = new();
         internal const float HotspotArrivalDistance = 4.5f;
         internal const long ResetPendingOutsideTimeoutMs = 20000L;
-        internal const long ResetPendingOutsideLogThrottleMs = 5000L;
         // Trash is cleared one breadcrumb at a time: the leader never advances more than a
         // single step and refuses any step whose corridor still holds live hostile trash.
         internal const float DungeonAdvanceStepDistance = 18f;
@@ -132,7 +135,6 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private bool _runtimeInitialized;
         private bool _resetPendingOutside;
         private long _resetPendingOutsideSinceUtcMs;
-        private long _lastResetPendingOutsideLogUtcMs;
         private uint _walkInRunDungeonId;
         private uint _walkInRunMapId;
         private int _hotspotIndex;
@@ -140,11 +142,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private uint _breadcrumbBossEntry;
         private int _breadcrumbIndex;
         private readonly Dictionary<(int X, int Y, int Z, uint MapId), long> _blacklistedNavPoints = new();
-        private long _completedAtUtcMs;
         private bool _lfgRunCompletedAwaitingRequeue;
         private bool _countedCurrentWalkInEntry;
-        private readonly HashSet<ulong> _runParticipants = new();
-        private IReadOnlyList<SquadConnectedMemberSnapshot> _participantSnapshots = Array.Empty<SquadConnectedMemberSnapshot>();
         private Composite? _activeEncounterBehavior;
         private WoWUnit? _activeEncounterTarget;
 
@@ -182,12 +181,15 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             _lastRoleSetUtcMs = 0;
             _lastProposalAcceptUtcMs = 0;
             _lastTeleportOutUtcMs = 0;
+            _lastInstanceResetAttemptUtcMs = 0;
+            _lastObservedResetGenOnFollower = 0;
             _hotspotIndex = 0;
             _visitedFallbackHotspots.Clear();
             _breadcrumbBossEntry = 0;
             _breadcrumbIndex = 0;
             _blacklistedNavPoints.Clear();
             _lfgRunCompletedAwaitingRequeue = false;
+            ClearResetPendingOutside();
             StopActiveEncounter();
         }
 
@@ -214,6 +216,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             _breadcrumbIndex = 0;
             _blacklistedNavPoints.Clear();
             _lfgRunCompletedAwaitingRequeue = false;
+            _lastInstanceResetAttemptUtcMs = 0;
+            _lastObservedResetGenOnFollower = 0;
+            ClearWalkInRun();
         }
 
         public void StopActiveEncounter()
@@ -248,7 +253,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 _lastLfgPollUtcMs = nowUtcMs;
                 string mode = SafeGetLfgMode();
                 if (mode == "proposal" && !LfgManager.ProposalPending)
-                    LfgManager.ProposalPending = true;
+                    LfgManager.MarkProposalPending();
                 else if (mode == "rolecheck" && !LfgManager.RoleCheckPending)
                     LfgManager.RoleCheckPending = true;
             }
@@ -363,6 +368,15 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 return false;
             }
         }
+
+        internal static string BuildIsInPartyOrRaidScript() =>
+            "return (GetNumPartyMembers() > 0 or GetNumRaidMembers() > 0) and 1 or 0";
+
+        internal static string BuildEmptyGroupResetScript() =>
+            "if GetNumPartyMembers() == 0 and GetNumRaidMembers() == 0 then ResetInstances(); return 1 end return 0";
+
+        private static bool IsInPartyOrRaidLua() =>
+            Lua.GetReturnVal<int>(BuildIsInPartyOrRaidScript(), 0) == 1;
 
         public static string SafeGetLfgMode()
         {
@@ -481,38 +495,56 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
         private void ClearWalkInRun()
         {
-            _resetPendingOutside = false;
+            ClearResetPendingOutside();
             _walkInRunDungeonId = 0;
             _walkInRunMapId = 0;
             _hotspotIndex = 0;
-            _completedAtUtcMs = 0;
             _countedCurrentWalkInEntry = false;
             _lfgRunCompletedAwaitingRequeue = false;
             _currentRunKilledBosses.Clear();
-            _runParticipants.Clear();
-            _participantSnapshots = Array.Empty<SquadConnectedMemberSnapshot>();
         }
 
         internal static bool HasFreshExitEvidence(
             ulong participantGuid, IReadOnlyList<SquadConnectedMemberSnapshot> connected, long completedAtUtcMs, long nowUtcMs)
         {
-            return connected.Any(m => m.LastStateReceivedUtcMs > completedAtUtcMs &&
+            return connected.Any(m => m.IsConnected &&
+                                      m.LastStateReceivedUtcMs > completedAtUtcMs &&
                                       m.LastStateReceivedUtcMs <= nowUtcMs &&
                                       nowUtcMs - m.LastStateReceivedUtcMs <= 5000L &&
                                       m.LatestState is { HasDungeonTelemetry: true, HasValidMap: true, IsInsideDungeon: false } state &&
                                       state.Guid == participantGuid);
         }
 
-        internal static bool AreAllWalkInParticipantsClearedForReset(
-            IReadOnlyCollection<ulong> runParticipants,
+        internal static bool AreAllRunParticipantsOutside(
+            IReadOnlyCollection<ulong> participantGuids,
+            ulong coordinatorGuid,
             IReadOnlyList<SquadConnectedMemberSnapshot> connected,
-            IReadOnlyCollection<ulong> currentGroupMemberGuids,
             long completedAtUtcMs,
             long nowUtcMs)
         {
-            return completedAtUtcMs > 0 && runParticipants.All(guid =>
-                !currentGroupMemberGuids.Contains(guid) ||
-                HasFreshExitEvidence(guid, connected, completedAtUtcMs, nowUtcMs));
+            if (completedAtUtcMs <= 0)
+                return false;
+
+            foreach (ulong guid in participantGuids)
+            {
+                if (guid == 0 || guid == coordinatorGuid)
+                    continue;
+                if (!HasFreshExitEvidence(guid, connected, completedAtUtcMs, nowUtcMs))
+                    return false;
+            }
+
+            foreach (var snap in connected)
+            {
+                if (!snap.IsConnected)
+                    continue;
+                ulong guid = snap.LatestState?.Guid ?? snap.Handshake.Guid;
+                if (guid == 0 || guid == coordinatorGuid)
+                    continue;
+                if (!HasFreshExitEvidence(guid, connected, completedAtUtcMs, nowUtcMs))
+                    return false;
+            }
+
+            return true;
         }
 
         public void RecordWalkInEntry(long nowUtcMs)
@@ -569,7 +601,6 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         {
             _resetPendingOutside = true;
             _resetPendingOutsideSinceUtcMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-            _lastResetPendingOutsideLogUtcMs = 0;
         }
 
         internal static bool ShouldAbandonResetPendingOutside(bool resetIssued, long pendingSinceUtcMs, long nowUtcMs) =>
@@ -581,7 +612,30 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         {
             _resetPendingOutside = false;
             _resetPendingOutsideSinceUtcMs = 0;
-            _lastResetPendingOutsideLogUtcMs = 0;
+        }
+
+        internal static (int KilledBosses, int TotalBosses, bool FinalBossKilled, bool IsComplete) EvaluateBossProgress(
+            IReadOnlyList<BossManager.Boss> bosses,
+            BossManager.Boss? currentBoss,
+            bool killOptionalBosses,
+            bool? isHorde,
+            bool inDungeon,
+            CompleteReason lfgCompletedReason)
+        {
+            int totalBosses = bosses.Count(b =>
+                BossManager.IsBossAvailableToFaction(b, isHorde) &&
+                (!b.IsOptional || killOptionalBosses));
+            int killedBosses = bosses.Count(b =>
+                b.IsDead &&
+                BossManager.IsBossAvailableToFaction(b, isHorde) &&
+                (!b.IsOptional || killOptionalBosses));
+            bool finalBossKilled = bosses.Any(b =>
+                b.IsDead && BossManager.IsBossFinalForFaction(b, isHorde));
+            bool complete = inDungeon && (
+                lfgCompletedReason != CompleteReason.None ||
+                finalBossKilled ||
+                (totalBosses > 0 && currentBoss == null));
+            return (killedBosses, totalBosses, finalBossKilled, complete);
         }
 
         public SquadDungeonSnapshot CaptureSnapshot(SquadSettings settings, IReadOnlyList<SquadConnectedMemberSnapshot> connected, int effectiveMinLevel, long nowUtcMs)
@@ -643,17 +697,78 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 : (activeId > 0 ? DungeonManager.GetEntranceForDungeon(activeId) : WoWPoint.Zero);
             WoWPoint exit = currentDungeon?.ExitLocation ?? WoWPoint.Zero;
 
+            bool? isHorde = me != null && StyxWoW.IsInGame ? (bool?)me.IsHorde : null;
+            bool killOptionalBosses = BossManager.KillOptionalBossesEnabled;
             var bosses = BossManager.Bosses;
-            var currentBoss = BossManager.CurrentBoss;
-            int totalBosses = bosses.Count(b => !b.IsOptional || settings.KillOptionalBosses);
-            int killedBosses = bosses.Count(b => b.IsDead && (!b.IsOptional || settings.KillOptionalBosses));
-            bool complete = inDungeon && (
-                LfgManager.DungeonCompletedReason != CompleteReason.None ||
-                (totalBosses > 0 && currentBoss == null));
+            var currentBoss = BossManager.SelectCurrentBoss(killOptionalBosses, isHorde);
+            var (killedBosses, totalBosses, _, complete) = EvaluateBossProgress(
+                bosses,
+                currentBoss,
+                killOptionalBosses,
+                isHorde,
+                inDungeon,
+                LfgManager.DungeonCompletedReason);
+
+            bool isInPartyOrRaid = partyList.Count > 1;
+            bool attendanceConfirmed = true;
+            var partyNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (me != null && !string.IsNullOrWhiteSpace(me.Name))
+                partyNames.Add(me.Name.Trim());
+            if (StyxWoW.IsInGame && me != null)
+            {
+                bool luaRosterReadSucceeded = false;
+                try
+                {
+                    isInPartyOrRaid = IsInPartyOrRaidLua();
+                    string luaRoster = Lua.GetReturnVal<string>(
+                        "local s='' " +
+                        "if GetNumRaidMembers() > 0 then " +
+                            "for i=1,GetNumRaidMembers() do local n,_,_,_,_,_,_,online=GetRaidRosterInfo(i) if n and n~='' and online then s=s..n..';' end end " +
+                        "elseif GetNumPartyMembers() > 0 then " +
+                            "for i=1,GetNumPartyMembers() do local n=UnitName('party'..i) if n and n~='' and UnitIsConnected('party'..i) then s=s..n..';' end end " +
+                        "end return s", 0) ?? string.Empty;
+                    foreach (string entry in luaRoster.Split(';', StringSplitOptions.RemoveEmptyEntries))
+                        partyNames.Add(entry.Trim());
+                    luaRosterReadSucceeded = true;
+                }
+                catch { }
+
+                if (!luaRosterReadSucceeded)
+                {
+                    int validMembers = 0;
+                    foreach (var pm in me.GroupInfo.AllMembers)
+                    {
+                        if (pm.Guid != 0 && pm.IsOnline && !string.IsNullOrWhiteSpace(pm.Name))
+                        {
+                            partyNames.Add(pm.Name.Trim());
+                            validMembers++;
+                        }
+                    }
+                    if (isInPartyOrRaid && validMembers == 0)
+                        attendanceConfirmed = false;
+                }
+            }
+            else if (me != null)
+            {
+                foreach (var pm in me.GroupInfo.AllMembers)
+                {
+                    if (pm.Guid != 0 && !string.IsNullOrWhiteSpace(pm.Name))
+                        partyNames.Add(pm.Name.Trim());
+                }
+            }
+
+            var requiredNames = new HashSet<string>(settings.GetExpectedMemberNames(), StringComparer.OrdinalIgnoreCase);
+            if (requiredNames.Count == 0)
+            {
+                foreach (var c in connected.Where(c => c.IsConnected && !string.IsNullOrWhiteSpace(c.CharacterName)))
+                    requiredNames.Add(c.CharacterName.Trim());
+            }
+            if (me != null && !string.IsNullOrWhiteSpace(me.Name))
+                requiredNames.Add(me.Name.Trim());
+            bool allExpectedMembersInParty = attendanceConfirmed && requiredNames.All(partyNames.Contains);
 
             if (settings.IsCoordinator && me != null)
             {
-                _participantSnapshots = connected;
                 if (inDungeon)
                 {
                     if (walkIn && !_countedCurrentWalkInEntry)
@@ -662,22 +777,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     }
                     _walkInRunDungeonId = activeId;
                     _walkInRunMapId = me.MapId;
-                    _runParticipants.UnionWith(partyList.Where(p => p.Guid != 0 && p.Guid != me.Guid).Select(p => p.Guid));
-                    if (complete && _completedAtUtcMs == 0)
-                    {
-                        _completedAtUtcMs = nowUtcMs;
+                    if (complete && !_resetPendingOutside)
                         MarkResetPendingOutside();
-                    }
-                }
-                if (_walkInRunDungeonId != 0)
-                {
-                    foreach (var participant in connected)
-                    {
-                        if (participant.LatestState is { HasDungeonTelemetry: true, IsInsideDungeon: true, Guid: not 0 } state &&
-                            state.MapId == _walkInRunMapId && state.Guid != me.Guid &&
-                            partyList.Any(member => member.Guid == state.Guid))
-                            _runParticipants.Add(state.Guid);
-                    }
                 }
             }
 
@@ -708,6 +809,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 TotalBossCount = totalBosses,
                 IsDungeonComplete = complete,
                 ResetPendingOutside = _resetPendingOutside,
+                IsInPartyOrRaid = isInPartyOrRaid,
+                AllExpectedMembersInParty = allExpectedMembersInParty,
                 LfgProposalPending = LfgManager.ProposalPending || SafeGetLfgMode() == "proposal",
                 LfgMode = SafeGetLfgMode(),
                 HasRandomPartyMembers = hasRandom,
@@ -747,11 +850,110 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             return true;
         }
 
+        private bool HandleDungeonResetStateTick(SquadSettings settings, SquadLeaderState? leader, long nowUtcMs)
+        {
+            var me = StyxWoW.Me;
+            if (me == null)
+                return false;
+
+            if (!settings.IsCoordinator && leader != null)
+            {
+                if (leader.InstanceResetGeneration != _lastObservedResetGenOnFollower)
+                {
+                    _lastObservedResetGenOnFollower = leader.InstanceResetGeneration;
+                    _lfgRunCompletedAwaitingRequeue = false;
+                    LfgManager.DungeonCompletedReason = CompleteReason.None;
+                    LfgManager.ResetProposalFlags();
+                }
+            }
+
+            SquadDungeonResetPhase resetPhase = leader?.DungeonResetPhase ?? SquadDungeonResetPhase.Idle;
+            if (resetPhase == SquadDungeonResetPhase.Idle)
+                return false;
+
+            if (me.IsMoving)
+                WoWMovement.MoveStop();
+
+            switch (resetPhase)
+            {
+                case SquadDungeonResetPhase.Completed:
+                case SquadDungeonResetPhase.Exiting:
+                    SquadPartySyncService.LogAction("Dungeon: waiting for reset exit confirmation");
+                    return true;
+
+                case SquadDungeonResetPhase.Disbanding:
+                {
+                    bool squadPausedCombatOrDead = leader != null &&
+                        (leader.Phase == SquadPhase.Paused || leader.InCombat || leader.IsDead || leader.IsGhost ||
+                         leader.Members.Any(m => m.IsConnected && (m.IsDead || m.IsGhost)));
+                    if (!squadPausedCombatOrDead)
+                    {
+                        if (settings.IsCoordinator)
+                        {
+                            long disbandingMs = leader != null ? nowUtcMs - leader.DungeonResetStateSinceUtcMs : 0L;
+                            if (leader != null &&
+                                ((!me.GroupInfo.IsLeader && disbandingMs >= 4000L) || disbandingMs >= 6000L) &&
+                                IsInPartyOrRaidLua())
+                            {
+                                Lua.DoString("LeaveParty();");
+                            }
+                        }
+                        else if (!IsInDungeonMap(me) &&
+                                 leader != null &&
+                                 nowUtcMs - leader.DungeonResetStateSinceUtcMs >= 2500L &&
+                                 IsInPartyOrRaidLua())
+                        {
+                            Lua.DoString("LeaveParty();");
+                        }
+                    }
+                    SquadPartySyncService.LogAction("Dungeon: disbanding party before reset");
+                    return true;
+                }
+
+                case SquadDungeonResetPhase.Resetting:
+                    if (settings.IsCoordinator && !IsInDungeonMap(me) && nowUtcMs - _lastInstanceResetAttemptUtcMs >= 500L)
+                    {
+                        _lastInstanceResetAttemptUtcMs = nowUtcMs;
+                        bool emptyAndReset = Lua.GetReturnVal<int>(BuildEmptyGroupResetScript(), 0) == 1;
+                        if (emptyAndReset)
+                        {
+                            RecordInstanceReset(nowUtcMs);
+                            _lfgRunCompletedAwaitingRequeue = false;
+                            LfgManager.DungeonCompletedReason = CompleteReason.None;
+                            LfgManager.ResetProposalFlags();
+                            BossManager.Reset();
+                            DungeonManager.Clear();
+                            ClearResetPendingOutside();
+                            Logging.Write("[PartyGrind Dungeon] Group empty; called ResetInstances() (generation={0}).", _instanceResetGeneration);
+                        }
+                    }
+                    else if (!settings.IsCoordinator)
+                    {
+                        _lfgRunCompletedAwaitingRequeue = false;
+                        LfgManager.DungeonCompletedReason = CompleteReason.None;
+                    }
+                    SquadPartySyncService.LogAction("Dungeon: resetting instance");
+                    return true;
+
+                case SquadDungeonResetPhase.Reinviting:
+                    _lfgRunCompletedAwaitingRequeue = false;
+                    LfgManager.DungeonCompletedReason = CompleteReason.None;
+                    SquadPartySyncService.LogAction("Dungeon: waiting for all members to rejoin party");
+                    return true;
+
+                default:
+                    return false;
+            }
+        }
+
         public bool RunQueueingOrEntryTick(SquadSettings settings, SquadLeaderState? leader, long nowUtcMs)
         {
             var me = StyxWoW.Me;
             if (me == null || me.Dead || me.IsGhost)
                 return false;
+
+            if (HandleDungeonResetStateTick(settings, leader, nowUtcMs))
+                return true;
 
             if (LfgManager.RoleCheckPending || SafeGetLfgMode() == "rolecheck")
             {
@@ -785,76 +987,6 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (entryMode == SquadDungeonEntryMode.WalkInPortalFarm)
             {
                 return RunWalkInPortalEntryTick(settings, leader, nowUtcMs);
-            }
-
-            if (_resetPendingOutside)
-            {
-                if (settings.IsCoordinator)
-                {
-                    if (IsInDungeonMap(me))
-                        return false;
-
-                    var group = me.GroupInfo;
-                    group.InvalidateCache();
-                    var groupGuids = group.AllMembers
-                        .Where(m => m.Guid != 0)
-                        .Select(m => m.Guid)
-                        .ToHashSet();
-                    int raidCount = group.NumRaidMembers;
-                    int expectedGroupCount = raidCount > 0 ? raidCount : group.NumPartyMembers;
-                    bool allOutside = groupGuids.Count == expectedGroupCount &&
-                        AreAllWalkInParticipantsClearedForReset(
-                            _runParticipants,
-                            _participantSnapshots,
-                            groupGuids,
-                            _completedAtUtcMs,
-                            nowUtcMs);
-                    if (!allOutside)
-                    {
-                        if (me.IsMoving)
-                            WoWMovement.MoveStop();
-                        SquadPartySyncService.LogAction("Dungeon: waiting for exit confirmation from all run participants");
-                        return true;
-                    }
-
-                    if (_resetPendingOutsideSinceUtcMs == 0)
-                        _resetPendingOutsideSinceUtcMs = nowUtcMs;
-
-                    if (nowUtcMs - _lastResetPendingOutsideLogUtcMs >= ResetPendingOutsideLogThrottleMs)
-                    {
-                        _lastResetPendingOutsideLogUtcMs = nowUtcMs;
-                        Logging.Write("[PartyGrind Dungeon] Resetting instances for next run.");
-                    }
-
-                    bool resetIssued = Lua.GetReturnVal<bool>(
-                        "if (GetNumPartyMembers() == 0 and GetNumRaidMembers() == 0) or IsPartyLeader() then ResetInstances(); return true end return false", 0);
-                    if (resetIssued)
-                    {
-                        RecordInstanceReset(nowUtcMs);
-                        _lfgRunCompletedAwaitingRequeue = false;
-                        ClearResetPendingOutside();
-                        return true;
-                    }
-
-                    if (ShouldAbandonResetPendingOutside(resetIssued, _resetPendingOutsideSinceUtcMs, nowUtcMs))
-                    {
-                        Logging.Write("[PartyGrind Dungeon] Instance reset could not be issued within {0}s ({1}); re-queueing without a reset.",
-                            ResetPendingOutsideTimeoutMs / 1000, me.IsInParty ? "not the party leader" : "no group");
-                        ClearResetPendingOutside();
-                        _lfgRunCompletedAwaitingRequeue = false;
-                        LfgManager.DungeonCompletedReason = CompleteReason.None;
-                        return false;
-                    }
-
-                    return true;
-                }
-
-                if (leader?.DungeonResetPendingOutside == true)
-                {
-                    if (me.IsMoving)
-                        WoWMovement.MoveStop();
-                    return true;
-                }
             }
 
             if (nowUtcMs - _lastRoleSetUtcMs >= 20000L)
@@ -978,6 +1110,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     break;
             }
 
+            LfgManager.ResetProposalFlags();
             LfgManager.DungeonCompletedReason = CompleteReason.None;
             return true;
         }
@@ -1012,48 +1145,6 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             var me = StyxWoW.Me!;
             if (IsInDungeonMap(me))
                 return false;
-
-            if (settings.IsCoordinator && _resetPendingOutside)
-            {
-                var group = me.GroupInfo;
-                group.InvalidateCache();
-                var groupGuids = group.AllMembers
-                    .Where(m => m.Guid != 0)
-                    .Select(m => m.Guid)
-                    .ToHashSet();
-                int raidCount = group.NumRaidMembers;
-                int expectedGroupCount = raidCount > 0 ? raidCount : group.NumPartyMembers;
-                bool allOutside = groupGuids.Count == expectedGroupCount &&
-                    AreAllWalkInParticipantsClearedForReset(
-                        _runParticipants,
-                        _participantSnapshots,
-                        groupGuids,
-                        _completedAtUtcMs,
-                        nowUtcMs);
-                if (!allOutside)
-                {
-                    if (me.IsMoving)
-                        WoWMovement.MoveStop();
-                    SquadPartySyncService.LogAction("Dungeon: waiting for exit confirmation from all run participants");
-                    return true;
-                }
-
-                Logging.Write("[PartyGrind Dungeon] Resetting instances for next walk-in run.");
-                bool resetIssued = Lua.GetReturnVal<bool>(
-                    "if (GetNumPartyMembers() == 0 and GetNumRaidMembers() == 0) or IsPartyLeader() then ResetInstances(); return true end return false", 0);
-                if (resetIssued)
-                {
-                    RecordInstanceReset(nowUtcMs);
-                }
-                return true;
-            }
-
-            if (!settings.IsCoordinator && leader?.DungeonResetPendingOutside == true)
-            {
-                if (me.IsMoving)
-                    WoWMovement.MoveStop();
-                return true;
-            }
 
             int entryLockoutSeconds = settings.IsCoordinator
                 ? GetWalkInEntryLockoutRemainingSeconds(nowUtcMs, settings.MaxInstancesPerHour)
@@ -1149,7 +1240,17 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 return false;
 
             if (!IsInDungeonMap(me))
+            {
+                if (leader?.Phase == SquadPhase.DungeonCompleteExit ||
+                    leader?.DungeonResetPhase == SquadDungeonResetPhase.Exiting)
+                {
+                    if (me.IsMoving)
+                        WoWMovement.MoveStop();
+                    SquadPartySyncService.LogAction("Dungeon: exited instance, waiting for squadmates");
+                    return true;
+                }
                 return false;
+            }
 
             SquadDungeonEntryMode entryMode = leader?.DungeonEntryMode ?? settings.DungeonEntryMode;
             if (entryMode != SquadDungeonEntryMode.WalkInPortalFarm)
@@ -1158,8 +1259,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 if (nowUtcMs - _lastTeleportOutUtcMs >= 3500L)
                 {
                     _lastTeleportOutUtcMs = nowUtcMs;
-                    bool leaveParty = leader?.HasRandomPartyMembers == true && settings.ExpectedMemberNamesCsv.Trim().Length == 0;
-                    Lua.DoString(leaveParty ? "LeaveParty(); LFGTeleport(true);" : "LFGTeleport(true);");
+                    Lua.DoString("LFGTeleport(true);");
                     LfgManager.DungeonCompletedReason = CompleteReason.None;
                     SquadPartySyncService.LogAction("Dungeon: teleporting out of completed LFG instance");
                 }

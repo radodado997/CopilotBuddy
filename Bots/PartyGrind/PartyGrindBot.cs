@@ -395,7 +395,8 @@ namespace CopilotBuddy.Bots.PartyGrind
                     _pullStartedUtcMs,
                     StyxWoW.Me.Rotation,
                     now,
-                    localTownRunRequest: GetLocalTownRunRequest());
+                    localTownRunRequest: GetLocalTownRunRequest(),
+                    instanceResetGeneration: _dungeon.InstanceResetGeneration);
                 SquadContext.UpdateLeaderState(leaderState);
                 _ipcServer.BroadcastLeaderState(leaderState, populateRoster: false);
             }
@@ -629,7 +630,6 @@ namespace CopilotBuddy.Bots.PartyGrind
         private void PulseCoordinator(SquadSettings settings, SquadMemberState localState, long now)
         {
             var snapshots = _ipcServer?.GetMemberSnapshots() ?? new List<SquadConnectedMemberSnapshot>();
-            _partySync.PulseCoordinatorPartySync(settings, snapshots);
 
             SquadProfileSnapshot profileSnap = CaptureProfileSnapshot(now);
             int hourlyResets = settings.BotMode == SquadBotMode.Dungeon ? _dungeon.GetHourlyResetCount(now) : 0;
@@ -666,6 +666,7 @@ namespace CopilotBuddy.Bots.PartyGrind
             leaderState.PullStartedUtcMs = _pullStartedUtcMs;
             SquadContext.IsIpcConnected = _ipcServer?.IsListening == true;
             SquadContext.UpdateLeaderState(leaderState);
+            _partySync.PulseCoordinatorPartySync(settings, snapshots, leaderState);
 
             if (leaderState.EffectiveSquadMinLevel > 0 && leaderState.EffectiveSquadMinLevel != _lastAppliedEffectiveLevel)
             {
@@ -1935,6 +1936,10 @@ namespace CopilotBuddy.Bots.PartyGrind
                             SquadContext.GetLeaderStateSnapshot()!.Phase == SquadPhase.DungeonQueueing ||
                             SquadContext.GetLeaderStateSnapshot()!.Phase == SquadPhase.DungeonTravelToPortal ||
                             SquadContext.GetLeaderStateSnapshot()!.Phase == SquadPhase.DungeonLockoutWait ||
+                            (SquadContext.GetLeaderStateSnapshot()!.DungeonResetPhase >= SquadDungeonResetPhase.Exiting &&
+                             SquadContext.GetLeaderStateSnapshot()!.Phase != SquadPhase.WaitingResurrection &&
+                             SquadContext.GetLeaderStateSnapshot()!.Phase != SquadPhase.CorpseRun &&
+                             !SquadContext.GetLeaderStateSnapshot()!.InCombat) ||
                             (SquadContext.GetLeaderStateSnapshot()!.Phase == SquadPhase.DungeonClearing &&
                              (SquadContext.GetLeaderStateSnapshot()!.DungeonEntryMode != SquadDungeonEntryMode.WalkInPortalFarm ||
                               (SquadContext.IsCoordinator && _dungeon.CanReenterCurrentWalkInRun))) ||

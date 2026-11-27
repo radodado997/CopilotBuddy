@@ -468,14 +468,23 @@ namespace Bots.DungeonBuddy
             Lua.Events.DetachEvent("LFG_INVALID_ERROR_MESSAGE", OnLfgInvalidErrorMessage);
         }
 
+        public static void MarkProposalPending()
+        {
+            ProposalFailed = false;
+            ProposalSucceeded = false;
+            ProposalPending = true;
+        }
+
         private static void OnProposalShow(object sender, LuaEventArgs args)
         {
             Logging.Write("[DungeonBuddy] LFG proposal received!");
-            ProposalPending = true;
+            MarkProposalPending();
         }
 
         private static void OnProposalFailed(object sender, LuaEventArgs args)
         {
+            if (ProposalSucceeded && !PostProposalTimer.IsFinished)
+                return;
             Logging.Write("[DungeonBuddy] LFG proposal failed/declined");
             ProposalFailed = true;
         }

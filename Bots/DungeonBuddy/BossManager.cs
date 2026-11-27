@@ -9,6 +9,7 @@ using Styx.WoWInternals.WoWObjects;
 using Styx.Logic.Pathing;
 using Styx.Helpers;
 using Bots.DungeonBuddy.Attributes;
+using Bots.DungeonBuddy.Enums;
 using Bots.DungeonBuddy.Profiles;
 using TreeSharp;
 
@@ -36,6 +37,9 @@ namespace Bots.DungeonBuddy
             public string Name { get; set; }
             public bool IsOptional { get; set; }
             public bool Optional { get { return IsOptional; } set { IsOptional = value; } }
+            public bool IsFinal { get; set; }
+            public BossAvailableToFaction FinalFaction { get; set; } = BossAvailableToFaction.Both;
+            public BossAvailableToFaction Faction { get; set; } = BossAvailableToFaction.Both;
             public bool IsDead { get; set; }
             public bool IsAlive => !IsDead;
             public int CastingSpellId { get; set; }
@@ -79,12 +83,56 @@ namespace Bots.DungeonBuddy
         /// here would return null when bosses are out of draw distance at the dungeon
         /// entrance, causing IsComplete = true and premature 'dungeon complete'.
         /// Matches HB smethod_9: IsAlive check + Optional/KillOptionalBosses guard.
-        /// (Faction guard omitted — inner Boss has no Faction field; all registered bosses default to Both.)
         /// </summary>
-        public static Boss? CurrentBoss =>
-            _bosses
-                .Where(b => !b.IsDead && (!b.IsOptional || KillOptionalBossesEnabled))
+        public static Boss? CurrentBoss => SelectCurrentBoss(KillOptionalBossesEnabled, TryGetLocalIsHorde());
+
+        internal static Boss? SelectCurrentBoss(bool killOptionalBosses, bool? isHorde)
+        {
+            if (IsFinalBossDeadForFaction(isHorde))
+                return null;
+            return _bosses
+                .Where(b => !b.IsDead &&
+                            IsBossAvailableToFaction(b, isHorde) &&
+                            (!b.IsOptional || killOptionalBosses))
                 .FirstOrDefault();
+        }
+
+        internal static bool IsBossAvailableToFaction(Boss boss, bool? isHorde)
+        {
+            if (boss.Faction == BossAvailableToFaction.Both || !isHorde.HasValue)
+                return true;
+            return isHorde.Value
+                ? boss.Faction == BossAvailableToFaction.Horde
+                : boss.Faction == BossAvailableToFaction.Alliance;
+        }
+
+        private static bool? TryGetLocalIsHorde()
+        {
+            try
+            {
+                return StyxWoW.IsInGame ? StyxWoW.Me?.IsHorde : null;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        internal static bool IsBossFinalForFaction(Boss boss, bool? isHorde)
+        {
+            if (!boss.IsFinal || !IsBossAvailableToFaction(boss, isHorde))
+                return false;
+            if (boss.FinalFaction == BossAvailableToFaction.Both || !isHorde.HasValue)
+                return true;
+            return isHorde.Value
+                ? boss.FinalFaction == BossAvailableToFaction.Horde
+                : boss.FinalFaction == BossAvailableToFaction.Alliance;
+        }
+
+        internal static bool IsFinalBossDeadForFaction(bool? isHorde) =>
+            _bosses.Any(b => b.IsDead && IsBossFinalForFaction(b, isHorde));
+
+        public static bool IsFinalBossDead => IsFinalBossDeadForFaction(TryGetLocalIsHorde());
 
         /// <summary>
         /// Liste de tous les boss du donjon
@@ -98,25 +146,66 @@ namespace Bots.DungeonBuddy
         /// </summary>
         public static void Initialize(Dungeon dungeon)
         {
+            if (dungeon == null)
+            {
+                _killedBossIds.Clear();
+                _bosses.Clear();
+                return;
+            }
+
+            PopulateFromProfileAndType(ProfileManager.CurrentProfile, dungeon.GetType());
+        }
+
+        internal static void PopulateFromProfileAndType(Profile? profile, Type? dungeonType)
+        {
             _killedBossIds.Clear();
             _bosses.Clear();
 
-            if (dungeon == null)
-                return;
-
-            var profile = ProfileManager.CurrentProfile;
+            var profileBossEntries = new HashSet<uint>();
             if (profile != null)
             {
-                foreach (var profileBoss in profile.BossEncounters.OrderBy(b => b.KillOrder))
-                    RegisterBoss(profileBoss.Entry, profileBoss.Name, profileBoss.Optional);
+                var ordered = profile.BossEncounters.OrderBy(b => b.KillOrder).ToList();
+                bool hasExplicitAllianceFinal = ordered.Any(b => b.IsFinal && b.Faction != BossAvailableToFaction.Horde);
+                bool hasExplicitHordeFinal = ordered.Any(b => b.IsFinal && b.Faction != BossAvailableToFaction.Alliance);
+                uint? inferredAllianceFinal = !hasExplicitAllianceFinal
+                    ? (ordered.LastOrDefault(b => !b.Optional && b.Faction != BossAvailableToFaction.Horde)?.Entry ??
+                       ordered.LastOrDefault(b => b.Faction != BossAvailableToFaction.Horde)?.Entry)
+                    : null;
+                uint? inferredHordeFinal = !hasExplicitHordeFinal
+                    ? (ordered.LastOrDefault(b => !b.Optional && b.Faction != BossAvailableToFaction.Alliance)?.Entry ??
+                       ordered.LastOrDefault(b => b.Faction != BossAvailableToFaction.Alliance)?.Entry)
+                    : null;
+
+                foreach (var profileBoss in ordered)
+                {
+                    profileBossEntries.Add(profileBoss.Entry);
+                    bool isAllianceFinal = inferredAllianceFinal.HasValue && profileBoss.Entry == inferredAllianceFinal.Value;
+                    bool isHordeFinal = inferredHordeFinal.HasValue && profileBoss.Entry == inferredHordeFinal.Value;
+                    bool isFinal = profileBoss.IsFinal || isAllianceFinal || isHordeFinal;
+                    BossAvailableToFaction finalFaction = profileBoss.IsFinal
+                        ? profileBoss.Faction
+                        : (isAllianceFinal && isHordeFinal
+                            ? BossAvailableToFaction.Both
+                            : (isAllianceFinal
+                                ? BossAvailableToFaction.Alliance
+                                : (isHordeFinal ? BossAvailableToFaction.Horde : BossAvailableToFaction.Both)));
+                    RegisterBoss(profileBoss.Entry, profileBoss.Name, profileBoss.Optional, isFinal, profileBoss.Faction, finalFaction);
+                }
             }
 
-            foreach (var method in dungeon.GetType().GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
+            if (dungeonType != null)
             {
-                foreach (EncounterHandlerAttribute attr in method.GetCustomAttributes(typeof(EncounterHandlerAttribute), false))
+                foreach (var method in dungeonType.GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
                 {
-                    if (attr.BossEntry != 0)
-                        RegisterBoss((uint)attr.BossEntry, attr.BossName);
+                    foreach (EncounterHandlerAttribute attr in method.GetCustomAttributes(typeof(EncounterHandlerAttribute), false))
+                    {
+                        if (attr.BossEntry != 0)
+                        {
+                            uint entry = (uint)attr.BossEntry;
+                            bool isScriptOnly = profileBossEntries.Count > 0 && !profileBossEntries.Contains(entry);
+                            RegisterBoss(entry, attr.BossName, isOptional: isScriptOnly);
+                        }
+                    }
                 }
             }
         }
@@ -194,17 +283,40 @@ namespace Bots.DungeonBuddy
         /// <summary>
         /// Register un boss (appelé par DungeonManager lors du chargement des scripts)
         /// </summary>
-        public static void RegisterBoss(uint entryId, string name, bool isOptional = false)
+        public static void RegisterBoss(
+            uint entryId,
+            string name,
+            bool isOptional = false,
+            bool isFinal = false,
+            BossAvailableToFaction faction = BossAvailableToFaction.Both,
+            BossAvailableToFaction finalFaction = BossAvailableToFaction.Both)
         {
-            if (!_bosses.Any(b => b.EntryId == entryId))
+            var existing = _bosses.FirstOrDefault(b => b.EntryId == entryId);
+            if (existing == null)
             {
                 _bosses.Add(new Boss
                 {
                     EntryId = entryId,
                     Name = name,
                     IsOptional = isOptional,
+                    IsFinal = isFinal,
+                    FinalFaction = finalFaction,
+                    Faction = faction,
                     IsDead = false
                 });
+            }
+            else
+            {
+                if (isFinal)
+                {
+                    if (!existing.IsFinal)
+                        existing.FinalFaction = finalFaction;
+                    else if (existing.FinalFaction != finalFaction)
+                        existing.FinalFaction = BossAvailableToFaction.Both;
+                    existing.IsFinal = true;
+                }
+                if (faction != BossAvailableToFaction.Both)
+                    existing.Faction = faction;
             }
         }
 

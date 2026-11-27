@@ -51,6 +51,16 @@ namespace Styx.PartyGrind
         DungeonLockoutWait = 14
     }
 
+    public enum SquadDungeonResetPhase
+    {
+        Idle = 0,
+        Completed = 1,
+        Exiting = 2,
+        Disbanding = 3,
+        Resetting = 4,
+        Reinviting = 5
+    }
+
     /// <summary>
     /// Party loot distribution method enforced by the coordinator.
     /// </summary>
