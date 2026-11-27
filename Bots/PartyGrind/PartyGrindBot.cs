@@ -76,7 +76,7 @@ namespace CopilotBuddy.Bots.PartyGrind
         private const long BacklineLatchMs = 8000L;
         private const long BacklineReachDebounceMs = 500L;
         private const float BacklineLatchTankDrift = 10.0f;
-        private const float BacklineCombatRangeRanged = 30.0f;
+        private const float BacklineCombatRangeRanged = 34.0f;
         private const float BacklineCombatRangeHealer = 35.0f;
         private const long PullCommitTimeoutMs = 10000L;
         private const float PullCommitMaxTargetDistance = 60.0f;
@@ -123,6 +123,7 @@ namespace CopilotBuddy.Bots.PartyGrind
         private bool IsGhostSourceRejected(string source, long nowUtcMs) =>
             _rejectedGhostEntranceUntilUtcMs.TryGetValue(source, out long until) && nowUtcMs < until;
         private bool _dungeonScriptTicked;
+        private bool _dungeonObjectScriptTicked;
         private bool _localWasNeedingRest;
         private long _dungeonAdvanceBlockedSinceUtcMs;
         private uint _dungeonAdvanceBlockedMapId;
@@ -173,6 +174,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                 if (IsRunning) { base.Stop(context); base.Start(context); }
                 _combatTicked = _combatBuffTicked = _preCombatBuffTicked = _restTicked = _healTicked = false;
                 _bot._dungeonScriptTicked = false;
+                _bot._dungeonObjectScriptTicked = false;
                 try { return base.Tick(context); }
                 finally
                 {
@@ -184,6 +186,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                     if (!_healTicked) SquadHealBridge.StopActiveHealBehavior();
                     if (!_restTicked) StopRoutine(ref _activeRestRoutine);
                     if (!_bot._dungeonScriptTicked) _bot._dungeon.StopActiveEncounter();
+                    if (!_bot._dungeonObjectScriptTicked) _bot._dungeon.StopActiveObjectBehavior();
                 }
             }
         }
@@ -378,6 +381,7 @@ namespace CopilotBuddy.Bots.PartyGrind
             ClearPullCommit();
             ResetBacklineState();
             _dungeon.StopActiveEncounter();
+            _dungeon.StopActiveObjectBehavior();
             _coordinator.IsPausedManually = true;
             _coordinator.ManualPauseReason = "Bot paused";
             var settings = SquadContext.ActiveSettings ?? SquadSettings.Instance;
@@ -1960,7 +1964,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                     new Action(ctx =>
                     {
                         _dungeonScriptTicked = true;
-                        return _dungeon.TryRunDungeonScriptBehaviors() ? RunStatus.Success : RunStatus.Failure;
+                        return _dungeon.TryRunDungeonEncounterBehaviors() ? RunStatus.Success : RunStatus.Failure;
                     })
                 ),
 
@@ -2040,6 +2044,24 @@ namespace CopilotBuddy.Bots.PartyGrind
                 new Decorator(
                     ctx => IsLootNeeded(),
                     new Action(ctx => RunLootBehavior())
+                ),
+
+                // 9.5 Dungeon Object Scripts (strictly after combat, heals, rest, and looting)
+                new Decorator(
+                    ctx => CanRunDungeonObjectScripts(
+                        SquadContext.IsDungeonModeActive && SquadDungeonService.IsInDungeonMap(StyxWoW.Me),
+                        StyxWoW.Me?.Combat == true,
+                        SquadContext.GetLeaderStateSnapshot()?.InCombat == true,
+                        SquadContext.GetLeaderStateSnapshot()?.FocusTargetGuid ?? 0UL,
+                        IsCombatOrHealNeeded(),
+                        HasNearbySquadThreat(),
+                        IsLootNeeded(),
+                        IsRestingPhaseActive() || IsProvisioningTickNeeded()),
+                    new Action(ctx =>
+                    {
+                        _dungeonObjectScriptTicked = true;
+                        return _dungeon.TryRunDungeonObjectBehaviors() ? RunStatus.Success : RunStatus.Failure;
+                    })
                 ),
 
                 // 10. Zone Migration & Travel / Pull / Roam
@@ -2568,6 +2590,26 @@ namespace CopilotBuddy.Bots.PartyGrind
             return meInCombat || leaderInCombat || focusInCombat || focusTargetingParty || tankDistanceToFocus <= 12f;
         }
 
+        internal static bool CanRunDungeonObjectScripts(
+            bool inDungeonMode,
+            bool meInCombat,
+            bool leaderInCombat,
+            ulong leaderFocusTargetGuid,
+            bool combatOrHealNeeded,
+            bool hasNearbyThreat,
+            bool lootNeeded,
+            bool restOrProvisionNeeded)
+        {
+            return inDungeonMode &&
+                   !meInCombat &&
+                   !leaderInCombat &&
+                   leaderFocusTargetGuid == 0UL &&
+                   !combatOrHealNeeded &&
+                   !hasNearbyThreat &&
+                   !lootNeeded &&
+                   !restOrProvisionNeeded;
+        }
+
         private bool IsCombatOrHealNeeded()
         {
             var me = StyxWoW.Me;
@@ -2617,6 +2659,27 @@ namespace CopilotBuddy.Bots.PartyGrind
             return false;
         }
 
+        private bool AbandonBlacklistedIdlePull(LocalPlayer me, ulong targetGuid)
+        {
+            bool blacklisted = targetGuid != 0UL &&
+                               SquadTankBridge.IsTemporarilyPullBlacklisted(targetGuid, Environment.TickCount64);
+            if (!blacklisted)
+                return false;
+
+            var unit = ObjectManager.GetObjectByGuid<WoWUnit>(targetGuid);
+            bool engaged = unit != null && unit.IsValid && !unit.Dead &&
+                           (unit.Combat || unit.IsTargetingMyPartyMember || unit.IsTargetingMeOrPet ||
+                            (unit.CurrentTargetGuid != 0 && SquadContext.GetKnownMemberGuids().Contains(unit.CurrentTargetGuid)));
+            if (!SquadTankBridge.ShouldRejectIdlePullTarget(blacklisted, engaged))
+                return false;
+
+            _currentFocusGuid = 0;
+            ClearPullCommit();
+            if (me.CurrentTargetGuid == targetGuid)
+                me.ClearTarget();
+            return true;
+        }
+
         private RunStatus RunCombatAndRoleBehavior()
         {
             var me = StyxWoW.Me;
@@ -2625,6 +2688,7 @@ namespace CopilotBuddy.Bots.PartyGrind
 
             var settings = SquadContext.ActiveSettings ?? SquadSettings.Instance;
             var leader = SquadContext.GetLeaderStateSnapshot();
+            _dungeon.StopActiveObjectBehavior();
 
             if (me.Mounted)
             {
@@ -2641,10 +2705,12 @@ namespace CopilotBuddy.Bots.PartyGrind
                     if (tankFocusGuid == 0 && !me.Combat && HasLivingAllyInCombat(leader, me.Guid))
                         return RunStatus.Failure;
                     if (!me.Combat && SquadContext.IsDungeonModeActive && SquadDungeonService.IsInDungeonMap(me) &&
-                        (leader == null || leader.EffectiveTankGuid == 0 || leader.EffectiveTankGuid == me.Guid) &&
-                        SquadTankBridge.TryExecuteSafeDungeonPull(tankFocusGuid))
+                        (leader == null || leader.EffectiveTankGuid == 0 || leader.EffectiveTankGuid == me.Guid))
                     {
-                        return RunStatus.Success;
+                        if (SquadTankBridge.TryExecuteSafeDungeonPull(tankFocusGuid))
+                            return RunStatus.Success;
+                        if (AbandonBlacklistedIdlePull(me, tankFocusGuid))
+                            return RunStatus.Failure;
                     }
                     return RunRoutineCombat(tankFocusGuid);
 
@@ -3050,15 +3116,45 @@ namespace CopilotBuddy.Bots.PartyGrind
                     : null;
             }
 
+            var (effectiveTankKnown, effectiveTankPos) = TryGetEffectiveTankPosition(leader, me.MapId);
+            var tankPos = effectiveTankKnown ? effectiveTankPos : new WoWPoint(leader.X, leader.Y, leader.Z);
+
             if (guardTarget != null && guardTarget.IsValid && !guardTarget.Dead && !guardTarget.IsFriendly)
             {
                 bool engaged = me.Combat || guardTarget.Combat || guardTarget.IsTargetingMyPartyMember;
                 float engageRange = settings.Role == SquadRole.Healer ? BacklineCombatRangeHealer : BacklineCombatRangeRanged;
-                if (ShouldYieldBacklineToCombat(engaged, (float)guardTarget.Distance, guardTarget.InLineOfSpellSight, engageRange))
+                bool inLos = guardTarget.InLineOfSpellSight;
+                if (ShouldYieldBacklineToCombat(engaged, (float)guardTarget.Distance, inLos, engageRange))
+                {
+                    _wasMovingToBackline = false;
                     return false;
-            }
+                }
 
-            var tankPos = new WoWPoint(leader.X, leader.Y, leader.Z);
+                float distanceToTank = effectiveTankKnown ? (float)me.Location.Distance(effectiveTankPos) : 0f;
+                BacklineCornerAction cornerAction = EvaluateEngagedNoLosBacklineAction(
+                    engaged,
+                    inLos,
+                    distanceToTank,
+                    hasTankPosition: effectiveTankKnown);
+                if (cornerAction == BacklineCornerAction.YieldToCombatRoutine)
+                {
+                    _wasMovingToBackline = false;
+                    return false;
+                }
+                if (cornerAction == BacklineCornerAction.MoveTowardTankForLos)
+                {
+                    _latchedBacklinePos = WoWPoint.Zero;
+                    _wasMovingToBackline = true;
+                    SquadPartySyncService.LogAction("Moving around corner to Tank for line of sight");
+                    MoveResult moveResult = Navigator.MoveTo(effectiveTankPos, "Moving to Tank for line of sight");
+                    if (moveResult == MoveResult.PathGenerationFailed || moveResult == MoveResult.Failed)
+                    {
+                        _wasMovingToBackline = false;
+                        return false;
+                    }
+                    return true;
+                }
+            }
 
             WoWPoint? focusPos = null;
             if (selectedTarget != null && selectedTarget.IsValid && !selectedTarget.Dead)
@@ -3090,8 +3186,13 @@ namespace CopilotBuddy.Bots.PartyGrind
                 var (slotIdx, slotCount) = SquadFormationService.ResolveSubRoleSlot(me.Name ?? string.Empty, settings.Role, leader);
                 if (indoorDungeon)
                 {
+                    Func<WoWPoint, WoWPoint, bool>? losCheck = ObjectManager.Executor != null
+                        ? (from, to) => Styx.WoWInternals.World.GameWorld.IsInLineOfSpellSight(
+                            new WoWPoint(from.X, from.Y, from.Z + 1.5f),
+                            new WoWPoint(to.X, to.Y, to.Z + 1.5f))
+                        : null;
                     slotPos = SquadFormationService.ComputeDungeonStandoffPosition(
-                        tankPos, leader.Facing, focusPos, leader.Breadcrumbs, leader.MapId, standoffDistance, slotIdx, slotCount);
+                        tankPos, leader.Facing, focusPos, leader.Breadcrumbs, leader.MapId, standoffDistance, slotIdx, slotCount, losCheck);
                 }
                 else
                 {
@@ -3117,6 +3218,29 @@ namespace CopilotBuddy.Bots.PartyGrind
 
             _wasMovingToBackline = false;
             return false;
+        }
+
+        internal const float BacklineCornerTankApproachDistance = 10.0f;
+
+        internal enum BacklineCornerAction
+        {
+            None,
+            MoveTowardTankForLos,
+            YieldToCombatRoutine
+        }
+
+        internal static BacklineCornerAction EvaluateEngagedNoLosBacklineAction(
+            bool engaged,
+            bool inLineOfSpellSight,
+            float distanceToTank,
+            bool hasTankPosition)
+        {
+            if (!engaged || inLineOfSpellSight || !hasTankPosition)
+                return BacklineCornerAction.None;
+
+            return distanceToTank > BacklineCornerTankApproachDistance
+                ? BacklineCornerAction.MoveTowardTankForLos
+                : BacklineCornerAction.YieldToCombatRoutine;
         }
 
         internal static bool ShouldYieldBacklineToCombat(bool engaged, float targetDistance, bool inLineOfSpellSight, float engageRange)
@@ -3496,10 +3620,12 @@ namespace CopilotBuddy.Bots.PartyGrind
                         {
                             if (me.CurrentTargetGuid != committed.Guid)
                                 committed.Target();
-                            if (!me.Combat && isDungeon && !anotherTankDrives &&
-                                SquadTankBridge.TryExecuteSafeDungeonPull(_pullCommittedGuid))
+                            if (!me.Combat && isDungeon && !anotherTankDrives)
                             {
-                                return RunStatus.Success;
+                                if (SquadTankBridge.TryExecuteSafeDungeonPull(_pullCommittedGuid))
+                                    return RunStatus.Success;
+                                if (AbandonBlacklistedIdlePull(me, _pullCommittedGuid))
+                                    return RunStatus.Failure;
                             }
                             return RunRoutineCombat(_pullCommittedGuid);
                         }
@@ -3591,10 +3717,12 @@ namespace CopilotBuddy.Bots.PartyGrind
                             _currentFocusGuid = dungeonTarget.Guid;
                             BeginPullCommit(dungeonTarget.Guid, now);
                             dungeonTarget.Target();
-                            if (!me.Combat && !anotherTankDrives &&
-                                SquadTankBridge.TryExecuteSafeDungeonPull(dungeonTarget.Guid))
+                            if (!me.Combat && !anotherTankDrives)
                             {
-                                return RunStatus.Success;
+                                if (SquadTankBridge.TryExecuteSafeDungeonPull(dungeonTarget.Guid))
+                                    return RunStatus.Success;
+                                if (AbandonBlacklistedIdlePull(me, dungeonTarget.Guid))
+                                    return RunStatus.Failure;
                             }
                             return RunRoutineCombat(dungeonTarget.Guid);
                         }

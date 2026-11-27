@@ -81,7 +81,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 ("RESURRECT_REQUEST", OnResurrectRequest),
                 ("START_LOOT_ROLL", OnStartLootRoll),
                 ("CONFIRM_SUMMON", OnConfirmSummon),
-                ("QUEST_ACCEPT_CONFIRM", OnQuestAcceptConfirm)
+                ("QUEST_ACCEPT_CONFIRM", OnQuestAcceptConfirm),
+                ("UI_ERROR_MESSAGE", OnUiErrorMessage)
             };
             var registered = new List<(string Name, LuaEventHandlerDelegate Handler)>();
             try
@@ -367,6 +368,16 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (!SquadContext.IsActive)
                 return;
             Lua.DoString("ConfirmAcceptQuest()");
+        }
+
+        private void OnUiErrorMessage(object sender, LuaEventArgs args)
+        {
+            if (!SquadContext.IsActive)
+                return;
+
+            string message = args.Args.Length > 0 ? args.Args[0]?.ToString() ?? string.Empty : string.Empty;
+            if (SquadTankBridge.IsLineOfSightErrorMessage(message))
+                SquadTankBridge.NotifyPullLineOfSightError(message);
         }
 
     }

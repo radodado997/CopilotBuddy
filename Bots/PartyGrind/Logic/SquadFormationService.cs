@@ -419,7 +419,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             uint mapId,
             float standoffDistance,
             int backlineSlotIndex,
-            int totalBacklineCount)
+            int totalBacklineCount,
+            Func<WoWPoint, WoWPoint, bool>? lineOfSightCheck = null)
         {
             float dist = Math.Clamp(standoffDistance, 16f, 20f);
             float[] lateralOffsets = totalBacklineCount switch
@@ -432,6 +433,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
             if (breadcrumbs != null && breadcrumbs.Count > 0)
             {
+                WoWPoint? fallbackCandidate = null;
                 for (int i = breadcrumbs.Count - 1; i >= 0; i--)
                 {
                     var bc = breadcrumbs[i];
@@ -459,9 +461,16 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                             tankPos.Y + uy * clampedDist + py * lateral,
                             bcPt.Z);
                         if (!focusTargetPos.HasValue || candidate.Distance(focusTargetPos.Value) >= dist)
-                            return candidate;
+                        {
+                            if (lineOfSightCheck == null || !focusTargetPos.HasValue || lineOfSightCheck(candidate, focusTargetPos.Value))
+                                return candidate;
+                            fallbackCandidate ??= candidate;
+                        }
                     }
                 }
+
+                if (fallbackCandidate.HasValue)
+                    return fallbackCandidate.Value;
             }
 
             float backAngle;

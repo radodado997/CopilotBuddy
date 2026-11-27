@@ -144,6 +144,23 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private readonly Dictionary<(int X, int Y, int Z, uint MapId), long> _blacklistedNavPoints = new();
         private bool _lfgRunCompletedAwaitingRequeue;
         private bool _countedCurrentWalkInEntry;
+        internal const long ObjectFirstCompletionCooldownMs = 5000L;
+        internal const long ObjectRepeatCompletionCooldownMs = 60000L;
+        internal const long ObjectMaxCompletionCooldownMs = 300000L;
+        internal const long ObjectRunningTimeoutMs = 12000L;
+        internal const long ObjectTimeoutCooldownMs = 30000L;
+
+        private sealed class DungeonObjectAttemptState
+        {
+            public int CompletionCount { get; set; }
+            public long SuppressedUntilMs { get; set; }
+        }
+
+        private readonly Dictionary<ulong, DungeonObjectAttemptState> _objectAttemptStates = new();
+        private Composite? _activeObjectBehavior;
+        private ulong _activeObjectGuid;
+        private long _activeObjectRunningSinceMs;
+        private long _unnamedObjectCooldownUntilMs;
         private Composite? _activeEncounterBehavior;
         private WoWUnit? _activeEncounterTarget;
 
@@ -188,6 +205,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             _breadcrumbBossEntry = 0;
             _breadcrumbIndex = 0;
             _blacklistedNavPoints.Clear();
+            ClearObjectScriptTracking();
+            DungeonManager.IsObjectHandlerSuppressed = IsDungeonObjectSuppressed;
             _lfgRunCompletedAwaitingRequeue = false;
             ClearResetPendingOutside();
             StopActiveEncounter();
@@ -196,6 +215,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         public void ShutdownRuntime()
         {
             StopActiveEncounter();
+            StopActiveObjectBehavior();
+            DungeonManager.IsObjectHandlerSuppressed = null;
+            ClearObjectScriptTracking();
             if (_lfgEventsAttached)
             {
                 try { LfgManager.DetachLfgEvents(); } catch { }
@@ -215,6 +237,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             _breadcrumbBossEntry = 0;
             _breadcrumbIndex = 0;
             _blacklistedNavPoints.Clear();
+            ClearObjectScriptTracking();
+            DungeonManager.IsObjectHandlerSuppressed = IsDungeonObjectSuppressed;
             _lfgRunCompletedAwaitingRequeue = false;
             _lastInstanceResetAttemptUtcMs = 0;
             _lastObservedResetGenOnFollower = 0;
@@ -283,9 +307,11 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 if (generationChanged)
                 {
                     StopActiveEncounter();
+                    StopActiveObjectBehavior();
                     DungeonManager.Clear();
                     BossManager.Reset();
                     _currentRunKilledBosses.Clear();
+                    ClearObjectScriptTracking();
                     _lastSyncedDungeonId = 0;
                     _lastResetGeneration = currentGen;
                 }
@@ -317,11 +343,13 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 if (desiredDungeonId > 0 && (generationChanged || _lastSyncedDungeonId != desiredDungeonId || _lastSyncedMapId != me.MapId || DungeonManager.CurrentDungeon == null))
                 {
                     StopActiveEncounter();
+                    StopActiveObjectBehavior();
                     _hotspotIndex = 0;
                     _visitedFallbackHotspots.Clear();
                     _breadcrumbBossEntry = 0;
                     _breadcrumbIndex = 0;
                     _blacklistedNavPoints.Clear();
+                    ClearObjectScriptTracking();
                     DungeonManager.SetDungeonById(desiredDungeonId);
                     BossManager.RestoreKilledBosses(_currentRunKilledBosses);
                     LfgManager.DungeonCompletedReason = CompleteReason.None;
@@ -336,12 +364,14 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 if (!isCorpseRun && _lastSyncedDungeonId != 0)
                 {
                     StopActiveEncounter();
+                    StopActiveObjectBehavior();
                     DungeonManager.Clear();
                     BossManager.Reset();
                     _lastSyncedDungeonId = 0;
                     _hotspotIndex = 0;
                     _visitedFallbackHotspots.Clear();
                     _currentRunKilledBosses.Clear();
+                    ClearObjectScriptTracking();
                 }
                 _lastSyncedMapId = me.MapId;
             }
@@ -1302,7 +1332,79 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             return true;
         }
 
-        public bool TryRunDungeonScriptBehaviors()
+        internal static long ComputeObjectCompletionCooldownMs(int completionCount)
+        {
+            if (completionCount <= 1)
+                return ObjectFirstCompletionCooldownMs;
+            if (completionCount == 2)
+                return ObjectRepeatCompletionCooldownMs;
+            return ObjectMaxCompletionCooldownMs;
+        }
+
+        internal bool IsObjectSuppressedAt(ulong guid, long nowUtcMs)
+        {
+            return guid != 0UL &&
+                   _objectAttemptStates.TryGetValue(guid, out var state) &&
+                   nowUtcMs < state.SuppressedUntilMs;
+        }
+
+        internal void RecordObjectScriptSuccess(ulong guid, long nowUtcMs)
+        {
+            if (guid == 0UL)
+                return;
+
+            if (!_objectAttemptStates.TryGetValue(guid, out var state))
+            {
+                state = new DungeonObjectAttemptState();
+                _objectAttemptStates[guid] = state;
+            }
+
+            state.CompletionCount++;
+            state.SuppressedUntilMs = nowUtcMs + ComputeObjectCompletionCooldownMs(state.CompletionCount);
+        }
+
+        internal void RecordObjectScriptTimeout(ulong guid, long nowUtcMs)
+        {
+            if (guid == 0UL)
+                return;
+
+            if (!_objectAttemptStates.TryGetValue(guid, out var state))
+            {
+                state = new DungeonObjectAttemptState();
+                _objectAttemptStates[guid] = state;
+            }
+
+            state.CompletionCount++;
+            state.SuppressedUntilMs = nowUtcMs + Math.Max(ObjectTimeoutCooldownMs, ComputeObjectCompletionCooldownMs(state.CompletionCount));
+        }
+
+        internal void ClearObjectScriptTracking()
+        {
+            _objectAttemptStates.Clear();
+            _activeObjectGuid = 0UL;
+            _activeObjectRunningSinceMs = 0L;
+            _unnamedObjectCooldownUntilMs = 0L;
+        }
+
+        private bool IsDungeonObjectSuppressed(WoWGameObject obj)
+        {
+            return obj != null && IsObjectSuppressedAt(obj.Guid, Environment.TickCount64);
+        }
+
+        public void StopActiveObjectBehavior()
+        {
+            var objectBehavior = _activeObjectBehavior;
+            _activeObjectBehavior = null;
+            if (objectBehavior != null && objectBehavior.IsRunning)
+            {
+                try { objectBehavior.Stop(null); } catch { }
+            }
+            DungeonManager.ResetLastActiveObject();
+            _activeObjectGuid = 0UL;
+            _activeObjectRunningSinceMs = 0L;
+        }
+
+        public bool TryRunDungeonEncounterBehaviors()
         {
             var me = StyxWoW.Me;
             if (me == null || DungeonManager.CurrentDungeon == null || !IsInDungeonMap(me))
@@ -1311,17 +1413,17 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 return false;
             }
 
-            var scriptBehavior = DungeonManager.CurrentDungeonBehavior;
-            if (scriptBehavior != null)
+            var encounterScript = DungeonManager.CurrentEncounterHandlersBehavior;
+            if (encounterScript != null)
             {
-                if (!scriptBehavior.IsRunning)
-                    scriptBehavior.Start(null);
-                RunStatus scriptStatus = scriptBehavior.Tick(null);
+                if (!encounterScript.IsRunning)
+                    encounterScript.Start(null);
+                RunStatus scriptStatus = encounterScript.Tick(null);
+                if (scriptStatus != RunStatus.Running && encounterScript.IsRunning)
+                    encounterScript.Stop(null);
                 if (scriptStatus == RunStatus.Running || scriptStatus == RunStatus.Success)
                 {
                     StopActiveEncounter();
-                    if (scriptStatus != RunStatus.Running)
-                        scriptBehavior.Stop(null);
                     return true;
                 }
             }
@@ -1350,6 +1452,91 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
             StopActiveEncounter();
             return false;
+        }
+
+        public bool TryRunDungeonObjectBehaviors()
+        {
+            var me = StyxWoW.Me;
+            if (me == null || DungeonManager.CurrentDungeon == null || !IsInDungeonMap(me))
+            {
+                StopActiveObjectBehavior();
+                return false;
+            }
+
+            DungeonManager.IsObjectHandlerSuppressed = IsDungeonObjectSuppressed;
+            var objectScript = DungeonManager.CurrentObjectHandlersBehavior;
+            if (objectScript == null)
+                return false;
+
+            if (!ReferenceEquals(_activeObjectBehavior, objectScript))
+            {
+                StopActiveObjectBehavior();
+                _activeObjectBehavior = objectScript;
+            }
+
+            long now = Environment.TickCount64;
+            if (now < _unnamedObjectCooldownUntilMs)
+                return false;
+
+            DungeonManager.ResetLastActiveObject();
+            if (!objectScript.IsRunning)
+                objectScript.Start(null);
+            RunStatus scriptStatus = objectScript.Tick(null);
+            if (scriptStatus != RunStatus.Running)
+            {
+                if (objectScript.IsRunning)
+                    objectScript.Stop(null);
+                _activeObjectBehavior = null;
+            }
+
+            ulong handledGuid = DungeonManager.LastActiveObjectGuid;
+            if (scriptStatus == RunStatus.Running)
+            {
+                if (_activeObjectRunningSinceMs == 0L)
+                    _activeObjectRunningSinceMs = now;
+
+                if (handledGuid != 0UL)
+                {
+                    if (_activeObjectGuid != 0UL && _activeObjectGuid != handledGuid)
+                        _activeObjectRunningSinceMs = now;
+                    _activeObjectGuid = handledGuid;
+                }
+
+                if (now - _activeObjectRunningSinceMs >= ObjectRunningTimeoutMs)
+                {
+                    ulong timedOutGuid = handledGuid != 0UL ? handledGuid : _activeObjectGuid;
+                    if (timedOutGuid != 0UL)
+                        RecordObjectScriptTimeout(timedOutGuid, now);
+                    else
+                        _unnamedObjectCooldownUntilMs = now + ObjectTimeoutCooldownMs;
+                    SquadPartySyncService.LogAction("Dungeon: skipping unresponsive object " + (DungeonManager.LastActiveObjectName ?? "object"));
+                    StopActiveObjectBehavior();
+                    return false;
+                }
+
+                return true;
+            }
+
+            if (scriptStatus == RunStatus.Success)
+            {
+                ulong completedGuid = handledGuid != 0UL ? handledGuid : _activeObjectGuid;
+                if (completedGuid != 0UL)
+                    RecordObjectScriptSuccess(completedGuid, now);
+                _activeObjectGuid = 0UL;
+                _activeObjectRunningSinceMs = 0L;
+                return true;
+            }
+
+            _activeObjectGuid = 0UL;
+            _activeObjectRunningSinceMs = 0L;
+            return false;
+        }
+
+        public bool TryRunDungeonScriptBehaviors()
+        {
+            if (TryRunDungeonEncounterBehaviors())
+                return true;
+            return TryRunDungeonObjectBehaviors();
         }
 
         internal static WoWPoint AdvanceBossBreadcrumb(

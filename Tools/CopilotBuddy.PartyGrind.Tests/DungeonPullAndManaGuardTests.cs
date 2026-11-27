@@ -4,6 +4,7 @@ using CopilotBuddy.Bots.PartyGrind.Logic;
 using Styx.Combat.CombatRoutine;
 using Styx.Logic.Pathing;
 using Styx.PartyGrind;
+using Styx.PartyGrind.IPC;
 using Xunit;
 
 namespace CopilotBuddy.PartyGrind.Tests
@@ -282,6 +283,154 @@ namespace CopilotBuddy.PartyGrind.Tests
             WoWPoint fallback = SquadDungeonService.ResolvePolylineAdvanceStep(
                 from, Array.Empty<WoWPoint>(), objective, Array.Empty<WoWPoint>());
             Assert.Equal(SquadDungeonService.ResolveDungeonAdvanceStep(from, objective, Array.Empty<WoWPoint>()), fallback);
+        }
+
+        [Fact]
+        public void DungeonPullLosRecovery_AdvancesCloserAndBlacklistsAfterRepeatFailure()
+        {
+            Assert.True(SquadTankBridge.IsLineOfSightErrorMessage("Target not in line of sight"));
+            Assert.True(SquadTankBridge.IsLineOfSightErrorMessage("You are not in LINE OF SIGHT"));
+            Assert.False(SquadTankBridge.IsLineOfSightErrorMessage("Out of range."));
+            Assert.False(SquadTankBridge.IsLineOfSightErrorMessage(null));
+
+            Assert.Equal(
+                SquadTankBridge.DungeonPullAction.CastOpener,
+                SquadTankBridge.EvaluateDungeonPullStep(true, true, false, long.MaxValue, false, 0, 22f));
+            Assert.Equal(
+                SquadTankBridge.DungeonPullAction.HoldAfterCast,
+                SquadTankBridge.EvaluateDungeonPullStep(true, true, true, 300L, false, 0, 22f));
+            Assert.Equal(
+                SquadTankBridge.DungeonPullAction.HoldAfterCast,
+                SquadTankBridge.EvaluateDungeonPullStep(true, true, true, 1600L, false, 0, 22f, isCasting: true));
+            Assert.Equal(
+                SquadTankBridge.DungeonPullAction.Approach,
+                SquadTankBridge.EvaluateDungeonPullStep(true, true, true, 50L, true, 1, 20f));
+            Assert.Equal(
+                SquadTankBridge.DungeonPullAction.Approach,
+                SquadTankBridge.EvaluateDungeonPullStep(true, true, true, 1300L, false, 1, 20f));
+            Assert.Equal(
+                SquadTankBridge.DungeonPullAction.CastOpener,
+                SquadTankBridge.EvaluateDungeonPullStep(true, true, true, 1300L, true, 1, 5.0f));
+            Assert.Equal(
+                SquadTankBridge.DungeonPullAction.AbandonAndBlacklist,
+                SquadTankBridge.EvaluateDungeonPullStep(true, true, true, 50L, true, 2, 5.0f));
+        }
+
+        [Fact]
+        public void DungeonPullElevationPenalty_StronglyPrefersSameFloorOverElevatedLedge()
+        {
+            double olafFloor = SquadTankBridge.ComputeDungeonPullElevationPenalty(-48.5f, -49.0f);
+            double baelogLedge = SquadTankBridge.ComputeDungeonPullElevationPenalty(-44.45f, -49.0f);
+
+            Assert.Equal(0.0, olafFloor);
+            Assert.True(baelogLedge < -150.0);
+        }
+
+        [Fact]
+        public void BacklineCornerLos_MovesTowardTankWhenFar_YieldsNearTank_AndPrefersLosBreadcrumb()
+        {
+            Assert.Equal(
+                CopilotBuddy.Bots.PartyGrind.PartyGrindBot.BacklineCornerAction.MoveTowardTankForLos,
+                CopilotBuddy.Bots.PartyGrind.PartyGrindBot.EvaluateEngagedNoLosBacklineAction(
+                    engaged: true, inLineOfSpellSight: false, distanceToTank: 18f, hasTankPosition: true));
+            Assert.Equal(
+                CopilotBuddy.Bots.PartyGrind.PartyGrindBot.BacklineCornerAction.YieldToCombatRoutine,
+                CopilotBuddy.Bots.PartyGrind.PartyGrindBot.EvaluateEngagedNoLosBacklineAction(
+                    engaged: true, inLineOfSpellSight: false, distanceToTank: 8f, hasTankPosition: true));
+            Assert.Equal(
+                CopilotBuddy.Bots.PartyGrind.PartyGrindBot.BacklineCornerAction.None,
+                CopilotBuddy.Bots.PartyGrind.PartyGrindBot.EvaluateEngagedNoLosBacklineAction(
+                    engaged: true, inLineOfSpellSight: true, distanceToTank: 18f, hasTankPosition: true));
+            Assert.Equal(
+                CopilotBuddy.Bots.PartyGrind.PartyGrindBot.BacklineCornerAction.None,
+                CopilotBuddy.Bots.PartyGrind.PartyGrindBot.EvaluateEngagedNoLosBacklineAction(
+                    engaged: false, inLineOfSpellSight: false, distanceToTank: 18f, hasTankPosition: true));
+
+            var tankPos = new WoWPoint(100f, 100f, 0f);
+            var mobPos = new WoWPoint(110f, 100f, 0f);
+            var blindCrumb = new SquadBreadcrumb { X = 84f, Y = 100f, Z = 0f, MapId = 70U };
+            var losCrumb = new SquadBreadcrumb { X = 88f, Y = 94f, Z = 0f, MapId = 70U };
+            var crumbs = new[] { losCrumb, blindCrumb };
+
+            WoWPoint chosen = SquadFormationService.ComputeDungeonStandoffPosition(
+                tankPos,
+                0f,
+                mobPos,
+                crumbs,
+                70U,
+                16f,
+                0,
+                1,
+                lineOfSightCheck: (candidate, _) => candidate.Y < 99.0f);
+
+            Assert.True(chosen.Y < 99.0f);
+            Assert.True(chosen.Distance(mobPos) >= 16f);
+        }
+
+        [Fact]
+        public void DungeonObjectScripts_YieldToCombatAndLoot_AndApplyEscalatingCooldown()
+        {
+            Assert.True(CopilotBuddy.Bots.PartyGrind.PartyGrindBot.CanRunDungeonObjectScripts(
+                inDungeonMode: true,
+                meInCombat: false,
+                leaderInCombat: false,
+                leaderFocusTargetGuid: 0UL,
+                combatOrHealNeeded: false,
+                hasNearbyThreat: false,
+                lootNeeded: false,
+                restOrProvisionNeeded: false));
+
+            Assert.False(CopilotBuddy.Bots.PartyGrind.PartyGrindBot.CanRunDungeonObjectScripts(true, true, false, 0UL, false, false, false, false));
+            Assert.False(CopilotBuddy.Bots.PartyGrind.PartyGrindBot.CanRunDungeonObjectScripts(true, false, true, 0UL, false, false, false, false));
+            Assert.False(CopilotBuddy.Bots.PartyGrind.PartyGrindBot.CanRunDungeonObjectScripts(true, false, false, 999UL, false, false, false, false));
+            Assert.False(CopilotBuddy.Bots.PartyGrind.PartyGrindBot.CanRunDungeonObjectScripts(true, false, false, 0UL, true, false, false, false));
+            Assert.False(CopilotBuddy.Bots.PartyGrind.PartyGrindBot.CanRunDungeonObjectScripts(true, false, false, 0UL, false, true, false, false));
+            Assert.False(CopilotBuddy.Bots.PartyGrind.PartyGrindBot.CanRunDungeonObjectScripts(true, false, false, 0UL, false, false, true, false));
+            Assert.False(CopilotBuddy.Bots.PartyGrind.PartyGrindBot.CanRunDungeonObjectScripts(true, false, false, 0UL, false, false, false, true));
+
+            var service = new SquadDungeonService();
+            const ulong altarGuid = 0x130511UL;
+
+            service.RecordObjectScriptSuccess(altarGuid, 10_000L);
+            Assert.True(service.IsObjectSuppressedAt(altarGuid, 14_999L));
+            Assert.False(service.IsObjectSuppressedAt(altarGuid, 15_000L));
+
+            service.RecordObjectScriptSuccess(altarGuid, 20_000L);
+            Assert.True(service.IsObjectSuppressedAt(altarGuid, 79_999L));
+            Assert.False(service.IsObjectSuppressedAt(altarGuid, 80_000L));
+
+            service.RecordObjectScriptSuccess(altarGuid, 90_000L);
+            Assert.True(service.IsObjectSuppressedAt(altarGuid, 389_999L));
+
+            service.ClearObjectScriptTracking();
+            Assert.False(service.IsObjectSuppressedAt(altarGuid, 95_000L));
+
+            service.RecordObjectScriptTimeout(altarGuid, 100_000L);
+            Assert.True(service.IsObjectSuppressedAt(altarGuid, 129_999L));
+        }
+    }
+
+    public sealed class DungeonPullBlacklistStateTests : IDisposable
+    {
+        public DungeonPullBlacklistStateTests()
+        {
+            SquadTankBridge.ResetPullStateForTests();
+        }
+
+        public void Dispose()
+        {
+            SquadTankBridge.ResetPullStateForTests();
+        }
+
+        [Fact]
+        public void TempBlacklist_BlocksUntilExpiryAndClearsOnReset()
+        {
+            const ulong baelogGuid = 0xDEAD0001UL;
+            SquadTankBridge.BlacklistPullTarget(baelogGuid, 10_000L);
+            Assert.True(SquadTankBridge.IsTemporarilyPullBlacklisted(baelogGuid, 17_999L));
+            Assert.False(SquadTankBridge.IsTemporarilyPullBlacklisted(baelogGuid, 18_000L));
+            Assert.True(SquadTankBridge.ShouldRejectIdlePullTarget(isTemporarilyBlacklisted: true, targetEngaged: false));
+            Assert.False(SquadTankBridge.ShouldRejectIdlePullTarget(isTemporarilyBlacklisted: true, targetEngaged: true));
         }
     }
 }
