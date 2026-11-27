@@ -24,6 +24,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private readonly object _invitePulseLock = new();
         private readonly SquadInviteTracker _inviteTracker = new();
         private long _lastLootMethodUtcMs;
+        private long _lastUninviteUtcMs;
+        private SquadDungeonResetPhase _lastResetPhase = SquadDungeonResetPhase.Idle;
 
         private static readonly object ActionLogLock = new();
         private static string _lastAction = string.Empty;
@@ -130,19 +132,56 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         /// <summary>
         /// Coordinator periodically invites missing squadmates and enforces the configured LootMethod.
         /// </summary>
-        public void PulseCoordinatorPartySync(SquadSettings settings, IReadOnlyList<SquadConnectedMemberSnapshot> connected)
+        public void PulseCoordinatorPartySync(
+            SquadSettings settings,
+            IReadOnlyList<SquadConnectedMemberSnapshot> connected,
+            SquadLeaderState? leader = null)
         {
             var me = StyxWoW.Me;
             if (me == null || !settings.IsCoordinator)
                 return;
 
             long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            SquadDungeonResetPhase resetPhase = leader?.DungeonResetPhase ?? SquadDungeonResetPhase.Idle;
+            bool suspendAutoInvite = leader?.SuspendAutoInvite == true;
+            bool anyCombatOrDead = leader != null &&
+                (leader.Phase == SquadPhase.Paused || leader.InCombat || leader.IsDead || leader.IsGhost ||
+                 leader.Members.Any(m => m.IsConnected && (m.IsDead || m.IsGhost)));
+
+            if (resetPhase == SquadDungeonResetPhase.Disbanding)
+            {
+                if (_lastResetPhase != SquadDungeonResetPhase.Disbanding)
+                    _lastUninviteUtcMs = 0;
+                if (!anyCombatOrDead && now - _lastUninviteUtcMs >= 1200L)
+                {
+                    _lastUninviteUtcMs = now;
+                    UninviteAllPartyMembers(me);
+                }
+            }
+            else
+            {
+                _lastUninviteUtcMs = 0;
+            }
+
+            if (resetPhase == SquadDungeonResetPhase.Reinviting &&
+                _lastResetPhase != SquadDungeonResetPhase.Reinviting)
+            {
+                _inviteTracker.Reset();
+                _lastInviteUtcMs = 0;
+            }
+            _lastResetPhase = resetPhase;
 
             // Serialize overlapping pulses as well as each player's pending-invite window.
             lock (_invitePulseLock)
             {
-                if (settings.AutoInviteMembers &&
-                    (now - _lastInviteUtcMs) >= Math.Max(3, settings.InviteIntervalSeconds) * 1000L)
+                bool allowInvite = !suspendAutoInvite &&
+                    (settings.AutoInviteMembers || resetPhase == SquadDungeonResetPhase.Reinviting);
+                long inviteIntervalMs = resetPhase == SquadDungeonResetPhase.Reinviting
+                    ? 2000L
+                    : Math.Max(3, settings.InviteIntervalSeconds) * 1000L;
+                long trackerCooldownMs = resetPhase == SquadDungeonResetPhase.Reinviting ? 4000L : 10000L;
+
+                if (allowInvite && (now - _lastInviteUtcMs) >= inviteIntervalMs)
                 {
                     _lastInviteUtcMs = now;
                     var desiredNames = new HashSet<string>(
@@ -164,18 +203,53 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                             // cannot occur between the membership test and InviteUnit.
                             return Lua.GetReturnVal<string>(BuildInviteScript(name, mayInvite), 0U)
                                 ?? string.Empty;
-                        });
+                        }, trackerCooldownMs);
                     }
                 }
             }
 
             // 2. Enforce configured party loot method (freeforall / group).
-            if ((now - _lastLootMethodUtcMs) >= 15000L)
+            if (resetPhase != SquadDungeonResetPhase.Disbanding &&
+                (now - _lastLootMethodUtcMs) >= 15000L)
             {
                 _lastLootMethodUtcMs = now;
                 string method = settings.LootMethod == SquadLootMethod.FreeForAll ? "freeforall" : "group";
                 Lua.DoString($"if GetPartyMember(1) and GetLootMethod() ~= '{method}' then SetLootMethod('{method}') end");
             }
+        }
+
+        internal static string BuildUninviteAllScript() =>
+            "local count = 0; " +
+            "if GetNumRaidMembers() > 0 then " +
+                "if IsRaidLeader() then " +
+                    "local meName = UnitName('player'); " +
+                    "for i = GetNumRaidMembers(), 1, -1 do " +
+                        "local name = GetRaidRosterInfo(i); " +
+                        "if name and name ~= '' and name ~= meName then UninviteUnit(name); count = count + 1; end " +
+                    "end " +
+                "end " +
+            "elseif GetNumPartyMembers() > 0 then " +
+                "if IsPartyLeader() then " +
+                    "for i = GetNumPartyMembers(), 1, -1 do " +
+                        "local name = UnitName('party' .. i); " +
+                        "if name and name ~= '' then UninviteUnit(name); count = count + 1; end " +
+                    "end " +
+                "end " +
+            "end; " +
+            "return count;";
+
+        public static int UninviteAllPartyMembers(Styx.WoWInternals.WoWObjects.LocalPlayer? me)
+        {
+            if (me == null)
+                return 0;
+
+            int count = Lua.GetReturnVal<int>(BuildUninviteAllScript(), 0);
+            if (count > 0)
+            {
+                Logging.Write("[PartyGrind Sync] Disbanding party after dungeon ({0} uninvite calls).", count);
+                LogAction($"Disbanding party ({count})");
+            }
+            return count;
         }
 
         internal static string BuildInviteScript(string name, bool mayInvite)
@@ -303,11 +377,19 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private readonly object _gate = new();
         private readonly Dictionary<string, long> _lastAttempts = new(StringComparer.OrdinalIgnoreCase);
 
-        internal void Check(string name, long now, Func<bool, string> checkAndInvite)
+        internal void Reset()
         {
             lock (_gate)
             {
-                bool mayInvite = !_lastAttempts.TryGetValue(name, out long last) || now - last >= InviteCooldownMs;
+                _lastAttempts.Clear();
+            }
+        }
+
+        internal void Check(string name, long now, Func<bool, string> checkAndInvite, long cooldownMs = InviteCooldownMs)
+        {
+            lock (_gate)
+            {
+                bool mayInvite = !_lastAttempts.TryGetValue(name, out long last) || now - last >= cooldownMs;
                 // Reserve before executing Lua, including when execution fails or returns no result.
                 if (mayInvite)
                     _lastAttempts[name] = now;

@@ -77,6 +77,13 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private bool _allTownTasksComplete;
         private bool _inLootWindow;
         private bool _dungeonCompleted;
+        private SquadDungeonResetPhase _dungeonResetPhase = SquadDungeonResetPhase.Idle;
+        private SquadDungeonResetPhase _lastLoggedResetPhase = SquadDungeonResetPhase.Idle;
+        private long _dungeonResetStateSinceUtcMs;
+        private long _lastExitingWarnUtcMs;
+        private long _dungeonCompletedAtUtcMs;
+        private int _resetBaselineGeneration;
+        private readonly HashSet<ulong> _dungeonRunParticipants = new();
         private long _lootWindowEndsUtcMs;
         private bool _wasAnyInCombat;
         private long _resWaitStartedUtcMs;
@@ -120,6 +127,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             MaxFollowerDistance = 0f;
             _inTownRun = false;
             _dungeonCompleted = false;
+            ResetDungeonResetState();
             _allTownTasksComplete = false;
             _inLootWindow = false;
             _lootWindowEndsUtcMs = 0;
@@ -436,15 +444,25 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             SquadTownRunRequest? townRequest = ResolveTownRunRequest(connectedClients, localTownRunRequest);
             bool anyInsideDungeon = isDungeonMode && (dungeon?.IsInsideDungeon == true || rosterStates.Any(m => m.IsInsideDungeon));
 
-            _dungeonCompleted = isDungeonMode &&
-                (dungeon?.ResetPendingOutside == true ||
-                 (anyInsideDungeon && (dungeon?.IsDungeonComplete == true || _dungeonCompleted)));
+            EvaluateDungeonResetState(
+                isDungeonMode,
+                anyInCombat,
+                anyDead,
+                anyInsideDungeon,
+                leaderLocal,
+                rosterStates,
+                connectedClients,
+                dungeon,
+                instanceResetGeneration,
+                nowUtcMs);
 
             if (!_inTownRun)
             {
                 bool anyNeedsTown = rosterStates.Any(m =>
                     !m.IsDead && !m.IsGhost && HasTownNeed(m));
-                if (!anyInCombat && !anyDead && !anyInsideDungeon && (townRequest != null || (settings.SyncTownRuns && anyNeedsTown)))
+                if (!anyInCombat && !anyDead && !anyInsideDungeon &&
+                    _dungeonResetPhase == SquadDungeonResetPhase.Idle &&
+                    (townRequest != null || (settings.SyncTownRuns && anyNeedsTown)))
                 {
                     _inTownRun = true;
                     _allTownTasksComplete = false;
@@ -514,7 +532,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             }
 
             // Provisioning arbitration.
-            if (anyInCombat || anyDead || _inTownRun || _migratingZone)
+            if (anyInCombat || anyDead || _inTownRun || _migratingZone || _dungeonResetPhase != SquadDungeonResetPhase.Idle)
             {
                 if (!string.IsNullOrEmpty(_activeProvisioner))
                 {
@@ -561,9 +579,16 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 {
                     phase = SquadPhase.DungeonClearing;
                 }
-                else if (anyInsideDungeon && _dungeonCompleted && !_inLootWindow)
+                else if (_dungeonResetPhase == SquadDungeonResetPhase.Exiting ||
+                         (anyInsideDungeon && _dungeonCompleted && !_inLootWindow))
                 {
                     phase = SquadPhase.DungeonCompleteExit;
+                }
+                else if (_dungeonResetPhase is SquadDungeonResetPhase.Disbanding or SquadDungeonResetPhase.Resetting or SquadDungeonResetPhase.Reinviting)
+                {
+                    phase = settings.DungeonEntryMode == SquadDungeonEntryMode.WalkInPortalFarm
+                        ? SquadPhase.DungeonTravelToPortal
+                        : SquadPhase.DungeonQueueing;
                 }
                 else if (_inLootWindow && (settings.DungeonLootMode == SquadDungeonLootMode.AllTrashAndBosses || _dungeonCompleted))
                 {
@@ -717,9 +742,12 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 KilledBossCount = dungeon?.KilledBossCount ?? 0,
                 TotalBossCount = dungeon?.TotalBossCount ?? 0,
                 IsDungeonComplete = _dungeonCompleted,
-                AcceptLfgProposalOrder = isDungeonMode && !_inTownRun && !anyDead && (dungeon?.LfgProposalPending == true || rosterStates.Any(m => m.LfgProposalPending)),
-                DungeonResetPendingOutside = isDungeonMode && dungeon?.ResetPendingOutside == true,
-                TeleportOutOrder = isDungeonMode && phase == SquadPhase.DungeonCompleteExit && settings.DungeonEntryMode != SquadDungeonEntryMode.WalkInPortalFarm,
+                AcceptLfgProposalOrder = isDungeonMode && _dungeonResetPhase == SquadDungeonResetPhase.Idle && !_inTownRun && !anyDead && (dungeon?.LfgProposalPending == true || rosterStates.Any(m => m.LfgProposalPending)),
+                DungeonResetPendingOutside = isDungeonMode && _dungeonResetPhase is SquadDungeonResetPhase.Exiting or SquadDungeonResetPhase.Disbanding or SquadDungeonResetPhase.Resetting,
+                TeleportOutOrder = isDungeonMode && phase == SquadPhase.DungeonCompleteExit && !anyInCombat && !anyDead && settings.DungeonEntryMode != SquadDungeonEntryMode.WalkInPortalFarm,
+                DungeonResetPhase = isDungeonMode ? _dungeonResetPhase : SquadDungeonResetPhase.Idle,
+                SuspendAutoInvite = isDungeonMode && _dungeonResetPhase is SquadDungeonResetPhase.Completed or SquadDungeonResetPhase.Exiting or SquadDungeonResetPhase.Disbanding or SquadDungeonResetPhase.Resetting,
+                DungeonResetStateSinceUtcMs = isDungeonMode ? _dungeonResetStateSinceUtcMs : 0L,
                 LfgStatusText = dungeon?.LfgMode ?? string.Empty,
                 HasRandomPartyMembers = dungeon?.HasRandomPartyMembers == true,
                 EffectiveTankGuid = dungeon?.EffectiveTankGuid ?? (settings.Role == SquadRole.TankLeader ? leaderLocal.Guid : 0UL),
@@ -737,6 +765,160 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 MemberRoles = roles,
                 Members = summaries
             };
+        }
+
+        private void ResetDungeonResetState()
+        {
+            _dungeonCompleted = false;
+            _dungeonResetPhase = SquadDungeonResetPhase.Idle;
+            _lastLoggedResetPhase = SquadDungeonResetPhase.Idle;
+            _dungeonResetStateSinceUtcMs = 0;
+            _lastExitingWarnUtcMs = 0;
+            _dungeonCompletedAtUtcMs = 0;
+            _resetBaselineGeneration = 0;
+            _dungeonRunParticipants.Clear();
+        }
+
+        private bool IsSquadConfirmedOutsideDungeon(
+            bool anyInsideDungeon,
+            SquadMemberState leaderLocal,
+            IReadOnlyList<SquadConnectedMemberSnapshot> connectedClients,
+            long nowUtcMs)
+        {
+            if (anyInsideDungeon || !leaderLocal.HasValidMap || leaderLocal.IsInsideDungeon)
+                return false;
+            return SquadDungeonService.AreAllRunParticipantsOutside(
+                _dungeonRunParticipants,
+                leaderLocal.Guid,
+                connectedClients,
+                _dungeonCompletedAtUtcMs,
+                nowUtcMs);
+        }
+
+        private void EvaluateDungeonResetState(
+            bool isDungeonMode,
+            bool anyInCombat,
+            bool anyDead,
+            bool anyInsideDungeon,
+            SquadMemberState leaderLocal,
+            IReadOnlyList<SquadMemberState> rosterStates,
+            IReadOnlyList<SquadConnectedMemberSnapshot> connectedClients,
+            SquadDungeonSnapshot? dungeon,
+            int instanceResetGeneration,
+            long nowUtcMs)
+        {
+            if (!isDungeonMode)
+            {
+                ResetDungeonResetState();
+                return;
+            }
+
+            if (dungeon == null)
+                return;
+
+            if (anyInsideDungeon && _dungeonResetPhase == SquadDungeonResetPhase.Idle)
+            {
+                foreach (var member in rosterStates)
+                {
+                    if (member.Guid != 0 && member.IsInsideDungeon)
+                        _dungeonRunParticipants.Add(member.Guid);
+                }
+                if (dungeon.IsInsideDungeon && leaderLocal.Guid != 0)
+                    _dungeonRunParticipants.Add(leaderLocal.Guid);
+            }
+
+            bool snapshotComplete = dungeon.IsDungeonComplete || dungeon.ResetPendingOutside;
+            _dungeonCompleted = _dungeonResetPhase switch
+            {
+                SquadDungeonResetPhase.Idle => snapshotComplete && (anyInsideDungeon || dungeon.ResetPendingOutside),
+                SquadDungeonResetPhase.Completed => true,
+                SquadDungeonResetPhase.Exiting => true,
+                SquadDungeonResetPhase.Disbanding => true,
+                SquadDungeonResetPhase.Resetting => false,
+                SquadDungeonResetPhase.Reinviting => false,
+                _ => false
+            };
+
+            if (_dungeonResetPhase == SquadDungeonResetPhase.Idle && _dungeonCompleted)
+            {
+                if (_dungeonCompletedAtUtcMs == 0)
+                    _dungeonCompletedAtUtcMs = nowUtcMs;
+                _dungeonResetPhase = (_inLootWindow || anyInCombat || anyDead)
+                    ? SquadDungeonResetPhase.Completed
+                    : SquadDungeonResetPhase.Exiting;
+                _dungeonResetStateSinceUtcMs = nowUtcMs;
+                _lastExitingWarnUtcMs = 0;
+            }
+
+            if (_dungeonResetPhase == SquadDungeonResetPhase.Completed &&
+                !_inLootWindow &&
+                !anyInCombat &&
+                !anyDead)
+            {
+                _dungeonResetPhase = SquadDungeonResetPhase.Exiting;
+                _dungeonResetStateSinceUtcMs = nowUtcMs;
+                _lastExitingWarnUtcMs = 0;
+            }
+
+            if (_dungeonResetPhase == SquadDungeonResetPhase.Exiting)
+            {
+                bool allOutside = IsSquadConfirmedOutsideDungeon(anyInsideDungeon, leaderLocal, connectedClients, nowUtcMs);
+                if (!anyInCombat && !anyDead && allOutside)
+                {
+                    _dungeonResetPhase = SquadDungeonResetPhase.Disbanding;
+                    _dungeonResetStateSinceUtcMs = nowUtcMs;
+                    _lastExitingWarnUtcMs = 0;
+                }
+                else if (!anyInsideDungeon && leaderLocal.HasValidMap && !leaderLocal.IsInsideDungeon &&
+                         nowUtcMs - _dungeonResetStateSinceUtcMs >= 15000L &&
+                         nowUtcMs - _lastExitingWarnUtcMs >= 10000L)
+                {
+                    _lastExitingWarnUtcMs = nowUtcMs;
+                    Logging.Write("[PartyGrind Dungeon] Exiting waiting for outside telemetry from all squad participants.");
+                }
+            }
+
+            if (_dungeonResetPhase == SquadDungeonResetPhase.Disbanding)
+            {
+                bool allOutside = IsSquadConfirmedOutsideDungeon(anyInsideDungeon, leaderLocal, connectedClients, nowUtcMs);
+                if (!allOutside)
+                {
+                    _dungeonResetPhase = SquadDungeonResetPhase.Exiting;
+                    _dungeonResetStateSinceUtcMs = nowUtcMs;
+                    _lastExitingWarnUtcMs = 0;
+                }
+                else if (!anyInCombat &&
+                         !anyDead &&
+                         !dungeon.IsInPartyOrRaid)
+                {
+                    _resetBaselineGeneration = instanceResetGeneration;
+                    _dungeonResetPhase = SquadDungeonResetPhase.Resetting;
+                    _dungeonResetStateSinceUtcMs = nowUtcMs;
+                }
+            }
+
+            if (_dungeonResetPhase == SquadDungeonResetPhase.Resetting &&
+                instanceResetGeneration > _resetBaselineGeneration)
+            {
+                _dungeonResetPhase = SquadDungeonResetPhase.Reinviting;
+                _dungeonResetStateSinceUtcMs = nowUtcMs;
+                _dungeonCompleted = false;
+                _dungeonCompletedAtUtcMs = 0;
+                _dungeonRunParticipants.Clear();
+            }
+
+            if (_dungeonResetPhase == SquadDungeonResetPhase.Reinviting &&
+                dungeon.AllExpectedMembersInParty)
+            {
+                _dungeonResetPhase = SquadDungeonResetPhase.Idle;
+                _dungeonResetStateSinceUtcMs = nowUtcMs;
+            }
+
+            if (_lastLoggedResetPhase != _dungeonResetPhase)
+            {
+                Logging.Write("[PartyGrind Dungeon] Reset phase: {0} -> {1}", _lastLoggedResetPhase, _dungeonResetPhase);
+                _lastLoggedResetPhase = _dungeonResetPhase;
+            }
         }
 
         /// <summary>

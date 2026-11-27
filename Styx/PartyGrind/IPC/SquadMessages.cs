@@ -269,6 +269,9 @@ namespace Styx.PartyGrind.IPC
         public bool AcceptLfgProposalOrder { get; set; }
         public bool TeleportOutOrder { get; set; }
         public bool DungeonResetPendingOutside { get; set; }
+        public SquadDungeonResetPhase DungeonResetPhase { get; set; } = SquadDungeonResetPhase.Idle;
+        public bool SuspendAutoInvite { get; set; }
+        public long DungeonResetStateSinceUtcMs { get; set; }
         public string LfgStatusText { get; set; } = string.Empty;
         public bool HasRandomPartyMembers { get; set; }
         public ulong EffectiveTankGuid { get; set; }

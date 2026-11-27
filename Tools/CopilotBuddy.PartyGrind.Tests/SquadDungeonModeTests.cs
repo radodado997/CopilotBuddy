@@ -162,6 +162,8 @@ namespace CopilotBuddy.PartyGrind.Tests
 
             Assert.Equal(SquadPhase.DungeonCompleteExit, exitState.Phase);
             Assert.True(exitState.TeleportOutOrder);
+            Assert.Equal(SquadDungeonResetPhase.Exiting, exitState.DungeonResetPhase);
+            Assert.True(exitState.SuspendAutoInvite);
 
             leader.IsInsideDungeon = false;
             leader.MapId = 0U;
@@ -170,14 +172,50 @@ namespace CopilotBuddy.PartyGrind.Tests
                 dungeon: snapOutside);
             Assert.Equal(SquadPhase.DungeonCompleteExit, leaderOutside.Phase);
             Assert.True(leaderOutside.TeleportOutOrder);
+            Assert.Equal(SquadDungeonResetPhase.Exiting, leaderOutside.DungeonResetPhase);
 
-            heal.LatestState.IsInsideDungeon = false;
-            dps.LatestState.IsInsideDungeon = false;
-            var allOutside = coord.EvaluateTick(
+            heal.LatestState!.IsInsideDungeon = false;
+            dps.LatestState!.IsInsideDungeon = false;
+            var staleOutside = coord.EvaluateTick(
+                settings, leader, new[] { heal, dps }, new SquadProfileSnapshot(), 0, 0, 0, 0f, 31_500L,
+                dungeon: snapOutside);
+            Assert.Equal(SquadDungeonResetPhase.Exiting, staleOutside.DungeonResetPhase);
+
+            heal = WrapClient(heal.LatestState, 32_000L);
+            dps = WrapClient(dps.LatestState, 32_000L);
+            snapOutside.IsInPartyOrRaid = true;
+            var disbandingState = coord.EvaluateTick(
                 settings, leader, new[] { heal, dps }, new SquadProfileSnapshot(), 0, 0, 0, 0f, 32_000L,
                 dungeon: snapOutside);
-            Assert.Equal(SquadPhase.DungeonQueueing, allOutside.Phase);
-            Assert.False(allOutside.TeleportOutOrder);
+            Assert.Equal(SquadPhase.DungeonQueueing, disbandingState.Phase);
+            Assert.False(disbandingState.TeleportOutOrder);
+            Assert.Equal(SquadDungeonResetPhase.Disbanding, disbandingState.DungeonResetPhase);
+            Assert.True(disbandingState.SuspendAutoInvite);
+
+            snapOutside.IsInPartyOrRaid = false;
+            snapOutside.AllExpectedMembersInParty = false;
+            var resettingState = coord.EvaluateTick(
+                settings, leader, new[] { heal, dps }, new SquadProfileSnapshot(), 0, 0, 0, 0f, 33_000L,
+                dungeon: snapOutside,
+                instanceResetGeneration: 0);
+            Assert.Equal(SquadDungeonResetPhase.Resetting, resettingState.DungeonResetPhase);
+            Assert.True(resettingState.SuspendAutoInvite);
+
+            var reinvitingState = coord.EvaluateTick(
+                settings, leader, new[] { heal, dps }, new SquadProfileSnapshot(), 0, 0, 0, 0f, 34_000L,
+                dungeon: snapOutside,
+                instanceResetGeneration: 1);
+            Assert.Equal(SquadDungeonResetPhase.Reinviting, reinvitingState.DungeonResetPhase);
+            Assert.False(reinvitingState.SuspendAutoInvite);
+
+            snapOutside.AllExpectedMembersInParty = true;
+            var idleAgain = coord.EvaluateTick(
+                settings, leader, new[] { heal, dps }, new SquadProfileSnapshot(), 0, 0, 0, 0f, 35_000L,
+                dungeon: snapOutside,
+                instanceResetGeneration: 1);
+            Assert.Equal(SquadDungeonResetPhase.Idle, idleAgain.DungeonResetPhase);
+            Assert.Equal(SquadPhase.DungeonQueueing, idleAgain.Phase);
+            Assert.False(idleAgain.SuspendAutoInvite);
         }
 
         [Fact]
@@ -580,27 +618,35 @@ namespace CopilotBuddy.PartyGrind.Tests
         }
 
         [Fact]
-        public void WalkInResetWait_RequiresFreshExitEvidenceUntilParticipantLeavesGameGroup()
+        public void RunParticipantsOutside_RequiresFreshConnectedExitEvidenceForEveryParticipant()
         {
-            ulong[] participants = [2UL, 3UL];
-            ulong[] fullGroup = [1UL, 2UL, 3UL];
+            ulong[] participants = [1UL, 2UL, 3UL];
             var heal = MakeMemberState("HealB", 2UL, SquadRole.Healer, WoWClass.Priest, 30);
             heal.MapId = 1U;
             var dps = MakeMemberState("DpsC", 3UL, SquadRole.DpsMelee, WoWClass.Rogue, 30, insideDungeon: true);
-            var outside = WrapClient(heal, 59_000L, isConnected: false);
+            var staleOutside = WrapClient(heal, 59_000L, isConnected: false);
+            var connectedOutside = WrapClient(heal, 59_000L, isConnected: true);
 
-            Assert.False(SquadDungeonService.AreAllWalkInParticipantsClearedForReset(
-                participants, [outside], fullGroup, 10_000L, 60_000L));
-            Assert.False(SquadDungeonService.AreAllWalkInParticipantsClearedForReset(
-                participants, [outside, WrapClient(dps, 59_000L)], fullGroup, 10_000L, 60_000L));
+            Assert.False(SquadDungeonService.AreAllRunParticipantsOutside(
+                participants, 1UL, [staleOutside, WrapClient(dps, 59_000L)], 10_000L, 60_000L));
+            Assert.False(SquadDungeonService.AreAllRunParticipantsOutside(
+                participants, 1UL, [connectedOutside, WrapClient(dps, 59_000L)], 10_000L, 60_000L));
 
             dps.IsInsideDungeon = false;
-            Assert.False(SquadDungeonService.AreAllWalkInParticipantsClearedForReset(
-                participants, [outside, WrapClient(dps, 11_000L)], fullGroup, 10_000L, 60_000L));
-            Assert.True(SquadDungeonService.AreAllWalkInParticipantsClearedForReset(
-                participants, [outside, WrapClient(dps, 59_000L)], fullGroup, 10_000L, 60_000L));
-            Assert.True(SquadDungeonService.AreAllWalkInParticipantsClearedForReset(
-                participants, [outside], [1UL, 2UL], 10_000L, 60_000L));
+            Assert.False(SquadDungeonService.AreAllRunParticipantsOutside(
+                participants, 1UL, [connectedOutside, WrapClient(dps, 10_000L)], 10_000L, 60_000L));
+            Assert.False(SquadDungeonService.AreAllRunParticipantsOutside(
+                participants, 1UL, [connectedOutside], 10_000L, 60_000L));
+
+            dps.HasValidMap = false;
+            Assert.False(SquadDungeonService.AreAllRunParticipantsOutside(
+                participants, 1UL, [connectedOutside, WrapClient(dps, 59_000L)], 10_000L, 60_000L));
+
+            dps.HasValidMap = true;
+            Assert.False(SquadDungeonService.AreAllRunParticipantsOutside(
+                participants, 1UL, [staleOutside, WrapClient(dps, 59_000L)], 10_000L, 60_000L));
+            Assert.True(SquadDungeonService.AreAllRunParticipantsOutside(
+                participants, 1UL, [connectedOutside, WrapClient(dps, 59_000L)], 10_000L, 60_000L));
         }
 
         [Fact]
@@ -814,6 +860,303 @@ namespace CopilotBuddy.PartyGrind.Tests
                 15.0f, 90.0f, ref bestStep, ref bestObj, ref lastProgress,
                 t0 + SquadDungeonService.DungeonStepStallTimeoutMs + 100L));
             Assert.Equal(t0 + SquadDungeonService.DungeonStepStallTimeoutMs + 100L, lastProgress);
+        }
+
+        private sealed class FakeScriptOnlyEncounterDungeon : global::Bots.DungeonBuddy.Dungeon
+        {
+            public override uint DungeonId => 20U;
+            public override string Name => "Fake RFD";
+
+            [global::Bots.DungeonBuddy.Attributes.EncounterHandler(7356, "Plaguemaw the Rotting")]
+            public TreeSharp.Composite PlaguemawHandler() => new TreeSharp.PrioritySelector();
+        }
+
+        [Fact]
+        public void BossManager_ScriptOnlyEncountersBecomeOptional_AndFinalBossCompletesDungeonUnconditionally()
+        {
+            global::Bots.DungeonBuddy.BossManager.Reset();
+            var xml = System.Xml.Linq.XElement.Parse(@"
+                <DungeonBuddyProfile>
+                    <Name>Razorfen Downs</Name>
+                    <DungeonId>20</DungeonId>
+                    <BossEncounters>
+                        <Boss isFinal=""false"" entry=""7355"" killOrder=""1"" optional=""true"" name=""Tuten'kash"" />
+                        <Boss isFinal=""false"" entry=""7357"" killOrder=""2"" optional=""false"" name=""Mordresh Fire Eye"" />
+                        <Boss isFinal=""true"" entry=""7358"" killOrder=""3"" optional=""false"" name=""Amnennar the Coldbringer"" />
+                    </BossEncounters>
+                </DungeonBuddyProfile>");
+            var profile = global::Bots.DungeonBuddy.Profiles.Profile.Load(xml, out var errors);
+            Assert.Empty(errors);
+
+            global::Bots.DungeonBuddy.BossManager.PopulateFromProfileAndType(
+                profile,
+                typeof(FakeScriptOnlyEncounterDungeon));
+
+            var plaguemaw = global::Bots.DungeonBuddy.BossManager.Bosses.First(b => b.Entry == 7356);
+            var amnennar = global::Bots.DungeonBuddy.BossManager.Bosses.First(b => b.Entry == 7358);
+            Assert.True(plaguemaw.IsOptional);
+            Assert.False(plaguemaw.IsFinal);
+            Assert.True(amnennar.IsFinal);
+
+            global::Bots.DungeonBuddy.BossManager.MarkBossDead(7358);
+            Assert.Null(global::Bots.DungeonBuddy.BossManager.CurrentBoss);
+
+            var (killed, total, finalDead, complete) = SquadDungeonService.EvaluateBossProgress(
+                global::Bots.DungeonBuddy.BossManager.Bosses,
+                global::Bots.DungeonBuddy.BossManager.CurrentBoss,
+                killOptionalBosses: true,
+                isHorde: true,
+                inDungeon: true,
+                global::Bots.DungeonBuddy.Enums.CompleteReason.None);
+
+            Assert.True(finalDead);
+            Assert.True(complete);
+            Assert.Equal(1, killed);
+            Assert.Equal(4, total);
+        }
+
+        [Fact]
+        public void DungeonResetStateMachine_SuspendsTeleportOnCombat_AndDoesNotAdvanceOnNullSnapshot()
+        {
+            var coord = new SquadCoordinatorService();
+            var settings = CreateDungeonSettings(SquadDungeonEntryMode.LfgSpecificByBracket);
+            var leader = MakeMemberState("TankA", 1UL, SquadRole.TankLeader, WoWClass.Paladin, 39, insideDungeon: true);
+            var healer = MakeMemberState("HealB", 2UL, SquadRole.Healer, WoWClass.Priest, 39, insideDungeon: true);
+            var snapInside = new SquadDungeonSnapshot
+            {
+                IsInsideDungeon = true,
+                ActiveDungeonId = 20U,
+                ActiveDungeonMapId = 129U,
+                IsDungeonComplete = true,
+                IsInPartyOrRaid = true
+            };
+
+            var exiting = coord.EvaluateTick(settings, leader, [WrapClient(healer, 10_000L)], new SquadProfileSnapshot(),
+                0, 0, 0, 0f, 10_000L, dungeon: snapInside);
+            Assert.Equal(SquadDungeonResetPhase.Exiting, exiting.DungeonResetPhase);
+            Assert.True(exiting.TeleportOutOrder);
+
+            healer.IsInCombat = true;
+            var resumedCombat = coord.EvaluateTick(settings, leader, [WrapClient(healer, 11_000L)], new SquadProfileSnapshot(),
+                0, 0, 0, 0f, 11_000L, dungeon: snapInside);
+            Assert.Equal(SquadPhase.DungeonClearing, resumedCombat.Phase);
+            Assert.False(resumedCombat.TeleportOutOrder);
+
+            healer.IsInCombat = false;
+            leader.IsInsideDungeon = false;
+            leader.MapId = 1U;
+            healer.IsInsideDungeon = false;
+            healer.MapId = 1U;
+            var snapOutside = new SquadDungeonSnapshot { IsInsideDungeon = false, IsInPartyOrRaid = true };
+            var disbanding = coord.EvaluateTick(settings, leader, [WrapClient(healer, 12_000L)], new SquadProfileSnapshot(),
+                0, 0, 0, 0f, 12_000L, dungeon: snapOutside, instanceResetGeneration: 3);
+            Assert.Equal(SquadDungeonResetPhase.Disbanding, disbanding.DungeonResetPhase);
+
+            coord.IsPausedManually = true;
+            var paused = coord.EvaluateTick(settings, leader, [WrapClient(healer, 13_000L)], new SquadProfileSnapshot(),
+                0, 0, 0, 0f, 13_000L, dungeon: null, instanceResetGeneration: 3);
+            Assert.Equal(SquadDungeonResetPhase.Disbanding, paused.DungeonResetPhase);
+            Assert.Equal(SquadPhase.Paused, paused.Phase);
+
+            coord.IsPausedManually = false;
+            var resumedDisband = coord.EvaluateTick(settings, leader, [WrapClient(healer, 14_000L)], new SquadProfileSnapshot(),
+                0, 0, 0, 0f, 14_000L, dungeon: snapOutside, instanceResetGeneration: 3);
+            Assert.Equal(SquadDungeonResetPhase.Disbanding, resumedDisband.DungeonResetPhase);
+        }
+
+        [Fact]
+        public void BossManager_FiltersFactionRestrictedBosses()
+        {
+            global::Bots.DungeonBuddy.BossManager.Reset();
+            global::Bots.DungeonBuddy.BossManager.RegisterBoss(
+                6907, "Olaf", isOptional: true, isFinal: false,
+                faction: global::Bots.DungeonBuddy.Enums.BossAvailableToFaction.Horde);
+            global::Bots.DungeonBuddy.BossManager.RegisterBoss(
+                2748, "Archaedas", isOptional: false, isFinal: true);
+
+            var (_, allianceTotal, _, _) = SquadDungeonService.EvaluateBossProgress(
+                global::Bots.DungeonBuddy.BossManager.Bosses,
+                global::Bots.DungeonBuddy.BossManager.CurrentBoss,
+                killOptionalBosses: true,
+                isHorde: false,
+                inDungeon: true,
+                global::Bots.DungeonBuddy.Enums.CompleteReason.None);
+            var (_, hordeTotal, _, _) = SquadDungeonService.EvaluateBossProgress(
+                global::Bots.DungeonBuddy.BossManager.Bosses,
+                global::Bots.DungeonBuddy.BossManager.CurrentBoss,
+                killOptionalBosses: true,
+                isHorde: true,
+                inDungeon: true,
+                global::Bots.DungeonBuddy.Enums.CompleteReason.None);
+
+            Assert.Equal(1, allianceTotal);
+            Assert.Equal(2, hordeTotal);
+
+            var sharedProfileXml = System.Xml.Linq.XElement.Parse(@"
+                <DungeonBuddyProfile>
+                    <Name>Faction Test</Name>
+                    <DungeonId>70</DungeonId>
+                    <BossEncounters>
+                        <Boss entry=""6907"" killOrder=""1"" optional=""false"" faction=""Horde"" name=""HordeLast"" />
+                        <Boss entry=""6910"" killOrder=""2"" optional=""false"" faction=""Alliance"" name=""AllianceLast"" />
+                    </BossEncounters>
+                </DungeonBuddyProfile>");
+            var factionProfile = global::Bots.DungeonBuddy.Profiles.Profile.Load(sharedProfileXml, out var errors);
+            Assert.Empty(errors);
+            global::Bots.DungeonBuddy.BossManager.PopulateFromProfileAndType(factionProfile, null);
+            Assert.True(global::Bots.DungeonBuddy.BossManager.Bosses.First(b => b.Entry == 6907).IsFinal);
+            Assert.True(global::Bots.DungeonBuddy.BossManager.Bosses.First(b => b.Entry == 6910).IsFinal);
+
+            var sharedBeforeHordeXml = System.Xml.Linq.XElement.Parse(@"
+                <DungeonBuddyProfile>
+                    <Name>Shared Then Horde</Name>
+                    <DungeonId>71</DungeonId>
+                    <BossEncounters>
+                        <Boss entry=""1001"" killOrder=""1"" optional=""false"" name=""SharedBoss"" />
+                        <Boss entry=""1002"" killOrder=""2"" optional=""false"" faction=""Horde"" name=""HordeFinalBoss"" />
+                    </BossEncounters>
+                </DungeonBuddyProfile>");
+            var sharedBeforeHordeProfile = global::Bots.DungeonBuddy.Profiles.Profile.Load(sharedBeforeHordeXml, out errors);
+            Assert.Empty(errors);
+            global::Bots.DungeonBuddy.BossManager.PopulateFromProfileAndType(sharedBeforeHordeProfile, null);
+            global::Bots.DungeonBuddy.BossManager.MarkBossDead(1001);
+            Assert.NotNull(global::Bots.DungeonBuddy.BossManager.SelectCurrentBoss(false, isHorde: true));
+            Assert.Null(global::Bots.DungeonBuddy.BossManager.SelectCurrentBoss(false, isHorde: false));
+
+            var dungeonService = new SquadDungeonService();
+            dungeonService.MarkResetPendingOutside();
+            Assert.True(dungeonService.IsResetPendingOutside);
+            dungeonService.ShutdownRuntime();
+            Assert.False(dungeonService.IsResetPendingOutside);
+        }
+
+        [Fact]
+        public void DungeonResetStateMachine_TransitionsLootWindowToExitDisbandResetReinviteAndIdle()
+        {
+            var coord = new SquadCoordinatorService();
+            var settings = CreateDungeonSettings(SquadDungeonEntryMode.LfgSpecificByBracket);
+            settings.MaxLootWindowSeconds = 8;
+
+            var leader = MakeMemberState("TankA", 1UL, SquadRole.TankLeader, WoWClass.Paladin, 39, insideDungeon: true);
+            var healer = MakeMemberState("HealB", 2UL, SquadRole.Healer, WoWClass.Priest, 39, insideDungeon: true);
+            leader.IsInCombat = true;
+            healer.IsInCombat = true;
+
+            var snapInside = new SquadDungeonSnapshot
+            {
+                IsInsideDungeon = true,
+                ActiveDungeonId = 20U,
+                ActiveDungeonMapId = 129U,
+                IsDungeonComplete = false,
+                IsInPartyOrRaid = true,
+                AllExpectedMembersInParty = true
+            };
+
+            coord.EvaluateTick(settings, leader, [WrapClient(healer, 10_000L)], new SquadProfileSnapshot(),
+                0, 0, 0, 0f, 10_000L, dungeon: snapInside, instanceResetGeneration: 0);
+
+            leader.IsInCombat = false;
+            healer.IsInCombat = false;
+            snapInside.IsDungeonComplete = true;
+
+            var completed = coord.EvaluateTick(settings, leader, [WrapClient(healer, 12_000L)], new SquadProfileSnapshot(),
+                0, 0, 0, 0f, 12_000L, dungeon: snapInside, instanceResetGeneration: 0);
+            Assert.Equal(SquadDungeonResetPhase.Completed, completed.DungeonResetPhase);
+            Assert.Equal(SquadPhase.Looting, completed.Phase);
+            Assert.True(completed.SuspendAutoInvite);
+            Assert.False(completed.AcceptLfgProposalOrder);
+
+            var exiting = coord.EvaluateTick(settings, leader, [WrapClient(healer, 25_000L)], new SquadProfileSnapshot(),
+                0, 0, 0, 0f, 25_000L, dungeon: snapInside, instanceResetGeneration: 0);
+            Assert.Equal(SquadDungeonResetPhase.Exiting, exiting.DungeonResetPhase);
+            Assert.Equal(SquadPhase.DungeonCompleteExit, exiting.Phase);
+            Assert.True(exiting.TeleportOutOrder);
+            Assert.True(exiting.SuspendAutoInvite);
+
+            leader.IsInsideDungeon = false;
+            leader.MapId = 1U;
+            healer.IsInsideDungeon = false;
+            healer.MapId = 1U;
+            var snapOutside = new SquadDungeonSnapshot
+            {
+                IsInsideDungeon = false,
+                IsInPartyOrRaid = true,
+                AllExpectedMembersInParty = true,
+                LfgProposalPending = true
+            };
+
+            var disbanding = coord.EvaluateTick(settings, leader, [WrapClient(healer, 27_000L)], new SquadProfileSnapshot(),
+                0, 0, 0, 0f, 27_000L, dungeon: snapOutside, instanceResetGeneration: 0);
+            Assert.Equal(SquadDungeonResetPhase.Disbanding, disbanding.DungeonResetPhase);
+            Assert.True(disbanding.SuspendAutoInvite);
+            Assert.False(disbanding.TeleportOutOrder);
+            Assert.False(disbanding.AcceptLfgProposalOrder);
+
+            snapOutside.IsInPartyOrRaid = false;
+            snapOutside.AllExpectedMembersInParty = false;
+            var resetting = coord.EvaluateTick(settings, leader, [WrapClient(healer, 28_000L)], new SquadProfileSnapshot(),
+                0, 0, 0, 0f, 28_000L, dungeon: snapOutside, instanceResetGeneration: 0);
+            Assert.Equal(SquadDungeonResetPhase.Resetting, resetting.DungeonResetPhase);
+            Assert.True(resetting.SuspendAutoInvite);
+
+            var reinviting = coord.EvaluateTick(settings, leader, [WrapClient(healer, 29_000L)], new SquadProfileSnapshot(),
+                0, 0, 0, 0f, 29_000L, dungeon: snapOutside, instanceResetGeneration: 1);
+            Assert.Equal(SquadDungeonResetPhase.Reinviting, reinviting.DungeonResetPhase);
+            Assert.False(reinviting.SuspendAutoInvite);
+
+            var stillWaitingFullParty = coord.EvaluateTick(settings, leader, [WrapClient(healer, 30_000L)], new SquadProfileSnapshot(),
+                0, 0, 0, 0f, 30_000L, dungeon: snapOutside, instanceResetGeneration: 1);
+            Assert.Equal(SquadDungeonResetPhase.Reinviting, stillWaitingFullParty.DungeonResetPhase);
+            Assert.False(stillWaitingFullParty.AcceptLfgProposalOrder);
+
+            snapOutside.IsInPartyOrRaid = true;
+            snapOutside.AllExpectedMembersInParty = true;
+            var readyToQueue = coord.EvaluateTick(settings, leader, [WrapClient(healer, 31_000L)], new SquadProfileSnapshot(),
+                0, 0, 0, 0f, 31_000L, dungeon: snapOutside, instanceResetGeneration: 1);
+            Assert.Equal(SquadDungeonResetPhase.Idle, readyToQueue.DungeonResetPhase);
+            Assert.Equal(SquadPhase.DungeonQueueing, readyToQueue.Phase);
+            Assert.True(readyToQueue.AcceptLfgProposalOrder);
+        }
+
+        [Fact]
+        public void SquadPartySync_UninviteScriptAndInviteTrackerReset_WorkForResetCycle()
+        {
+            string script = SquadPartySyncService.BuildUninviteAllScript();
+            Assert.Contains("UninviteUnit", script);
+            Assert.Contains("IsPartyLeader", script);
+            Assert.Contains("IsRaidLeader", script);
+
+            string inGroupScript = SquadDungeonService.BuildIsInPartyOrRaidScript();
+            string emptyResetScript = SquadDungeonService.BuildEmptyGroupResetScript();
+            Assert.DoesNotContain("true", inGroupScript);
+            Assert.DoesNotContain("false", inGroupScript);
+            Assert.Contains("and 1 or 0", inGroupScript);
+            Assert.DoesNotContain("true", emptyResetScript);
+            Assert.DoesNotContain("false", emptyResetScript);
+            Assert.Contains("return 1", emptyResetScript);
+            Assert.Contains("return 0", emptyResetScript);
+
+            var tracker = new SquadInviteTracker();
+            int invites = 0;
+            tracker.Check("HealB", 1_000L, mayInvite =>
+            {
+                if (mayInvite) invites++;
+                return "invited";
+            });
+            tracker.Check("HealB", 2_000L, mayInvite =>
+            {
+                if (mayInvite) invites++;
+                return "waiting";
+            });
+            Assert.Equal(1, invites);
+
+            tracker.Reset();
+            tracker.Check("HealB", 2_100L, mayInvite =>
+            {
+                if (mayInvite) invites++;
+                return "invited";
+            });
+            Assert.Equal(2, invites);
         }
     }
 }

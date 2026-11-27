@@ -297,7 +297,6 @@ if (Activator.CreateInstance(type) is not Dungeon instance)
                 foreach (var attr in encounterAttrs)
                 {
                     _encounterHandlers[dungeonId][attr.BossEntry] = method;
-                    BossManager.RegisterBoss((uint)attr.BossEntry, attr.BossName);
                 }
 
                 // Index object handlers
