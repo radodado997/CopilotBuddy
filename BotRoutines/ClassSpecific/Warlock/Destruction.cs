@@ -34,6 +34,29 @@ namespace Singular.ClassSpecific.Warlock
 
         #region Normal Rotation
 
+        private static Composite CreateDestructionSingleTargetRotation(Composite curseSelector)
+        {
+            return new PrioritySelector(
+                curseSelector,
+                Spell.Buff("Immolate", true, ret => StyxWoW.Me.CurrentTarget != null &&
+                    !StyxWoW.Me.CurrentTarget.IsImmune(WoWSpellSchool.Fire) &&
+                    (StyxWoW.Me.CurrentTarget.IsBoss() || StyxWoW.Me.CurrentTarget.HealthPercent > 25)),
+                Spell.Cast("Conflagrate", ret => StyxWoW.Me.CurrentTarget != null &&
+                    StyxWoW.Me.CurrentTarget.HasMyAura("Immolate") &&
+                    !StyxWoW.Me.CurrentTarget.IsImmune(WoWSpellSchool.Fire)),
+                Spell.Buff("Corruption", true, ret => StyxWoW.Me.CurrentTarget != null &&
+                    (StyxWoW.Me.CurrentTarget.IsBoss() || StyxWoW.Me.CurrentTarget.HealthPercent > 30)),
+                Spell.Cast("Chaos Bolt"),
+                Spell.Cast("Shadowburn", ret => StyxWoW.Me.CurrentTarget != null && StyxWoW.Me.CurrentTarget.HealthPercent <= 20),
+                Spell.Cast("Incinerate", ret => StyxWoW.Me.CurrentTarget != null && !StyxWoW.Me.CurrentTarget.IsImmune(WoWSpellSchool.Fire)),
+                Spell.Cast("Shadow Bolt", ret => !SpellManager.HasSpell("Incinerate") ||
+                    (StyxWoW.Me.CurrentTarget != null &&
+                     (StyxWoW.Me.CurrentTarget.IsImmune(WoWSpellSchool.Fire) ||
+                      !SpellManager.CanCast("Incinerate", StyxWoW.Me.CurrentTarget, false, false)))),
+                Helpers.Common.CreateUseWand(ret => StyxWoW.Me.ManaPercent < 15 && !SpellManager.CanCast("Life Tap"))
+                );
+        }
+
         [Class(WoWClass.Warlock)]
         [Spec(TalentSpec.DestructionWarlock)]
         [Behavior(BehaviorType.Pull)]
@@ -44,11 +67,13 @@ namespace Singular.ClassSpecific.Warlock
                 Safers.EnsureTarget(),
                 Movement.CreateMoveToLosBehavior(),
                 Movement.CreateFaceTargetBehavior(),
-                Spell.WaitForCast(true),
-                Helpers.Common.CreateAutoAttack(true),
+                Spell.PreventDoubleCast("Immolate"),
+                Spell.WaitForCastOrChannel(),
+                Helpers.Common.CreatePetAttack(),
                 Spell.Cast("Soul Fire"),
-                Spell.Buff("Immolate", true),
-                Movement.CreateMoveToTargetBehavior(true, 32f)
+                Spell.Buff("Immolate", true, ret => StyxWoW.Me.CurrentTarget != null && !StyxWoW.Me.CurrentTarget.IsImmune(WoWSpellSchool.Fire)),
+                Spell.Cast("Shadow Bolt"),
+                Movement.CreateMoveToTargetBehavior(true, 28f)
                 );
         }
 
@@ -62,8 +87,9 @@ namespace Singular.ClassSpecific.Warlock
                 Safers.EnsureTarget(),
                 Movement.CreateMoveToLosBehavior(),
                 Movement.CreateFaceTargetBehavior(),
-                Spell.WaitForCast(true),
-                Helpers.Common.CreateAutoAttack(true),
+                Spell.PreventDoubleCast("Immolate"),
+                Spell.WaitForCastOrChannel(),
+                Helpers.Common.CreatePetAttack(),
                 Helpers.Common.CreateInterruptSpellCast(ret => StyxWoW.Me.CurrentTarget),
 
                 // Cooldowns
@@ -75,7 +101,7 @@ namespace Singular.ClassSpecific.Warlock
                             ret => Unit.NearbyUnfriendlyUnits.Count(u => u.DistanceSqr < 10 * 10 && StyxWoW.Me.IsSafelyFacing(u, 90)) >= 3),
 
                 Spell.BuffSelf("Howl of Terror", ret => Unit.NearbyUnfriendlyUnits.Count(u => u.DistanceSqr < 10 * 10) >= 3),
-                Spell.Buff("Fear", ret => Targeting.Instance.TargetList.ElementAtOrDefault(1), ret => !StyxWoW.Me.CurrentTarget.HasAura("Fear")),
+                Spell.Buff("Fear", ret => Targeting.Instance.TargetList.ElementAtOrDefault(1), ret => StyxWoW.Me.CurrentTarget != null && !StyxWoW.Me.CurrentTarget.HasAura("Fear")),
                 Spell.Buff("Fear", ret => StyxWoW.Me.HealthPercent < 80),
 
                 // Single target rotation
@@ -84,15 +110,15 @@ namespace Singular.ClassSpecific.Warlock
                 // it does NOT make Soul Fire instant (that's the Cata redesign). Hard-casting 6s Soul Fire mid-combat = massive DPS loss
                 // vs. letting the 100% crit proc be consumed by the next Incinerate/Conflagrate/Chaos Bolt (~2s cast).
                 // WotLK: Only one curse per target — use Curse of Doom (solo DPS), skip CoE to avoid ping-pong
-                Spell.Buff("Curse of Doom", true),
-                Spell.Buff("Immolate", true,ret => !StyxWoW.Me.CurrentTarget.IsImmune(WoWSpellSchool.Fire)),
-                Spell.Cast("Conflagrate"),
-                Spell.Buff("Corruption", true),
-                Spell.Cast("Chaos Bolt"),
-                Spell.Cast("Shadowburn", ret => StyxWoW.Me.CurrentTarget.HealthPercent <= 20),
-                Spell.Cast("Incinerate"),
+                CreateDestructionSingleTargetRotation(
+                    new PrioritySelector(
+                        Spell.Buff("Curse of Doom", true, ret => StyxWoW.Me.CurrentTarget != null &&
+                            (StyxWoW.Me.CurrentTarget.Elite || StyxWoW.Me.CurrentTarget.HealthPercent > 75)),
+                        Spell.Buff("Curse of Agony", true, ret => !SpellManager.HasSpell("Curse of Doom") &&
+                            StyxWoW.Me.CurrentTarget != null && StyxWoW.Me.CurrentTarget.HealthPercent > 40)
+                        )),
 
-                Movement.CreateMoveToTargetBehavior(true, 32f)
+                Movement.CreateMoveToTargetBehavior(true, 28f)
                 );
         }
 
@@ -111,33 +137,31 @@ namespace Singular.ClassSpecific.Warlock
                 Safers.EnsureTarget(),
                 Movement.CreateMoveToLosBehavior(),
                 Movement.CreateFaceTargetBehavior(),
-                Spell.WaitForCast(true),
-                Helpers.Common.CreateAutoAttack(true),
+                Spell.PreventDoubleCast("Immolate"),
+                Spell.WaitForCastOrChannel(),
+                Helpers.Common.CreatePetAttack(),
                 Helpers.Common.CreateInterruptSpellCast(ret => StyxWoW.Me.CurrentTarget),
 
                 // Cooldowns
                 Spell.BuffSelf("Soulshatter", ret => Unit.NearbyUnfriendlyUnits.Any(u => u.IsTargetingMeOrPet)),
                 Spell.Cast("Death Coil", ret => StyxWoW.Me.HealthPercent <= 70),
 
-                Spell.CastOnGround("Shadowfury", ret => StyxWoW.Me.CurrentTarget.Location),
+                Spell.CastOnGround("Shadowfury", ret => StyxWoW.Me.CurrentTarget != null ? StyxWoW.Me.CurrentTarget.Location : Styx.Logic.Pathing.WoWPoint.Zero),
 
                 Spell.BuffSelf("Howl of Terror", ret => Unit.NearbyUnfriendlyUnits.Count(u => u.DistanceSqr < 10 * 10) >= 3),
                 // Dimishing returns fucks Fear up. Avoid using it until a proper DR logic.
                 //Spell.Buff("Fear", ret => Targeting.Instance.TargetList.ElementAtOrDefault(1)),
-                Spell.Buff("Curse of Tongues", ret => StyxWoW.Me.CurrentTarget.PowerType == WoWPowerType.Mana),
-                // WotLK QC: Fixed spell name — "Curse of the Elements" (with "the")
-                Spell.Buff("Curse of the Elements", ret => StyxWoW.Me.CurrentTarget.PowerType != WoWPowerType.Mana),
                 // Single target rotation
                 // WotLK QC: Removed "Soul Fire on Empowered Imp" — see Normal rotation comment for details.
-                Spell.Buff("Immolate", true),
-                Spell.Cast("Conflagrate"),
+                // WotLK QC: Fixed spell name — "Curse of the Elements" (with "the")
                 // WotLK: Curse of Doom removed from PvP — CoT/CoE above are more valuable, only one curse allowed per target
-                Spell.Buff("Corruption", true),
-                Spell.Cast("Chaos Bolt"),
-                Spell.Cast("Shadowburn", ret => StyxWoW.Me.CurrentTarget.HealthPercent <= 20),
-                Spell.Cast("Incinerate"),
+                CreateDestructionSingleTargetRotation(
+                    new PrioritySelector(
+                        Spell.Buff("Curse of Tongues", ret => StyxWoW.Me.CurrentTarget != null && StyxWoW.Me.CurrentTarget.PowerType == WoWPowerType.Mana),
+                        Spell.Buff("Curse of the Elements", ret => StyxWoW.Me.CurrentTarget != null && StyxWoW.Me.CurrentTarget.PowerType != WoWPowerType.Mana)
+                        )),
 
-                Movement.CreateMoveToTargetBehavior(true, 32f)
+                Movement.CreateMoveToTargetBehavior(true, 28f)
                 );
         }
 
@@ -156,8 +180,9 @@ namespace Singular.ClassSpecific.Warlock
                 Safers.EnsureTarget(),
                 Movement.CreateMoveToLosBehavior(),
                 Movement.CreateFaceTargetBehavior(),
-                Spell.WaitForCast(true),
-                Helpers.Common.CreateAutoAttack(true),
+                Spell.PreventDoubleCast("Immolate"),
+                Spell.WaitForCastOrChannel(),
+                Helpers.Common.CreatePetAttack(),
                 Helpers.Common.CreateInterruptSpellCast(ret => StyxWoW.Me.CurrentTarget),
 
                 // Cooldowns
@@ -166,27 +191,30 @@ namespace Singular.ClassSpecific.Warlock
 
                 // AoE rotation
                 new Decorator(
-                    ret => Unit.NearbyUnfriendlyUnits.Count(u => u.IsTargetingMeOrPet || u.IsTargetingMyPartyMember || u.IsTargetingMyRaidMember) >= 3,
+                    ret => StyxWoW.Me.CurrentTarget != null &&
+                           Unit.NearbyUnfriendlyUnits.Count(u => u.IsTargetingMeOrPet || u.IsTargetingMyPartyMember || u.IsTargetingMyRaidMember) >= 3,
                     new PrioritySelector(
-                        Spell.CastOnGround("Shadowfury", ret => StyxWoW.Me.CurrentTarget.Location),
-                        Spell.CastOnGround("Rain of Fire", ret => StyxWoW.Me.CurrentTarget.Location)
+                        Spell.CastOnGround("Shadowfury", ret => StyxWoW.Me.CurrentTarget != null ? StyxWoW.Me.CurrentTarget.Location : Styx.Logic.Pathing.WoWPoint.Zero),
+                        Spell.CastOnGround("Rain of Fire", ret => StyxWoW.Me.CurrentTarget != null ? StyxWoW.Me.CurrentTarget.Location : Styx.Logic.Pathing.WoWPoint.Zero)
                         )),
 
                 // Single target rotation
                 // WotLK: Improved Soul Fire does not exist (Cata 4.0.1).
                 // WotLK QC: Removed "Soul Fire on Empowered Imp" — see Normal rotation comment for details.
                 // WotLK: Only one curse per target — CoE for raid debuff on bosses, CoD for sustained DPS
-                Spell.Buff("Curse of the Elements", ret => StyxWoW.Me.CurrentTarget.IsBoss()),
-                Spell.Buff("Curse of Doom", true, ret => !StyxWoW.Me.CurrentTarget.IsBoss()),
-                Spell.Buff("Immolate", true, ret => !StyxWoW.Me.CurrentTarget.IsImmune(WoWSpellSchool.Fire)),
                 // WotLK QC: Added missing Conflagrate to Instance rotation (core Destruction DPS ability)
-                Spell.Cast("Conflagrate"),
-                Spell.Buff("Corruption", true),
-                Spell.Cast("Chaos Bolt"),
-                Spell.Cast("Shadowburn", ret => StyxWoW.Me.CurrentTarget.HealthPercent <= 20),
-                Spell.Cast("Incinerate"),
+                CreateDestructionSingleTargetRotation(
+                    new PrioritySelector(
+                        Spell.Buff("Curse of the Elements", ret => StyxWoW.Me.CurrentTarget != null && StyxWoW.Me.CurrentTarget.IsBoss()),
+                        Spell.Buff("Curse of Doom", true, ret => StyxWoW.Me.CurrentTarget != null &&
+                            !StyxWoW.Me.CurrentTarget.IsBoss() && StyxWoW.Me.CurrentTarget.HealthPercent > 60),
+                        Spell.Buff("Curse of Agony", true, ret => !SpellManager.HasSpell("Curse of Doom") &&
+                            StyxWoW.Me.CurrentTarget != null &&
+                            ((StyxWoW.Me.CurrentTarget.IsBoss() && !SpellManager.HasSpell("Curse of the Elements")) ||
+                             (!StyxWoW.Me.CurrentTarget.IsBoss() && StyxWoW.Me.CurrentTarget.HealthPercent > 50 && !StyxWoW.Me.CurrentTarget.HasAura("Curse of the Elements"))))
+                        )),
 
-                Movement.CreateMoveToTargetBehavior(true, 32f)
+                Movement.CreateMoveToTargetBehavior(true, 28f)
                 );
         }
 

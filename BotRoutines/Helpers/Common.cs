@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 
 using Singular.Managers;
 using Styx;
@@ -14,6 +14,32 @@ namespace Singular.Helpers
 {
     internal static class Common
     {
+        private static Composite CreateSendPetAttack()
+        {
+            return new Decorator(
+                ret => StyxWoW.Me.GotAlivePet && (StyxWoW.Me.Pet.CurrentTarget == null || StyxWoW.Me.Pet.CurrentTarget != StyxWoW.Me.CurrentTarget),
+                new Action(
+                    delegate
+                    {
+                        PetManager.CastPetAction("Attack");
+                        return RunStatus.Failure;
+                    }));
+        }
+
+        public static Composite CreatePetAttack()
+        {
+            return new PrioritySelector(
+                new Decorator(
+                    ret => StyxWoW.Me.IsAutoAttacking && StyxWoW.Me.AutoRepeatingSpellId == 0,
+                    new Action(ret =>
+                        {
+                            Lua.DoString("StopAttack()");
+                            return RunStatus.Failure;
+                        })),
+                CreateSendPetAttack()
+                );
+        }
+
         /// <summary>
         ///  Creates a behavior to start auto attacking to current target.
         /// </summary>
@@ -35,13 +61,8 @@ namespace Singular.Helpers
                             return RunStatus.Failure;
                         })),
                 new Decorator(
-                    ret => includePet && StyxWoW.Me.GotAlivePet && (StyxWoW.Me.Pet.CurrentTarget == null || StyxWoW.Me.Pet.CurrentTarget != StyxWoW.Me.CurrentTarget),
-                    new Action(
-                        delegate
-                        {
-                            PetManager.CastPetAction("Attack");
-                            return RunStatus.Failure;
-                        }))
+                    ret => includePet,
+                    CreateSendPetAttack())
                 );
         }
 

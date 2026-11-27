@@ -1,4 +1,4 @@
-﻿
+
 using System.Linq;
 using Singular.Dynamics;
 using Singular.Helpers;
@@ -39,7 +39,7 @@ namespace Singular.ClassSpecific.Warlock
                 Safers.EnsureTarget(),
                 Movement.CreateMoveToLosBehavior(),
                 Movement.CreateFaceTargetBehavior(),
-                Helpers.Common.CreateAutoAttack(true),
+                Helpers.Common.CreatePetAttack(),
                 Helpers.Common.CreateInterruptSpellCast(ret => StyxWoW.Me.CurrentTarget),
                 Spell.PreventDoubleCast("Immolate"),
                 Spell.WaitForCast(true),

@@ -46,9 +46,9 @@ namespace Singular.ClassSpecific.Warlock
                 Movement.CreateMoveToLosBehavior(),
                 Movement.CreateFaceTargetBehavior(),
                 Spell.WaitForCast(true),
-                Helpers.Common.CreateAutoAttack(true),
+                Helpers.Common.CreatePetAttack(),
                 Spell.Buff("Immolate", true),
-                Movement.CreateMoveToTargetBehavior(true, 32f)
+                Movement.CreateMoveToTargetBehavior(true, 28f)
                 );
         }
 
@@ -63,7 +63,7 @@ namespace Singular.ClassSpecific.Warlock
                 Movement.CreateMoveToLosBehavior(),
                 Movement.CreateFaceTargetBehavior(),
                 Spell.WaitForCast(true),
-                Helpers.Common.CreateAutoAttack(true),
+                Helpers.Common.CreatePetAttack(),
                 Helpers.Common.CreateInterruptSpellCast(ret => StyxWoW.Me.CurrentTarget),
 
                 // Cooldowns
@@ -92,7 +92,7 @@ namespace Singular.ClassSpecific.Warlock
                 Spell.Cast("Soul Fire", ret => StyxWoW.Me.ActiveAuras.ContainsKey("Decimation")),
                 Spell.Cast("Shadow Bolt"),
 
-                Movement.CreateMoveToTargetBehavior(true, 32f)
+                Movement.CreateMoveToTargetBehavior(true, 28f)
                 );
         }
 
@@ -112,7 +112,7 @@ namespace Singular.ClassSpecific.Warlock
                 Movement.CreateMoveToLosBehavior(),
                 Movement.CreateFaceTargetBehavior(),
                 Spell.WaitForCast(true),
-                Helpers.Common.CreateAutoAttack(true),
+                Helpers.Common.CreatePetAttack(),
                 Helpers.Common.CreateInterruptSpellCast(ret => StyxWoW.Me.CurrentTarget),
 
                 // Cooldowns
@@ -145,7 +145,7 @@ namespace Singular.ClassSpecific.Warlock
                 Spell.Cast("Soul Fire", ret => StyxWoW.Me.ActiveAuras.ContainsKey("Decimation")),
                 Spell.Cast("Shadow Bolt"),
 
-                Movement.CreateMoveToTargetBehavior(true, 32f)
+                Movement.CreateMoveToTargetBehavior(true, 28f)
                 );
         }
 
@@ -165,7 +165,7 @@ namespace Singular.ClassSpecific.Warlock
                 Movement.CreateMoveToLosBehavior(),
                 Movement.CreateFaceTargetBehavior(),
                 Spell.WaitForCast(true),
-                Helpers.Common.CreateAutoAttack(true),
+                Helpers.Common.CreatePetAttack(),
                 Helpers.Common.CreateInterruptSpellCast(ret => StyxWoW.Me.CurrentTarget),
 
                 // Cooldowns
@@ -193,7 +193,7 @@ namespace Singular.ClassSpecific.Warlock
                 Spell.Cast("Soul Fire", ret => StyxWoW.Me.ActiveAuras.ContainsKey("Decimation")),
                 Spell.Cast("Shadow Bolt"),
 
-                Movement.CreateMoveToTargetBehavior(true, 32f)
+                Movement.CreateMoveToTargetBehavior(true, 28f)
                 );
         }
 
