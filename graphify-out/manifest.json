@@ -894,9 +894,9 @@
     "semantic_hash": "7b16b14d8136cfca3f4c638d85f02e35"
   },
   "Bots/DungeonBuddy/DungeonManager.cs": {
-    "mtime": 1795786252.1882505,
-    "seen": 1795786358.1271706,
-    "ast_hash": "67760b5e6d107e65c0bd9c0b59cfc00b",
+    "mtime": 1795800299.4288032,
+    "seen": 1795800408.4381733,
+    "ast_hash": "83b7e5880bd4a45c6708af4aaed78c63",
     "semantic_hash": ""
   },
   "Bots/DungeonBuddy/DungeonTargeting.cs": {
@@ -1260,27 +1260,27 @@
     "semantic_hash": "e2321716a990ce0aa7be818675d480b6"
   },
   "Bots/PartyGrind/Logic/SquadApproach.cs": {
-    "mtime": 1795605239.1019132,
-    "seen": 1795783548.9553506,
-    "ast_hash": "8d8dc1c51624005521da1f4e918c2e63",
-    "semantic_hash": "8d8dc1c51624005521da1f4e918c2e63"
+    "mtime": 1795796682.6935008,
+    "seen": 1795796808.2549417,
+    "ast_hash": "58f878450d29023675892b25d215a4f4",
+    "semantic_hash": ""
   },
   "Bots/PartyGrind/Logic/SquadCoordinatorService.cs": {
-    "mtime": 1795778732.3837712,
-    "seen": 1795783548.9553506,
-    "ast_hash": "3a30e712abf9bbd42baad3915a258321",
-    "semantic_hash": "3a30e712abf9bbd42baad3915a258321"
+    "mtime": 1795796690.2836988,
+    "seen": 1795796808.2549417,
+    "ast_hash": "f8078c029ee548d93247c4f73c49162a",
+    "semantic_hash": ""
   },
   "Bots/PartyGrind/Logic/SquadDungeonService.cs": {
-    "mtime": 1795786826.9098914,
-    "seen": 1795786929.8346457,
-    "ast_hash": "1014d720006f37e10678aaab1e69c679",
+    "mtime": 1795799706.4331605,
+    "seen": 1795799802.5689268,
+    "ast_hash": "33bb4f3280030a3e00a1ab75ad694fa1",
     "semantic_hash": ""
   },
   "Bots/PartyGrind/Logic/SquadFormationService.cs": {
-    "mtime": 1795784690.389384,
-    "seen": 1795785726.4675968,
-    "ast_hash": "87e002f05872a4496e12f976b2ccee9c",
+    "mtime": 1795796000.944764,
+    "seen": 1795796079.5900455,
+    "ast_hash": "dd2afed3d60c3bcc2fd2c078845b7858",
     "semantic_hash": ""
   },
   "Bots/PartyGrind/Logic/SquadHealBridge.cs": {
@@ -1302,15 +1302,15 @@
     "semantic_hash": ""
   },
   "Bots/PartyGrind/Logic/SquadProvisioningService.cs": {
-    "mtime": 1795641116.2481365,
-    "seen": 1795783548.9553506,
-    "ast_hash": "781c69cdc0b43981e78798bdbc9c98e0",
-    "semantic_hash": "781c69cdc0b43981e78798bdbc9c98e0"
+    "mtime": 1795800994.54265,
+    "seen": 1795801112.123655,
+    "ast_hash": "45fac2d3a0b1e162eb2308a44a231ffc",
+    "semantic_hash": ""
   },
   "Bots/PartyGrind/Logic/SquadTankBridge.cs": {
-    "mtime": 1795787441.259634,
-    "seen": 1795787551.9558582,
-    "ast_hash": "1396a7cccb6b995526fee9394cabe645",
+    "mtime": 1795800992.3124938,
+    "seen": 1795801112.123655,
+    "ast_hash": "4e7dbf98fafeb52476a7b2884294a93c",
     "semantic_hash": ""
   },
   "Bots/PartyGrind/Logic/SquadTownRunService.cs": {
@@ -1320,9 +1320,9 @@
     "semantic_hash": "d3eac6624386ec287078c119e2045a40"
   },
   "Bots/PartyGrind/PartyGrindBot.cs": {
-    "mtime": 1795787459.9821062,
-    "seen": 1795787551.9558582,
-    "ast_hash": "fd6e0990693c3733e46a2c68114a0d18",
+    "mtime": 1795799710.489855,
+    "seen": 1795799802.5689268,
+    "ast_hash": "c52159613c4b87521cab689b22b688a3",
     "semantic_hash": ""
   },
   "Bots/Quest/Actions/ActionSelectQuest.cs": {
@@ -1836,10 +1836,10 @@
     "semantic_hash": "969c943b172eb4ce7faaad7d0524e9ba"
   },
   "CopilotBuddy.csproj": {
-    "mtime": 1795384499.3603494,
-    "seen": 1795783548.9553506,
-    "ast_hash": "cbec8e2c374340ad04c1f47ddb247b78",
-    "semantic_hash": "cbec8e2c374340ad04c1f47ddb247b78"
+    "mtime": 1795790988.531788,
+    "seen": 1795791279.1012876,
+    "ast_hash": "7690ccdd9c70b4579dfbb7567f13196b",
+    "semantic_hash": ""
   },
   "CopilotBuddy.slnx": {
     "mtime": 1794846237.9640923,
@@ -3288,10 +3288,10 @@
     "semantic_hash": "fc922794a064ec9ee434c43d91d7329c"
   },
   "Styx/Logic/Inventory/Frames/LootFrame/LootFrame.cs": {
-    "mtime": 1794846238.2170637,
-    "seen": 1795783548.9563496,
-    "ast_hash": "a47a2f6257dc8c26b80c2c20cb654d74",
-    "semantic_hash": "a47a2f6257dc8c26b80c2c20cb654d74"
+    "mtime": 1795793451.497594,
+    "seen": 1795793633.407129,
+    "ast_hash": "9be90a42bf3fdd61f3ab4303bbf9cbc6",
+    "semantic_hash": ""
   },
   "Styx/Logic/Inventory/Frames/LootFrame/LootRarity.cs": {
     "mtime": 1794846238.2180622,
@@ -4452,10 +4452,10 @@
     "semantic_hash": "cf2131d546d367a65a5ef525170644c6"
   },
   "Styx/PartyGrind/IPC/SquadMessages.cs": {
-    "mtime": 1795778732.392768,
-    "seen": 1795783548.9563496,
-    "ast_hash": "8bf1f86b2097af1779d379a868791500",
-    "semantic_hash": "8bf1f86b2097af1779d379a868791500"
+    "mtime": 1795791892.0813332,
+    "seen": 1795792144.3804264,
+    "ast_hash": "3a2761eebb55104205e35802ddd0ccbb",
+    "semantic_hash": ""
   },
   "Styx/PartyGrind/IPC/SquadPeerAuthentication.cs": {
     "mtime": 1795191943.003171,
@@ -5256,10 +5256,10 @@
     "semantic_hash": "ca5d137b0c603f8f104955e9d505e2ea"
   },
   "Styx/WoWInternals/WoWObjects/WoWGameObject.cs": {
-    "mtime": 1794846238.393008,
-    "seen": 1795783548.957349,
-    "ast_hash": "2018457c6b90eeedca98cc963f332e13",
-    "semantic_hash": "2018457c6b90eeedca98cc963f332e13"
+    "mtime": 1795790832.3814607,
+    "seen": 1795791279.1032856,
+    "ast_hash": "496925cb4229afd028c2748ca476e446",
+    "semantic_hash": ""
   },
   "Styx/WoWInternals/WoWObjects/WoWGlyphInfo.cs": {
     "mtime": 1794846238.393008,
@@ -5586,9 +5586,9 @@
     "semantic_hash": "da9b37fa3932da90958cebd780df3694"
   },
   "Tools/CopilotBuddy.PartyGrind.Tests/DungeonPullAndManaGuardTests.cs": {
-    "mtime": 1795787442.6968734,
-    "seen": 1795787551.958861,
-    "ast_hash": "749fac36ebffb6bbabf1bc8908caea24",
+    "mtime": 1795796691.7357128,
+    "seen": 1795796808.2569418,
+    "ast_hash": "2698ce8a7b2b9739c82aeec4810d9359",
     "semantic_hash": ""
   },
   "Tools/CopilotBuddy.PartyGrind.Tests/RequeueAndRestGuardTests.cs": {
@@ -5598,10 +5598,10 @@
     "semantic_hash": "d423deea56acc00755f48cc67a7f0253"
   },
   "Tools/CopilotBuddy.PartyGrind.Tests/SingularRoutineCompileTests.cs": {
-    "mtime": 1795778732.3947878,
-    "seen": 1795783548.957349,
-    "ast_hash": "2cbe9f2adcef08929e3fd07e9f73a2db",
-    "semantic_hash": "2cbe9f2adcef08929e3fd07e9f73a2db"
+    "mtime": 1795798080.3706558,
+    "seen": 1795798169.7008026,
+    "ast_hash": "3f7a25f5337c06c31980d8a30c0d6744",
+    "semantic_hash": ""
   },
   "Tools/CopilotBuddy.PartyGrind.Tests/SquadCoordinatorAndProfileTests.cs": {
     "mtime": 1795225159.8772595,
@@ -5640,10 +5640,10 @@
     "semantic_hash": "687316e1ccb79a4bbde0dc9a1b2eb0ba"
   },
   "Tools/CopilotBuddy.PartyGrind.Tests/SquadProvisioningAndTradeTests.cs": {
-    "mtime": 1795610717.2613554,
-    "seen": 1795783548.957349,
-    "ast_hash": "6711715943fc49e53de89f0ed3dc988a",
-    "semantic_hash": "6711715943fc49e53de89f0ed3dc988a"
+    "mtime": 1795799712.1507547,
+    "seen": 1795799802.5719247,
+    "ast_hash": "612f4e5b4b1179a38f6366751698560f",
+    "semantic_hash": ""
   },
   "Tools/CopilotBuddy.PartyGrind.Tests/SquadTownRunMandatoryVendorTests.cs": {
     "mtime": 1795191943.0181704,
@@ -6196,5 +6196,11 @@
     "seen": 1795783548.957349,
     "ast_hash": "25d07a3148e132fae885f7376132a2e6",
     "semantic_hash": "25d07a3148e132fae885f7376132a2e6"
+  },
+  "Dungeon Scripts/Classic/Uldaman.cs": {
+    "mtime": 1795791032.7211154,
+    "seen": 1795791279.1012876,
+    "ast_hash": "9253b692c5e140713c817ee672deca3e",
+    "semantic_hash": ""
   }
 }

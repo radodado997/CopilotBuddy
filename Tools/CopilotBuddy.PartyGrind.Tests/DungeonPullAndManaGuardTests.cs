@@ -290,6 +290,8 @@ namespace CopilotBuddy.PartyGrind.Tests
         {
             Assert.True(SquadTankBridge.IsLineOfSightErrorMessage("Target not in line of sight"));
             Assert.True(SquadTankBridge.IsLineOfSightErrorMessage("You are not in LINE OF SIGHT"));
+            Assert.True(SquadTankBridge.IsLineOfSightErrorMessage("Ziel nicht im Sichtfeld", "Ziel nicht im Sichtfeld"));
+            Assert.False(SquadTankBridge.IsLineOfSightErrorMessage("Out of range.", "Ziel nicht im Sichtfeld"));
             Assert.False(SquadTankBridge.IsLineOfSightErrorMessage("Out of range."));
             Assert.False(SquadTankBridge.IsLineOfSightErrorMessage(null));
 
@@ -365,6 +367,19 @@ namespace CopilotBuddy.PartyGrind.Tests
 
             Assert.True(chosen.Y < 99.0f);
             Assert.True(chosen.Distance(mobPos) >= 16f);
+
+            WoWPoint unreachable = SquadFormationService.ComputeDungeonStandoffPosition(
+                tankPos,
+                0f,
+                mobPos,
+                crumbs,
+                70U,
+                16f,
+                0,
+                1,
+                lineOfSightCheck: null,
+                isReachableCheck: _ => false);
+            Assert.Equal(WoWPoint.Zero, unreachable);
         }
 
         [Fact]
@@ -408,6 +423,105 @@ namespace CopilotBuddy.PartyGrind.Tests
             service.RecordObjectScriptTimeout(altarGuid, 100_000L);
             Assert.True(service.IsObjectSuppressedAt(altarGuid, 129_999L));
         }
+
+        [Fact]
+        public void DungeonChestLooting_HandlesUnlockedFlags_AndDelegatesOnlyToEffectiveTank()
+        {
+            Assert.True(Styx.WoWInternals.WoWObjects.WoWGameObject.CanLootUnlockedChest(
+                Styx.WoWInternals.WoWObjects.WoWGameObjectState.Ready,
+                Styx.WoWInternals.WoWObjects.GameObjectFlags.None));
+            Assert.True(Styx.WoWInternals.WoWObjects.WoWGameObject.CanLootUnlockedChest(
+                Styx.WoWInternals.WoWObjects.WoWGameObjectState.Ready,
+                Styx.WoWInternals.WoWObjects.GameObjectFlags.NoDespawn));
+
+            Assert.False(Styx.WoWInternals.WoWObjects.WoWGameObject.CanLootUnlockedChest(
+                Styx.WoWInternals.WoWObjects.WoWGameObjectState.Active,
+                Styx.WoWInternals.WoWObjects.GameObjectFlags.None));
+            Assert.False(Styx.WoWInternals.WoWObjects.WoWGameObject.CanLootUnlockedChest(
+                Styx.WoWInternals.WoWObjects.WoWGameObjectState.Destroyed,
+                Styx.WoWInternals.WoWObjects.GameObjectFlags.None));
+            Assert.False(Styx.WoWInternals.WoWObjects.WoWGameObject.CanLootUnlockedChest(
+                Styx.WoWInternals.WoWObjects.WoWGameObjectState.Ready,
+                Styx.WoWInternals.WoWObjects.GameObjectFlags.InUse));
+            Assert.False(Styx.WoWInternals.WoWObjects.WoWGameObject.CanLootUnlockedChest(
+                Styx.WoWInternals.WoWObjects.WoWGameObjectState.Ready,
+                Styx.WoWInternals.WoWObjects.GameObjectFlags.NotSelectable));
+            Assert.False(Styx.WoWInternals.WoWObjects.WoWGameObject.CanLootUnlockedChest(
+                Styx.WoWInternals.WoWObjects.WoWGameObjectState.Ready,
+                Styx.WoWInternals.WoWObjects.GameObjectFlags.ConditionInteract));
+
+            Assert.True(CopilotBuddy.Bots.PartyGrind.PartyGrindBot.IsDesignatedDungeonChestLooter(
+                SquadBotMode.Dungeon, isInsideDungeonMap: true, SquadRole.TankLeader, localGuid: 100UL, effectiveTankGuid: 100UL));
+            Assert.False(CopilotBuddy.Bots.PartyGrind.PartyGrindBot.IsDesignatedDungeonChestLooter(
+                SquadBotMode.Dungeon, isInsideDungeonMap: true, SquadRole.DpsRanged, localGuid: 200UL, effectiveTankGuid: 100UL));
+            Assert.False(CopilotBuddy.Bots.PartyGrind.PartyGrindBot.IsDesignatedDungeonChestLooter(
+                SquadBotMode.Dungeon, isInsideDungeonMap: true, SquadRole.Healer, localGuid: 300UL, effectiveTankGuid: 0UL));
+            Assert.True(CopilotBuddy.Bots.PartyGrind.PartyGrindBot.IsDesignatedDungeonChestLooter(
+                SquadBotMode.Dungeon, isInsideDungeonMap: false, SquadRole.DpsRanged, localGuid: 200UL, effectiveTankGuid: 100UL));
+            Assert.True(CopilotBuddy.Bots.PartyGrind.PartyGrindBot.IsDesignatedDungeonChestLooter(
+                SquadBotMode.OpenWorldGrind, isInsideDungeonMap: false, SquadRole.DpsRanged, localGuid: 200UL, effectiveTankGuid: 100UL));
+        }
+
+        [Fact]
+        public void ComputeDungeonStandoffPosition_PrefersReachableLoSGeometricOverBlindBreadcrumb()
+        {
+            var tankPos = new WoWPoint(100f, 100f, 0f);
+            var targetPos = new WoWPoint(110f, 100f, 0f);
+            var breadcrumbs = new[]
+            {
+                new SquadBreadcrumb { MapId = 70U, X = 100f, Y = 88f, Z = 0f, TimestampUtcMs = 1000L }
+            };
+
+            WoWPoint chosen = SquadFormationService.ComputeDungeonStandoffPosition(
+                tankPos,
+                tankFacingRadians: 0f,
+                mapId: 70U,
+                standoffDistance: 16f,
+                backlineSlotIndex: 0,
+                totalBacklineCount: 1,
+                breadcrumbs: breadcrumbs,
+                focusTargetPos: targetPos,
+                lineOfSightCheck: (from, _) => from.Y > 92f,
+                isReachableCheck: _ => true);
+
+            Assert.True(chosen.Y > 92f);
+            Assert.NotEqual(WoWPoint.Zero, chosen);
+        }
+
+        [Fact]
+        public void ComputeDungeonStandoffPosition_DeduplicatesRepeatedProjectedDestinations()
+        {
+            var tankPos = new WoWPoint(100f, 100f, 0f);
+            var targetPos = new WoWPoint(100f, 110f, 0f);
+            var breadcrumbs = new[]
+            {
+                new SquadBreadcrumb { MapId = 70U, X = 80f, Y = 100f, Z = 0f, TimestampUtcMs = 1000L },
+                new SquadBreadcrumb { MapId = 70U, X = 82f, Y = 100f, Z = 0f, TimestampUtcMs = 2000L },
+                new SquadBreadcrumb { MapId = 70U, X = 84f, Y = 100f, Z = 0f, TimestampUtcMs = 3000L }
+            };
+
+            var checkedPoints = new List<WoWPoint>();
+            WoWPoint chosen = SquadFormationService.ComputeDungeonStandoffPosition(
+                tankPos,
+                tankFacingRadians: 0f,
+                mapId: 70U,
+                standoffDistance: 16f,
+                backlineSlotIndex: 0,
+                totalBacklineCount: 1,
+                breadcrumbs: breadcrumbs,
+                focusTargetPos: targetPos,
+                lineOfSightCheck: null,
+                isReachableCheck: pt =>
+                {
+                    checkedPoints.Add(pt);
+                    return false;
+                });
+
+            Assert.Equal(WoWPoint.Zero, chosen);
+            Assert.Equal(2, checkedPoints.Count);
+            Assert.Equal(1, checkedPoints.Count(p => p == new WoWPoint(84f, 100f, 0f)));
+            Assert.Equal(1, checkedPoints.Count(p => p == new WoWPoint(100f, 84f, 0f)));
+        }
     }
 
     public sealed class DungeonPullBlacklistStateTests : IDisposable
@@ -429,6 +543,10 @@ namespace CopilotBuddy.PartyGrind.Tests
             SquadTankBridge.BlacklistPullTarget(baelogGuid, 10_000L);
             Assert.True(SquadTankBridge.IsTemporarilyPullBlacklisted(baelogGuid, 17_999L));
             Assert.False(SquadTankBridge.IsTemporarilyPullBlacklisted(baelogGuid, 18_000L));
+            SquadTankBridge.BlacklistPullTarget(baelogGuid, 20_000L);
+            Assert.True(SquadTankBridge.IsTemporarilyPullBlacklisted(baelogGuid, 21_000L));
+            SquadTankBridge.ResetPullStateForTests();
+            Assert.False(SquadTankBridge.IsTemporarilyPullBlacklisted(baelogGuid, 21_000L));
             Assert.True(SquadTankBridge.ShouldRejectIdlePullTarget(isTemporarilyBlacklisted: true, targetEngaged: false));
             Assert.False(SquadTankBridge.ShouldRejectIdlePullTarget(isTemporarilyBlacklisted: true, targetEngaged: true));
         }

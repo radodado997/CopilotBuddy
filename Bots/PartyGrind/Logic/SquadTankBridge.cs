@@ -182,19 +182,19 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                         if (unit.IsFriendly || unit.IsPlayer || unit.IsCritter || unit.IsNonCombatPet || unit.ControllingPlayer != null)
                             continue;
 
-                        if (committedGuid != 0 && unit.Guid == committedGuid)
-                        {
-                            if (!IsTemporarilyPullBlacklisted(unit.Guid, Environment.TickCount64))
-                                outgoingUnits.Add(unit);
-                            continue;
-                        }
-
                         bool partyThreat = unit.IsTargetingMyPartyMember || unit.IsTargetingMeOrPet ||
                                            (unit.Combat && unit.CurrentTargetGuid != 0 && memberGuids.Contains(unit.CurrentTargetGuid));
 
                         if (partyThreat && unit.Location.Distance(meLoc) <= 60f)
                         {
                             outgoingUnits.Add(unit);
+                            continue;
+                        }
+
+                        if (committedGuid != 0 && unit.Guid == committedGuid)
+                        {
+                            if (!IsTemporarilyPullBlacklisted(unit.Guid, Environment.TickCount64))
+                                outgoingUnits.Add(unit);
                             continue;
                         }
 
@@ -670,16 +670,56 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private static readonly object PullStateLock = new();
         private static long _lastDungeonPullCastUtcMs;
         private static ulong _lastDungeonPullTargetGuid;
+        private static int _lastDungeonPullSpellId;
+        private static string _lastDungeonPullSpellName = string.Empty;
         private static int _pullFailureCountForTarget;
         private static bool _lastPullCastCountedFailure;
         private static bool _pullLosErrorSinceLastCast;
         private static readonly Dictionary<ulong, long> PullBlacklistedUntilMs = new();
         private static readonly SquadApproach PullApproach = new();
 
-        internal static bool IsLineOfSightErrorMessage(string? message)
+        private static string? _localizedLosErrorText;
+        private static long _nextLocalizedLosRetryUtcMs;
+
+        private static string? GetLocalizedLineOfSightErrorText()
         {
-            return !string.IsNullOrEmpty(message) &&
-                   message.IndexOf("line of sight", StringComparison.OrdinalIgnoreCase) >= 0;
+            if (!string.IsNullOrEmpty(_localizedLosErrorText))
+                return _localizedLosErrorText;
+            if (ObjectManager.Executor == null)
+                return null;
+
+            long now = Environment.TickCount64;
+            if (now < _nextLocalizedLosRetryUtcMs)
+                return null;
+
+            try
+            {
+                string? localized = Lua.GetReturnVal<string>("return tostring(SPELL_FAILED_LINE_OF_SIGHT or '')", 0);
+                if (!string.IsNullOrWhiteSpace(localized))
+                {
+                    _localizedLosErrorText = localized.Trim();
+                    return _localizedLosErrorText;
+                }
+            }
+            catch
+            {
+            }
+
+            _nextLocalizedLosRetryUtcMs = now + 5000L;
+            return null;
+        }
+
+        internal static bool IsLineOfSightErrorMessage(string? message, string? localizedLosError = null)
+        {
+            if (string.IsNullOrWhiteSpace(message))
+                return false;
+
+            if (message.IndexOf("line of sight", StringComparison.OrdinalIgnoreCase) >= 0)
+                return true;
+
+            string? resolvedLocalized = localizedLosError ?? GetLocalizedLineOfSightErrorText();
+            return !string.IsNullOrEmpty(resolvedLocalized) &&
+                   message.IndexOf(resolvedLocalized, StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
         public static void NotifyPullLineOfSightError(string? message = null, long? nowUtcMs = null)
@@ -738,6 +778,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 {
                     _lastDungeonPullTargetGuid = 0;
                     _lastDungeonPullCastUtcMs = 0;
+                    _lastDungeonPullSpellId = 0;
+                    _lastDungeonPullSpellName = string.Empty;
                     _pullFailureCountForTarget = 0;
                     _lastPullCastCountedFailure = false;
                     _pullLosErrorSinceLastCast = false;
@@ -751,6 +793,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             {
                 _lastDungeonPullTargetGuid = 0;
                 _lastDungeonPullCastUtcMs = 0;
+                _lastDungeonPullSpellId = 0;
+                _lastDungeonPullSpellName = string.Empty;
                 _pullFailureCountForTarget = 0;
                 _lastPullCastCountedFailure = false;
                 _pullLosErrorSinceLastCast = false;
@@ -789,7 +833,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     return DungeonPullAction.Approach;
 
                 if (losErrorAfterCast && distanceToTarget <= MeleePullFallbackRange)
-                    return DungeonPullAction.CastOpener;
+                    return inLineOfSpellSight ? DungeonPullAction.CastOpener : DungeonPullAction.Approach;
             }
 
             if (pullFailureCount >= 1 && distanceToTarget > MeleePullFallbackRange)
@@ -878,17 +922,18 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         internal static WoWUnit? SelectIsolatedPullTarget(WoWUnit? current, WoWPoint from, float scanRadius)
         {
             if (current == null || !current.IsValid || current.Dead)
-                return current;
+                return null;
 
+            long nowMs = Environment.TickCount64;
+            bool currentBlacklisted = IsTemporarilyPullBlacklisted(current.Guid, nowMs);
             int currentPack = CountPullPackSize(current);
-            if (currentPack <= MaxComfortablePackSize)
+            if (!currentBlacklisted && currentPack <= MaxComfortablePackSize)
                 return current;
 
             WoWUnit? best = null;
-            int bestPack = currentPack;
-            float bestDistance = from.Distance(current.Location);
+            int bestPack = currentBlacklisted ? int.MaxValue : currentPack;
+            float bestDistance = currentBlacklisted ? float.MaxValue : from.Distance(current.Location);
 
-            long nowMs = Environment.TickCount64;
             int inspected = 0;
             foreach (var unit in ObjectManager.CachedUnits)
             {
@@ -896,11 +941,12 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     break;
                 if (unit == null || !unit.IsValid || unit.Dead || unit.Guid == current.Guid)
                     continue;
-                if (!unit.Attackable || unit.IsFriendly || unit.IsPlayer || unit.IsCritter || unit.IsNonCombatPet)
+                if (!unit.CanSelect || !unit.Attackable || !unit.IsHostile || unit.IsFriendly || unit.IsPlayer || unit.IsCritter || unit.IsNonCombatPet)
                     continue;
                 if (unit.ControllingPlayer != null || unit.Combat)
                     continue;
-                if (IsTemporarilyPullBlacklisted(unit.Guid, nowMs))
+                if (IsTemporarilyPullBlacklisted(unit.Guid, nowMs) ||
+                    global::Bots.DungeonBuddy.Profiles.ProfileManager.IsNpcInPullBlackspot(unit))
                     continue;
 
                 float distance = from.Distance(unit.Location);
@@ -908,7 +954,20 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     continue;
 
                 inspected++;
+                if (!unit.InLineOfSight || (!unit.IsFlying && !Navigator.CanNavigateWithinDistance(from, unit.Location, 35f)))
+                    continue;
                 int pack = CountPullPackSize(unit);
+                if (currentBlacklisted)
+                {
+                    if (pack < bestPack || (pack == bestPack && distance < bestDistance))
+                    {
+                        best = unit;
+                        bestPack = pack;
+                        bestDistance = distance;
+                    }
+                    continue;
+                }
+
                 if (!IsBetterPullCandidate(pack, distance, bestPack, bestDistance))
                     continue;
 
@@ -917,7 +976,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 bestDistance = distance;
             }
 
-            return best ?? current;
+            return currentBlacklisted ? best : (best ?? current);
         }
 
         internal static bool IsPackPullTooRisky(int packSize, float lowestPartyManaPercent, long holdElapsedMs)
@@ -960,7 +1019,10 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 return false;
 
             long now = Environment.TickCount64;
-            bool isCastingOpener = me.IsCasting || me.ChanneledCastingSpellId != 0;
+            bool isCastingAny = me.IsCasting || me.ChanneledCastingSpellId != 0;
+            int activeCastingSpellId = isCastingAny ? me.CastingSpellId : 0;
+            string? activeCastingSpellName = isCastingAny ? me.CurrentCastingSpell?.Name : null;
+            bool isCastingOpener;
             bool hasRecentCast;
             long elapsed;
             bool losError;
@@ -979,10 +1041,17 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 {
                     _lastDungeonPullTargetGuid = targetGuid;
                     _lastDungeonPullCastUtcMs = 0;
+                    _lastDungeonPullSpellId = 0;
+                    _lastDungeonPullSpellName = string.Empty;
                     _pullFailureCountForTarget = 0;
                     _lastPullCastCountedFailure = false;
                     _pullLosErrorSinceLastCast = false;
                 }
+
+                isCastingOpener = isCastingAny && (_lastDungeonPullSpellId > 0
+                    ? activeCastingSpellId == _lastDungeonPullSpellId
+                    : (string.IsNullOrEmpty(_lastDungeonPullSpellName) ||
+                       string.Equals(activeCastingSpellName, _lastDungeonPullSpellName, StringComparison.OrdinalIgnoreCase)));
 
                 bool hasRecordedCast = _lastDungeonPullCastUtcMs > 0;
                 if (hasRecordedCast && isCastingOpener && !_pullLosErrorSinceLastCast)
@@ -1009,8 +1078,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 SpellManager.HasSpell(s) && SpellManager.CanCast(s, target, checkRange: false, checkMovement: false));
 
             float maxRange = 28f;
-            if (!string.IsNullOrEmpty(chosenSpell) && SpellManager.Spells.TryGetValue(chosenSpell, out WoWSpell? info) && info.MaxRange > 5f)
-                maxRange = Math.Max(8f, info.MaxRange - 1.5f);
+            WoWSpell? chosenSpellInfo = null;
+            if (!string.IsNullOrEmpty(chosenSpell) && SpellManager.Spells.TryGetValue(chosenSpell, out chosenSpellInfo) && chosenSpellInfo.MaxRange > 5f)
+                maxRange = Math.Max(8f, chosenSpellInfo.MaxRange - 1.5f);
 
             float targetDistance = (float)target.Distance;
             DungeonPullAction action = EvaluateDungeonPullStep(
@@ -1042,13 +1112,15 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                         return false;
                     if (!global::Bots.DungeonBuddy.Helpers.ScriptHelpers.MovementEnabled)
                         return false;
-                    if (PullApproach.TryMove(target, "Approaching dungeon pull " + target.Name))
+                    if (PullApproach.TryMove(target, "Approaching dungeon pull " + target.Name, out bool retryDeferred))
                         return true;
-                    if (failureCount > 0)
-                    {
-                        BlacklistPullTarget(targetGuid, now);
-                        SquadPartySyncService.LogAction("Skipping unreachable pull target " + target.Name);
-                    }
+                    if (retryDeferred)
+                        return true;
+                    if (failureCount == 0 && targetDistance <= maxRange && target.InLineOfSpellSight && !losError)
+                        break;
+                    BlacklistPullTarget(targetGuid, now);
+                    PullApproach.ResetTarget(targetGuid);
+                    SquadPartySyncService.LogAction("Skipping unreachable pull target " + target.Name);
                     return false;
             }
 
@@ -1070,6 +1142,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 {
                     _lastDungeonPullTargetGuid = targetGuid;
                     _lastDungeonPullCastUtcMs = now;
+                    _lastDungeonPullSpellId = chosenSpellInfo != null ? (int)chosenSpellInfo.Id : 0;
+                    _lastDungeonPullSpellName = chosenSpell;
                     _lastPullCastCountedFailure = false;
                     _pullLosErrorSinceLastCast = false;
                 }

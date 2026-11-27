@@ -139,7 +139,41 @@ namespace Styx.Logic.Inventory.Frames.LootFrame
         /// </summary>
         public void LootAll()
         {
-            Lua.DoString("for i=1, GetNumLootItems() do LootSlot(i) ConfirmBindOnUse() end CloseLoot()");
+            LootAllItems(closeAfterLoot: true);
+        }
+
+        public bool? LootAllAndCheckRemaining()
+        {
+            Lua.DoString("for i=1, GetNumLootItems() do LootSlot(i) ConfirmBindOnUse() end");
+            StyxWoW.Sleep(200);
+            if (!IsVisible)
+            {
+                return false;
+            }
+
+            bool? remaining = null;
+            try
+            {
+                var result = Lua.GetReturnValues("return GetNumLootItems()");
+                if (result != null && result.Count > 0 && int.TryParse(result[0], out int count))
+                {
+                    remaining = count > 0;
+                }
+            }
+            catch
+            {
+                remaining = null;
+            }
+
+            Close();
+            return remaining;
+        }
+
+        private void LootAllItems(bool closeAfterLoot)
+        {
+            Lua.DoString(closeAfterLoot
+                ? "for i=1, GetNumLootItems() do LootSlot(i) ConfirmBindOnUse() end CloseLoot()"
+                : "for i=1, GetNumLootItems() do LootSlot(i) ConfirmBindOnUse() end");
         }
 
         /// <summary>

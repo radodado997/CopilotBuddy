@@ -66,6 +66,13 @@
     <Content Include="BotRoutines\**" Link="Routines\Singular wotlk\%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Compile Remove="Dungeon Scripts\**" />
+    <EmbeddedResource Remove="Dungeon Scripts\**" />
+    <None Remove="Dungeon Scripts\**" />
+    <Content Include="Dungeon Scripts\**" Link="Dungeon Scripts\%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
 
   <!-- PostBuild: move satellite culture folders into Languages/ subdir (HB pattern) -->
   <Target Name="MoveSatelliteAssemblies" AfterTargets="Build">

@@ -157,10 +157,11 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         }
 
         private readonly Dictionary<ulong, DungeonObjectAttemptState> _objectAttemptStates = new();
+        private readonly Dictionary<Composite, long> _suppressedObjectHandlersUntilMs = new();
         private Composite? _activeObjectBehavior;
+        private Composite? _activeObjectHandler;
         private ulong _activeObjectGuid;
         private long _activeObjectRunningSinceMs;
-        private long _unnamedObjectCooldownUntilMs;
         private Composite? _activeEncounterBehavior;
         private WoWUnit? _activeEncounterTarget;
 
@@ -205,10 +206,11 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             _breadcrumbBossEntry = 0;
             _breadcrumbIndex = 0;
             _blacklistedNavPoints.Clear();
-            ClearObjectScriptTracking();
-            DungeonManager.IsObjectHandlerSuppressed = IsDungeonObjectSuppressed;
             _lfgRunCompletedAwaitingRequeue = false;
             ClearResetPendingOutside();
+            ClearObjectScriptTracking();
+            DungeonManager.IsObjectHandlerSuppressed = IsDungeonObjectSuppressed;
+            DungeonManager.IsObjectHandlerCompositeSuppressed = IsDungeonObjectCompositeSuppressed;
             StopActiveEncounter();
         }
 
@@ -217,6 +219,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             StopActiveEncounter();
             StopActiveObjectBehavior();
             DungeonManager.IsObjectHandlerSuppressed = null;
+            DungeonManager.IsObjectHandlerCompositeSuppressed = null;
             ClearObjectScriptTracking();
             if (_lfgEventsAttached)
             {
@@ -237,8 +240,6 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             _breadcrumbBossEntry = 0;
             _breadcrumbIndex = 0;
             _blacklistedNavPoints.Clear();
-            ClearObjectScriptTracking();
-            DungeonManager.IsObjectHandlerSuppressed = IsDungeonObjectSuppressed;
             _lfgRunCompletedAwaitingRequeue = false;
             _lastInstanceResetAttemptUtcMs = 0;
             _lastObservedResetGenOnFollower = 0;
@@ -255,6 +256,12 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             {
                 try { active.Stop(target); } catch { }
             }
+        }
+
+        public void StopActiveEncounterScriptBehavior()
+        {
+            DungeonManager.StopEncounterHandlersBehaviorIfRunning();
+            StopActiveEncounter();
         }
 
         public void PulseEnvironment(SquadSettings settings, SquadLeaderState? leader, long nowUtcMs)
@@ -1381,9 +1388,10 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         internal void ClearObjectScriptTracking()
         {
             _objectAttemptStates.Clear();
+            _suppressedObjectHandlersUntilMs.Clear();
+            _activeObjectHandler = null;
             _activeObjectGuid = 0UL;
             _activeObjectRunningSinceMs = 0L;
-            _unnamedObjectCooldownUntilMs = 0L;
         }
 
         private bool IsDungeonObjectSuppressed(WoWGameObject obj)
@@ -1391,10 +1399,18 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             return obj != null && IsObjectSuppressedAt(obj.Guid, Environment.TickCount64);
         }
 
+        private bool IsDungeonObjectCompositeSuppressed(Composite composite)
+        {
+            return composite != null &&
+                   _suppressedObjectHandlersUntilMs.TryGetValue(composite, out long untilMs) &&
+                   Environment.TickCount64 < untilMs;
+        }
+
         public void StopActiveObjectBehavior()
         {
             var objectBehavior = _activeObjectBehavior;
             _activeObjectBehavior = null;
+            _activeObjectHandler = null;
             if (objectBehavior != null && objectBehavior.IsRunning)
             {
                 try { objectBehavior.Stop(null); } catch { }
@@ -1464,6 +1480,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             }
 
             DungeonManager.IsObjectHandlerSuppressed = IsDungeonObjectSuppressed;
+            DungeonManager.IsObjectHandlerCompositeSuppressed = IsDungeonObjectCompositeSuppressed;
             var objectScript = DungeonManager.CurrentObjectHandlersBehavior;
             if (objectScript == null)
                 return false;
@@ -1475,9 +1492,6 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             }
 
             long now = Environment.TickCount64;
-            if (now < _unnamedObjectCooldownUntilMs)
-                return false;
-
             DungeonManager.ResetLastActiveObject();
             if (!objectScript.IsRunning)
                 objectScript.Start(null);
@@ -1490,16 +1504,26 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             }
 
             ulong handledGuid = DungeonManager.LastActiveObjectGuid;
+            Composite? handledComposite = DungeonManager.LastActiveObjectComposite;
             if (scriptStatus == RunStatus.Running)
             {
-                if (_activeObjectRunningSinceMs == 0L)
-                    _activeObjectRunningSinceMs = now;
-
-                if (handledGuid != 0UL)
+                if (!ReferenceEquals(_activeObjectHandler, handledComposite))
                 {
-                    if (_activeObjectGuid != 0UL && _activeObjectGuid != handledGuid)
-                        _activeObjectRunningSinceMs = now;
+                    _activeObjectHandler = handledComposite;
+                    _activeObjectRunningSinceMs = now;
                     _activeObjectGuid = handledGuid;
+                }
+                else
+                {
+                    if (_activeObjectRunningSinceMs == 0L)
+                        _activeObjectRunningSinceMs = now;
+
+                    if (handledGuid != 0UL)
+                    {
+                        if (_activeObjectGuid != 0UL && _activeObjectGuid != handledGuid)
+                            _activeObjectRunningSinceMs = now;
+                        _activeObjectGuid = handledGuid;
+                    }
                 }
 
                 if (now - _activeObjectRunningSinceMs >= ObjectRunningTimeoutMs)
@@ -1507,8 +1531,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     ulong timedOutGuid = handledGuid != 0UL ? handledGuid : _activeObjectGuid;
                     if (timedOutGuid != 0UL)
                         RecordObjectScriptTimeout(timedOutGuid, now);
-                    else
-                        _unnamedObjectCooldownUntilMs = now + ObjectTimeoutCooldownMs;
+                    else if (handledComposite != null)
+                        _suppressedObjectHandlersUntilMs[handledComposite] = now + ObjectTimeoutCooldownMs;
                     SquadPartySyncService.LogAction("Dungeon: skipping unresponsive object " + (DungeonManager.LastActiveObjectName ?? "object"));
                     StopActiveObjectBehavior();
                     return false;
@@ -1519,14 +1543,20 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
             if (scriptStatus == RunStatus.Success)
             {
-                ulong completedGuid = handledGuid != 0UL ? handledGuid : _activeObjectGuid;
+                ulong completedGuid = handledGuid != 0UL
+                    ? handledGuid
+                    : (ReferenceEquals(_activeObjectHandler, handledComposite) ? _activeObjectGuid : 0UL);
                 if (completedGuid != 0UL)
                     RecordObjectScriptSuccess(completedGuid, now);
+                else if (handledComposite != null)
+                    _suppressedObjectHandlersUntilMs[handledComposite] = now + ObjectFirstCompletionCooldownMs;
+                _activeObjectHandler = null;
                 _activeObjectGuid = 0UL;
                 _activeObjectRunningSinceMs = 0L;
                 return true;
             }
 
+            _activeObjectHandler = null;
             _activeObjectGuid = 0UL;
             _activeObjectRunningSinceMs = 0L;
             return false;
@@ -1535,7 +1565,10 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         public bool TryRunDungeonScriptBehaviors()
         {
             if (TryRunDungeonEncounterBehaviors())
+            {
+                StopActiveObjectBehavior();
                 return true;
+            }
             return TryRunDungeonObjectBehaviors();
         }
 

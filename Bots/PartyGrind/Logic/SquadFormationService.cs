@@ -420,7 +420,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             float standoffDistance,
             int backlineSlotIndex,
             int totalBacklineCount,
-            Func<WoWPoint, WoWPoint, bool>? lineOfSightCheck = null)
+            Func<WoWPoint, WoWPoint, bool>? lineOfSightCheck = null,
+            Func<WoWPoint, bool>? isReachableCheck = null)
         {
             float dist = Math.Clamp(standoffDistance, 16f, 20f);
             float[] lateralOffsets = totalBacklineCount switch
@@ -431,9 +432,24 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             };
             float lateral = lateralOffsets[Math.Abs(backlineSlotIndex) % lateralOffsets.Length];
 
+            Dictionary<(float X, float Y, float Z), bool>? reachabilityCache = isReachableCheck != null
+                ? new Dictionary<(float X, float Y, float Z), bool>()
+                : null;
+            bool CheckReachable(WoWPoint pt)
+            {
+                if (isReachableCheck == null)
+                    return true;
+                var key = (pt.X, pt.Y, pt.Z);
+                if (reachabilityCache!.TryGetValue(key, out bool cached))
+                    return cached;
+                bool result = isReachableCheck(pt);
+                reachabilityCache[key] = result;
+                return result;
+            }
+
+            WoWPoint? fallbackCandidate = null;
             if (breadcrumbs != null && breadcrumbs.Count > 0)
             {
-                WoWPoint? fallbackCandidate = null;
                 for (int i = breadcrumbs.Count - 1; i >= 0; i--)
                 {
                     var bc = breadcrumbs[i];
@@ -462,15 +478,16 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                             bcPt.Z);
                         if (!focusTargetPos.HasValue || candidate.Distance(focusTargetPos.Value) >= dist)
                         {
-                            if (lineOfSightCheck == null || !focusTargetPos.HasValue || lineOfSightCheck(candidate, focusTargetPos.Value))
-                                return candidate;
-                            fallbackCandidate ??= candidate;
+                            bool reachable = CheckReachable(candidate);
+                            if (reachable)
+                            {
+                                if (lineOfSightCheck == null || !focusTargetPos.HasValue || lineOfSightCheck(candidate, focusTargetPos.Value))
+                                    return candidate;
+                                fallbackCandidate ??= candidate;
+                            }
                         }
                     }
                 }
-
-                if (fallbackCandidate.HasValue)
-                    return fallbackCandidate.Value;
             }
 
             float backAngle;
@@ -493,10 +510,17 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             float perpY = dirX;
             float axial = MathF.Sqrt(MathF.Max(1.0f, dist * dist - lateral * lateral));
 
-            return new WoWPoint(
+            var geometricCandidate = new WoWPoint(
                 tankPos.X + dirX * axial + perpX * lateral,
                 tankPos.Y + dirY * axial + perpY * lateral,
                 tankPos.Z);
+            bool geometricReachable = CheckReachable(geometricCandidate);
+            bool geometricHasLoS = lineOfSightCheck == null || !focusTargetPos.HasValue || lineOfSightCheck(geometricCandidate, focusTargetPos.Value);
+            if (geometricReachable && geometricHasLoS)
+                return geometricCandidate;
+            if (fallbackCandidate.HasValue)
+                return fallbackCandidate.Value;
+            return geometricReachable ? geometricCandidate : WoWPoint.Zero;
         }
 
         /// <summary>

@@ -85,6 +85,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private int _resetBaselineGeneration;
         private readonly HashSet<ulong> _dungeonRunParticipants = new();
         private long _lootWindowEndsUtcMs;
+        private long _lootWindowHardCappedAtUtcMs;
+        private readonly HashSet<string> _hardCappedLootingNames = new(StringComparer.OrdinalIgnoreCase);
         private bool _wasAnyInCombat;
         private long _resWaitStartedUtcMs;
         private string _resWaitMemberKey = string.Empty;
@@ -98,7 +100,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private string _activeTradeTarget = string.Empty;
         private long _provisionStartedUtcMs;
         private SquadPhase? _lastLoggedPhase;
-        private bool _assignedFood, _assignedDrink, _assignedHealthstone;
+        private bool _assignedFood, _assignedDrink, _assignedHealthstone, _assignedDungeonItems;
+        private uint _assignedDungeonId;
         private string _townRunRequestedByName = string.Empty;
         private string _townRunRequestReason = string.Empty;
         private long _townRunRequestedUtcMs;
@@ -131,6 +134,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             _allTownTasksComplete = false;
             _inLootWindow = false;
             _lootWindowEndsUtcMs = 0;
+            _lootWindowHardCappedAtUtcMs = 0;
+            _hardCappedLootingNames.Clear();
             _wasAnyInCombat = false;
             _resWaitStartedUtcMs = 0;
             _resWaitMemberKey = string.Empty;
@@ -141,6 +146,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             _activeProvisioner = string.Empty;
             _activeTradeTarget = string.Empty;
             _provisionStartedUtcMs = 0;
+            _assignedFood = _assignedDrink = _assignedHealthstone = _assignedDungeonItems = false;
+            _assignedDungeonId = 0;
             _townRunRequestedByName = string.Empty;
             _townRunRequestReason = string.Empty;
             _townRunRequestedUtcMs = 0;
@@ -359,15 +366,33 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             {
                 _inLootWindow = true;
                 _lootWindowEndsUtcMs = nowUtcMs + Math.Max(1, settings.MaxLootWindowSeconds) * 1000L;
+                _lootWindowHardCappedAtUtcMs = 0;
+                _hardCappedLootingNames.Clear();
+            }
+            if (anyInCombat)
+            {
+                _lootWindowHardCappedAtUtcMs = 0;
+                _hardCappedLootingNames.Clear();
             }
             _wasAnyInCombat = anyInCombat;
 
             if (_inLootWindow)
             {
                 bool anyLooting = rosterStates.Any(m => m.IsLooting);
-                if (anyInCombat || (!anyLooting && nowUtcMs >= _lootWindowEndsUtcMs) || nowUtcMs >= (_lootWindowEndsUtcMs + 4000L))
+                bool hardCapReached = nowUtcMs >= (_lootWindowEndsUtcMs + 4000L);
+                if (anyInCombat || (!anyLooting && nowUtcMs >= _lootWindowEndsUtcMs) || hardCapReached)
                 {
                     _inLootWindow = false;
+                    if (hardCapReached && !anyInCombat && anyLooting)
+                    {
+                        _lootWindowHardCappedAtUtcMs = nowUtcMs;
+                        _hardCappedLootingNames.Clear();
+                        foreach (var m in rosterStates)
+                        {
+                            if (m.IsLooting && !string.IsNullOrWhiteSpace(m.CharacterName))
+                                _hardCappedLootingNames.Add(m.CharacterName.Trim());
+                        }
+                    }
                 }
             }
 
@@ -544,7 +569,27 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             }
             else
             {
-                EvaluateProvisioningArbitration(settings, rosterStates, nowUtcMs, dungeon?.HasRandomPartyMembers != true);
+                bool recentLootHardCap = _lootWindowHardCappedAtUtcMs > 0 && nowUtcMs - _lootWindowHardCappedAtUtcMs < 15000L;
+                if (!recentLootHardCap)
+                {
+                    _hardCappedLootingNames.Clear();
+                }
+                else if (_hardCappedLootingNames.Count > 0)
+                {
+                    _hardCappedLootingNames.RemoveWhere(name => !rosterStates.Any(m =>
+                        m.IsLooting && string.Equals((m.CharacterName ?? string.Empty).Trim(), name, StringComparison.OrdinalIgnoreCase)));
+                }
+                bool lootClear = !_inLootWindow && !rosterStates.Any(m =>
+                    m.IsLooting && (!recentLootHardCap || !_hardCappedLootingNames.Contains((m.CharacterName ?? string.Empty).Trim())));
+                EvaluateProvisioningArbitration(
+                    settings,
+                    rosterStates,
+                    nowUtcMs,
+                    dungeon?.HasRandomPartyMembers != true,
+                    isDungeonMode,
+                    dungeon?.ActiveDungeonId ?? 0U,
+                    dungeon?.EffectiveTankGuid ?? (settings.Role == SquadRole.TankLeader ? leaderLocal.Guid : 0UL),
+                    lootClear);
             }
 
             SquadPhase phase;
@@ -595,7 +640,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     phase = SquadPhase.Looting;
                 }
                 else if (!string.IsNullOrEmpty(_activeProvisioner) &&
-                         (_assignedHealthstone || dungeon?.HasRandomPartyMembers != true))
+                         (_assignedDungeonItems || _assignedHealthstone || dungeon?.HasRandomPartyMembers != true))
                 {
                     phase = SquadPhase.Provisioning;
                 }
@@ -729,6 +774,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 ReleaseCorpseOrder = !rosterIncomplete && _inCorpseRun && anyDead,
                 ActiveProvisionerName = _activeProvisioner,
                 ActiveTradeTargetName = _activeTradeTarget,
+                IsDungeonItemTransferAssignment = isDungeonMode && _assignedDungeonItems,
                 BotMode = settings.BotMode,
                 DungeonEntryMode = settings.DungeonEntryMode,
                 DungeonLootMode = settings.DungeonLootMode,
@@ -1127,7 +1173,11 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             SquadSettings settings,
             List<SquadMemberState> rosterStates,
             long nowUtcMs,
-            bool allowFoodAndDrink)
+            bool allowFoodAndDrink,
+            bool isDungeonMode = false,
+            uint activeDungeonId = 0U,
+            ulong effectiveTankGuid = 0UL,
+            bool allowDungeonItems = false)
         {
             if (!allowFoodAndDrink && (_assignedFood || _assignedDrink))
             {
@@ -1148,40 +1198,128 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     return;
 
                 bool timedOut = (nowUtcMs - _provisionStartedUtcMs) > timeoutMs;
-                bool stillNeeded = prov != null && (prov.IsProvisioningBusy ||
-                    (recv != null && ((_assignedFood && recv.WantsFood) ||
-                        (_assignedDrink && recv.WantsDrink) || (_assignedHealthstone && recv.WantsHealthstone))));
-
-                bool healthstoneSupplyLost = _assignedHealthstone &&
-                    (prov == null || (!prov.IsProvisioningBusy &&
-                        (recv == null || !CanProvideHealthstoneTo(prov, recv))));
-
-                if (healthstoneSupplyLost)
+                if (_assignedDungeonItems)
                 {
-                    Logging.WriteDebug("[PartyGrind Provision] Released '{0}' -> '{1}' (healthstone unavailable)",
-                        _activeProvisioner, _activeTradeTarget);
-                    SquadPartySyncService.MarkActivity();
-                    ClearProvisioning();
-                }
-                else if (timedOut)
-                {
-                    if (!string.IsNullOrEmpty(_activeTradeTarget))
-                        RecordProvisionCooldown(_activeTradeTarget, settings.ProvisionCooldownSeconds, nowUtcMs);
-                    Logging.WriteDebug("[PartyGrind Provision] Timeout '{0}' -> '{1}' (cooldown {2}s)",
-                        _activeProvisioner, _activeTradeTarget, settings.ProvisionCooldownSeconds);
-                    SquadPartySyncService.MarkActivity();
-                    ClearProvisioning();
-                }
-                else if (stillNeeded)
-                {
-                    return;
+                    var currentTankReceiver = isDungeonMode
+                        ? rosterStates.FirstOrDefault(m =>
+                            !m.IsDead && !m.IsGhost && m.FreeBagSlots >= 1 &&
+                            (effectiveTankGuid != 0UL ? m.Guid == effectiveTankGuid : m.Role == SquadRole.TankLeader))
+                        : null;
+                    bool sameTargetAndDungeon = currentTankReceiver != null &&
+                                                recv != null &&
+                                                recv.Guid == currentTankReceiver.Guid &&
+                                                _assignedDungeonId == activeDungeonId;
+                    bool dungeonTradeStillNeeded = sameTargetAndDungeon && prov != null && recv != null &&
+                        (allowDungeonItems || prov.IsProvisioningBusy) &&
+                        !prov.IsDead && !prov.IsGhost && !recv.IsDead && !recv.IsGhost &&
+                        prov.MapId == recv.MapId &&
+                        recv.FreeBagSlots >= 1 &&
+                        (prov.IsProvisioningBusy ||
+                         (SquadProvisioningService.GetNeededDungeonTransferEntries(
+                              prov.TradableDungeonItems, recv.HeldDungeonItems, _assignedDungeonId, prov.HeldDungeonItems).Count > 0 &&
+                          SquadProvisioningService.HasRequiredTankReceiverBagSpace(
+                              recv.HeldDungeonItems, recv.FreeBagSlots, prov.TradableDungeonItems, _assignedDungeonId, prov.HeldDungeonItems)));
+                    if (timedOut)
+                    {
+                        if (!string.IsNullOrEmpty(_activeProvisioner) && !string.IsNullOrEmpty(_activeTradeTarget))
+                            RecordProvisionCooldown(BuildDungeonTransferCooldownKey(_activeProvisioner, _activeTradeTarget), settings.ProvisionCooldownSeconds, nowUtcMs);
+                        Logging.WriteDebug("[PartyGrind Provision] Dungeon item transfer timeout '{0}' -> '{1}'",
+                            _activeProvisioner, _activeTradeTarget);
+                        SquadPartySyncService.MarkActivity();
+                        ClearProvisioning();
+                    }
+                    else if (dungeonTradeStillNeeded)
+                    {
+                        return;
+                    }
+                    else
+                    {
+                        Logging.WriteDebug("[PartyGrind Provision] Dungeon item transfer done '{0}' -> '{1}'",
+                            _activeProvisioner, _activeTradeTarget);
+                        SquadPartySyncService.MarkActivity();
+                        ClearProvisioning();
+                    }
                 }
                 else
                 {
-                    Logging.WriteDebug("[PartyGrind Provision] Done '{0}' -> '{1}' (needs resolved)",
-                        _activeProvisioner, _activeTradeTarget);
-                    SquadPartySyncService.MarkActivity();
-                    ClearProvisioning();
+                    bool stillNeeded = prov != null && (prov.IsProvisioningBusy ||
+                        (recv != null && ((_assignedFood && recv.WantsFood) ||
+                            (_assignedDrink && recv.WantsDrink) || (_assignedHealthstone && recv.WantsHealthstone))));
+
+                    bool healthstoneSupplyLost = _assignedHealthstone &&
+                        (prov == null || (!prov.IsProvisioningBusy &&
+                            (recv == null || !CanProvideHealthstoneTo(prov, recv))));
+
+                    if (healthstoneSupplyLost)
+                    {
+                        Logging.WriteDebug("[PartyGrind Provision] Released '{0}' -> '{1}' (healthstone unavailable)",
+                            _activeProvisioner, _activeTradeTarget);
+                        SquadPartySyncService.MarkActivity();
+                        ClearProvisioning();
+                    }
+                    else if (timedOut)
+                    {
+                        if (!string.IsNullOrEmpty(_activeTradeTarget))
+                            RecordProvisionCooldown(_activeTradeTarget, settings.ProvisionCooldownSeconds, nowUtcMs);
+                        Logging.WriteDebug("[PartyGrind Provision] Timeout '{0}' -> '{1}' (cooldown {2}s)",
+                            _activeProvisioner, _activeTradeTarget, settings.ProvisionCooldownSeconds);
+                        SquadPartySyncService.MarkActivity();
+                        ClearProvisioning();
+                    }
+                    else if (stillNeeded)
+                    {
+                        return;
+                    }
+                    else
+                    {
+                        Logging.WriteDebug("[PartyGrind Provision] Done '{0}' -> '{1}' (needs resolved)",
+                            _activeProvisioner, _activeTradeTarget);
+                        SquadPartySyncService.MarkActivity();
+                        ClearProvisioning();
+                    }
+                }
+            }
+
+            if (isDungeonMode && allowDungeonItems)
+            {
+                var tankReceiver = rosterStates.FirstOrDefault(m =>
+                    !m.IsDead && !m.IsGhost && m.FreeBagSlots >= 1 &&
+                    (effectiveTankGuid != 0UL ? m.Guid == effectiveTankGuid : m.Role == SquadRole.TankLeader));
+                if (tankReceiver != null)
+                {
+                    var tankPos = new WoWPoint(tankReceiver.X, tankReceiver.Y, tankReceiver.Z);
+                    var carrier = rosterStates.FirstOrDefault(m =>
+                    {
+                        if (m.IsDead || m.IsGhost ||
+                            string.Equals(m.CharacterName, tankReceiver.CharacterName, StringComparison.OrdinalIgnoreCase) ||
+                            m.MapId != tankReceiver.MapId ||
+                            tankPos.Distance(new WoWPoint(m.X, m.Y, m.Z)) > SquadProvisioningService.MaxDungeonTransferDistance ||
+                            IsOnProvisionCooldown(BuildDungeonTransferCooldownKey(m.CharacterName, tankReceiver.CharacterName), nowUtcMs))
+                            return false;
+
+                        var transferEntries = SquadProvisioningService.GetNeededDungeonTransferEntries(
+                            m.TradableDungeonItems, tankReceiver.HeldDungeonItems, activeDungeonId, m.HeldDungeonItems);
+                        return transferEntries.Count > 0 &&
+                               SquadProvisioningService.HasRequiredTankReceiverBagSpace(
+                                   tankReceiver.HeldDungeonItems,
+                                   tankReceiver.FreeBagSlots,
+                                   m.TradableDungeonItems,
+                                   activeDungeonId,
+                                   m.HeldDungeonItems);
+                    });
+                    if (carrier != null)
+                    {
+                        _assignedFood = _assignedDrink = _assignedHealthstone = false;
+                        _assignedDungeonItems = true;
+                        _assignedDungeonId = activeDungeonId;
+                        _activeProvisioner = carrier.CharacterName;
+                        _activeTradeTarget = tankReceiver.CharacterName;
+                        _provisionStartedUtcMs = nowUtcMs;
+                        Logging.WriteDebug("[PartyGrind Provision] Assigned dungeon item transfer '{0}' -> '{1}'",
+                            carrier.CharacterName, tankReceiver.CharacterName);
+                        SquadPartySyncService.MarkActivity();
+                        return;
+                    }
                 }
             }
 
@@ -1246,6 +1384,11 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             }
         }
 
+        private static string BuildDungeonTransferCooldownKey(string providerName, string receiverName)
+        {
+            return "dungeon:" + providerName.Trim() + "->" + receiverName.Trim();
+        }
+
         private bool IsOnProvisionCooldown(string name, long nowUtcMs)
         {
             return !string.IsNullOrWhiteSpace(name) &&
@@ -1258,6 +1401,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             _activeProvisioner = string.Empty;
             _activeTradeTarget = string.Empty;
             _provisionStartedUtcMs = 0;
+            _assignedFood = _assignedDrink = _assignedHealthstone = _assignedDungeonItems = false;
+            _assignedDungeonId = 0;
         }
 
         private List<SquadMemberSummary> BuildMemberSummaries(
@@ -1353,6 +1498,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 WantsFood = m.WantsFood,
                 WantsDrink = m.WantsDrink,
                 WantsHealthstone = m.WantsHealthstone,
+                HeldDungeonItems = m.HeldDungeonItems != null ? new List<uint>(m.HeldDungeonItems) : new List<uint>(),
+                TradableDungeonItems = m.TradableDungeonItems != null ? new List<uint>(m.TradableDungeonItems) : new List<uint>(),
                 CanProvideMageFood = m.CanProvideMageFood,
                 CanProvideMageDrink = m.CanProvideMageDrink,
                 CanProvideHealthstone = m.CanProvideHealthstone,

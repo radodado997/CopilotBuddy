@@ -33,14 +33,17 @@ namespace Bots.DungeonBuddy
         private static Composite? _currentObjectHandlersBehavior;
 
         public static Func<WoWGameObject, bool>? IsObjectHandlerSuppressed { get; set; }
+        internal static Func<Composite, bool>? IsObjectHandlerCompositeSuppressed { get; set; }
 
         internal static ulong LastActiveObjectGuid { get; private set; }
         internal static string? LastActiveObjectName { get; private set; }
+        internal static Composite? LastActiveObjectComposite { get; private set; }
 
         internal static void ResetLastActiveObject()
         {
             LastActiveObjectGuid = 0UL;
             LastActiveObjectName = null;
+            LastActiveObjectComposite = null;
         }
 
         private sealed class ObjectTrackingDecorator : Decorator
@@ -53,8 +56,18 @@ namespace Bots.DungeonBuddy
                 _resolveObject = resolveObject;
             }
 
+            protected override bool CanRun(object context)
+            {
+                return IsObjectHandlerCompositeSuppressed?.Invoke(this) != true && base.CanRun(context);
+            }
+
             protected override IEnumerable<RunStatus> Execute(object context)
             {
+                if (IsObjectHandlerCompositeSuppressed?.Invoke(this) == true)
+                {
+                    yield return RunStatus.Failure;
+                    yield break;
+                }
                 if (DecoratedChild == null)
                 {
                     yield return RunStatus.Failure;
@@ -64,14 +77,24 @@ namespace Bots.DungeonBuddy
                 DecoratedChild.Start(context);
                 while (true)
                 {
+                    WoWGameObject? preTarget = _resolveObject(context);
+                    ulong preGuid = preTarget != null && preTarget.IsValid ? preTarget.Guid : 0UL;
+                    string? preName = preTarget != null && preTarget.IsValid ? preTarget.Name : null;
                     RunStatus status = DecoratedChild.Tick(context);
                     if (status == RunStatus.Running || status == RunStatus.Success)
                     {
+                        LastActiveObjectComposite = this;
                         WoWGameObject? target = _resolveObject(context);
                         if (target != null && target.IsValid)
                         {
                             LastActiveObjectGuid = target.Guid;
                             LastActiveObjectName = target.Name;
+                        }
+                        else if (preGuid != 0UL)
+                        {
+                            LastActiveObjectGuid = preGuid;
+                            if (!string.IsNullOrEmpty(preName))
+                                LastActiveObjectName = preName;
                         }
                     }
 
@@ -114,8 +137,14 @@ namespace Bots.DungeonBuddy
         {
             if (behavior != null && behavior.IsRunning)
             {
-                try { behavior.Stop(null); } catch { }
+                try { behavior.Stop(null); }
+                catch (Exception ex) { Logging.WriteException(ex); }
             }
+        }
+
+        internal static void StopEncounterHandlersBehaviorIfRunning()
+        {
+            StopCachedBehavior(_currentEncounterHandlersBehavior);
         }
 
         private static void ResetCachedBehaviors()
@@ -190,7 +219,7 @@ namespace Bots.DungeonBuddy
                             behaviors.Add(new PrioritySelector(
                                 new ContextChangeHandler(context => ObjectManager.GetObjectsOfType<WoWGameObject>(false, false)
                                     .Where(o => o.IsValid && o.DistanceSqr <= objectRangeSqr && !IsObjectSuppressed(o))),
-                                new ObjectTrackingDecorator(composite, ctx => (ctx as IEnumerable<WoWGameObject>)?.FirstOrDefault())));
+                                new ObjectTrackingDecorator(composite, _ => null)));
                         }
                         else
                         {

@@ -7,6 +7,7 @@ using Styx.Helpers;
 using Styx.Logic.Combat;
 using Styx.Logic.Inventory;
 using Styx.Logic.Inventory.Frames.LootFrame;
+using Styx.Logic.Inventory.Frames.Merchant;
 using Styx.Logic.Inventory.Frames.Trade;
 using Styx.Logic.Pathing;
 using Styx.PartyGrind;
@@ -31,6 +32,22 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         public bool IsHealthstone { get; init; }
     }
 
+    public readonly struct DungeonItemRecipe
+    {
+        public DungeonItemRecipe(uint componentA, uint componentB, uint resultEntry, uint? dungeonId = null)
+        {
+            ComponentA = componentA;
+            ComponentB = componentB;
+            ResultEntry = resultEntry;
+            DungeonId = dungeonId;
+        }
+
+        public uint ComponentA { get; }
+        public uint ComponentB { get; }
+        public uint ResultEntry { get; }
+        public uint? DungeonId { get; }
+    }
+
     public readonly struct ConsumableNeedEvaluation
     {
         public bool WantsFood { get; init; }
@@ -49,7 +66,14 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         public const uint ArcanePowderItemEntry = 17020U;
         private const uint SoulShardItemEntry = 6265U;
         private const long SoulwellSetupWindowMs = 6000L;
+        private const long DungeonItemCraftCooldownMs = 1500L;
         private const uint ItemFlagSoulbound = 0x1U;
+
+        internal static readonly DungeonItemRecipe[] DungeonConsolidationRecipes =
+        {
+            // Uldaman: Gni'kiv Medallion (7740) + The Shaft of Tsol (7741) -> Staff of Prehistoria (7733)
+            new DungeonItemRecipe(7740U, 7741U, 7733U, 22U)
+        };
 
         private static readonly (int Rank, int CasterLevel, int ItemReqLevel)[] ConjureWaterRanks =
         {
@@ -68,8 +92,10 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             (1, 10, 10), (2, 22, 22), (3, 34, 34), (4, 46, 46), (5, 58, 58), (6, 68, 68)
         };
 
+        internal const float MaxDungeonTransferDistance = 45f;
         private readonly Dictionary<string, long> _cooldownUntilUtcMs = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
         private string _activeTradeTarget = string.Empty;
+        private bool _activeTradeIsDungeonItemTransfer;
         private long _tradeStartedUtcMs;
         private long _lastTradeOfferRetryUtcMs;
         private bool _tradeItemsPlaced;
@@ -79,8 +105,289 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private byte _assistedRitualProgress;
         private long _soulwellPendingUntilUtcMs;
         private long _nextSoulwellCheckUtcMs;
+        private long _lastDungeonCraftAttemptUtcMs;
 
         public bool IsTradeBusy => !string.IsNullOrEmpty(_activeTradeTarget) || TradeFrame.Instance.IsVisible;
+
+        internal static IEnumerable<DungeonItemRecipe> GetActiveDungeonRecipes(uint activeDungeonId)
+        {
+            foreach (var recipe in DungeonConsolidationRecipes)
+            {
+                if (!recipe.DungeonId.HasValue || (activeDungeonId != 0U && recipe.DungeonId.Value == activeDungeonId))
+                    yield return recipe;
+            }
+        }
+
+        private static bool CarrierMustSelfCraftRecipe(
+            DungeonItemRecipe recipe,
+            IReadOnlyCollection<uint>? carrierTradableItems,
+            IReadOnlyCollection<uint>? carrierHeldItems)
+        {
+            if (carrierHeldItems == null ||
+                !carrierHeldItems.Contains(recipe.ComponentA) ||
+                !carrierHeldItems.Contains(recipe.ComponentB))
+            {
+                return false;
+            }
+
+            return carrierTradableItems == null ||
+                   !carrierTradableItems.Contains(recipe.ComponentA) ||
+                   !carrierTradableItems.Contains(recipe.ComponentB);
+        }
+
+        internal static List<uint> GetNeededDungeonTransferEntries(
+            IReadOnlyCollection<uint>? carrierTradableItems,
+            IReadOnlyCollection<uint>? receiverHeldItems,
+            uint activeDungeonId,
+            IReadOnlyCollection<uint>? carrierHeldItems = null)
+        {
+            var result = new List<uint>();
+            if (carrierTradableItems == null || carrierTradableItems.Count == 0)
+                return result;
+
+            foreach (var recipe in GetActiveDungeonRecipes(activeDungeonId))
+            {
+                if (receiverHeldItems != null && receiverHeldItems.Contains(recipe.ResultEntry))
+                    continue;
+                if (CarrierMustSelfCraftRecipe(recipe, carrierTradableItems, carrierHeldItems))
+                    continue;
+
+                foreach (uint component in new[] { recipe.ComponentA, recipe.ComponentB })
+                {
+                    if (carrierTradableItems.Contains(component) &&
+                        (receiverHeldItems == null || !receiverHeldItems.Contains(component)) &&
+                        !result.Contains(component))
+                    {
+                        result.Add(component);
+                    }
+                }
+            }
+
+            return result;
+        }
+
+        internal static uint? SelectDungeonRecipeCraftComponent(
+            IReadOnlyCollection<uint>? localHeldItems,
+            IReadOnlyCollection<uint>? localTradableItems,
+            uint activeDungeonId,
+            bool isDesignatedReceiver,
+            bool hasOtherEligibleTankReceiver)
+        {
+            if (localHeldItems == null || localHeldItems.Count == 0)
+                return null;
+
+            foreach (var recipe in GetActiveDungeonRecipes(activeDungeonId))
+            {
+                if (localHeldItems.Contains(recipe.ResultEntry))
+                    continue;
+                if (!localHeldItems.Contains(recipe.ComponentA) || !localHeldItems.Contains(recipe.ComponentB))
+                    continue;
+
+                if (isDesignatedReceiver || !hasOtherEligibleTankReceiver || CarrierMustSelfCraftRecipe(recipe, localTradableItems, localHeldItems))
+                    return recipe.ComponentA;
+            }
+
+            return null;
+        }
+
+        internal static void CaptureDungeonItemTelemetry(
+            LocalPlayer? me,
+            uint activeDungeonId,
+            out List<uint> heldItems,
+            out List<uint> tradableItems)
+        {
+            heldItems = new List<uint>();
+            tradableItems = new List<uint>();
+            if (me == null)
+                return;
+
+            var relevantEntries = new HashSet<uint>();
+            var tradableComponents = new HashSet<uint>();
+            foreach (var recipe in GetActiveDungeonRecipes(activeDungeonId))
+            {
+                relevantEntries.Add(recipe.ComponentA);
+                relevantEntries.Add(recipe.ComponentB);
+                relevantEntries.Add(recipe.ResultEntry);
+                tradableComponents.Add(recipe.ComponentA);
+                tradableComponents.Add(recipe.ComponentB);
+            }
+
+            if (relevantEntries.Count == 0)
+                return;
+
+            foreach (var item in me.BagItems)
+            {
+                if (item == null || !item.IsValid || item.StackCount == 0 || !relevantEntries.Contains(item.Entry))
+                    continue;
+
+                if (!heldItems.Contains(item.Entry))
+                    heldItems.Add(item.Entry);
+
+                bool isSoulbound = (item.Flags & ItemFlagSoulbound) != 0;
+                if (!isSoulbound && tradableComponents.Contains(item.Entry) && !tradableItems.Contains(item.Entry))
+                    tradableItems.Add(item.Entry);
+            }
+        }
+
+        public bool TryCraftDungeonConsolidationItems(SquadSettings settings, SquadLeaderState? leader)
+        {
+            var me = StyxWoW.Me;
+            if (me == null || me.Combat || me.Dead || me.IsGhost || me.Mounted ||
+                me.IsCasting || me.ChanneledCastingSpellId != 0 ||
+                TradeFrame.Instance.IsVisible || MerchantFrame.Instance.IsVisible)
+                return false;
+
+            if (!SquadContext.IsDungeonModeActive || !SquadDungeonService.IsInDungeonMap(me))
+                return false;
+
+            long now = Environment.TickCount64;
+            if (now - _lastDungeonCraftAttemptUtcMs < DungeonItemCraftCooldownMs)
+                return false;
+
+            uint activeDungeonId = leader != null && leader.ActiveDungeonId != 0U
+                ? leader.ActiveDungeonId
+                : (global::Bots.DungeonBuddy.DungeonManager.CurrentDungeon?.DungeonId ?? 0U);
+            CaptureDungeonItemTelemetry(me, activeDungeonId, out var heldItems, out var tradableItems);
+
+            ulong effectiveTankGuid = leader?.EffectiveTankGuid ?? 0UL;
+            bool isDesignatedReceiver = PartyGrindBot.IsDesignatedDungeonChestLooter(
+                SquadContext.ResolveBotMode(leader, settings),
+                isInsideDungeonMap: true,
+                settings.Role,
+                me.Guid,
+                effectiveTankGuid);
+
+            var tankReceiver = leader?.Members?.FirstOrDefault(m =>
+                m.IsConnected && !m.IsDead && !m.IsGhost && m.MapId == me.MapId &&
+                me.Location.Distance(new WoWPoint(m.X, m.Y, m.Z)) <= MaxDungeonTransferDistance &&
+                !IsOnCooldown(m.CharacterName, isDungeonTransfer: true) &&
+                (effectiveTankGuid != 0UL ? m.Guid == effectiveTankGuid : m.Role == SquadRole.TankLeader) &&
+                m.Guid != me.Guid);
+            bool hasOtherEligibleTankReceiver = tankReceiver != null &&
+                GetNeededDungeonTransferEntries(tradableItems, tankReceiver.HeldDungeonItems, activeDungeonId, heldItems).Count > 0 &&
+                HasRequiredTankReceiverBagSpace(tankReceiver.HeldDungeonItems, tankReceiver.FreeBagSlots, tradableItems, activeDungeonId, heldItems);
+
+            uint? componentEntry = SelectDungeonRecipeCraftComponent(
+                heldItems, tradableItems, activeDungeonId, isDesignatedReceiver, hasOtherEligibleTankReceiver);
+            if (!componentEntry.HasValue)
+                return false;
+
+            WoWItem? component = me.BagItems.FirstOrDefault(i =>
+                i != null && i.IsValid && i.Entry == componentEntry.Value && i.StackCount > 0);
+            if (component == null)
+                return false;
+
+            if (me.IsMoving)
+                WoWMovement.MoveStop();
+
+            _lastDungeonCraftAttemptUtcMs = now;
+            SquadPartySyncService.LogAction("Dungeon craft: combining " + (component.Name ?? componentEntry.Value.ToString()));
+            component.UseContainerItem();
+            return true;
+        }
+
+        internal static bool HasRequiredTankReceiverBagSpace(
+            IReadOnlyCollection<uint>? receiverHeldItems,
+            int receiverFreeBagSlots,
+            IReadOnlyCollection<uint>? carrierTradableItems,
+            uint activeDungeonId,
+            IReadOnlyCollection<uint>? carrierHeldItems = null)
+        {
+            int missing = CountTotalMissingRecipeSlotsForReceiver(receiverHeldItems, carrierTradableItems, activeDungeonId, carrierHeldItems);
+            return missing == 0 || receiverFreeBagSlots >= missing;
+        }
+
+        internal static int CountTotalMissingRecipeSlotsForReceiver(
+            IReadOnlyCollection<uint>? receiverHeldItems,
+            IReadOnlyCollection<uint>? carrierTradableItems,
+            uint activeDungeonId,
+            IReadOnlyCollection<uint>? carrierHeldItems = null)
+        {
+            if (carrierTradableItems == null || carrierTradableItems.Count == 0)
+                return 0;
+
+            var missingTotal = new HashSet<uint>();
+            foreach (var recipe in GetActiveDungeonRecipes(activeDungeonId))
+            {
+                if (receiverHeldItems != null && receiverHeldItems.Contains(recipe.ResultEntry))
+                    continue;
+                if (CarrierMustSelfCraftRecipe(recipe, carrierTradableItems, carrierHeldItems))
+                    continue;
+                bool carrierHasComponent = carrierTradableItems.Contains(recipe.ComponentA) ||
+                                           carrierTradableItems.Contains(recipe.ComponentB);
+                if (!carrierHasComponent)
+                    continue;
+
+                if (receiverHeldItems == null || !receiverHeldItems.Contains(recipe.ComponentA))
+                    missingTotal.Add(recipe.ComponentA);
+                if (receiverHeldItems == null || !receiverHeldItems.Contains(recipe.ComponentB))
+                    missingTotal.Add(recipe.ComponentB);
+            }
+            return missingTotal.Count;
+        }
+
+        private static List<WoWItem> GetNeededDungeonItemsToTrade(
+            LocalPlayer me,
+            SquadMemberSummary? targetSummary,
+            uint activeDungeonId)
+        {
+            if (targetSummary == null)
+                return new List<WoWItem>();
+
+            CaptureDungeonItemTelemetry(me, activeDungeonId, out var localHeld, out var localTradable);
+            var neededEntries = GetNeededDungeonTransferEntries(localTradable, targetSummary.HeldDungeonItems, activeDungeonId, localHeld);
+            if (neededEntries.Count == 0)
+                return new List<WoWItem>();
+
+            var items = new List<WoWItem>(neededEntries.Count);
+            foreach (uint entry in neededEntries)
+            {
+                WoWItem? bagItem = me.BagItems.FirstOrDefault(i =>
+                    i != null && i.IsValid && i.Entry == entry &&
+                    IsTradableStack((i.Flags & ItemFlagSoulbound) != 0, i.StackCount));
+                if (bagItem != null)
+                    items.Add(bagItem);
+            }
+            return items;
+        }
+
+        private static bool IsActiveDungeonTransferAssignment(
+            LocalPlayer me,
+            SquadLeaderState? leader,
+            string expectedTradeTarget)
+        {
+            return leader != null &&
+                   leader.IsDungeonItemTransferAssignment &&
+                   TradeFrame.IsPartnerAuthorized(me.Name, leader.ActiveProvisionerName) &&
+                   TradeFrame.IsPartnerAuthorized(leader.ActiveTradeTargetName, expectedTradeTarget);
+        }
+
+        private bool RunDungeonItemTransferTick(
+            LocalPlayer me,
+            SquadLeaderState leader,
+            long now)
+        {
+            if (!leader.IsDungeonItemTransferAssignment)
+                return false;
+
+            var members = leader.Members ?? new List<SquadMemberSummary>();
+            string targetName = leader.ActiveTradeTargetName;
+            if (string.IsNullOrEmpty(targetName) || IsOnCooldown(targetName, isDungeonTransfer: true))
+                return false;
+
+            var targetSummary = members.FirstOrDefault(m =>
+                string.Equals(m.CharacterName, targetName, StringComparison.OrdinalIgnoreCase));
+            var neededItems = GetNeededDungeonItemsToTrade(me, targetSummary, leader.ActiveDungeonId);
+            if (neededItems.Count == 0 || targetSummary == null ||
+                !HasRequiredTankReceiverBagSpace(
+                    targetSummary.HeldDungeonItems,
+                    targetSummary.FreeBagSlots,
+                    neededItems.Select(i => i.Entry).ToList(),
+                    leader.ActiveDungeonId))
+                return false;
+
+            return InitiateTradeWithMember(me, targetSummary, now, isDungeonItemTransfer: true);
+        }
 
         /// <summary>
         /// Evaluates what consumables the local player needs based on stacks, mana class, and bag space.
@@ -331,13 +638,19 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             return true;
         }
 
+        private static string BuildTradeCooldownKey(string targetName, bool isDungeonTransfer)
+        {
+            string trimmed = targetName.Trim();
+            return isDungeonTransfer ? "dungeon:" + trimmed : trimmed;
+        }
+
         private void OnTradeCancelledOrTimeout(string targetName, int cooldownSeconds)
         {
             if (!TradeFrame.IsPartnerAuthorized(targetName, _activeTradeTarget)) return;
             if (!string.IsNullOrWhiteSpace(targetName))
             {
                 long until = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() + Math.Max(1, cooldownSeconds) * 1000L;
-                _cooldownUntilUtcMs[targetName.Trim()] = until;
+                _cooldownUntilUtcMs[BuildTradeCooldownKey(targetName, _activeTradeIsDungeonItemTransfer)] = until;
             }
             ResetActiveTradeState();
         }
@@ -387,6 +700,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private void ResetActiveTradeState()
         {
             _activeTradeTarget = string.Empty;
+            _activeTradeIsDungeonItemTransfer = false;
             _tradeStartedUtcMs = 0;
             _lastTradeOfferRetryUtcMs = 0;
             _tradeItemsPlaced = false;
@@ -394,11 +708,11 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             _offeredItems.Clear();
         }
 
-        private bool IsOnCooldown(string targetName)
+        private bool IsOnCooldown(string targetName, bool isDungeonTransfer = false)
         {
             long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             return !string.IsNullOrWhiteSpace(targetName) &&
-                   _cooldownUntilUtcMs.TryGetValue(targetName.Trim(), out long until) &&
+                   _cooldownUntilUtcMs.TryGetValue(BuildTradeCooldownKey(targetName, isDungeonTransfer), out long until) &&
                    now < until;
         }
 
@@ -428,6 +742,14 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 // A confirmed mutual acceptance closes the frame on success; do not
                 // misclassify that as a timeout and penalize the recipient.
                 if (_tradeCompletionPending)
+                {
+                    ResetActiveTradeState();
+                    return false;
+                }
+                bool transferMismatch = _activeTradeIsDungeonItemTransfer
+                    ? !IsActiveDungeonTransferAssignment(me, leader, _activeTradeTarget)
+                    : leader?.IsDungeonItemTransferAssignment == true;
+                if (transferMismatch)
                 {
                     ResetActiveTradeState();
                     return false;
@@ -483,6 +805,17 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 return true;
             }
 
+            if (SquadContext.IsDungeonModeActive &&
+                leader != null &&
+                leader.IsDungeonItemTransferAssignment &&
+                !string.IsNullOrEmpty(leader.ActiveProvisionerName))
+            {
+                if (string.Equals(leader.ActiveProvisionerName, me.Name, StringComparison.OrdinalIgnoreCase))
+                    return RunDungeonItemTransferTick(me, leader, now);
+                if (string.Equals(leader.ActiveTradeTargetName, me.Name, StringComparison.OrdinalIgnoreCase))
+                    return RunReceiverApproachProvisioner(me, leader);
+            }
+
             if (TryConjureForSelf(settings))
                 return true;
 
@@ -499,32 +832,17 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (leader == null || string.IsNullOrEmpty(leader.ActiveProvisionerName) ||
                 !string.Equals(leader.ActiveProvisionerName, me.Name, StringComparison.OrdinalIgnoreCase))
             {
-                // Receiver: if coordinator designated us as ActiveTradeTargetName, step closer to provisioner.
                 if (leader != null &&
                     !string.IsNullOrEmpty(leader.ActiveProvisionerName) &&
                     string.Equals(leader.ActiveTradeTargetName, me.Name, StringComparison.OrdinalIgnoreCase))
                 {
-                    var prov = leader.Members?.FirstOrDefault(m =>
-                        string.Equals(m.CharacterName, leader.ActiveProvisionerName, StringComparison.OrdinalIgnoreCase));
-                    if (prov != null && me.Location.Distance(new WoWPoint(prov.X, prov.Y, prov.Z)) > 5f)
-                    {
-                        SquadPartySyncService.LogAction("Provision: approaching " + prov.CharacterName);
-                        Navigator.MoveTo(new WoWPoint(prov.X, prov.Y, prov.Z), "Approaching provisioner " + prov.CharacterName);
-                        return true;
-                    }
-                    if (prov != null)
-                    {
-                        if (me.IsMoving)
-                            WoWMovement.MoveStop();
-                        if (LootFrame.Instance.IsVisible)
-                            Lua.DoString("CloseLoot()");
-                        Lua.DoString("if MerchantFrame and MerchantFrame:IsVisible() then CloseMerchant() end if GossipFrame and GossipFrame:IsVisible() then CloseGossip() end");
-                        SquadPartySyncService.LogAction("Provision: waiting for offer");
-                        return true;
-                    }
+                    return RunReceiverApproachProvisioner(me, leader);
                 }
                 return false;
             }
+
+            if (leader.IsDungeonItemTransferAssignment)
+                return SquadContext.IsDungeonModeActive && RunDungeonItemTransferTick(me, leader, now);
 
             if (me.Class == WoWClass.Mage && settings.EnableMageProvisioning)
                 return RunMageProvisionerTick(me, settings, leader, now);
@@ -535,6 +853,27 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             return false;
         }
 
+        private static bool RunReceiverApproachProvisioner(LocalPlayer me, SquadLeaderState leader)
+        {
+            var prov = leader.Members?.FirstOrDefault(m =>
+                string.Equals(m.CharacterName, leader.ActiveProvisionerName, StringComparison.OrdinalIgnoreCase));
+            if (prov == null || prov.MapId != me.MapId)
+                return false;
+            if (me.Location.Distance(new WoWPoint(prov.X, prov.Y, prov.Z)) > 5f)
+            {
+                SquadPartySyncService.LogAction("Provision: approaching " + prov.CharacterName);
+                Navigator.MoveTo(new WoWPoint(prov.X, prov.Y, prov.Z), "Approaching provisioner " + prov.CharacterName);
+                return true;
+            }
+            if (me.IsMoving)
+                WoWMovement.MoveStop();
+            if (LootFrame.Instance.IsVisible)
+                Lua.DoString("CloseLoot()");
+            Lua.DoString("if MerchantFrame and MerchantFrame:IsVisible() then CloseMerchant() end if GossipFrame and GossipFrame:IsVisible() then CloseGossip() end");
+            SquadPartySyncService.LogAction("Provision: waiting for offer");
+            return true;
+        }
+
         private bool HandleOpenTradeFrame(LocalPlayer me, SquadSettings settings, SquadLeaderState? leader, long now)
         {
             string partner = TradeFrame.Instance.PartnerName;
@@ -543,6 +882,16 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             if (!string.IsNullOrEmpty(_activeTradeTarget))
             {
                 if (!TradeFrame.IsPartnerAuthorized(partner, _activeTradeTarget))
+                {
+                    TradeFrame.Instance.CancelTrade();
+                    ResetActiveTradeState();
+                    return true;
+                }
+
+                bool transferMismatch = _activeTradeIsDungeonItemTransfer
+                    ? !IsActiveDungeonTransferAssignment(me, leader, _activeTradeTarget)
+                    : leader?.IsDungeonItemTransferAssignment == true;
+                if (transferMismatch)
                 {
                     TradeFrame.Instance.CancelTrade();
                     ResetActiveTradeState();
@@ -561,25 +910,53 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     var targetSummary = leader?.Members?.FirstOrDefault(m =>
                         string.Equals(m.CharacterName, _activeTradeTarget, StringComparison.OrdinalIgnoreCase));
                     int receiverLevel = targetSummary?.Level ?? me.Level;
-                    bool wantFood = me.Class == WoWClass.Mage && settings.EnableMageProvisioning && SpellManager.HasSpell("Conjure Food") && (targetSummary?.WantsFood ?? false);
-                    bool wantDrink = me.Class == WoWClass.Mage && settings.EnableMageProvisioning && SpellManager.HasSpell("Conjure Water") && (targetSummary?.WantsDrink ?? false);
-                    bool wantHs = me.Class == WoWClass.Warlock && settings.EnableWarlockHealthstones && (targetSummary?.WantsHealthstone ?? false);
+                    var dungeonTransferItems = SquadContext.IsDungeonModeActive && _activeTradeIsDungeonItemTransfer
+                        ? (leader?.IsDungeonItemTransferAssignment == true
+                            ? GetNeededDungeonItemsToTrade(me, targetSummary, leader.ActiveDungeonId)
+                            : new List<WoWItem>())
+                        : new List<WoWItem>();
 
                     int tradeSlot = 1;
                     bool placed = true;
-                    foreach (var request in new[] { (wantFood, true, false, false, settings.TargetMemberFoodStack),
-                        (wantDrink, false, true, false, settings.TargetMemberDrinkStack), (wantHs, false, false, true, 1) })
+                    if (_activeTradeIsDungeonItemTransfer)
                     {
-                        if (!request.Item1) continue;
-                        var item = FindTradableBagItem(me, receiverLevel, request.Item2, request.Item3, request.Item4);
-                        if (item == null) { placed = false; break; }
-                        int count = (int)Math.Min(item.StackCount, (uint)Math.Max(1, request.Item5));
-                        if (_offeredItems.Any(i => i.Entry == item.Entry && i.Count >= count)) continue;
-                        if (!TradeFrame.Instance.PutItem(item, tradeSlot, count) ||
-                            !TradeFrame.Instance.ContainsPlayerItem(tradeSlot, item.Entry, count))
-                        { placed = false; break; }
-                        _offeredItems.Add((tradeSlot, item.Entry, count));
-                        tradeSlot++;
+                        foreach (var dungeonItem in dungeonTransferItems)
+                        {
+                            if (tradeSlot > 6)
+                                break;
+                            int count = 1;
+                            if (_offeredItems.Any(i => i.Entry == dungeonItem.Entry && i.Count >= count))
+                                continue;
+                            if (!TradeFrame.Instance.PutItem(dungeonItem, tradeSlot, count) ||
+                                !TradeFrame.Instance.ContainsPlayerItem(tradeSlot, dungeonItem.Entry, count))
+                            {
+                                placed = false;
+                                break;
+                            }
+                            _offeredItems.Add((tradeSlot, dungeonItem.Entry, count));
+                            tradeSlot++;
+                        }
+                    }
+                    else
+                    {
+                        bool wantFood = me.Class == WoWClass.Mage && settings.EnableMageProvisioning && SpellManager.HasSpell("Conjure Food") && (targetSummary?.WantsFood ?? false);
+                        bool wantDrink = me.Class == WoWClass.Mage && settings.EnableMageProvisioning && SpellManager.HasSpell("Conjure Water") && (targetSummary?.WantsDrink ?? false);
+                        bool wantHs = me.Class == WoWClass.Warlock && settings.EnableWarlockHealthstones && (targetSummary?.WantsHealthstone ?? false);
+
+                        foreach (var request in new[] { (wantFood, true, false, false, settings.TargetMemberFoodStack),
+                            (wantDrink, false, true, false, settings.TargetMemberDrinkStack), (wantHs, false, false, true, 1) })
+                        {
+                            if (!request.Item1) continue;
+                            var item = FindTradableBagItem(me, receiverLevel, request.Item2, request.Item3, request.Item4);
+                            if (item == null) { placed = false; break; }
+                            int count = (int)Math.Min(item.StackCount, (uint)Math.Max(1, request.Item5));
+                            if (_offeredItems.Any(i => i.Entry == item.Entry && i.Count >= count)) continue;
+                            if (!TradeFrame.Instance.PutItem(item, tradeSlot, count) ||
+                                !TradeFrame.Instance.ContainsPlayerItem(tradeSlot, item.Entry, count))
+                            { placed = false; break; }
+                            _offeredItems.Add((tradeSlot, item.Entry, count));
+                            tradeSlot++;
+                        }
                     }
                     if (!placed || tradeSlot == 1)
                     {
@@ -774,7 +1151,11 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             return InitiateTradeWithMember(me, targetSummary, now);
         }
 
-        private bool InitiateTradeWithMember(LocalPlayer me, SquadMemberSummary targetSummary, long now)
+        private bool InitiateTradeWithMember(
+            LocalPlayer me,
+            SquadMemberSummary targetSummary,
+            long now,
+            bool isDungeonItemTransfer = false)
         {
             WoWPlayer? targetPlayer = targetSummary.Guid != 0
                 ? ObjectManager.GetObjectByGuid<WoWPlayer>(targetSummary.Guid)
@@ -815,6 +1196,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             }
 
             _activeTradeTarget = targetSummary.CharacterName;
+            _activeTradeIsDungeonItemTransfer = isDungeonItemTransfer;
             _tradeStartedUtcMs = now;
             _lastTradeOfferRetryUtcMs = now;
             _tradeItemsPlaced = false;
