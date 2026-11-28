@@ -174,6 +174,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 if (isDungeon)
                 {
                     WoWPoint meLoc = StyxWoW.Me.Location;
+                    uint meMapId = StyxWoW.Me.MapId;
+                    long filterNowMs = Environment.TickCount64;
                     bool canPull = StyxWoW.Me.Combat || committedGuid != 0 || CanInitiatePull(leader, settings.MaxPullGatherDistance);
                     foreach (WoWObject obj in incomingUnits)
                     {
@@ -193,7 +195,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
                         if (committedGuid != 0 && unit.Guid == committedGuid)
                         {
-                            if (!IsTemporarilyPullBlacklisted(unit.Guid, Environment.TickCount64))
+                            if (!IsTemporarilyPullBlacklisted(unit.Guid, filterNowMs))
                                 outgoingUnits.Add(unit);
                             continue;
                         }
@@ -202,13 +204,13 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                         {
                             if (!unit.IsHostile || unit.DistanceSqr > 1225.0)
                                 continue;
-                            if (IsTemporarilyPullBlacklisted(unit.Guid, Environment.TickCount64))
+                            if (IsTemporarilyPullBlacklisted(unit.Guid, filterNowMs))
                                 continue;
                             if (global::Bots.DungeonBuddy.Profiles.ProfileManager.IsNpcInPullBlackspot(unit))
                                 continue;
                             if (!unit.InLineOfSight)
                                 continue;
-                            if (!unit.IsFlying && !Navigator.CanNavigateWithinDistance(meLoc, unit.Location, 35f))
+                            if (!unit.IsFlying && !CanNavigateWithinDistanceCached(meMapId, meLoc, unit.Guid, unit.Location, 35f, filterNowMs))
                                 continue;
                             outgoingUnits.Add(unit);
                         }
@@ -676,6 +678,31 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private static bool _lastPullCastCountedFailure;
         private static bool _pullLosErrorSinceLastCast;
         private static readonly Dictionary<ulong, long> PullBlacklistedUntilMs = new();
+        internal const long PullNavCacheTtlMs = 500L;
+        internal const float PullNavCacheMoveTolerance = 1.5f;
+        private const int PullNavCacheMaxEntries = 64;
+
+        private readonly struct PullNavCacheEntry
+        {
+            public PullNavCacheEntry(uint mapId, WoWPoint from, WoWPoint to, float maxDistance, bool reachable, long timestampUtcMs)
+            {
+                MapId = mapId;
+                From = from;
+                To = to;
+                MaxDistance = maxDistance;
+                Reachable = reachable;
+                TimestampUtcMs = timestampUtcMs;
+            }
+
+            public uint MapId { get; }
+            public WoWPoint From { get; }
+            public WoWPoint To { get; }
+            public float MaxDistance { get; }
+            public bool Reachable { get; }
+            public long TimestampUtcMs { get; }
+        }
+
+        private static readonly Dictionary<ulong, PullNavCacheEntry> PullNavCache = new();
         private static readonly SquadApproach PullApproach = new();
 
         private static string? _localizedLosErrorText;
@@ -787,6 +814,82 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             }
         }
 
+        internal static bool ShouldReusePullNavCache(
+            uint cachedMapId,
+            WoWPoint cachedFrom,
+            WoWPoint cachedTo,
+            float cachedMaxDistance,
+            long cachedUtcMs,
+            uint currentMapId,
+            WoWPoint currentFrom,
+            WoWPoint currentTo,
+            float currentMaxDistance,
+            long nowUtcMs)
+        {
+            return cachedUtcMs > 0 &&
+                   nowUtcMs >= cachedUtcMs &&
+                   nowUtcMs - cachedUtcMs < PullNavCacheTtlMs &&
+                   cachedMapId == currentMapId &&
+                   MathF.Abs(cachedMaxDistance - currentMaxDistance) <= 0.01f &&
+                   cachedFrom.Distance(currentFrom) <= PullNavCacheMoveTolerance &&
+                   cachedTo.Distance(currentTo) <= PullNavCacheMoveTolerance;
+        }
+
+        private static bool CanNavigateWithinDistanceCached(
+            uint mapId,
+            WoWPoint from,
+            ulong unitGuid,
+            WoWPoint to,
+            float maxDistance,
+            long nowUtcMs)
+        {
+            if (unitGuid != 0)
+            {
+                lock (PullStateLock)
+                {
+                    if (PullNavCache.TryGetValue(unitGuid, out var cached) &&
+                        ShouldReusePullNavCache(
+                            cached.MapId,
+                            cached.From,
+                            cached.To,
+                            cached.MaxDistance,
+                            cached.TimestampUtcMs,
+                            mapId,
+                            from,
+                            to,
+                            maxDistance,
+                            nowUtcMs))
+                    {
+                        return cached.Reachable;
+                    }
+                }
+            }
+
+            bool reachable = Navigator.CanNavigateWithinDistance(from, to, maxDistance);
+            if (unitGuid != 0)
+            {
+                lock (PullStateLock)
+                {
+                    if (PullNavCache.Count >= PullNavCacheMaxEntries)
+                    {
+                        foreach (ulong expired in PullNavCache
+                            .Where(kv => nowUtcMs < kv.Value.TimestampUtcMs || nowUtcMs - kv.Value.TimestampUtcMs >= PullNavCacheTtlMs)
+                            .Select(kv => kv.Key)
+                            .ToList())
+                        {
+                            PullNavCache.Remove(expired);
+                        }
+                        if (PullNavCache.Count >= PullNavCacheMaxEntries)
+                            PullNavCache.Clear();
+                    }
+
+                    PullNavCache[unitGuid] = new PullNavCacheEntry(mapId, from, to, maxDistance, reachable, nowUtcMs);
+                }
+            }
+
+            return reachable;
+        }
+
         internal static void ResetPullStateForTests()
         {
             lock (PullStateLock)
@@ -799,6 +902,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 _lastPullCastCountedFailure = false;
                 _pullLosErrorSinceLastCast = false;
                 PullBlacklistedUntilMs.Clear();
+                PullNavCache.Clear();
             }
         }
 
@@ -925,6 +1029,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 return null;
 
             long nowMs = Environment.TickCount64;
+            uint fromMapId = StyxWoW.Me?.MapId ?? 0U;
             bool currentBlacklisted = IsTemporarilyPullBlacklisted(current.Guid, nowMs);
             int currentPack = CountPullPackSize(current);
             if (!currentBlacklisted && currentPack <= MaxComfortablePackSize)
@@ -954,7 +1059,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     continue;
 
                 inspected++;
-                if (!unit.InLineOfSight || (!unit.IsFlying && !Navigator.CanNavigateWithinDistance(from, unit.Location, 35f)))
+                if (!unit.InLineOfSight || (!unit.IsFlying && !CanNavigateWithinDistanceCached(fromMapId, from, unit.Guid, unit.Location, 35f, nowMs)))
                     continue;
                 int pack = CountPullPackSize(unit);
                 if (currentBlacklisted)

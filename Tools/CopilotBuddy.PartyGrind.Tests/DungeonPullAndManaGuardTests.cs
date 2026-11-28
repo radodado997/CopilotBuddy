@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using CopilotBuddy.Bots.PartyGrind.Logic;
 using Styx.Combat.CombatRoutine;
 using Styx.Logic.Pathing;
+using Styx.Logic.POI;
 using Styx.PartyGrind;
 using Styx.PartyGrind.IPC;
 using Xunit;
@@ -365,6 +366,7 @@ namespace CopilotBuddy.PartyGrind.Tests
                 1,
                 lineOfSightCheck: (candidate, _) => candidate.Y < 99.0f);
 
+            Assert.NotEqual(WoWPoint.Zero, chosen);
             Assert.True(chosen.Y < 99.0f);
             Assert.True(chosen.Distance(mobPos) >= 16f);
 
@@ -549,6 +551,170 @@ namespace CopilotBuddy.PartyGrind.Tests
             Assert.False(SquadTankBridge.IsTemporarilyPullBlacklisted(baelogGuid, 21_000L));
             Assert.True(SquadTankBridge.ShouldRejectIdlePullTarget(isTemporarilyBlacklisted: true, targetEngaged: false));
             Assert.False(SquadTankBridge.ShouldRejectIdlePullTarget(isTemporarilyBlacklisted: true, targetEngaged: true));
+        }
+
+        [Fact]
+        public void CorridorBlock_SlowTwoSecondTicksDoNotResetEightSecondGraceWindow()
+        {
+            uint blockedMap = 0U;
+            WoWPoint blockedObj = WoWPoint.Zero;
+            long lastEval = 0L;
+            long blockedSince = 0L;
+            long now = 5_000_000L;
+            var reveloshPos = new WoWPoint(-233.5f, 171.1f, -44.6f);
+
+            bool firstHold = CopilotBuddy.Bots.PartyGrind.PartyGrindBot.EvaluateDungeonCorridorBlock(
+                bypassTrashGrace: false,
+                hasTrashOnSegment: true,
+                70U,
+                reveloshPos,
+                ref blockedMap,
+                ref blockedObj,
+                ref lastEval,
+                ref blockedSince,
+                now,
+                out bool newlyBlocked,
+                out bool graceExpired);
+            Assert.True(firstHold);
+            Assert.True(newlyBlocked);
+            Assert.False(graceExpired);
+
+            for (int tick = 1; tick <= 4; tick++)
+            {
+                now += 1700L;
+                bool hold = CopilotBuddy.Bots.PartyGrind.PartyGrindBot.EvaluateDungeonCorridorBlock(
+                    bypassTrashGrace: false,
+                    hasTrashOnSegment: true,
+                    70U,
+                    reveloshPos,
+                    ref blockedMap,
+                    ref blockedObj,
+                    ref lastEval,
+                    ref blockedSince,
+                    now,
+                    out bool restarted,
+                    out bool tickExpired);
+                Assert.True(hold);
+                Assert.False(restarted);
+                Assert.False(tickExpired);
+            }
+
+            now += 1700L;
+            bool holdAtEnd = CopilotBuddy.Bots.PartyGrind.PartyGrindBot.EvaluateDungeonCorridorBlock(
+                bypassTrashGrace: false,
+                hasTrashOnSegment: true,
+                70U,
+                reveloshPos,
+                ref blockedMap,
+                ref blockedObj,
+                ref lastEval,
+                ref blockedSince,
+                now,
+                out _,
+                out bool expiredAtEnd);
+            Assert.False(holdAtEnd);
+            Assert.True(expiredAtEnd);
+            Assert.Equal(0L, blockedSince);
+        }
+
+        [Fact]
+        public void DungeonTrashScan_MatchesPullEligibilityAndExcludesUnpullableUnits()
+        {
+            float radius = CopilotBuddy.Bots.PartyGrind.PartyGrindBot.DungeonTrashScanRadius;
+
+            Assert.Equal(35f, radius);
+            Assert.True(CopilotBuddy.Bots.PartyGrind.PartyGrindBot.IsEligibleDungeonTrashUnit(
+                isValid: true, isDead: false, canSelect: true, attackable: true,
+                isHostile: true, inCombat: false, isFriendly: false, isPlayer: false,
+                isCritter: false, isNonCombatPet: false, hasControllingPlayer: false,
+                inPullBlackspot: false,
+                distance: 34.5f, scanRadius: radius));
+
+            Assert.True(CopilotBuddy.Bots.PartyGrind.PartyGrindBot.IsEligibleDungeonTrashUnit(
+                isValid: true, isDead: false, canSelect: true, attackable: true,
+                isHostile: false, inCombat: true, isFriendly: false, isPlayer: false,
+                isCritter: false, isNonCombatPet: false, hasControllingPlayer: false,
+                inPullBlackspot: false,
+                distance: 15f, scanRadius: radius));
+
+            Assert.False(CopilotBuddy.Bots.PartyGrind.PartyGrindBot.IsEligibleDungeonTrashUnit(
+                isValid: true, isDead: false, canSelect: true, attackable: true,
+                isHostile: true, inCombat: false, isFriendly: false, isPlayer: false,
+                isCritter: false, isNonCombatPet: false, hasControllingPlayer: false,
+                inPullBlackspot: false,
+                distance: 38f, scanRadius: radius));
+
+            Assert.False(CopilotBuddy.Bots.PartyGrind.PartyGrindBot.IsEligibleDungeonTrashUnit(
+                isValid: true, isDead: false, canSelect: true, attackable: true,
+                isHostile: false, inCombat: false, isFriendly: false, isPlayer: false,
+                isCritter: false, isNonCombatPet: false, hasControllingPlayer: false,
+                inPullBlackspot: false,
+                distance: 12f, scanRadius: radius));
+
+            Assert.False(CopilotBuddy.Bots.PartyGrind.PartyGrindBot.IsEligibleDungeonTrashUnit(
+                isValid: true, isDead: false, canSelect: false, attackable: true,
+                isHostile: true, inCombat: false, isFriendly: false, isPlayer: false,
+                isCritter: false, isNonCombatPet: false, hasControllingPlayer: false,
+                inPullBlackspot: false,
+                distance: 12f, scanRadius: radius));
+
+            Assert.False(CopilotBuddy.Bots.PartyGrind.PartyGrindBot.IsEligibleDungeonTrashUnit(
+                isValid: true, isDead: false, canSelect: true, attackable: true,
+                isHostile: true, inCombat: false, isFriendly: false, isPlayer: false,
+                isCritter: false, isNonCombatPet: false, hasControllingPlayer: false,
+                inPullBlackspot: true,
+                distance: 12f, scanRadius: radius));
+
+            Assert.True(CopilotBuddy.Bots.PartyGrind.PartyGrindBot.IsEligibleDungeonTrashUnit(
+                isValid: true, isDead: false, canSelect: true, attackable: true,
+                isHostile: true, inCombat: true, isFriendly: false, isPlayer: false,
+                isCritter: false, isNonCombatPet: false, hasControllingPlayer: false,
+                inPullBlackspot: true,
+                distance: 12f, scanRadius: radius));
+        }
+
+        [Fact]
+        public void DungeonObjectTimeout_SuspendsWhileCastingOrChanneling()
+        {
+            long started = 100_000L;
+            long afterCutoff = started + SquadDungeonService.ObjectRunningTimeoutMs;
+
+            Assert.False(SquadDungeonService.ShouldTimeOutDungeonObjectHandler(started, afterCutoff, isCastingOrChanneling: true));
+            Assert.True(SquadDungeonService.ShouldTimeOutDungeonObjectHandler(started, afterCutoff, isCastingOrChanneling: false));
+            Assert.False(SquadDungeonService.ShouldTimeOutDungeonObjectHandler(started, afterCutoff - 1L, isCastingOrChanneling: false));
+        }
+
+        [Fact]
+        public void PullAndLeaderNavCaches_ReuseWithinTtlAndMoveToleranceOnly()
+        {
+            var origin = new WoWPoint(-250f, 134f, -47f);
+            var target = new WoWPoint(-233.5f, 171.1f, -44.6f);
+
+            Assert.True(SquadTankBridge.ShouldReusePullNavCache(
+                70U, origin, target, 35f, 10_000L,
+                70U, new WoWPoint(-249.5f, 134f, -47f), target, 35f, 10_400L));
+            Assert.False(SquadTankBridge.ShouldReusePullNavCache(
+                70U, origin, target, 35f, 10_000L,
+                70U, origin, target, 35f, 10_500L));
+            Assert.False(SquadTankBridge.ShouldReusePullNavCache(
+                70U, origin, target, 35f, 10_000L,
+                70U, new WoWPoint(-247f, 134f, -47f), target, 35f, 10_100L));
+            Assert.False(SquadTankBridge.ShouldReusePullNavCache(
+                70U, origin, target, 35f, 10_000L,
+                109U, origin, target, 35f, 10_100L));
+
+            Assert.True(SquadDungeonService.ShouldReuseLeaderTargetCache(
+                10_000L, 70U, origin, 6910U, PoiType.None, WoWPoint.Zero, 0, target,
+                10_250L, 70U, new WoWPoint(-249f, 134f, -47f), 6910U, PoiType.None, WoWPoint.Zero, 0));
+            Assert.False(SquadDungeonService.ShouldReuseLeaderTargetCache(
+                10_000L, 70U, origin, 6910U, PoiType.None, WoWPoint.Zero, 0, target,
+                10_400L, 70U, origin, 6910U, PoiType.None, WoWPoint.Zero, 0));
+            Assert.False(SquadDungeonService.ShouldReuseLeaderTargetCache(
+                10_000L, 70U, origin, 6910U, PoiType.None, WoWPoint.Zero, 0, target,
+                10_100L, 70U, origin, 7228U, PoiType.None, WoWPoint.Zero, 0));
+            Assert.False(SquadDungeonService.ShouldReuseLeaderTargetCache(
+                10_000L, 70U, origin, 6910U, PoiType.None, WoWPoint.Zero, 0, target,
+                10_100L, 70U, new WoWPoint(-234f, 170f, -44.6f), 6910U, PoiType.None, WoWPoint.Zero, 0));
         }
     }
 }

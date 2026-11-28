@@ -83,8 +83,9 @@ namespace CopilotBuddy.Bots.PartyGrind
         private const float PullCommitMaxTargetDistance = 60.0f;
         private const float PullCandidateMaxDistance = 55.0f;
         private const long CombatFocusStickyMs = 2500L;
-        private const float DungeonTrashScanRadius = 40f;
+        internal const float DungeonTrashScanRadius = 35f;
         internal const long DungeonAdvanceBlockMaxMs = 8000L;
+        internal const long DungeonCorridorInactivityResetMs = 5000L;
         private const long DungeonForcedStepMaxMs = 8000L;
         private const long DungeonAdvancePathRefreshMs = 500L;
         private const float RestThreatRadius = 15f;
@@ -964,6 +965,33 @@ namespace CopilotBuddy.Bots.PartyGrind
         /// breadcrumb step is safe. Hostiles already locked in a fight with the squad are included
         /// on purpose: the tank must finish that pack before walking deeper into the corridor.
         /// </summary>
+        internal static bool IsEligibleDungeonTrashUnit(
+            bool isValid,
+            bool isDead,
+            bool canSelect,
+            bool attackable,
+            bool isHostile,
+            bool inCombat,
+            bool isFriendly,
+            bool isPlayer,
+            bool isCritter,
+            bool isNonCombatPet,
+            bool hasControllingPlayer,
+            bool inPullBlackspot,
+            float distance,
+            float scanRadius)
+        {
+            if (!isValid || isDead || !canSelect || !attackable)
+                return false;
+            if (!isHostile && !inCombat)
+                return false;
+            if (isFriendly || isPlayer || isCritter || isNonCombatPet || hasControllingPlayer)
+                return false;
+            if (!inCombat && inPullBlackspot)
+                return false;
+            return distance <= scanRadius;
+        }
+
         private static List<WoWPoint> CollectDungeonTrashPoints(WoWPoint from, float radius)
         {
             var points = new List<WoWPoint>();
@@ -971,12 +999,24 @@ namespace CopilotBuddy.Bots.PartyGrind
             {
                 if (unit == null || !unit.IsValid || unit.Dead)
                     continue;
-                if (!unit.Attackable || unit.IsFriendly || unit.IsPlayer || unit.IsCritter || unit.IsNonCombatPet)
+                if (!IsEligibleDungeonTrashUnit(
+                        isValid: true,
+                        isDead: false,
+                        unit.CanSelect,
+                        unit.Attackable,
+                        unit.IsHostile,
+                        unit.Combat,
+                        unit.IsFriendly,
+                        unit.IsPlayer,
+                        unit.IsCritter,
+                        unit.IsNonCombatPet,
+                        unit.ControllingPlayer != null,
+                        global::Bots.DungeonBuddy.Profiles.ProfileManager.IsNpcInPullBlackspot(unit),
+                        unit.Location.Distance(from),
+                        radius))
+                {
                     continue;
-                if (unit.ControllingPlayer != null)
-                    continue;
-                if (unit.Location.Distance(from) > radius)
-                    continue;
+                }
                 points.Add(unit.Location);
             }
             return points;
@@ -1017,7 +1057,7 @@ namespace CopilotBuddy.Bots.PartyGrind
             out bool newlyBlocked,
             out bool graceExpired,
             long blockGraceMs = DungeonAdvanceBlockMaxMs,
-            long continuousEvalGapMs = 1500L)
+            long continuousEvalGapMs = DungeonCorridorInactivityResetMs)
         {
             newlyBlocked = false;
             graceExpired = false;
@@ -3899,6 +3939,7 @@ namespace CopilotBuddy.Bots.PartyGrind
                             _packPullHoldSinceUtcMs = 0;
                             _currentFocusGuid = dungeonTarget.Guid;
                             BeginPullCommit(dungeonTarget.Guid, now);
+                            ResetDungeonCorridorBlock();
                             dungeonTarget.Target();
                             if (!me.Combat && !anotherTankDrives)
                             {

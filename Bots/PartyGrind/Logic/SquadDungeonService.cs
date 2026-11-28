@@ -142,6 +142,16 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         private uint _breadcrumbBossEntry;
         private int _breadcrumbIndex;
         private readonly Dictionary<(int X, int Y, int Z, uint MapId), long> _blacklistedNavPoints = new();
+        internal const long LeaderTargetCacheTtlMs = 350L;
+        internal const float LeaderTargetCacheMoveTolerance = 2.0f;
+        private long _cachedLeaderTargetUtcMs;
+        private uint _cachedLeaderTargetMapId;
+        private WoWPoint _cachedLeaderTargetOrigin = WoWPoint.Zero;
+        private uint _cachedLeaderTargetBossEntry;
+        private PoiType _cachedLeaderTargetPoiType;
+        private WoWPoint _cachedLeaderTargetPoiLoc = WoWPoint.Zero;
+        private int _cachedLeaderTargetBlacklistCount;
+        private WoWPoint _cachedLeaderTargetResult = WoWPoint.Zero;
         private bool _lfgRunCompletedAwaitingRequeue;
         private bool _countedCurrentWalkInEntry;
         internal const long ObjectFirstCompletionCooldownMs = 5000L;
@@ -206,6 +216,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             _breadcrumbBossEntry = 0;
             _breadcrumbIndex = 0;
             _blacklistedNavPoints.Clear();
+            ClearLeaderTargetCache();
             _lfgRunCompletedAwaitingRequeue = false;
             ClearResetPendingOutside();
             ClearObjectScriptTracking();
@@ -240,6 +251,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             _breadcrumbBossEntry = 0;
             _breadcrumbIndex = 0;
             _blacklistedNavPoints.Clear();
+            ClearLeaderTargetCache();
             _lfgRunCompletedAwaitingRequeue = false;
             _lastInstanceResetAttemptUtcMs = 0;
             _lastObservedResetGenOnFollower = 0;
@@ -356,6 +368,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     _breadcrumbBossEntry = 0;
                     _breadcrumbIndex = 0;
                     _blacklistedNavPoints.Clear();
+                    ClearLeaderTargetCache();
                     ClearObjectScriptTracking();
                     DungeonManager.SetDungeonById(desiredDungeonId);
                     BossManager.RestoreKilledBosses(_currentRunKilledBosses);
@@ -1526,7 +1539,11 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     }
                 }
 
-                if (now - _activeObjectRunningSinceMs >= ObjectRunningTimeoutMs)
+                bool isCastingOrChanneling = me.IsCasting || me.IsChanneling;
+                if (isCastingOrChanneling)
+                    _activeObjectRunningSinceMs = now;
+
+                if (ShouldTimeOutDungeonObjectHandler(_activeObjectRunningSinceMs, now, isCastingOrChanneling))
                 {
                     ulong timedOutGuid = handledGuid != 0UL ? handledGuid : _activeObjectGuid;
                     if (timedOutGuid != 0UL)
@@ -1797,6 +1814,13 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         public void BlacklistDungeonNavigationPoint(uint mapId, WoWPoint point, long nowUtcMs)
         {
             BlacklistNavPoint(_blacklistedNavPoints, mapId, point, nowUtcMs);
+            ClearLeaderTargetCache();
+        }
+
+        private void ClearLeaderTargetCache()
+        {
+            _cachedLeaderTargetUtcMs = 0;
+            _cachedLeaderTargetResult = WoWPoint.Zero;
         }
 
         public bool IsDungeonNavigationPointBlacklisted(uint mapId, WoWPoint point, long nowUtcMs) =>
@@ -1902,6 +1926,46 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             return Navigator.NavigationProvider != null && Navigator.CanNavigateFully(from, candidate);
         }
 
+        internal static bool ShouldTimeOutDungeonObjectHandler(
+            long runningSinceMs,
+            long nowUtcMs,
+            bool isCastingOrChanneling)
+        {
+            return !isCastingOrChanneling &&
+                   runningSinceMs > 0L &&
+                   nowUtcMs - runningSinceMs >= ObjectRunningTimeoutMs;
+        }
+
+        internal static bool ShouldReuseLeaderTargetCache(
+            long cachedUtcMs,
+            uint cachedMapId,
+            WoWPoint cachedOrigin,
+            uint cachedBossEntry,
+            PoiType cachedPoiType,
+            WoWPoint cachedPoiLoc,
+            int cachedBlacklistCount,
+            WoWPoint cachedResult,
+            long nowUtcMs,
+            uint currentMapId,
+            WoWPoint currentLocation,
+            uint currentBossEntry,
+            PoiType currentPoiType,
+            WoWPoint currentPoiLoc,
+            int currentBlacklistCount)
+        {
+            return cachedUtcMs > 0 &&
+                   nowUtcMs >= cachedUtcMs &&
+                   nowUtcMs - cachedUtcMs < LeaderTargetCacheTtlMs &&
+                   cachedMapId == currentMapId &&
+                   cachedOrigin.Distance(currentLocation) <= LeaderTargetCacheMoveTolerance &&
+                   cachedBossEntry == currentBossEntry &&
+                   cachedPoiType == currentPoiType &&
+                   cachedPoiLoc == currentPoiLoc &&
+                   cachedBlacklistCount == currentBlacklistCount &&
+                   (cachedResult == WoWPoint.Zero ||
+                    currentLocation.Distance(cachedResult) > HotspotArrivalDistance);
+        }
+
         public WoWPoint ComputeLeaderNextDungeonPoint()
         {
             var me = StyxWoW.Me;
@@ -1911,6 +1975,62 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             long nowUtcMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             PruneExpiredNavBlacklist(_blacklistedNavPoints, nowUtcMs);
 
+            var currentBoss = BossManager.CurrentBoss;
+            uint currentBossEntry = currentBoss?.Entry ?? 0U;
+            PoiType currentPoiType = BotPoi.Current.Type;
+            WoWPoint currentPoiLoc = BotPoi.Current.Location;
+            if (currentPoiType == PoiType.Hotspot &&
+                currentPoiLoc != WoWPoint.Zero &&
+                me.Location.Distance(currentPoiLoc) <= HotspotArrivalDistance)
+            {
+                BotPoi.Clear("Reached dungeon hotspot");
+                currentPoiType = BotPoi.Current.Type;
+                currentPoiLoc = BotPoi.Current.Location;
+                ClearLeaderTargetCache();
+            }
+            int blacklistCount = _blacklistedNavPoints.Count;
+
+            if (ShouldReuseLeaderTargetCache(
+                    _cachedLeaderTargetUtcMs,
+                    _cachedLeaderTargetMapId,
+                    _cachedLeaderTargetOrigin,
+                    _cachedLeaderTargetBossEntry,
+                    _cachedLeaderTargetPoiType,
+                    _cachedLeaderTargetPoiLoc,
+                    _cachedLeaderTargetBlacklistCount,
+                    _cachedLeaderTargetResult,
+                    nowUtcMs,
+                    me.MapId,
+                    me.Location,
+                    currentBossEntry,
+                    currentPoiType,
+                    currentPoiLoc,
+                    blacklistCount))
+            {
+                return _cachedLeaderTargetResult;
+            }
+
+            WoWPoint result = ComputeLeaderNextDungeonPointUncached(me, currentBoss?.Entry, nowUtcMs);
+            if ((BossManager.CurrentBoss?.Entry ?? 0U) == currentBossEntry)
+            {
+                _cachedLeaderTargetUtcMs = nowUtcMs;
+                _cachedLeaderTargetMapId = me.MapId;
+                _cachedLeaderTargetOrigin = me.Location;
+                _cachedLeaderTargetBossEntry = currentBossEntry;
+                _cachedLeaderTargetPoiType = BotPoi.Current.Type;
+                _cachedLeaderTargetPoiLoc = BotPoi.Current.Location;
+                _cachedLeaderTargetBlacklistCount = _blacklistedNavPoints.Count;
+                _cachedLeaderTargetResult = result;
+            }
+            else
+            {
+                ClearLeaderTargetCache();
+            }
+            return result;
+        }
+
+        private WoWPoint ComputeLeaderNextDungeonPointUncached(LocalPlayer me, uint? currentBossEntry, long nowUtcMs)
+        {
             if (BotPoi.Current.Type == PoiType.Hotspot && BotPoi.Current.Location != WoWPoint.Zero)
             {
                 WoWPoint hs = BotPoi.Current.Location;
@@ -1923,10 +2043,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             var profile = DbProfileManager.CurrentProfile;
             if (profile != null && profile.BossEncounters.Count > 0)
             {
-                var currentBoss = BossManager.CurrentBoss;
-                var profileBoss = currentBoss == null
+                var profileBoss = !currentBossEntry.HasValue
                     ? null
-                    : profile.BossEncounters.FirstOrDefault(b => b.Entry == currentBoss.Entry);
+                    : profile.BossEncounters.FirstOrDefault(b => b.Entry == currentBossEntry.Value);
 
                 if (profileBoss != null)
                 {
@@ -2006,7 +2125,9 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                         eligibleLiveBossLocation,
                         livePathDist,
                         ref bossIdx);
-                    if (bossTarget != WoWPoint.Zero && IsReachableDungeonCandidate(me.MapId, me.Location, bossTarget, nowUtcMs))
+                    if (bossTarget != WoWPoint.Zero &&
+                        ((eligibleLiveBossLocation.HasValue && livePathDist.HasValue && bossTarget == eligibleLiveBossLocation.Value) ||
+                         IsReachableDungeonCandidate(me.MapId, me.Location, bossTarget, nowUtcMs)))
                         return bossTarget;
 
                     if (liveCurrentBoss == null &&
@@ -2022,8 +2143,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     .Where(u => u != null && u.IsValid && u.IsAlive &&
                                 profile.BossEncounters.Any(b => b.Entry == u.Entry &&
                                     (!b.Optional || BossManager.KillOptionalBossesEnabled) &&
-                                    (currentBoss == null || b.Entry == currentBoss.Entry || b.KillOrder <=
-                                     (profile.BossEncounters.FirstOrDefault(pb => pb.Entry == currentBoss.Entry)?.KillOrder ?? int.MaxValue))))
+                                    (!currentBossEntry.HasValue || b.Entry == currentBossEntry.Value || b.KillOrder <=
+                                     (profile.BossEncounters.FirstOrDefault(pb => pb.Entry == currentBossEntry.Value)?.KillOrder ?? int.MaxValue))))
                     .Where(u => !IsNavPointBlacklisted(_blacklistedNavPoints, me.MapId, u.Location, nowUtcMs))
                     .Where(u => Navigator.PathDistance(me.Location, u.Location, BossFallbackApproachDistance) is float pd &&
                                 pd < BossFallbackApproachDistance)

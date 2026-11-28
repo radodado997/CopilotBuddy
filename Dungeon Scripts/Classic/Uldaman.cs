@@ -107,7 +107,9 @@ namespace Bots.DungeonBuddy.Dungeon_Scripts.Classic
         {
             return new PrioritySelector(
                 new Decorator(
-                    ctx => LootFrame.Instance.IsVisible && ((WoWGameObject)ctx).DistanceSqr <= 36.0,
+                    ctx => LootFrame.Instance.IsVisible &&
+                           LootFrame.Instance.LootingObjectGuid == ((WoWGameObject)ctx).Guid &&
+                           ((WoWGameObject)ctx).DistanceSqr <= 36.0,
                     new Action(ctx =>
                     {
                         LootFrame.Instance.LootAll();
@@ -140,6 +142,10 @@ namespace Bots.DungeonBuddy.Dungeon_Scripts.Classic
                         .OrderBy(o => o.DistanceSqr)
                         .FirstOrDefault(),
                     0,
+                    obj => (obj != null && obj.IsValid && (obj.Locked || obj.State == WoWGameObjectState.Active)) ||
+                           ObjectManager.GetObjectsOfType<WoWGameObject>().Any(o =>
+                               o != null && o.IsValid && o.Entry == KeystoneEntry && (o.Locked || o.State == WoWGameObjectState.Active)) ||
+                           IsBossDeadOrPresent(IronayaEntry),
                     () => { _keystoneTriggered = true; }));
         }
 
@@ -162,8 +168,9 @@ namespace Bots.DungeonBuddy.Dungeon_Scripts.Classic
                                    HasBagItem(ShaftOfTsolEntry),
                             new Action(ctx =>
                             {
-                                TryCombineStaffOfPrehistoria();
-                                return RunStatus.Success;
+                                if (!TryCombineStaffOfPrehistoria())
+                                    return RunStatus.Failure;
+                                return HasBagItem(StaffOfPrehistoriaEntry) ? RunStatus.Success : RunStatus.Running;
                             })),
                         new Decorator(
                             ctx => HasBagItem(StaffOfPrehistoriaEntry),
@@ -173,6 +180,13 @@ namespace Bots.DungeonBuddy.Dungeon_Scripts.Classic
                                     .OrderBy(o => o.DistanceSqr)
                                     .FirstOrDefault(),
                                 12,
+                                obj =>
+                                {
+                                    WoWGameObject currentDoor = HallOfCraftersDoor;
+                                    return (obj != null && obj.IsValid && obj.State == WoWGameObjectState.Active) ||
+                                           (currentDoor != null && currentDoor.IsValid && currentDoor.State == WoWGameObjectState.Active) ||
+                                           IsBossDeadOrPresent(IronayaEntry);
+                                },
                                 () => { _ironayaTriggered = true; })))));
         }
 
@@ -185,7 +199,7 @@ namespace Bots.DungeonBuddy.Dungeon_Scripts.Classic
                        Math.Abs(((WoWGameObject)ctx).Location.Z - StyxWoW.Me.Location.Z) < 10 &&
                        BossManager.CurrentBoss != null &&
                        BossManager.CurrentBoss.Entry == ArchaedasEntry &&
-                       BossManager.CurrentBoss.ToWoWUnit() == null,
+                       !IsBossAwake(ArchaedasEntry),
                 ScriptHelpers.CreateInteractWithObject(AltarOfArchaedasEntry, 12));
         }
 
@@ -243,6 +257,12 @@ namespace Bots.DungeonBuddy.Dungeon_Scripts.Classic
                    ObjectManager.GetObjectsOfType<WoWUnit>().Any(u => u != null && u.IsValid && u.Entry == bossEntry);
         }
 
+        private static bool IsBossAwake(uint bossEntry)
+        {
+            return ObjectManager.GetObjectsOfType<WoWUnit>().Any(u =>
+                u != null && u.IsValid && u.Entry == bossEntry && u.IsAlive && u.Attackable && u.CanSelect);
+        }
+
         private static bool AreLostDwarvesAliveNearby()
         {
             return ObjectManager.GetObjectsOfType<WoWUnit>().Any(u =>
@@ -253,6 +273,7 @@ namespace Bots.DungeonBuddy.Dungeon_Scripts.Classic
         private static Composite CreateSingleUseObjectInteract(
             Func<WoWGameObject> selector,
             int channelTime,
+            Func<WoWGameObject, bool> isActivated,
             System.Action markCompleted)
         {
             WoWGameObject gameObject = null;
@@ -260,7 +281,18 @@ namespace Bots.DungeonBuddy.Dungeon_Scripts.Classic
                 ctx => gameObject = selector(),
                 new Decorator(
                     ctx => gameObject != null && gameObject.DistanceSqr > 16.0,
-                    new Action(ctx => Navigator.MoveTo(gameObject.Location))),
+                    new Action(ctx =>
+                    {
+                        MoveResult moveResult = Navigator.MoveTo(
+                            gameObject.Location,
+                            Math.Min(Navigator.PathPrecision, 3.0f),
+                            "Approaching " + gameObject.Name);
+                        if (moveResult == MoveResult.Failed ||
+                            moveResult == MoveResult.PathGenerationFailed ||
+                            moveResult == MoveResult.ReachedDestination)
+                            return RunStatus.Failure;
+                        return RunStatus.Running;
+                    })),
                 new Decorator(
                     ctx => gameObject != null && gameObject.DistanceSqr <= 16.0,
                     new Sequence(
@@ -272,13 +304,26 @@ namespace Bots.DungeonBuddy.Dungeon_Scripts.Classic
                         new Action(ctx => gameObject.Interact()),
                         new WaitContinue(
                             2,
-                            ctx => StyxWoW.Me.IsCasting || StyxWoW.Me.IsActuallyInCombat,
+                            ctx => StyxWoW.Me.IsCasting || StyxWoW.Me.IsActuallyInCombat || (isActivated != null && isActivated(selector())),
                             new ActionAlwaysSucceed()),
                         new WaitContinue(
                             channelTime,
                             ctx => !StyxWoW.Me.IsCasting || StyxWoW.Me.IsActuallyInCombat,
                             new ActionAlwaysSucceed()),
-                        new Action(ctx => markCompleted()))));
+                        new WaitContinue(
+                            2,
+                            ctx => StyxWoW.Me.IsActuallyInCombat || (isActivated != null && isActivated(selector())),
+                            new ActionAlwaysSucceed()),
+                        new Action(ctx =>
+                        {
+                            WoWGameObject current = selector();
+                            if (isActivated == null || isActivated(current))
+                            {
+                                markCompleted();
+                                return RunStatus.Success;
+                            }
+                            return RunStatus.Failure;
+                        }))));
         }
     }
 }
