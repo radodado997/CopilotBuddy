@@ -29,6 +29,87 @@ namespace Bots.DungeonBuddy
         
         private static Dungeon? _currentDungeon;
         private static Composite? _currentDungeonBehavior;
+        private static Composite? _currentEncounterHandlersBehavior;
+        private static Composite? _currentObjectHandlersBehavior;
+
+        public static Func<WoWGameObject, bool>? IsObjectHandlerSuppressed { get; set; }
+        internal static Func<Composite, bool>? IsObjectHandlerCompositeSuppressed { get; set; }
+
+        internal static ulong LastActiveObjectGuid { get; private set; }
+        internal static string? LastActiveObjectName { get; private set; }
+        internal static Composite? LastActiveObjectComposite { get; private set; }
+
+        internal static void ResetLastActiveObject()
+        {
+            LastActiveObjectGuid = 0UL;
+            LastActiveObjectName = null;
+            LastActiveObjectComposite = null;
+        }
+
+        private sealed class ObjectTrackingDecorator : Decorator
+        {
+            private readonly Func<object?, WoWGameObject?> _resolveObject;
+
+            public ObjectTrackingDecorator(Composite child, Func<object?, WoWGameObject?> resolveObject)
+                : base(child)
+            {
+                _resolveObject = resolveObject;
+            }
+
+            protected override bool CanRun(object context)
+            {
+                return IsObjectHandlerCompositeSuppressed?.Invoke(this) != true && base.CanRun(context);
+            }
+
+            protected override IEnumerable<RunStatus> Execute(object context)
+            {
+                if (IsObjectHandlerCompositeSuppressed?.Invoke(this) == true)
+                {
+                    yield return RunStatus.Failure;
+                    yield break;
+                }
+                if (DecoratedChild == null)
+                {
+                    yield return RunStatus.Failure;
+                    yield break;
+                }
+
+                DecoratedChild.Start(context);
+                while (true)
+                {
+                    WoWGameObject? preTarget = _resolveObject(context);
+                    ulong preGuid = preTarget != null && preTarget.IsValid ? preTarget.Guid : 0UL;
+                    string? preName = preTarget != null && preTarget.IsValid ? preTarget.Name : null;
+                    RunStatus status = DecoratedChild.Tick(context);
+                    if (status == RunStatus.Running || status == RunStatus.Success)
+                    {
+                        LastActiveObjectComposite = this;
+                        WoWGameObject? target = _resolveObject(context);
+                        if (target != null && target.IsValid)
+                        {
+                            LastActiveObjectGuid = target.Guid;
+                            LastActiveObjectName = target.Name;
+                        }
+                        else if (preGuid != 0UL)
+                        {
+                            LastActiveObjectGuid = preGuid;
+                            if (!string.IsNullOrEmpty(preName))
+                                LastActiveObjectName = preName;
+                        }
+                    }
+
+                    if (status != RunStatus.Running)
+                        break;
+
+                    yield return RunStatus.Running;
+                }
+
+                DecoratedChild.Stop(context);
+                yield return DecoratedChild.LastStatus == RunStatus.Failure
+                    ? RunStatus.Failure
+                    : RunStatus.Success;
+            }
+        }
 
         /// <summary>
         /// Donjon actif
@@ -39,18 +120,50 @@ namespace Bots.DungeonBuddy
             set
             {
                 _currentDungeon = value;
-                _currentDungeonBehavior = null;
+                ResetCachedBehaviors();
             }
         }
 
-        public static Composite CurrentDungeonBehavior => _currentDungeonBehavior ??= BuildDungeonBehavior();
+        public static Composite CurrentDungeonBehavior =>
+            _currentDungeonBehavior ??= BuildDungeonBehavior(includeEncounterHandlers: true, includeObjectHandlers: true);
+
+        public static Composite CurrentEncounterHandlersBehavior =>
+            _currentEncounterHandlersBehavior ??= BuildDungeonBehavior(includeEncounterHandlers: true, includeObjectHandlers: false);
+
+        public static Composite CurrentObjectHandlersBehavior =>
+            _currentObjectHandlersBehavior ??= BuildDungeonBehavior(includeEncounterHandlers: false, includeObjectHandlers: true);
+
+        private static void StopCachedBehavior(Composite? behavior)
+        {
+            if (behavior != null && behavior.IsRunning)
+            {
+                try { behavior.Stop(null); }
+                catch (Exception ex) { Logging.WriteException(ex); }
+            }
+        }
+
+        internal static void StopEncounterHandlersBehaviorIfRunning()
+        {
+            StopCachedBehavior(_currentEncounterHandlersBehavior);
+        }
+
+        private static void ResetCachedBehaviors()
+        {
+            StopCachedBehavior(_currentDungeonBehavior);
+            StopCachedBehavior(_currentEncounterHandlersBehavior);
+            StopCachedBehavior(_currentObjectHandlersBehavior);
+            _currentDungeonBehavior = null;
+            _currentEncounterHandlersBehavior = null;
+            _currentObjectHandlersBehavior = null;
+            ResetLastActiveObject();
+        }
 
         /// <summary>
         /// Port de HB 4.3.4 ns26.Class147.smethod_0(Dungeon).
         /// Construit le comportement de script de donjon en enveloppant les handlers
         /// EncounterHandler et ObjectHandler avec leur contexte approprié.
         /// </summary>
-        private static Composite BuildDungeonBehavior()
+        private static Composite BuildDungeonBehavior(bool includeEncounterHandlers, bool includeObjectHandlers)
         {
             if (_currentDungeon == null)
                 return new PrioritySelector();
@@ -58,8 +171,8 @@ namespace Bots.DungeonBuddy
             var methodInfos = _currentDungeon.GetType().GetMethods(BindingFlags.Instance | BindingFlags.Public)
                 .Where(m => m.GetParameters().Length == 0 &&
                             (m.ReturnType == typeof(Composite) || m.ReturnType.IsSubclassOf(typeof(Composite))))
-                .Where(m => m.GetCustomAttributes(typeof(EncounterHandlerAttribute), false).Any() ||
-                            m.GetCustomAttributes(typeof(ObjectHandlerAttribute), false).Any());
+                .Where(m => (includeEncounterHandlers && m.GetCustomAttributes(typeof(EncounterHandlerAttribute), false).Any()) ||
+                            (includeObjectHandlers && m.GetCustomAttributes(typeof(ObjectHandlerAttribute), false).Any()));
 
             var behaviors = new List<Composite>();
 
@@ -74,8 +187,12 @@ namespace Bots.DungeonBuddy
                         continue;
                     }
 
-                    var encounterAttrs = method.GetCustomAttributes<EncounterHandlerAttribute>(false).ToList();
-                    var objectAttrs = method.GetCustomAttributes<ObjectHandlerAttribute>(false).ToList();
+                    var encounterAttrs = includeEncounterHandlers
+                        ? method.GetCustomAttributes<EncounterHandlerAttribute>(false).ToList()
+                        : new List<EncounterHandlerAttribute>();
+                    var objectAttrs = includeObjectHandlers
+                        ? method.GetCustomAttributes<ObjectHandlerAttribute>(false).ToList()
+                        : new List<ObjectHandlerAttribute>();
 
                     if (encounterAttrs.Count > 0)
                     {
@@ -101,14 +218,15 @@ namespace Bots.DungeonBuddy
                             var objectRangeSqr = objectAttrs[0].ObjectRangeSqr;
                             behaviors.Add(new PrioritySelector(
                                 new ContextChangeHandler(context => ObjectManager.GetObjectsOfType<WoWGameObject>(false, false)
-                                    .Where(o => o.IsValid && o.DistanceSqr <= objectRangeSqr)),
-                                composite));
+                                    .Where(o => o.IsValid && o.DistanceSqr <= objectRangeSqr && !IsObjectSuppressed(o))),
+                                new ObjectTrackingDecorator(composite, _ => null)));
                         }
                         else
                         {
                             behaviors.Add(new PrioritySelector(
                                 new ContextChangeHandler(context => (object)FindNearestObject(objectAttrs)!),
-                                new Decorator(ctx => ctx != null, composite)));
+                                new Decorator(ctx => ctx != null,
+                                    new ObjectTrackingDecorator(composite, ctx => ctx as WoWGameObject))));
                         }
                     }
                 }
@@ -157,10 +275,16 @@ namespace Bots.DungeonBuddy
             return encounterAttrs.Any(attr => attr.Mode == CallBehaviorMode.CurrentBoss && currentBoss.Entry == (uint)attr.BossEntry);
         }
 
+        private static bool IsObjectSuppressed(WoWGameObject obj)
+        {
+            return IsObjectHandlerSuppressed?.Invoke(obj) == true;
+        }
+
         private static WoWGameObject? FindNearestObject(List<ObjectHandlerAttribute> objectAttrs)
         {
             return ObjectManager.GetObjectsOfType<WoWGameObject>(false, false)
-                .Where(obj => obj.IsValid && objectAttrs.Any(attr => obj.Entry == attr.ObjectEntry && obj.DistanceSqr <= attr.ObjectRangeSqr))
+                .Where(obj => obj.IsValid && !IsObjectSuppressed(obj) &&
+                              objectAttrs.Any(attr => obj.Entry == attr.ObjectEntry && obj.DistanceSqr <= attr.ObjectRangeSqr))
                 .OrderBy(obj => obj.DistanceSqr)
                 .FirstOrDefault();
         }
@@ -353,7 +477,7 @@ if (Activator.CreateInstance(type) is not Dungeon instance)
             _currentDungeon?.Detach();
             _currentDungeon?.Dispose();
             _currentDungeon = null;
-            _currentDungeonBehavior = null;
+            ResetCachedBehaviors();
 
             if (_dungeonTypes.TryGetValue(dungeonId, out var dungeonType))
             {
@@ -422,7 +546,7 @@ if (Activator.CreateInstance(type) is not Dungeon instance)
             _currentDungeon?.Dispose();
             LfgManager.DungeonCompletedReason = CompleteReason.None;
             _currentDungeon = null;
-            _currentDungeonBehavior = null;
+            ResetCachedBehaviors();
             ProfileManager.UnloadProfile();
         }
 
@@ -459,7 +583,7 @@ if (Activator.CreateInstance(type) is not Dungeon instance)
             Logging.Write("[DungeonBuddy] Reloading dungeon scripts...");
             _currentDungeon?.Detach();
             _currentDungeon = null;
-            _currentDungeonBehavior = null;
+            ResetCachedBehaviors();
             LoadDungeonScripts();
         }
     }

@@ -172,6 +172,8 @@ namespace Styx.PartyGrind.IPC
         public bool WantsFood { get; set; }
         public bool WantsDrink { get; set; }
         public bool WantsHealthstone { get; set; }
+        public List<uint> HeldDungeonItems { get; set; } = new();
+        public List<uint> TradableDungeonItems { get; set; } = new();
         public bool CanProvideMageFood { get; set; }
         public bool CanProvideMageDrink { get; set; }
         public bool CanProvideHealthstone { get; set; }
@@ -251,6 +253,7 @@ namespace Styx.PartyGrind.IPC
         // Provisioning / Trade Arbitration
         public string ActiveProvisionerName { get; set; } = string.Empty;
         public string ActiveTradeTargetName { get; set; } = string.Empty;
+        public bool IsDungeonItemTransferAssignment { get; set; }
 
         public SquadBotMode BotMode { get; set; } = SquadBotMode.OpenWorldGrind;
         public SquadDungeonEntryMode DungeonEntryMode { get; set; } = SquadDungeonEntryMode.LfgRandomNormal;
@@ -347,6 +350,8 @@ namespace Styx.PartyGrind.IPC
         public bool WantsFood { get; set; }
         public bool WantsDrink { get; set; }
         public bool WantsHealthstone { get; set; }
+        public List<uint> HeldDungeonItems { get; set; } = new();
+        public List<uint> TradableDungeonItems { get; set; } = new();
         public bool IsProvisioningBusy { get; set; }
         public bool CanProvideMageFood { get; set; }
         public bool CanProvideMageDrink { get; set; }

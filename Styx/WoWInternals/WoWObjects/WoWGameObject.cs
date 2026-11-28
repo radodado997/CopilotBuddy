@@ -319,12 +319,25 @@ namespace Styx.WoWInternals.WoWObjects
                     }
                     return false;
                 }
+                else if (IsChest && !Locked)
+                {
+                    return CanLootUnlockedChest(State, Flags);
+                }
                 
-                // Fallback for quest GameObjects (Goobers, unlocked chests, etc.):
+                // Fallback for quest GameObjects (Goobers, etc.):
                 // Check DynamicFlags: bit 0 = activatable, bit 3 = has loot/sparkle
                 // (FlagsDynamic & 9) == 9 means both flags are set
                 return (FlagsDynamic & 9) == 9;
             }
+        }
+
+        internal static bool CanLootUnlockedChest(WoWGameObjectState state, GameObjectFlags flags)
+        {
+            return state == WoWGameObjectState.Ready &&
+                   (flags & (GameObjectFlags.InUse |
+                             GameObjectFlags.ConditionInteract |
+                             GameObjectFlags.NotSelectable |
+                             GameObjectFlags.Destroyed)) == 0;
         }
         
         // HB 4.3.4: CanMine just checks LockType (no State check in HB)

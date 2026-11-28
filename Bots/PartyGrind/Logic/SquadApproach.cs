@@ -10,14 +10,29 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
     internal sealed class SquadApproach
     {
         private readonly Dictionary<ulong, (float Distance, long Progress, long Retry, long Attempt)> _progress = new();
+        public void ResetTarget(ulong guid)
+        {
+            _progress.Remove(guid);
+        }
+
         public bool TryMove(WoWUnit target, string reason)
         {
+            return TryMove(target, reason, out _);
+        }
+
+        public bool TryMove(WoWUnit target, string reason, out bool retryDeferred)
+        {
+            retryDeferred = false;
             long now = Environment.TickCount64;
             foreach (var stale in _progress.Where(p => p.Key != target.Guid && now >= p.Value.Retry && now - p.Value.Attempt > 15000).Select(p => p.Key).ToList())
                 _progress.Remove(stale);
             float distance = StyxWoW.Me.Location.Distance(target.Location);
             if (!_progress.TryGetValue(target.Guid, out var state)) state = (distance, now, 0, now);
-            if (now < state.Retry) return false;
+            if (now < state.Retry)
+            {
+                retryDeferred = true;
+                return false;
+            }
             if (now - state.Attempt > 1000 || state.Retry != 0 || distance < state.Distance - 1f) state = (distance, now, 0, now);
 
             // A target inside navigation tolerance can still be unreachable for spell

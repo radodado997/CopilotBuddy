@@ -776,7 +776,18 @@ namespace Bots.DungeonBuddy.Helpers
 
                 new Decorator(
                     ctx => gameObject != null && gameObject.DistanceSqr > 16.0,
-                    new Action(ctx => Navigator.MoveTo(gameObject.Location))),
+                    new Action(ctx =>
+                    {
+                        MoveResult moveResult = Navigator.MoveTo(
+                            gameObject.Location,
+                            Math.Min(Navigator.PathPrecision, 3.0f),
+                            "Moving to " + gameObject.Name);
+                        if (moveResult == MoveResult.Failed ||
+                            moveResult == MoveResult.PathGenerationFailed ||
+                            moveResult == MoveResult.ReachedDestination)
+                            return RunStatus.Failure;
+                        return RunStatus.Running;
+                    })),
 
                 new Decorator(
                     ctx => gameObject != null && gameObject.DistanceSqr <= 16.0,

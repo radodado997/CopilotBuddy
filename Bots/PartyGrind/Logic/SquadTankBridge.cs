@@ -174,6 +174,8 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 if (isDungeon)
                 {
                     WoWPoint meLoc = StyxWoW.Me.Location;
+                    uint meMapId = StyxWoW.Me.MapId;
+                    long filterNowMs = Environment.TickCount64;
                     bool canPull = StyxWoW.Me.Combat || committedGuid != 0 || CanInitiatePull(leader, settings.MaxPullGatherDistance);
                     foreach (WoWObject obj in incomingUnits)
                     {
@@ -181,12 +183,6 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                             continue;
                         if (unit.IsFriendly || unit.IsPlayer || unit.IsCritter || unit.IsNonCombatPet || unit.ControllingPlayer != null)
                             continue;
-
-                        if (committedGuid != 0 && unit.Guid == committedGuid)
-                        {
-                            outgoingUnits.Add(unit);
-                            continue;
-                        }
 
                         bool partyThreat = unit.IsTargetingMyPartyMember || unit.IsTargetingMeOrPet ||
                                            (unit.Combat && unit.CurrentTargetGuid != 0 && memberGuids.Contains(unit.CurrentTargetGuid));
@@ -197,15 +193,24 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                             continue;
                         }
 
+                        if (committedGuid != 0 && unit.Guid == committedGuid)
+                        {
+                            if (!IsTemporarilyPullBlacklisted(unit.Guid, filterNowMs))
+                                outgoingUnits.Add(unit);
+                            continue;
+                        }
+
                         if (!StyxWoW.Me.Combat && canPull)
                         {
                             if (!unit.IsHostile || unit.DistanceSqr > 1225.0)
+                                continue;
+                            if (IsTemporarilyPullBlacklisted(unit.Guid, filterNowMs))
                                 continue;
                             if (global::Bots.DungeonBuddy.Profiles.ProfileManager.IsNpcInPullBlackspot(unit))
                                 continue;
                             if (!unit.InLineOfSight)
                                 continue;
-                            if (!unit.IsFlying && !Navigator.CanNavigateWithinDistance(meLoc, unit.Location, 35f))
+                            if (!unit.IsFlying && !CanNavigateWithinDistanceCached(meMapId, meLoc, unit.Guid, unit.Location, 35f, filterNowMs))
                                 continue;
                             outgoingUnits.Add(unit);
                         }
@@ -362,7 +367,10 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
                     tp.Score += ComputeTankTargetBonus(targetingOtherParty, targetingHealer, inCombatWithSquad, distToTank, tankInCombat);
                     if (isDungeon && !tankInCombat)
+                    {
                         tp.Score -= unit.Distance * 2.0;
+                        tp.Score += ComputeDungeonPullElevationPenalty(unit.Location.Z, meLoc.Z);
+                    }
                 }
             }
             else if (leader != null)
@@ -646,9 +654,300 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
             return false;
         }
 
+        internal const long PullCastHoldWindowMs = 3500L;
+        internal const long PullLosWaitBeforeAdvanceMs = 1200L;
+        internal const long PullTempBlacklistMs = 8000L;
+        internal const long PullStateStaleResetMs = 12000L;
+        internal const float MeleePullFallbackRange = 5.5f;
+        internal const float DungeonPullLedgeDeltaZ = 3.5f;
+
+        internal enum DungeonPullAction
+        {
+            Approach,
+            HoldAfterCast,
+            CastOpener,
+            AbandonAndBlacklist
+        }
+
+        private static readonly object PullStateLock = new();
         private static long _lastDungeonPullCastUtcMs;
         private static ulong _lastDungeonPullTargetGuid;
+        private static int _lastDungeonPullSpellId;
+        private static string _lastDungeonPullSpellName = string.Empty;
+        private static int _pullFailureCountForTarget;
+        private static bool _lastPullCastCountedFailure;
+        private static bool _pullLosErrorSinceLastCast;
+        private static readonly Dictionary<ulong, long> PullBlacklistedUntilMs = new();
+        internal const long PullNavCacheTtlMs = 500L;
+        internal const float PullNavCacheMoveTolerance = 1.5f;
+        private const int PullNavCacheMaxEntries = 64;
+
+        private readonly struct PullNavCacheEntry
+        {
+            public PullNavCacheEntry(uint mapId, WoWPoint from, WoWPoint to, float maxDistance, bool reachable, long timestampUtcMs)
+            {
+                MapId = mapId;
+                From = from;
+                To = to;
+                MaxDistance = maxDistance;
+                Reachable = reachable;
+                TimestampUtcMs = timestampUtcMs;
+            }
+
+            public uint MapId { get; }
+            public WoWPoint From { get; }
+            public WoWPoint To { get; }
+            public float MaxDistance { get; }
+            public bool Reachable { get; }
+            public long TimestampUtcMs { get; }
+        }
+
+        private static readonly Dictionary<ulong, PullNavCacheEntry> PullNavCache = new();
         private static readonly SquadApproach PullApproach = new();
+
+        private static string? _localizedLosErrorText;
+        private static long _nextLocalizedLosRetryUtcMs;
+
+        private static string? GetLocalizedLineOfSightErrorText()
+        {
+            if (!string.IsNullOrEmpty(_localizedLosErrorText))
+                return _localizedLosErrorText;
+            if (ObjectManager.Executor == null)
+                return null;
+
+            long now = Environment.TickCount64;
+            if (now < _nextLocalizedLosRetryUtcMs)
+                return null;
+
+            try
+            {
+                string? localized = Lua.GetReturnVal<string>("return tostring(SPELL_FAILED_LINE_OF_SIGHT or '')", 0);
+                if (!string.IsNullOrWhiteSpace(localized))
+                {
+                    _localizedLosErrorText = localized.Trim();
+                    return _localizedLosErrorText;
+                }
+            }
+            catch
+            {
+            }
+
+            _nextLocalizedLosRetryUtcMs = now + 5000L;
+            return null;
+        }
+
+        internal static bool IsLineOfSightErrorMessage(string? message, string? localizedLosError = null)
+        {
+            if (string.IsNullOrWhiteSpace(message))
+                return false;
+
+            if (message.IndexOf("line of sight", StringComparison.OrdinalIgnoreCase) >= 0)
+                return true;
+
+            string? resolvedLocalized = localizedLosError ?? GetLocalizedLineOfSightErrorText();
+            return !string.IsNullOrEmpty(resolvedLocalized) &&
+                   message.IndexOf(resolvedLocalized, StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        public static void NotifyPullLineOfSightError(string? message = null, long? nowUtcMs = null)
+        {
+            long now = nowUtcMs ?? Environment.TickCount64;
+            lock (PullStateLock)
+            {
+                if (_lastDungeonPullTargetGuid == 0 ||
+                    _lastDungeonPullCastUtcMs <= 0 ||
+                    now - _lastDungeonPullCastUtcMs >= PullCastHoldWindowMs)
+                    return;
+
+                _pullLosErrorSinceLastCast = true;
+                if (!_lastPullCastCountedFailure)
+                {
+                    _lastPullCastCountedFailure = true;
+                    _pullFailureCountForTarget++;
+                }
+            }
+        }
+
+        internal static bool IsTemporarilyPullBlacklisted(ulong guid, long nowUtcMs)
+        {
+            if (guid == 0)
+                return false;
+
+            lock (PullStateLock)
+            {
+                if (PullBlacklistedUntilMs.TryGetValue(guid, out long untilMs))
+                {
+                    if (nowUtcMs < untilMs)
+                        return true;
+                    PullBlacklistedUntilMs.Remove(guid);
+                }
+                return false;
+            }
+        }
+
+        internal static bool ShouldRejectIdlePullTarget(bool isTemporarilyBlacklisted, bool targetEngaged)
+        {
+            return isTemporarilyBlacklisted && !targetEngaged;
+        }
+
+        internal static void BlacklistPullTarget(ulong guid, long nowUtcMs)
+        {
+            if (guid == 0)
+                return;
+
+            lock (PullStateLock)
+            {
+                foreach (ulong expired in PullBlacklistedUntilMs.Where(kv => kv.Value <= nowUtcMs).Select(kv => kv.Key).ToList())
+                    PullBlacklistedUntilMs.Remove(expired);
+
+                PullBlacklistedUntilMs[guid] = nowUtcMs + PullTempBlacklistMs;
+                if (_lastDungeonPullTargetGuid == guid)
+                {
+                    _lastDungeonPullTargetGuid = 0;
+                    _lastDungeonPullCastUtcMs = 0;
+                    _lastDungeonPullSpellId = 0;
+                    _lastDungeonPullSpellName = string.Empty;
+                    _pullFailureCountForTarget = 0;
+                    _lastPullCastCountedFailure = false;
+                    _pullLosErrorSinceLastCast = false;
+                }
+            }
+        }
+
+        internal static bool ShouldReusePullNavCache(
+            uint cachedMapId,
+            WoWPoint cachedFrom,
+            WoWPoint cachedTo,
+            float cachedMaxDistance,
+            long cachedUtcMs,
+            uint currentMapId,
+            WoWPoint currentFrom,
+            WoWPoint currentTo,
+            float currentMaxDistance,
+            long nowUtcMs)
+        {
+            return cachedUtcMs > 0 &&
+                   nowUtcMs >= cachedUtcMs &&
+                   nowUtcMs - cachedUtcMs < PullNavCacheTtlMs &&
+                   cachedMapId == currentMapId &&
+                   MathF.Abs(cachedMaxDistance - currentMaxDistance) <= 0.01f &&
+                   cachedFrom.Distance(currentFrom) <= PullNavCacheMoveTolerance &&
+                   cachedTo.Distance(currentTo) <= PullNavCacheMoveTolerance;
+        }
+
+        private static bool CanNavigateWithinDistanceCached(
+            uint mapId,
+            WoWPoint from,
+            ulong unitGuid,
+            WoWPoint to,
+            float maxDistance,
+            long nowUtcMs)
+        {
+            if (unitGuid != 0)
+            {
+                lock (PullStateLock)
+                {
+                    if (PullNavCache.TryGetValue(unitGuid, out var cached) &&
+                        ShouldReusePullNavCache(
+                            cached.MapId,
+                            cached.From,
+                            cached.To,
+                            cached.MaxDistance,
+                            cached.TimestampUtcMs,
+                            mapId,
+                            from,
+                            to,
+                            maxDistance,
+                            nowUtcMs))
+                    {
+                        return cached.Reachable;
+                    }
+                }
+            }
+
+            bool reachable = Navigator.CanNavigateWithinDistance(from, to, maxDistance);
+            if (unitGuid != 0)
+            {
+                lock (PullStateLock)
+                {
+                    if (PullNavCache.Count >= PullNavCacheMaxEntries)
+                    {
+                        foreach (ulong expired in PullNavCache
+                            .Where(kv => nowUtcMs < kv.Value.TimestampUtcMs || nowUtcMs - kv.Value.TimestampUtcMs >= PullNavCacheTtlMs)
+                            .Select(kv => kv.Key)
+                            .ToList())
+                        {
+                            PullNavCache.Remove(expired);
+                        }
+                        if (PullNavCache.Count >= PullNavCacheMaxEntries)
+                            PullNavCache.Clear();
+                    }
+
+                    PullNavCache[unitGuid] = new PullNavCacheEntry(mapId, from, to, maxDistance, reachable, nowUtcMs);
+                }
+            }
+
+            return reachable;
+        }
+
+        internal static void ResetPullStateForTests()
+        {
+            lock (PullStateLock)
+            {
+                _lastDungeonPullTargetGuid = 0;
+                _lastDungeonPullCastUtcMs = 0;
+                _lastDungeonPullSpellId = 0;
+                _lastDungeonPullSpellName = string.Empty;
+                _pullFailureCountForTarget = 0;
+                _lastPullCastCountedFailure = false;
+                _pullLosErrorSinceLastCast = false;
+                PullBlacklistedUntilMs.Clear();
+                PullNavCache.Clear();
+            }
+        }
+
+        internal static double ComputeDungeonPullElevationPenalty(float targetZ, float tankZ)
+        {
+            float absDz = MathF.Abs(targetZ - tankZ);
+            return absDz > DungeonPullLedgeDeltaZ ? -(120.0 + absDz * 15.0) : 0.0;
+        }
+
+        internal static DungeonPullAction EvaluateDungeonPullStep(
+            bool targetInRange,
+            bool inLineOfSpellSight,
+            bool hasRecentCast,
+            long elapsedSinceCastMs,
+            bool losErrorAfterCast,
+            int pullFailureCount,
+            float distanceToTarget,
+            bool isCasting = false)
+        {
+            if (pullFailureCount >= 2)
+                return DungeonPullAction.AbandonAndBlacklist;
+
+            if (hasRecentCast)
+            {
+                if (isCasting && !losErrorAfterCast)
+                    return DungeonPullAction.HoldAfterCast;
+
+                if (!losErrorAfterCast && elapsedSinceCastMs < PullLosWaitBeforeAdvanceMs)
+                    return DungeonPullAction.HoldAfterCast;
+
+                if (pullFailureCount >= 1 && distanceToTarget > MeleePullFallbackRange)
+                    return DungeonPullAction.Approach;
+
+                if (losErrorAfterCast && distanceToTarget <= MeleePullFallbackRange)
+                    return inLineOfSpellSight ? DungeonPullAction.CastOpener : DungeonPullAction.Approach;
+            }
+
+            if (pullFailureCount >= 1 && distanceToTarget > MeleePullFallbackRange)
+                return DungeonPullAction.Approach;
+
+            if (!targetInRange || !inLineOfSpellSight)
+                return DungeonPullAction.Approach;
+
+            return DungeonPullAction.CastOpener;
+        }
 
         // Pulling a mob that already stands next to its pack with a multi-target opener
         // (Avenger's Shield bounces to three targets) drags the whole pack in one go.
@@ -727,15 +1026,18 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
         internal static WoWUnit? SelectIsolatedPullTarget(WoWUnit? current, WoWPoint from, float scanRadius)
         {
             if (current == null || !current.IsValid || current.Dead)
-                return current;
+                return null;
 
+            long nowMs = Environment.TickCount64;
+            uint fromMapId = StyxWoW.Me?.MapId ?? 0U;
+            bool currentBlacklisted = IsTemporarilyPullBlacklisted(current.Guid, nowMs);
             int currentPack = CountPullPackSize(current);
-            if (currentPack <= MaxComfortablePackSize)
+            if (!currentBlacklisted && currentPack <= MaxComfortablePackSize)
                 return current;
 
             WoWUnit? best = null;
-            int bestPack = currentPack;
-            float bestDistance = from.Distance(current.Location);
+            int bestPack = currentBlacklisted ? int.MaxValue : currentPack;
+            float bestDistance = currentBlacklisted ? float.MaxValue : from.Distance(current.Location);
 
             int inspected = 0;
             foreach (var unit in ObjectManager.CachedUnits)
@@ -744,9 +1046,12 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     break;
                 if (unit == null || !unit.IsValid || unit.Dead || unit.Guid == current.Guid)
                     continue;
-                if (!unit.Attackable || unit.IsFriendly || unit.IsPlayer || unit.IsCritter || unit.IsNonCombatPet)
+                if (!unit.CanSelect || !unit.Attackable || !unit.IsHostile || unit.IsFriendly || unit.IsPlayer || unit.IsCritter || unit.IsNonCombatPet)
                     continue;
                 if (unit.ControllingPlayer != null || unit.Combat)
+                    continue;
+                if (IsTemporarilyPullBlacklisted(unit.Guid, nowMs) ||
+                    global::Bots.DungeonBuddy.Profiles.ProfileManager.IsNpcInPullBlackspot(unit))
                     continue;
 
                 float distance = from.Distance(unit.Location);
@@ -754,7 +1059,20 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                     continue;
 
                 inspected++;
+                if (!unit.InLineOfSight || (!unit.IsFlying && !CanNavigateWithinDistanceCached(fromMapId, from, unit.Guid, unit.Location, 35f, nowMs)))
+                    continue;
                 int pack = CountPullPackSize(unit);
+                if (currentBlacklisted)
+                {
+                    if (pack < bestPack || (pack == bestPack && distance < bestDistance))
+                    {
+                        best = unit;
+                        bestPack = pack;
+                        bestDistance = distance;
+                    }
+                    continue;
+                }
+
                 if (!IsBetterPullCandidate(pack, distance, bestPack, bestDistance))
                     continue;
 
@@ -763,7 +1081,7 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 bestDistance = distance;
             }
 
-            return best ?? current;
+            return currentBlacklisted ? best : (best ?? current);
         }
 
         internal static bool IsPackPullTooRisky(int packSize, float lowestPartyManaPercent, long holdElapsedMs)
@@ -806,13 +1124,54 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
                 return false;
 
             long now = Environment.TickCount64;
-            if (_lastDungeonPullTargetGuid == targetGuid && now - _lastDungeonPullCastUtcMs < 3500L)
+            bool isCastingAny = me.IsCasting || me.ChanneledCastingSpellId != 0;
+            int activeCastingSpellId = isCastingAny ? me.CastingSpellId : 0;
+            string? activeCastingSpellName = isCastingAny ? me.CurrentCastingSpell?.Name : null;
+            bool isCastingOpener;
+            bool hasRecentCast;
+            long elapsed;
+            bool losError;
+            int failureCount;
+            lock (PullStateLock)
             {
-                if (me.IsMoving)
-                    WoWMovement.MoveStop();
-                if (!me.IsFacing(target))
-                    target.Face();
-                return true;
+                if (PullBlacklistedUntilMs.TryGetValue(targetGuid, out long untilMs))
+                {
+                    if (now < untilMs)
+                        return false;
+                    PullBlacklistedUntilMs.Remove(targetGuid);
+                }
+
+                if (_lastDungeonPullTargetGuid != targetGuid ||
+                    (_lastDungeonPullCastUtcMs > 0 && now - _lastDungeonPullCastUtcMs >= PullStateStaleResetMs))
+                {
+                    _lastDungeonPullTargetGuid = targetGuid;
+                    _lastDungeonPullCastUtcMs = 0;
+                    _lastDungeonPullSpellId = 0;
+                    _lastDungeonPullSpellName = string.Empty;
+                    _pullFailureCountForTarget = 0;
+                    _lastPullCastCountedFailure = false;
+                    _pullLosErrorSinceLastCast = false;
+                }
+
+                isCastingOpener = isCastingAny && (_lastDungeonPullSpellId > 0
+                    ? activeCastingSpellId == _lastDungeonPullSpellId
+                    : (string.IsNullOrEmpty(_lastDungeonPullSpellName) ||
+                       string.Equals(activeCastingSpellName, _lastDungeonPullSpellName, StringComparison.OrdinalIgnoreCase)));
+
+                bool hasRecordedCast = _lastDungeonPullCastUtcMs > 0;
+                if (hasRecordedCast && isCastingOpener && !_pullLosErrorSinceLastCast)
+                    _lastDungeonPullCastUtcMs = now;
+
+                hasRecentCast = hasRecordedCast && now - _lastDungeonPullCastUtcMs < PullCastHoldWindowMs;
+                elapsed = hasRecordedCast ? now - _lastDungeonPullCastUtcMs : long.MaxValue;
+                if (hasRecordedCast && !isCastingOpener && !_pullLosErrorSinceLastCast && !_lastPullCastCountedFailure && elapsed >= PullLosWaitBeforeAdvanceMs)
+                {
+                    _lastPullCastCountedFailure = true;
+                    _pullFailureCountForTarget++;
+                }
+
+                losError = _pullLosErrorSinceLastCast;
+                failureCount = _pullFailureCountForTarget;
             }
 
             string[] pullSpells = GetPullSpellPriority(
@@ -822,19 +1181,56 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
             string? chosenSpell = pullSpells.FirstOrDefault(s =>
                 SpellManager.HasSpell(s) && SpellManager.CanCast(s, target, checkRange: false, checkMovement: false));
-            if (string.IsNullOrEmpty(chosenSpell))
-                return false;
 
             float maxRange = 28f;
-            if (SpellManager.Spells.TryGetValue(chosenSpell, out WoWSpell? info) && info.MaxRange > 5f)
-                maxRange = Math.Max(8f, info.MaxRange - 1.5f);
+            WoWSpell? chosenSpellInfo = null;
+            if (!string.IsNullOrEmpty(chosenSpell) && SpellManager.Spells.TryGetValue(chosenSpell, out chosenSpellInfo) && chosenSpellInfo.MaxRange > 5f)
+                maxRange = Math.Max(8f, chosenSpellInfo.MaxRange - 1.5f);
 
-            if (target.Distance > maxRange || !target.InLineOfSpellSight)
+            float targetDistance = (float)target.Distance;
+            DungeonPullAction action = EvaluateDungeonPullStep(
+                targetDistance <= maxRange,
+                target.InLineOfSpellSight,
+                hasRecentCast,
+                elapsed,
+                losError,
+                failureCount,
+                targetDistance,
+                isCastingOpener);
+
+            switch (action)
             {
-                if (!global::Bots.DungeonBuddy.Helpers.ScriptHelpers.MovementEnabled)
+                case DungeonPullAction.AbandonAndBlacklist:
+                    BlacklistPullTarget(targetGuid, now);
+                    SquadPartySyncService.LogAction("Skipping unreachable LoS pull target " + target.Name);
                     return false;
-                return PullApproach.TryMove(target, "Approaching dungeon pull " + target.Name);
+
+                case DungeonPullAction.HoldAfterCast:
+                    if (me.IsMoving)
+                        WoWMovement.MoveStop();
+                    if (!me.IsFacing(target))
+                        target.Face();
+                    return true;
+
+                case DungeonPullAction.Approach:
+                    if (string.IsNullOrEmpty(chosenSpell) && failureCount == 0 && pullSpells.Length == 0)
+                        return false;
+                    if (!global::Bots.DungeonBuddy.Helpers.ScriptHelpers.MovementEnabled)
+                        return false;
+                    if (PullApproach.TryMove(target, "Approaching dungeon pull " + target.Name, out bool retryDeferred))
+                        return true;
+                    if (retryDeferred)
+                        return true;
+                    if (failureCount == 0 && targetDistance <= maxRange && target.InLineOfSpellSight && !losError)
+                        break;
+                    BlacklistPullTarget(targetGuid, now);
+                    PullApproach.ResetTarget(targetGuid);
+                    SquadPartySyncService.LogAction("Skipping unreachable pull target " + target.Name);
+                    return false;
             }
+
+            if (string.IsNullOrEmpty(chosenSpell))
+                return false;
 
             if (me.IsMoving)
                 WoWMovement.MoveStop();
@@ -847,8 +1243,15 @@ namespace CopilotBuddy.Bots.PartyGrind.Logic
 
             if (SpellManager.CanCast(chosenSpell, target, true, false) && SpellManager.Cast(chosenSpell, target))
             {
-                _lastDungeonPullTargetGuid = targetGuid;
-                _lastDungeonPullCastUtcMs = now;
+                lock (PullStateLock)
+                {
+                    _lastDungeonPullTargetGuid = targetGuid;
+                    _lastDungeonPullCastUtcMs = now;
+                    _lastDungeonPullSpellId = chosenSpellInfo != null ? (int)chosenSpellInfo.Id : 0;
+                    _lastDungeonPullSpellName = chosenSpell;
+                    _lastPullCastCountedFailure = false;
+                    _pullLosErrorSinceLastCast = false;
+                }
                 SquadPartySyncService.LogAction("Pulling " + target.Name + " with " + chosenSpell);
                 return true;
             }
